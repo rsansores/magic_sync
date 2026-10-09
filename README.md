@@ -5,9 +5,9 @@ what the replicas write. Offline-first: a replica keeps working while it is
 unreachable, and catches up when it is back — with nobody repairing data by
 hand.
 
-![The shop example: a head office and two registers, one of them unplugged](book/src/images/shop.png)
+![The shop example: a head office and two registers, one of them unplugged](https://raw.githubusercontent.com/rsansores/magic_sync/main/book/src/images/shop.png)
 
-*The [shop example](examples/shop): register 2 is unplugged. It keeps selling
+*The [shop example](https://rsansores.github.io/magic_sync/getting-started.html): register 2 is unplugged. It keeps selling
 from the products it holds; the head office knows it holds 5 of 7, and that
 two receipts are on their way. Plug it back in and both catch up.*
 
@@ -84,8 +84,8 @@ Built on that:
 - **Any transport.** You implement one method that sends bytes to a replica
   (NATS JetStream, HTTP, a queue, a USB stick). The engine needs one property
   from it: a replica's messages arrive in order, one at a time.
-- **Any language on the replica side.** The [protocol](magic_sync/PROTOCOL.md)
-  is written down, its messages are a [`.proto`](magic_sync/proto/sync.proto),
+- **Any language on the replica side.** The [protocol](https://rsansores.github.io/magic_sync/protocol.html)
+  is written down, its messages are a [`.proto`](https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto),
   and the engine's own replica is just one implementation of it.
 
 ## Where it fits, and where it does not
@@ -109,13 +109,13 @@ server — no extra service to run.
 
 ## Learn it
 
-- **[The book](book/src/SUMMARY.md)** — the shop, built step by step: what you
+- **[The book](https://rsansores.github.io/magic_sync/)** — the shop, built step by step: what you
   write, then what happens.
-- **[How it works](book/src/how-it-works.md)** — the engine from the ground up:
+- **[How it works](https://rsansores.github.io/magic_sync/how-it-works.html)** — the engine from the ground up:
   the idea, the life of a change, every failure and how it heals.
-- **[The replica protocol](magic_sync/PROTOCOL.md)** — what a replica in any
+- **[The replica protocol](https://rsansores.github.io/magic_sync/protocol.html)** — what a replica in any
   language must do.
-- **[The shop example](examples/shop)** — run it in five minutes.
+- **[The shop example](https://github.com/rsansores/magic_sync/tree/main/examples/shop)** — [run it](https://rsansores.github.io/magic_sync/getting-started.html) in five minutes.
 
 ## Status
 
@@ -130,5 +130,5 @@ A build of the crate is one side: the `postgres` feature for the server, the
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/rsansores/magic_sync/blob/main/LICENSE-APACHE) or
+[MIT license](https://github.com/rsansores/magic_sync/blob/main/LICENSE-MIT) at your option.
