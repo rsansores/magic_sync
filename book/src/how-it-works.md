@@ -1,11 +1,6 @@
-# magic_sync
+# How it works
 
-A sync engine that keeps copies of PostgreSQL tables on SQLite replicas, and
-brings rows the replicas write back to the server. It is built on `sqlx`, and
-carries its messages on any transport you give it (the first host uses NATS
-JetStream).
-
-This document explains the engine from the ground up: the idea it rests on,
+This chapter explains the engine from the ground up: the idea it rests on,
 what a table declares, what happens to a change from the moment it is written
 to the moment a replica holds it, how every kind of failure is handled, and
 what the host application has to provide. Read it in order; each section
@@ -111,13 +106,18 @@ catalogue, so this needs no declaration: the schema already says it.
 | `RETIRED` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
 | `ORIGIN` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
 | `UNMIRRORED` | columns one side has that the row leaves out |
+| `ACTIVE` | a relation (a view) the rows replicas should hold are read through, leaving the others out; the table itself when there is none |
+
+`#[derive(Row)]` writes all of them from the struct and its attributes
+([The rows](guide/rows.md)); a host can implement the trait by hand too.
 
 ### The codec
 
-A table travels as its own protobuf message. A [`wire::Codec`] erases the row
-type so the engine can hold every table in one list: it is built from the row
-type, its message type, and the two mapping functions between them. The engine
-never names a table; it dispatches on the table name through the codecs.
+A table travels in its own encoding: the row's serde shape as JSON
+(`Codec::json`), or a protobuf message of its own with a mapping each way
+(`Codec::new`). A [`wire::Codec`] erases the row type so the engine can hold
+every table in one list. The engine never names a table; it dispatches on the
+table name through the codecs.
 
 ---
 
@@ -253,11 +253,13 @@ merely sent.
 ## 5. The life of a change, replica to server
 
 A replica writes its own rows (records, and its columns of two-way tables).
-Its own triggers note them locally; the host's upload loop gathers the noted
-rows as they are now ([`replica::collect`]) and sends them in an
-[`envelope::Up`]. A row that is gone by then goes as its key, but only for a
-table keyed by its replica (`ORIGIN`): history a replica pruned before it went
-up is not the server's to delete.
+A trigger notes each write in the writing transaction (`sync_notes`: the table
+and the key), so no write path can forget. The replica's upward loop gathers
+the noted rows **as they are now** — a row edited twice goes up once, with its
+last version — into an [`envelope::Up`], and hands it to the host's uplink. A
+row that is gone by then goes as its key, but only for a table keyed by its
+replica (`ORIGIN`): history a replica pruned before it went up is not the
+server's to delete.
 
 Each upload is numbered by the highest note it carries. The server answers
 every upload it filed with a `Filed` message, after its transaction commits,
@@ -265,8 +267,14 @@ and the replica lets go of those notes. An upload the server does not answer
 goes again after a while. So the replica always knows what it wrote that has
 not reached the server yet.
 
-The server files an upload ([`replica::file`]) under **the replica the message
-came from, and what the server knows about it**, never what the rows claim:
+The same `Up` carries everything else a replica has to tell the server: the
+rows it could not take, the last message it applied, and, hourly, its
+digests. A replica may split its writes into **lanes** — a table written often
+on a stream of its own — and the first lane carries what the engine itself
+says.
+
+The server files an upload under **the replica the message came from, and
+what the server knows about it**, never what the rows claim:
 
 - a record is kept from its first delivery, or the newest report wins when it
   has a `VERSION`;
@@ -378,11 +386,10 @@ The engine guarantees that:
    guard on every row.
 5. **One failure holds back only what it is about.**
 
-They rest on what the host provides:
+They rest on:
 
-- **One relay at a time.** The host runs the relay under a lock (a PostgreSQL
-  advisory lock in the first host), and records each pass on that lock's
-  connection.
+- **One relay at a time.** The server's runner holds a PostgreSQL advisory
+  lock while it relays, and records each pass on that lock's connection.
 - **One message in flight per replica.** The transport delivers a replica's
   messages in order and does not deliver the next one until the previous one
   is acknowledged. With NATS JetStream, that is a durable pull consumer with
@@ -396,52 +403,20 @@ They rest on what the host provides:
 
 ---
 
-## 8. What a host does
+## 8. What is the host's, and what is the engine's
 
-Most of what follows is done for the host by the runners: [`Server`] on the
-server and [`Replica`] on a replica ([`run`]). A host builds one, runs it in a
-task of its own, and hands it every message the transport delivers. The
-steps below are what the runners do, for a host that drives the engine
-itself.
+The host writes its tables, a struct per table, the codec list, where the
+replicas are, how bytes travel each way (a [`relay::Transport`] and a
+[`run::replica::Uplink`]), and, when it needs to, what it knows about a
+sender ([`run::server::Senders`]). [Build your own](guide/tables.md) walks
+through each.
 
-### On the server
-
-1. **Install the schema.** Run `sql/postgres.sql` in a migration, before any
-   table calls `sync.mirror_table`. It creates the `sync` schema: `notes`,
-   `held`, `replicas`, `quarantine`, `inbox`, the message sequence, the epoch,
-   and the trigger functions.
-2. **Mirror the tables.** After each table, `SELECT sync.mirror_table(...)`;
-   after each group table, `SELECT sync.mirror_group(...)`.
-3. **Declare the rows and codecs**, and **declare the replicas**
-   ([`plan::Replicas`]): the relation listing them, which of them are live, and
-   the partition column, if any.
-4. **Build the engine** once ([`plan::Engine::new`]). It reads the catalogue
-   and refuses declarations the schema cannot honour: a cycle, a `Follows`
-   column that is not a foreign key, a table with no notes.
-5. **Implement the transport** ([`relay::Transport`]): send one message's
-   bytes to one replica, returning a transient or permanent `Error::Transport`
-   on failure.
-6. **Run the relay loop**, holding the lock:
-   - each pass: `prepare` in a read transaction, `publish`, then `record` in a
-     transaction on the lock's connection;
-   - on a transient error, back off and run the pass again;
-   - when the lock is taken, and on a timer: `unpark`, `retry_quarantine`, and
-     re-file the inbox (`inbox` + `refile`);
-   - on a timer: `prune` done notes, and check `health`.
-7. **File uploads** with `replica::file` in a transaction, and run the effects
-   the host wants once it commits.
-8. **Provision a replica** with `note_resync` in the transaction that links it.
-
-### On a replica
-
-1. **Install the schema.** Run `sql/sqlite.sql` in a migration.
-2. **Receive** each message with `replica::receive`, in a transaction;
-   acknowledge it to the transport only after the commit, and not at all when
-   `receive` fails.
-3. **Send up** with `replica::outbox`, then `replica::delivered` once the
-   transport took the message: one message per lane says everything the
-   replica has to tell the server — the rows it wrote, the rows it could not
-   take, the last message it applied, and, on a timer, its digests.
+Everything else is the runners' ([`run`]): on the server, the lock, the
+passes and their backoff, retrying what was set aside, pruning, the alarms,
+filing uploads and answering them; on a replica, applying each message in one
+transaction, and the upward loop. The step functions they are built on —
+`Relay::prepare`/`publish`/`record`, `replica::apply`, `replica::outbox` and
+the rest — stay public, for a host that needs to drive the engine itself.
 
 ---
 
@@ -451,7 +426,7 @@ itself.
 |---|---|
 | [`row`] | a table's declaration (`Row`, `Mirror`, `Sync`, `Column`), and the writes both sides make: upsert with the version guard, insert-first-wins, retire |
 | [`wire`] | the codec: a table's rows encoded as its own message, and applied by the rules its row declares |
-| [`envelope`] | the messages between server and replica, the packer, the fingerprint (the wire is `proto/sync.proto`, and [PROTOCOL.md](PROTOCOL.md) says what a replica in any language must do) |
+| [`envelope`] | the messages between server and replica, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
 | [`plan`] | the planner and the notes (server) |
 | [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, the inbox, health (server) |
 | [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica), and filing uploads (server) |
@@ -462,6 +437,10 @@ itself.
 |---|---|
 | `sql/postgres.sql` | the server's schema |
 | `sql/sqlite.sql` | a replica's schema |
+| `proto/sync.proto` | the engine's messages, for a replica in another language |
+
+The derive lives in its own crate, `magic_sync_derive`, re-exported as
+`magic_sync::Row` and `magic_sync::Columns`.
 
 The crate is compiled for one backend at a time: `postgres` for the server,
 `sqlite` for a replica.
@@ -486,5 +465,36 @@ The crate is compiled for one backend at a time: `postgres` for the server,
 - **The replica side** runs on SQLite: messages from the past, rows it cannot
   decode, tables it does not have, digests.
 
-Run them with `just test-sync-engine` (PostgreSQL through `DATABASE_URL`, SQLite
-in a temporary file).
+Run them with `cargo test -p magic_sync --features postgres` (PostgreSQL
+through `DATABASE_URL`; each test gets a database of its own) and
+`cargo test -p magic_sync --features sqlite`.
+
+[`row::Row`]: https://docs.rs/magic_sync/latest/magic_sync/row/trait.Row.html
+[`wire::Codec`]: https://docs.rs/magic_sync/latest/magic_sync/wire/struct.Codec.html
+[`envelope::Down`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Down.html
+[`envelope::EndSnapshot`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.EndSnapshot.html
+[`envelope::ToReplica`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.ToReplica.html
+[`envelope::Up`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Up.html
+[`replica::apply`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.apply.html
+[`replica::file`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.file.html
+[`Error::is_transient`]: https://docs.rs/magic_sync/latest/magic_sync/enum.Error.html#method.is_transient
+[`plan::Engine::progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.progress
+[`plan::Engine::row_progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.row_progress
+[`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.new
+[`plan::Replicas`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Replicas.html
+[`replica::progress`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.progress.html
+[`relay::health`]: https://docs.rs/magic_sync/latest/magic_sync/relay/fn.health.html
+[`relay::replica_status`]: https://docs.rs/magic_sync/latest/magic_sync/relay/fn.replica_status.html
+[`relay::Transport`]: https://docs.rs/magic_sync/latest/magic_sync/relay/trait.Transport.html
+[`run::replica::Uplink`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/trait.Uplink.html
+[`run::server::Senders`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Senders.html
+[`run`]: https://docs.rs/magic_sync/latest/magic_sync/run/index.html
+[`row`]: https://docs.rs/magic_sync/latest/magic_sync/row/index.html
+[`wire`]: https://docs.rs/magic_sync/latest/magic_sync/wire/index.html
+[`envelope`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/index.html
+[`plan`]: https://docs.rs/magic_sync/latest/magic_sync/plan/index.html
+[`relay`]: https://docs.rs/magic_sync/latest/magic_sync/relay/index.html
+[`replica`]: https://docs.rs/magic_sync/latest/magic_sync/replica/index.html
+[`dialect`]: https://docs.rs/magic_sync/latest/magic_sync/dialect/index.html
+[`Server`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html
+[`Replica`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/struct.Replica.html

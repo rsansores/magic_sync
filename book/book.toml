@@ -1,0 +1,9 @@
+[book]
+title = "magic_sync"
+authors = ["Ricardo Sansores"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/rsansores/magic_sync"
+edit-url-template = "https://github.com/rsansores/magic_sync/edit/main/book/{path}"

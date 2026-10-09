@@ -801,7 +801,7 @@ impl Table {
 /// A crate's mirrored tables, listed once — the list sync dispatches on, in
 /// the order it sends them: a table after the tables it points at. Defines
 /// `TABLES` and `tables()`; a server-only row in it does not compile, and
-/// [`Engine::new`](crate::plan::Engine::new) refuses a noted table no row
+/// `Engine::new` refuses a noted table no row
 /// declares.
 ///
 /// Led by `migrator = "path::TO_MIGRATOR";`, it also defines a test holding

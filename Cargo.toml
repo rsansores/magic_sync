@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["magic_sync", "magic_sync_derive"]
 # The shop example is two programs, one per side: each its own workspace.
 exclude = ["examples"]

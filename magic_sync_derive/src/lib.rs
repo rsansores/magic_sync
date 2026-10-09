@@ -189,9 +189,9 @@ fn row_field(field: &Field) -> syn::Result<RowField> {
             } else if meta.path.is_ident("created") {
                 out.created = true;
             } else {
-                return Err(meta.error(
-                    "expected `version`, `created`, `replica_owned` or `generated`",
-                ));
+                return Err(
+                    meta.error("expected `version`, `created`, `replica_owned` or `generated`")
+                );
             }
             Ok(())
         })?;
@@ -334,29 +334,30 @@ fn columns_impl(input: &DeriveInput, krate: &syn::Path) -> syn::Result<(TokenStr
     }
 
     // A marked column here, or else the first flattened part's.
-    let role = |pick: fn(&RowField) -> bool, which: TokenStream, what: &str| -> syn::Result<TokenStream> {
-        let marked: Vec<&Direct> = direct.iter().filter(|d| pick(&d.flags)).collect();
-        if let [_, second, ..] = marked.as_slice() {
-            return Err(syn::Error::new_spanned(
-                &second.ident,
-                format!("one column at most is #[row({what})]"),
-            ));
-        }
-        let mut value = match marked.first() {
-            Some(column) => {
-                let name = &column.name;
-                quote!(Some(#name))
+    let role =
+        |pick: fn(&RowField) -> bool, which: TokenStream, what: &str| -> syn::Result<TokenStream> {
+            let marked: Vec<&Direct> = direct.iter().filter(|d| pick(&d.flags)).collect();
+            if let [_, second, ..] = marked.as_slice() {
+                return Err(syn::Error::new_spanned(
+                    &second.ident,
+                    format!("one column at most is #[row({what})]"),
+                ));
             }
-            None => quote!(None),
+            let mut value = match marked.first() {
+                Some(column) => {
+                    let name = &column.name;
+                    quote!(Some(#name))
+                }
+                None => quote!(None),
+            };
+            for part in flattened.iter().rev() {
+                value = quote!(match #value {
+                    Some(column) => Some(column),
+                    None => <#part as #krate::row::Columns>::#which,
+                });
+            }
+            Ok(value)
         };
-        for part in flattened.iter().rev() {
-            value = quote!(match #value {
-                Some(column) => Some(column),
-                None => <#part as #krate::row::Columns>::#which,
-            });
-        }
-        Ok(value)
-    };
     let version = role(|f| f.version, quote!(VERSION_COLUMN), "version")?;
     let created = role(|f| f.created, quote!(CREATED_COLUMN), "created")?;
 
