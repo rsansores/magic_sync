@@ -1,0 +1,84 @@
+// The sync engine's messages, for a replica written in any language.
+// PROTOCOL.md says what each one means and what a replica must do with it.
+// The engine's Rust types (src/envelope.rs) are these messages, tag for tag.
+syntax = "proto3";
+
+package sync;
+
+// A row's key: its parts as text, in primary key order. A uuid part is
+// lowercase and hyphenated; an integer part is decimal.
+message Key {
+  repeated string parts = 1;
+}
+
+// Everything the server sends a replica: one message, whichever it is.
+// `protocol` is the version the server speaks; a replica that receives a
+// later one than its own does not act on it, and does not acknowledge it.
+message ToReplica {
+  uint32 protocol = 1;
+  oneof body {
+    Down down = 2;
+    EndSnapshot end_snapshot = 3;
+    Filed filed = 4;
+  }
+}
+
+// One table's part of a message.
+message Table {
+  string table = 1;
+  // Rows to hold, each encoded as the table's own row message.
+  repeated bytes upserts = 2;
+  // Rows to let go of.
+  repeated Key deletes = 3;
+  // The key of each upsert, in the same order.
+  repeated Key keys = 4;
+}
+
+// Server to replica: rows to hold and rows to let go.
+message Down {
+  string snapshot_id = 1;
+  repeated Table tables = 2;
+  uint64 sequence = 3;
+  string epoch = 4;
+}
+
+// Server to replica: a snapshot is complete.
+message EndSnapshot {
+  string snapshot_id = 1;
+  repeated string tables = 2;
+  uint64 sequence = 3;
+  string epoch = 4;
+}
+
+// Server to replica: these uploads are filed.
+message Filed {
+  repeated uint64 uploads = 1;
+}
+
+// Replica to server: rows it wrote, rows it could not take, what it holds,
+// and the last message it applied.
+message Up {
+  string replica_id = 1;
+  repeated Table tables = 2;
+  repeated Rejected rejected = 3;
+  repeated Digest digests = 4;
+  string epoch = 5;
+  uint64 sequence = 6;
+  repeated uint64 uploads = 7;
+  // The version of the protocol the replica speaks.
+  uint32 protocol = 8;
+}
+
+// A row a replica could not take.
+message Rejected {
+  string table = 1;
+  Key key = 2;
+  string reason = 3;
+}
+
+// What a replica holds of one table.
+message Digest {
+  string table = 1;
+  uint64 count = 2;
+  uint64 fingerprint = 3;
+}

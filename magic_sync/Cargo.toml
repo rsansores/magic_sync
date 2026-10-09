@@ -1,0 +1,31 @@
+[package]
+name = "magic_sync"
+description = "Keeps partial copies of PostgreSQL tables on SQLite replicas — offline-first, by comparing what each replica holds with what it should hold"
+keywords = ["sync", "replication", "offline-first", "postgres", "sqlite"]
+categories = ["database"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../README.md"
+
+[features]
+# One backend per build: the server plans and sends on postgres, a replica
+# applies on sqlite.
+postgres = ["sqlx/postgres"]
+sqlite = ["sqlx/sqlite"]
+
+[dependencies]
+magic_map = { version = "0.5.1", features = ["uuid", "chrono", "decimal", "json"] }
+prost = "0.14"
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "macros", "chrono", "uuid", "rust_decimal", "json"] }
+thiserror = "1.0"
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[package.metadata.docs.rs]
+features = ["postgres"]
