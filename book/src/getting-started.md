@@ -16,6 +16,12 @@ docker compose up -d
 
 That starts one on port 5433 with the user, password and database `shop`,
 which is what the head office connects to unless you set `DATABASE_URL`.
+Without Docker Compose, the same with plain Docker:
+
+```sh
+docker run -d --name shop-postgres -p 5433:5432 \
+  -e POSTGRES_USER=shop -e POSTGRES_PASSWORD=shop -e POSTGRES_DB=shop postgres:17
+```
 
 ## 2. The head office
 
@@ -39,6 +45,14 @@ cargo run -- --name "Register 2" --port 8082
 
 Each introduces itself to the head office, which provisions it, and appears on
 the head office's page with its own page inside.
+
+Both listen on `127.0.0.1` only: the example has no login. To open it from
+another machine (over a VPN, say), bind them to every interface:
+
+```sh
+cargo run -- --bind 0.0.0.0:8080                                  # the head office
+cargo run -- --name "Register 1" --port 8081 --bind 0.0.0.0       # a register
+```
 
 ## 4. Things to try
 

@@ -116,8 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/sync/{register}/ack", post(ack))
         .route("/sync/{register}/up", post(up))
         .with_state(app);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-    tracing::info!("the head office is at http://127.0.0.1:8080");
+    // `--bind 0.0.0.0:8080` to reach it from another machine: it has no login.
+    let args: Vec<String> = std::env::args().collect();
+    let bind = args
+        .iter()
+        .position(|a| a == "--bind")
+        .and_then(|i| args.get(i + 1).cloned())
+        .unwrap_or_else(|| "127.0.0.1:8080".to_owned());
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("the head office is at http://{bind}");
     axum::serve(listener, router).await?;
     Ok(())
 }

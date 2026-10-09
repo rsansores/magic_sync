@@ -95,6 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name = arg("--name", "Register 1");
     let port = arg("--port", "8081");
     let server = arg("--server", "http://127.0.0.1:8080");
+    // `--bind 0.0.0.0` to reach its page from another machine: it has no login.
+    let bind = arg("--bind", "127.0.0.1");
     let file = arg("--db", &format!("register-{port}.db"));
 
     let pool = SqlitePool::connect_with(
@@ -165,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sell", post(sell))
         .route("/api/plug", post(plug))
         .with_state(app);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    let listener = tokio::net::TcpListener::bind(format!("{bind}:{port}")).await?;
     tracing::info!("this register is at {url}");
     axum::serve(listener, router).await?;
     Ok(())
