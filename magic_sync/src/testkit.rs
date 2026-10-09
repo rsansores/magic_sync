@@ -5,7 +5,7 @@ use magic_map::MappingError;
 use std::cell::Cell;
 use uuid::Uuid;
 
-#[derive(sqlx::FromRow, Clone, Debug, crate::Row)]
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
 #[row(
     table = "items",
     schema = "fixture",

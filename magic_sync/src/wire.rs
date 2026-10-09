@@ -38,7 +38,42 @@ impl<P: Sync + 'static> Codec<P> {
     {
         Self {
             table: Table::of::<R>(),
-            ops: Box::new(Typed { to, from, place }),
+            ops: Box::new(Typed {
+                encode: Box::new(move |row: R| {
+                    to(row)
+                        .map(|m| m.encode_to_vec())
+                        .map_err(|e| mapping(R::TABLE, e))
+                }),
+                decode: Box::new(move |bytes: &[u8]| {
+                    let message = M::decode(bytes)
+                        .map_err(|e| Error::Misuse(format!("`{}` on the wire: {e}", R::TABLE)))?;
+                    from(message).map_err(|e| mapping(R::TABLE, e))
+                }),
+                place,
+            }),
+        }
+    }
+
+    /// A table that travels as JSON: its row type's own serde shape, with no
+    /// message of its own to declare. For a replica in another language, a
+    /// row is a JSON object of its columns.
+    pub fn json<R>(place: Option<Place<R, P>>) -> Self
+    where
+        R: Row + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        Self {
+            table: Table::of::<R>(),
+            ops: Box::new(Typed {
+                encode: Box::new(|row: R| {
+                    serde_json::to_vec(&row)
+                        .map_err(|e| Error::Misuse(format!("`{}` as JSON: {e}", R::TABLE)))
+                }),
+                decode: Box::new(|bytes: &[u8]| {
+                    serde_json::from_slice(bytes)
+                        .map_err(|e| Error::Misuse(format!("`{}` as JSON: {e}", R::TABLE)))
+                }),
+                place,
+            }),
         }
     }
 
@@ -225,9 +260,12 @@ enum How {
     UpFirst,
 }
 
-struct Typed<R, M, P> {
-    to: fn(R) -> Result<M, magic_map::MappingError>,
-    from: fn(M) -> Result<R, magic_map::MappingError>,
+type Encode<R> = Box<dyn Fn(R) -> Result<Vec<u8>, Error> + Send + Sync>;
+type Decode<R> = Box<dyn Fn(&[u8]) -> Result<R, Error> + Send + Sync>;
+
+struct Typed<R, P> {
+    encode: Encode<R>,
+    decode: Decode<R>,
     place: Option<Place<R, P>>,
 }
 
@@ -235,10 +273,9 @@ fn mapping(table: &str, e: magic_map::MappingError) -> Error {
     Error::Misuse(format!("`{table}` on the wire: {e}"))
 }
 
-impl<R, M, P> Typed<R, M, P>
+impl<R, P> Typed<R, P>
 where
     R: Row + Clone + Send + Sync,
-    M: prost::Message + Default + 'static,
 {
     /// Every row that decodes, by its place in `rows`; one that does not is
     /// answered apart, so it cannot take the rest of its table down with it.
@@ -246,9 +283,7 @@ where
         let mut decoded = Vec::new();
         let mut failed = Vec::new();
         for (at, bytes) in rows.into_iter().enumerate() {
-            let row = M::decode(bytes.as_slice())
-                .map_err(|e| Error::Misuse(format!("`{}` on the wire: {e}", R::TABLE)))
-                .and_then(|m| (self.from)(m).map_err(|e| mapping(R::TABLE, e)));
+            let row = (self.decode)(bytes.as_slice());
             match row {
                 Ok(row) => decoded.push((at, row)),
                 Err(e) => {
@@ -349,19 +384,18 @@ where
     }
 }
 
-impl<R, M, P: Sync> Ops<P> for Typed<R, M, P>
+impl<R, P: Sync> Ops<P> for Typed<R, P>
 where
     R: Row + Clone + Send + Sync,
-    M: prost::Message + Default + 'static,
 {
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded> {
         Box::pin(async move {
             let mut encoded = Encoded::default();
             for row in row::get_by_keys::<R>(conn, keys).await? {
                 let key = row.key();
-                match (self.to)(row) {
-                    Ok(message) => encoded.rows.push((key, message.encode_to_vec())),
-                    Err(e) => encoded.failed.push((key, mapping(R::TABLE, e))),
+                match (self.encode)(row) {
+                    Ok(bytes) => encoded.rows.push((key, bytes)),
+                    Err(e) => encoded.failed.push((key, e)),
                 }
             }
             Ok(encoded)

@@ -760,6 +760,7 @@ dependencies = [
  "magic_map",
  "magic_sync_derive",
  "prost",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",

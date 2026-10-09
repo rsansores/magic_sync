@@ -454,3 +454,21 @@ async fn install_notes_every_write_of_what_goes_up(pool: crate::DbPool) {
     let refused = check(&mut conn, &codecs).await.unwrap_err();
     assert!(refused.to_string().contains("readings"), "{refused}");
 }
+
+/// A table that travels as JSON is applied like any other.
+#[sqlx::test(migrations = false)]
+async fn a_json_table_is_applied_like_any_other(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = vec![Codec::<()>::json::<Item>(None)];
+    let id = Uuid::now_v7();
+    let row = serde_json::to_vec(&Item {
+        id,
+        partition_id: Uuid::nil(),
+        name: "as json".to_owned(),
+    })
+    .unwrap();
+    apply(&mut conn, &codecs, &down("items", "e", 1, vec![(id, row)]))
+        .await
+        .unwrap();
+    assert_eq!(names(&mut conn).await, vec!["as json"]);
+}

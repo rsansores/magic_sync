@@ -51,10 +51,11 @@ applied (section 5.2).
 
 ## 3. Rows and keys
 
-Each table travels as **its own message**: a protobuf message with one field
-per column, agreed between the server and the replica for that table. The
-engine's messages carry those rows as opaque bytes, so this protocol never
-changes when a table does.
+Each table travels in **its own encoding**, agreed between the server and the
+replica for that table: either a protobuf message with one field per column,
+or a JSON object of its columns (the column names as keys). The engine's
+messages carry those rows as opaque bytes, so this protocol never changes when
+a table does.
 
 A row's **key** is its primary key, as text, in key order:
 
