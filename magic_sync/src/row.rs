@@ -111,6 +111,11 @@ pub struct Column {
 /// A struct's columns and their binds, in one order. Derived with
 /// `#[derive(Row)]`, or with `#[derive(Columns)]` for a part a row flattens in.
 pub trait Columns {
+    /// The column marked `version`, here or in a part flattened in.
+    const VERSION_COLUMN: Option<&'static str> = None;
+    /// The column marked `created`, here or in a part flattened in.
+    const CREATED_COLUMN: Option<&'static str> = None;
+
     fn columns(out: &mut Vec<Column>);
 
     fn push_binds<'args>(self, sep: &mut Separated<'_, 'args, Db, &'static str>);
@@ -795,10 +800,24 @@ impl Table {
 
 /// A crate's mirrored tables, listed once — the list sync dispatches on, in
 /// the order it sends them: a table after the tables it points at. Defines
-/// `TABLES` and `tables()`; `#[derive(Row)]` fails a test for any mirrored row
-/// left out of it, and a server-only row in it does not compile.
+/// `TABLES` and `tables()`; a server-only row in it does not compile, and
+/// [`Engine::new`](crate::plan::Engine::new) refuses a noted table no row
+/// declares.
+///
+/// Led by `migrator = "path::TO_MIGRATOR";`, it also defines a test holding
+/// every listed row against the table that migrator builds
+/// ([`assert_parity`]): a column added on one side only fails it.
 #[macro_export]
 macro_rules! mirrored {
+    (migrator = $migrator:literal; $($row:path),* $(,)?) => {
+        $crate::mirrored!($($row),*);
+
+        #[cfg(test)]
+        #[sqlx::test(migrator = $migrator)]
+        async fn every_mirrored_row_is_its_table_column_for_column(pool: $crate::DbPool) {
+            $($crate::row::assert_parity::<$row>(&pool).await;)*
+        }
+    };
     ($($row:path),* $(,)?) => {
         $(const _: () = assert!(
             !matches!(<$row as $crate::row::Row>::MIRROR, $crate::row::Mirror::ServerOnly),

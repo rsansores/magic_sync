@@ -1,63 +1,23 @@
 //! A table for the engine's own tests: one row type, its message, and a codec
 //! whose encoding has a bug that refuses one value, on either backend.
 
-use crate::row::{Column, Columns, Key, KeyPart, Mirror, Row, Sync, Wire};
-use crate::Db;
 use magic_map::MappingError;
-use sqlx::query_builder::Separated;
 use std::cell::Cell;
 use uuid::Uuid;
 
-#[derive(sqlx::FromRow, Clone, Debug)]
+#[derive(sqlx::FromRow, Clone, Debug, crate::Row)]
+#[row(
+    table = "items",
+    schema = "fixture",
+    mirror = "catalog",
+    sync = "broadcast",
+    active = "items",
+    retired = "retired_at"
+)]
 pub struct Item {
     pub id: Uuid,
     pub partition_id: Uuid,
     pub name: String,
-}
-
-impl Columns for Item {
-    fn columns(out: &mut Vec<Column>) {
-        for (name, wire) in [
-            ("id", Wire::String),
-            ("partition_id", Wire::String),
-            ("name", Wire::String),
-        ] {
-            out.push(Column {
-                name,
-                field: name,
-                nullable: false,
-                generated: false,
-                replica_owned: false,
-                wire,
-                compatible: |_| true,
-            });
-        }
-    }
-
-    fn push_binds<'args>(self, sep: &mut Separated<'_, 'args, Db, &'static str>) {
-        sep.push_bind(self.id);
-        sep.push_bind(self.partition_id);
-        sep.push_bind(self.name);
-    }
-}
-
-impl Row for Item {
-    const TABLE: &'static str = "items";
-    const KEY: &'static [&'static str] = &["id"];
-    const SCHEMA: &'static str = "fixture";
-    const QUALIFIED: &'static str = crate::qualified!("fixture", "items");
-    const MIRROR: Mirror = Mirror::Catalog;
-    const SYNC: Sync = Sync::Broadcast;
-    const ACTIVE: Option<&'static str> = Some("items");
-    const RETIRED: Option<&'static str> = Some("retired_at");
-
-    fn key_repr(&self) -> String {
-        self.id.to_string()
-    }
-
-    fn key(&self) -> Key {
-        vec![KeyPart::Uuid(self.id)]
-    }
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -125,54 +85,12 @@ pub mod records {
     use super::*;
 
     /// A record: written on a replica, filed on the server under it.
-    #[derive(sqlx::FromRow, Clone, Debug)]
+    #[derive(sqlx::FromRow, Clone, Debug, crate::Row)]
+    #[row(table = "readings", schema = "fixture", mirror = "record")]
     pub struct Reading {
         pub id: Uuid,
         pub replica_id: Uuid,
         pub value: String,
-    }
-
-    impl Columns for Reading {
-        fn columns(out: &mut Vec<Column>) {
-            for (name, wire) in [
-                ("id", Wire::String),
-                ("replica_id", Wire::String),
-                ("value", Wire::String),
-            ] {
-                out.push(Column {
-                    name,
-                    field: name,
-                    nullable: false,
-                    generated: false,
-                    replica_owned: false,
-                    wire,
-                    compatible: |_| true,
-                });
-            }
-        }
-
-        fn push_binds<'args>(self, sep: &mut Separated<'_, 'args, Db, &'static str>) {
-            sep.push_bind(self.id);
-            sep.push_bind(self.replica_id);
-            sep.push_bind(self.value);
-        }
-    }
-
-    impl Row for Reading {
-        const TABLE: &'static str = "readings";
-        const KEY: &'static [&'static str] = &["id"];
-        const SCHEMA: &'static str = "fixture";
-        const QUALIFIED: &'static str = crate::qualified!("fixture", "readings");
-        const MIRROR: Mirror = Mirror::Record;
-        const SYNC: Sync = Sync::Referenced;
-
-        fn key_repr(&self) -> String {
-            self.id.to_string()
-        }
-
-        fn key(&self) -> Key {
-            vec![KeyPart::Uuid(self.id)]
-        }
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

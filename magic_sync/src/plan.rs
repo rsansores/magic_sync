@@ -672,6 +672,20 @@ impl Engine {
             }
         }
 
+        // A noted table no row declares: its changes are noted, and nothing
+        // would ever send them.
+        if let Some((schema, table)) = noted.iter().find(|(schema, table)| {
+            !plans.iter().any(|p| p.schema == schema && p.table == table)
+                && !plans.iter().any(|p| {
+                    p.group
+                        .as_ref()
+                        .is_some_and(|g| g.members == *table || g.assigned == *table)
+                })
+        }) {
+            return Err(Error::Misuse(format!(
+                "`{schema}.{table}` is noted, but no row declares it: list its row with the others"
+            )));
+        }
         let order = topological(&plans)?;
         Ok(Self {
             plans,

@@ -758,6 +758,7 @@ name = "magic_sync"
 version = "0.1.0"
 dependencies = [
  "magic_map",
+ "magic_sync_derive",
  "prost",
  "serde_json",
  "sqlx",
@@ -765,6 +766,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "magic_sync_derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

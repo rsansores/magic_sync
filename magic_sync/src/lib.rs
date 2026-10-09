@@ -22,6 +22,12 @@ mod testkit;
 pub mod wire;
 
 pub use error::Error;
+pub use magic_sync_derive::{Columns, Row};
+
+// The derive's generated code names this crate, and sqlx through it.
+extern crate self as magic_sync;
+#[doc(hidden)]
+pub use sqlx as __sqlx;
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
 pub use run::replica::Replica;
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
