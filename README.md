@@ -12,10 +12,8 @@ from the products it holds; the head office knows it holds 5 of 7, and that
 two receipts are on their way. Plug it back in and both catch up.*
 
 ```rust
-use magic_sync::{Row, Server, Replica};
-
-// One struct is one table, and says how it travels.
-#[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, Row)]
+// One struct is one table, and says how it travels. Both sides share it.
+#[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, magic_sync::Row)]
 #[row(table = "products", schema = "shop", mirror = "catalog", sync = "broadcast")]
 pub struct Product {
     pub id: Uuid,
@@ -24,13 +22,19 @@ pub struct Product {
     #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
+```
 
-// On the server: the engine runs itself. You say how bytes reach a replica.
-let server = Server::install(pool.clone(), codecs(), REGISTERS, my_transport, Anyone(pool), Settings::default()).await?;
+```rust
+// The server (feature `postgres`): the engine runs itself. You say how bytes
+// reach a replica.
+let server = magic_sync::Server::install(pool.clone(), codecs(), REGISTERS, my_transport, Anyone(pool), Settings::default()).await?;
 tokio::spawn(async move { server.run(shutdown).await });
+```
 
-// On each replica: hand it what arrives, acknowledge after it returns Ok.
-let replica = Replica::new(sqlite, codecs(), my_id, my_uplink, Settings::default());
+```rust
+// A replica (feature `sqlite`): hand it what arrives; acknowledge it to your
+// transport once `receive` returned Ok.
+let replica = magic_sync::Replica::new(sqlite, codecs(), my_id, my_uplink, Settings::default());
 replica.receive(&bytes).await?;
 ```
 
