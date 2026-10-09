@@ -37,6 +37,15 @@ CREATE TABLE sync_applied (
     acknowledged INTEGER NOT NULL DEFAULT 0
 );
 
+-- What this replica last told the server it wrote and the server has not
+-- filed ([{table, unsent, unfiled}]), and when (unix seconds): it says again
+-- when that changes, at most so often while it grows.
+CREATE TABLE sync_backlog (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    backlog     TEXT    NOT NULL,
+    reported_at INTEGER NOT NULL
+);
+
 -- Rows the server sent that this replica could not take, until it takes
 -- them: the server is told once (reported_at), quarantines them, and sends
 -- them again once a fix is deployed on either side.

@@ -62,12 +62,12 @@ struct Group {
     assigned_replica: String,
 }
 
-struct Plan {
-    table: &'static str,
+pub(crate) struct Plan {
+    pub(crate) table: &'static str,
     schema: &'static str,
     /// What the rows replicas should hold are read from.
     active: String,
-    key: Vec<Column>,
+    pub(crate) key: Vec<Column>,
     sync: Sync,
     references: Vec<Reference>,
     group: Option<Group>,
@@ -193,66 +193,6 @@ impl Delta {
     }
 }
 
-/// Which replicas a progress report covers.
-#[derive(Clone, Copy, Debug)]
-pub enum Scope<'a> {
-    Replicas(&'a [Uuid]),
-    Partition(Uuid),
-    All,
-}
-
-/// How far one replica is from holding what it should.
-#[derive(Debug, Clone)]
-pub struct ReplicaProgress {
-    pub replica: Uuid,
-    pub tables: Vec<TableProgress>,
-}
-
-/// One table on one replica, counted from what the replica acknowledged
-/// applying. `holds - outdated` of `should` is how far along it is; the
-/// numbers never count a row as held that the replica has not confirmed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TableProgress {
-    pub table: &'static str,
-    /// Rows its rules say it should hold. For a table that only travels with
-    /// others, what the engine decided to send it.
-    pub should: i64,
-    /// Rows it should hold and has confirmed it holds.
-    pub holds: i64,
-    /// Of those, rows changed since: a newer version is on its way or owed.
-    pub outdated: i64,
-    /// Rows sent and not confirmed yet.
-    pub in_flight: i64,
-    /// Rows it holds and should no longer: on their way out.
-    pub to_remove: i64,
-    /// Rows set aside for it until a fix.
-    pub quarantined: i64,
-}
-
-impl TableProgress {
-    /// Rows it holds as they should be.
-    pub fn up_to_date(&self) -> i64 {
-        self.holds - self.outdated
-    }
-}
-
-/// Where one row stands on one replica.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowState {
-    /// It holds the row as it is.
-    Holds,
-    /// It holds an older version; the newer one is on its way or owed.
-    Outdated,
-    /// Sent, not yet confirmed.
-    OnItsWay,
-    /// It should hold the row and does not yet.
-    Missing,
-    /// It holds the row and should no longer.
-    Leaving,
-    /// Set aside for it until a fix.
-    Quarantined,
-}
-
 /// A pending note: what changed, and the one replica it is still owed to
 /// when a send to that replica failed.
 #[derive(Clone, Debug)]
@@ -313,11 +253,11 @@ const RECORD_CHUNK: usize = 50_000;
 
 /// The engine, built once from the codecs and the schema.
 pub struct Engine {
-    plans: Vec<Plan>,
+    pub(crate) plans: Vec<Plan>,
     by_name: HashMap<&'static str, usize>,
     /// Parents before children.
-    order: Vec<usize>,
-    replicas: Replicas,
+    pub(crate) order: Vec<usize>,
+    pub(crate) replicas: Replicas,
 }
 
 type Conn = crate::row::Conn;
@@ -365,7 +305,7 @@ fn key_in(alias: &str, columns: &[impl AsRef<str>], types: &[Column], param: &st
 }
 
 /// Parses a key back into its parts, as the table's key columns type them.
-fn parse_key(columns: &[Column], text: &str) -> Result<Key, Error> {
+pub(crate) fn parse_key(columns: &[Column], text: &str) -> Result<Key, Error> {
     columns
         .iter()
         .zip(text.split('|'))
@@ -695,7 +635,7 @@ impl Engine {
         })
     }
 
-    fn index(&self, table: &str) -> Option<usize> {
+    pub(crate) fn index(&self, table: &str) -> Option<usize> {
         self.by_name.get(table).copied()
     }
 
@@ -704,7 +644,7 @@ impl Engine {
     }
 
     /// The live replicas, as a subquery `s(id, partition)`.
-    fn replicas_sql(&self) -> String {
+    pub(crate) fn replicas_sql(&self) -> String {
         let partition = self.replicas.partition.unwrap_or("NULL::uuid");
         format!(
             "(SELECT id, {partition} AS partition FROM {} WHERE {}) AS s",
@@ -724,7 +664,7 @@ impl Engine {
     /// to a live replica, narrowed by `filter` on the table aliased `t`;
     /// `None` for a table that travels only when pointed at, or with its
     /// parent.
-    fn wanted_sql(&self, i: usize, filter: &str) -> Option<String> {
+    pub(crate) fn wanted_sql(&self, i: usize, filter: &str) -> Option<String> {
         let plan = &self.plans[i];
         let key = key_sql("t", &plan.key.iter().map(|c| c.name).collect::<Vec<_>>());
         let replicas = self.replicas_sql();
@@ -764,7 +704,7 @@ impl Engine {
 
     /// Who should hold which of `keys` (`None`: every key) and, where
     /// `replicas` is given, only among those.
-    async fn wanted(
+    pub(crate) async fn wanted(
         &self,
         conn: &mut Conn,
         i: usize,
@@ -1717,188 +1657,6 @@ impl Engine {
         Ok(())
     }
 
-    /// How far each replica of `scope` is from holding what it should, per
-    /// table, counted from what each has acknowledged applying — never from
-    /// what was merely sent. See [`TableProgress`].
-    pub async fn progress(
-        &self,
-        conn: &mut Conn,
-        scope: Scope<'_>,
-    ) -> Result<Vec<ReplicaProgress>, Error> {
-        let replicas = self.scoped(conn, scope).await?;
-        let epoch: Option<Uuid> = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-            .fetch_optional(&mut *conn)
-            .await?;
-        let mut out: BTreeMap<Uuid, ReplicaProgress> = replicas
-            .iter()
-            .map(|r| {
-                (
-                    *r,
-                    ReplicaProgress {
-                        replica: *r,
-                        tables: Vec::new(),
-                    },
-                )
-            })
-            .collect();
-        let quarantined: Vec<(Uuid, String, i64)> = sqlx::query_as(
-            "SELECT replica_id, relation, count(*) FROM sync.quarantine \
-              WHERE replica_id = ANY($1) GROUP BY 1, 2",
-        )
-        .bind(&replicas)
-        .fetch_all(&mut *conn)
-        .await?;
-        for &i in &self.order {
-            let plan = &self.plans[i];
-            // A table that only travels with others is owed what the engine
-            // decided to send it: there is no rule to count it from.
-            let wanted = self.wanted_sql(i, "true").unwrap_or_else(|| {
-                "SELECT NULL::uuid AS replica_id, NULL::text AS key WHERE false".to_owned()
-            });
-            let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
-                "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
-                 h AS (SELECT h.replica_id, h.row_key AS key, \
-                              coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = $3, false) AS confirmed, \
-                              EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL \
-                                       AND n.kind = 'row' AND n.relation = $1 \
-                                       AND n.row_key = h.row_key AND n.xid >= h.horizon) AS outdated \
-                         FROM sync.held h LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-                        WHERE h.relation = $1 AND h.replica_id = ANY($2)) \
-                 SELECT coalesce(w.replica_id, h.replica_id), \
-                        count(w.key) + CASE WHEN $4 THEN count(h.key) ELSE 0 END, \
-                        count(*) FILTER (WHERE ($4 OR w.key IS NOT NULL) AND h.confirmed), \
-                        count(*) FILTER (WHERE ($4 OR w.key IS NOT NULL) AND h.confirmed AND h.outdated), \
-                        count(*) FILTER (WHERE h.key IS NOT NULL AND NOT h.confirmed), \
-                        count(*) FILTER (WHERE NOT $4 AND w.key IS NULL AND h.confirmed) \
-                   FROM w FULL JOIN h ON w.replica_id = h.replica_id AND w.key = h.key \
-                  GROUP BY 1"
-            ))
-            .bind(plan.table)
-            .bind(&replicas)
-            .bind(epoch)
-            .bind(self.wanted_sql(i, "true").is_none())
-            .fetch_all(&mut *conn)
-            .await?;
-            let counted: BTreeMap<Uuid, (i64, i64, i64, i64, i64)> = rows
-                .into_iter()
-                .map(|(r, should, holds, outdated, in_flight, to_remove)| {
-                    (r, (should, holds, outdated, in_flight, to_remove))
-                })
-                .collect();
-            for (replica, progress) in out.iter_mut() {
-                let (should, holds, outdated, in_flight, to_remove) =
-                    counted.get(replica).copied().unwrap_or_default();
-                let quarantined = quarantined
-                    .iter()
-                    .find(|(r, t, _)| r == replica && t == plan.table)
-                    .map_or(0, |(_, _, n)| *n);
-                progress.tables.push(TableProgress {
-                    table: plan.table,
-                    should: should
-                        + if self.wanted_sql(i, "true").is_none() {
-                            quarantined
-                        } else {
-                            0
-                        },
-                    holds,
-                    outdated,
-                    in_flight,
-                    to_remove,
-                    quarantined,
-                });
-            }
-        }
-        Ok(out.into_values().collect())
-    }
-
-    /// Where one row stands on every replica that holds it, should, or is
-    /// owed it.
-    pub async fn row_progress(
-        &self,
-        conn: &mut Conn,
-        table: &str,
-        key: &str,
-    ) -> Result<Vec<(Uuid, RowState)>, Error> {
-        let i = self
-            .index(table)
-            .ok_or_else(|| Error::Misuse(format!("`{table}` is not mirrored")))?;
-        parse_key(&self.plans[i].key, key)?;
-        let keys = [key.to_owned()];
-        let wanted: BTreeSet<Uuid> = self
-            .wanted(conn, i, Some(&keys), None)
-            .await?
-            .into_iter()
-            .map(|(r, _)| r)
-            .collect();
-        let rule = self.wanted_sql(i, "true").is_some();
-        let held: Vec<(Uuid, bool, bool)> = sqlx::query_as(
-            "SELECT h.replica_id, \
-                    coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = e.epoch, false), \
-                    EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
-                             AND n.relation = h.relation AND n.row_key = h.row_key AND n.xid >= h.horizon) \
-               FROM sync.held h CROSS JOIN sync.epoch e \
-               LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-              WHERE h.relation = $1 AND h.row_key = $2",
-        )
-        .bind(table)
-        .bind(key)
-        .fetch_all(&mut *conn)
-        .await?;
-        let quarantined: BTreeSet<Uuid> = sqlx::query_scalar(
-            "SELECT replica_id FROM sync.quarantine WHERE relation = $1 AND row_key = $2",
-        )
-        .bind(table)
-        .bind(key)
-        .fetch_all(&mut *conn)
-        .await?
-        .into_iter()
-        .collect();
-        let mut out: BTreeMap<Uuid, RowState> = BTreeMap::new();
-        for replica in &wanted {
-            out.insert(*replica, RowState::Missing);
-        }
-        for (replica, confirmed, outdated) in held {
-            let state = match (confirmed, outdated) {
-                (false, _) => RowState::OnItsWay,
-                (true, _) if rule && !wanted.contains(&replica) => RowState::Leaving,
-                (true, true) => RowState::Outdated,
-                (true, false) => RowState::Holds,
-            };
-            out.insert(replica, state);
-        }
-        for replica in quarantined {
-            out.insert(replica, RowState::Quarantined);
-        }
-        Ok(out.into_iter().collect())
-    }
-
-    /// The replicas a scope names.
-    async fn scoped(&self, conn: &mut Conn, scope: Scope<'_>) -> Result<Vec<Uuid>, Error> {
-        Ok(match scope {
-            Scope::Replicas(replicas) => replicas.to_vec(),
-            Scope::Partition(partition) => {
-                let Some(column) = self.replicas.partition else {
-                    return Err(Error::Misuse("the replicas have no partition".to_owned()));
-                };
-                sqlx::query_scalar(&format!(
-                    "SELECT id FROM {} WHERE {column} = $1 ORDER BY id",
-                    self.replicas.relation
-                ))
-                .bind(partition)
-                .fetch_all(&mut *conn)
-                .await?
-            }
-            Scope::All => {
-                sqlx::query_scalar(&format!(
-                    "SELECT id FROM {} ORDER BY id",
-                    self.replicas.relation
-                ))
-                .fetch_all(&mut *conn)
-                .await?
-            }
-        })
-    }
-
     /// The tables every snapshot names, parents first.
     pub fn snapshot_tables(&self) -> Vec<&'static str> {
         self.order.iter().map(|&i| self.plans[i].table).collect()
@@ -1957,7 +1715,7 @@ impl Noted {
 
 /// The pending notes, oldest first: not parked, and not owed to a replica
 /// that is waiting out a failure. A note this build cannot read is left out,
-/// and stays pending where [`crate::relay::health`] counts it.
+/// and stays pending where [`Engine::health`] counts it.
 pub async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Error> {
     let rows: Vec<Noted> = sqlx::query_as(
         "SELECT id, kind, relation, row_key, replica_id, previous, scope, xid::text::bigint AS xid \

@@ -339,8 +339,28 @@ the replica holding exactly what it should, without anyone noticing it first.
 
 ### Progress: what each replica holds, honestly
 
-[`plan::Engine::progress`] answers, for one replica, a list of them, a whole
-partition or every replica, and per table:
+Every read below takes a scope — some replicas, a partition, or all of them —
+and counts only live replicas, so a host shows each audience its own.
+
+[`plan::Engine::overview`] answers first whether everything is where it
+should be. Per replica, one state:
+
+| State | Means |
+|---|---|
+| `synced` | it holds what it should, and the server filed everything it last said it wrote |
+| `catching_up` | changes are on their way to it (noted and not yet planned, or in a message it has not confirmed) or from it (its backlog) |
+| `unreachable` | sends to it fail; it is tried again after a backoff |
+| `awaiting_fix` | something is set aside for it until a fix: a row in quarantine, a parked note, an upload in the inbox |
+
+It never counts the rows a replica should hold: it reads only what the engine
+records, so it costs the same for a fleet as for one replica, and it is exact
+all the same. A change a replica lacks is in one of three places — a note not
+yet planned, a message it has not confirmed, or set aside — and each is
+recorded. Per table, the same figures over the scope's replicas say which
+tables are not where they should be yet.
+
+[`plan::Engine::progress`] answers how far along: for a few replicas, per
+table:
 
 | Figure | Meaning |
 |---|---|
@@ -360,16 +380,17 @@ its way, lacks it, is letting it go, or has it set aside.
 
 The replica answers the opposite direction with [`replica::progress`]: per
 table, rows it wrote that are not sent yet, and rows sent the server has not
-filed yet.
+filed yet. It tells the server the same whenever it changes, and the server
+shows it as the replica's backlog.
 
 ### What an operator sees
 
-[`relay::health`] answers how the engine is doing: how many notes are pending
-and how old the oldest is, the parked notes, how many rows are in quarantine
-and in the inbox, and the replicas a send keeps failing to.
-[`relay::replica_status`] answers the same for one replica. Each of these
-means one of two things: wait (the infrastructure is down), or deploy a fix (a
-bug). Never "go fix the data".
+[`plan::Engine::health`] answers what the engine waits on over a scope: how
+many notes are pending and since when, the parked notes, the rows in
+quarantine and why, the uploads in the inbox and why, and the replicas a send
+keeps failing to. Each of these means one of two things: wait (the
+infrastructure is down), or deploy a fix (a bug). Never "go fix the data".
+When there are none, the engine is healthy — the normal state.
 
 ---
 
@@ -428,7 +449,8 @@ the rest — stay public, for a host that needs to drive the engine itself.
 | [`wire`] | the codec: a table's rows encoded as its own message, and applied by the rules its row declares |
 | [`envelope`] | the messages between server and replica, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
 | [`plan`] | the planner and the notes (server) |
-| [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, the inbox, health (server) |
+| [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, the inbox (server) |
+| [`status`] | what the engine answers about itself: the overview, health, progress, where a row is (server) |
 | [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica), and filing uploads (server) |
 | [`dialect`] | the few things PostgreSQL and SQLite spell differently |
 | [`run`] | the runners: [`Server`] (the relay under its lock, retries, filing and answering uploads) and [`Replica`] (receiving, and the way up) |
@@ -478,13 +500,13 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`replica::apply`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.apply.html
 [`replica::file`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.file.html
 [`Error::is_transient`]: https://docs.rs/magic_sync/latest/magic_sync/enum.Error.html#method.is_transient
+[`plan::Engine::overview`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.overview
+[`plan::Engine::health`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.health
 [`plan::Engine::progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.progress
 [`plan::Engine::row_progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.row_progress
 [`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.new
 [`plan::Replicas`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Replicas.html
 [`replica::progress`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.progress.html
-[`relay::health`]: https://docs.rs/magic_sync/latest/magic_sync/relay/fn.health.html
-[`relay::replica_status`]: https://docs.rs/magic_sync/latest/magic_sync/relay/fn.replica_status.html
 [`relay::Transport`]: https://docs.rs/magic_sync/latest/magic_sync/relay/trait.Transport.html
 [`run::replica::Uplink`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/trait.Uplink.html
 [`run::server::Senders`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Senders.html
@@ -494,6 +516,7 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`envelope`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/index.html
 [`plan`]: https://docs.rs/magic_sync/latest/magic_sync/plan/index.html
 [`relay`]: https://docs.rs/magic_sync/latest/magic_sync/relay/index.html
+[`status`]: https://docs.rs/magic_sync/latest/magic_sync/status/index.html
 [`replica`]: https://docs.rs/magic_sync/latest/magic_sync/replica/index.html
 [`dialect`]: https://docs.rs/magic_sync/latest/magic_sync/dialect/index.html
 [`Server`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html

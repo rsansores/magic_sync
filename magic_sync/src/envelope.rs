@@ -132,6 +132,30 @@ pub struct Up {
     /// [`PROTOCOL`], as the replica speaks it.
     #[prost(uint32, tag = "8")]
     pub protocol: u32,
+    /// What the replica wrote and the server has not filed, when it says:
+    /// on the first lane, when it changed. `None`: it did not say this time.
+    #[prost(message, optional, tag = "9")]
+    pub backlog: Option<Backlog>,
+}
+
+/// What a replica wrote that the server has not filed yet, per table.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Backlog {
+    #[prost(message, repeated, tag = "1")]
+    pub tables: Vec<TableBacklog>,
+}
+
+/// One table's part of a [`Backlog`].
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct TableBacklog {
+    #[prost(string, tag = "1")]
+    pub table: String,
+    /// Rows not sent yet.
+    #[prost(uint64, tag = "2")]
+    pub unsent: u64,
+    /// Rows sent the server has not said it filed.
+    #[prost(uint64, tag = "3")]
+    pub unfiled: u64,
 }
 
 /// Server to replica: these uploads are filed (or kept, if a row could not
@@ -455,6 +479,7 @@ mod tests {
                     sequence: 1,
                     uploads: vec![1],
                     protocol: PROTOCOL,
+                    backlog: Some(Backlog::default()),
                 }
                 .encode_to_vec(),
             ),
@@ -464,6 +489,22 @@ mod tests {
                     table: "t".into(),
                     key: Some(key.clone()),
                     reason: "r".into(),
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "Backlog",
+                Backlog {
+                    tables: vec![TableBacklog::default()],
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "TableBacklog",
+                TableBacklog {
+                    table: "t".into(),
+                    unsent: 1,
+                    unfiled: 1,
                 }
                 .encode_to_vec(),
             ),

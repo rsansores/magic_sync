@@ -470,38 +470,6 @@ pub async fn rejected(
     Ok(())
 }
 
-/// How one replica is doing, for its status page.
-#[derive(Debug, Default, sqlx::FromRow)]
-pub struct ReplicaStatus {
-    /// Notes owed to it alone, after a send to it failed.
-    pub owed: i64,
-    /// Rows waiting in quarantine for it.
-    pub quarantined: i64,
-    /// Sends to it that failed in a row, and the last one's error.
-    pub failures: i32,
-    pub last_error: Option<String>,
-    /// Seconds until it is tried again, while it waits out a failure.
-    pub retry_in: Option<f64>,
-    /// Seconds since it was last sent to.
-    pub sent_ago: Option<f64>,
-}
-
-/// How `replica` is doing.
-pub async fn replica_status(conn: &mut Conn, replica: Uuid) -> Result<ReplicaStatus, Error> {
-    Ok(sqlx::query_as(
-        "SELECT \
-           (SELECT count(*) FROM sync.notes WHERE scope = $1 AND done_at IS NULL) AS owed, \
-           (SELECT count(*) FROM sync.quarantine WHERE replica_id = $1) AS quarantined, \
-           coalesce(r.failures, 0) AS failures, r.last_error, \
-           extract(epoch FROM r.retry_after - now())::float8 AS retry_in, \
-           extract(epoch FROM now() - r.last_sent_at)::float8 AS sent_ago \
-         FROM (SELECT 1) one LEFT JOIN sync.replicas r ON r.replica_id = $1",
-    )
-    .bind(replica)
-    .fetch_one(&mut *conn)
-    .await?)
-}
-
 /// Records that `replica` applied every message up to `sequence` from the
 /// server installation `epoch`: the rows those messages carried are held from
 /// now on. An acknowledgement from another epoch, or behind the last one, is
@@ -684,6 +652,28 @@ pub async fn compare(
     Ok(differ)
 }
 
+/// What `replica` says it wrote and the server has not filed.
+pub async fn backlog(
+    conn: &mut Conn,
+    replica: Uuid,
+    backlog: &envelope::Backlog,
+) -> Result<(), Error> {
+    let tables: Vec<crate::replica::UpProgress> = backlog
+        .tables
+        .iter()
+        .map(crate::replica::UpProgress::from)
+        .collect();
+    sqlx::query(
+        "INSERT INTO sync.replicas AS r (replica_id, backlog, backlog_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (replica_id) DO UPDATE SET backlog = EXCLUDED.backlog, backlog_at = now()",
+    )
+    .bind(replica)
+    .bind(sqlx::types::Json(tables))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// A content fingerprint, the same for the same bytes in the same build.
 fn digest(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -817,81 +807,6 @@ pub async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
     .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected())
-}
-
-/// How the engine is doing, for an alarm or a status page.
-#[derive(Debug, Default)]
-pub struct Health {
-    /// Notes waiting to be sent.
-    pub pending: i64,
-    /// How long the oldest of them has waited.
-    pub oldest: Option<std::time::Duration>,
-    /// Notes the planner set aside: each one a bug or data no declaration
-    /// allows, waiting for a deploy.
-    pub parked: Vec<Parked>,
-    /// Rows waiting in quarantine, over every replica.
-    pub quarantined: i64,
-    /// Uploaded rows waiting in the inbox to be filed.
-    pub unfiled: i64,
-    /// Replicas a send keeps failing to.
-    pub failing: Vec<Failing>,
-}
-
-/// A parked note.
-#[derive(Debug, sqlx::FromRow)]
-pub struct Parked {
-    pub id: i64,
-    pub kind: String,
-    pub relation: Option<String>,
-    pub row_key: Option<String>,
-    pub attempts: i32,
-    pub last_error: Option<String>,
-}
-
-/// A replica a send keeps failing to.
-#[derive(Debug, sqlx::FromRow)]
-pub struct Failing {
-    pub replica_id: Uuid,
-    pub failures: i32,
-    pub last_error: Option<String>,
-}
-
-/// The engine's health, with up to `limit` parked notes and failing replicas.
-pub async fn health(conn: &mut Conn, limit: i64) -> Result<Health, Error> {
-    let (pending, oldest): (i64, Option<f64>) = sqlx::query_as(
-        "SELECT count(*), extract(epoch FROM now() - min(noted_at))::float8 \
-           FROM sync.notes WHERE done_at IS NULL AND parked_at IS NULL",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
-    let parked = sqlx::query_as(
-        "SELECT id, kind, relation, row_key, attempts, last_error FROM sync.notes \
-          WHERE done_at IS NULL AND parked_at IS NOT NULL ORDER BY id LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
-    let quarantined = sqlx::query_scalar("SELECT count(*) FROM sync.quarantine")
-        .fetch_one(&mut *conn)
-        .await?;
-    let unfiled = sqlx::query_scalar("SELECT count(*) FROM sync.inbox")
-        .fetch_one(&mut *conn)
-        .await?;
-    let failing = sqlx::query_as(
-        "SELECT replica_id, failures, last_error FROM sync.replicas \
-          WHERE failures > 0 ORDER BY failures DESC LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
-    Ok(Health {
-        pending,
-        oldest: oldest.map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0))),
-        parked,
-        quarantined,
-        unfiled,
-        failing,
-    })
 }
 
 #[cfg(test)]

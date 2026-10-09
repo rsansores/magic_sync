@@ -33,7 +33,9 @@ CREATE TABLE sync.notes (
     last_error   TEXT
 );
 
-CREATE INDEX notes_pending ON sync.notes (id) WHERE done_at IS NULL AND parked_at IS NULL;
+-- Every read of what is not done yet — the relay's, and a dashboard's, parked
+-- notes included — stays among those, however many done ones wait to be pruned.
+CREATE INDEX notes_undone ON sync.notes (id) WHERE done_at IS NULL;
 
 COMMENT ON TABLE sync.notes IS
     'Every change to a mirrored table or a group table, and every replica to provision '
@@ -112,12 +114,17 @@ CREATE TABLE sync.replicas (
     last_sequence    BIGINT,
     applied_epoch    UUID,
     applied_sequence BIGINT,
-    applied_at       TIMESTAMPTZ
+    applied_at       TIMESTAMPTZ,
+    backlog          JSONB,
+    backlog_at       TIMESTAMPTZ
 );
 
 COMMENT ON TABLE sync.replicas IS
     'How sending to each replica is going: consecutive failures, when it is tried again, '
     'when it was last sent to, and the last message it acknowledged applying.';
+COMMENT ON COLUMN sync.replicas.backlog IS
+    'What the replica last said it wrote and the server has not filed, per table '
+    '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
 
 -- Rows a replica should hold that the engine could not get to it for a reason
 -- a retry cannot change: a row that does not encode, a message the transport

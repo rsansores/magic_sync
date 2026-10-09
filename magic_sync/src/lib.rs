@@ -33,6 +33,8 @@ pub mod relay;
 pub mod replica;
 pub mod row;
 pub mod run;
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+pub mod status;
 #[cfg(test)]
 mod testkit;
 pub mod wire;

@@ -171,7 +171,7 @@ async fn state(State(app): State<App>) -> Result<Json<ShopState>, (StatusCode, S
     let progress = app
         .server
         .engine()
-        .progress(&mut tx, magic_sync::plan::Scope::All)
+        .progress(&mut tx, magic_sync::status::Scope::All)
         .await
         .map_err(fail)?;
     let queues = app.queues.0.lock().unwrap().clone();

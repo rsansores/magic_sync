@@ -913,6 +913,7 @@ dependencies = [
 name = "magic_sync"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "magic_map",
  "magic_sync_derive",
  "prost",

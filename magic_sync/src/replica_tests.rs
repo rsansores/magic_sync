@@ -403,6 +403,87 @@ async fn the_outbox_says_each_thing_once_on_its_lane(pool: crate::DbPool) {
     );
 }
 
+/// The replica tells the server what it wrote and the server has not filed:
+/// with the rows it sends, at once when that starts or empties, and while it
+/// grows, no more often than it was told to.
+#[sqlx::test(migrations = false)]
+async fn the_backlog_is_said_when_it_changes(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = codecs();
+    let lanes = [
+        Lane {
+            name: "main",
+            tables: &[],
+        },
+        Lane {
+            name: "fast",
+            tables: &["items"],
+        },
+    ];
+    let mut settings = Outbox::default();
+    let me = Uuid::now_v7();
+    let note = |key: Uuid| {
+        sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', $1)")
+            .bind(key.simple().to_string())
+    };
+    let said = |o: &Option<Outgoing>| {
+        o.as_ref().and_then(|o| o.up.backlog.clone()).map(|b| {
+            b.tables
+                .into_iter()
+                .map(|t| (t.table, t.unsent, t.unfiled))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    note(Uuid::now_v7()).execute(&mut *conn).await.unwrap();
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap();
+    assert_eq!(said(&main), Some(vec![("items".into(), 1, 0)]), "it starts");
+    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
+
+    note(Uuid::now_v7()).execute(&mut *conn).await.unwrap();
+    assert!(
+        outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+            .await
+            .unwrap()
+            .is_none(),
+        "it grows, and was said a moment ago"
+    );
+    settings.backlog_every = std::time::Duration::ZERO;
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap();
+    assert_eq!(said(&main), Some(vec![("items".into(), 2, 0)]), "when due");
+    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
+
+    let fast = outbox(&mut conn, &codecs, me, &lanes, 1, &settings, false)
+        .await
+        .unwrap()
+        .expect("the rows");
+    assert!(fast.up.backlog.is_none(), "the main lane says it");
+    delivered(&mut conn, &fast).await.unwrap();
+    filed(
+        &mut conn,
+        &envelope::Filed {
+            uploads: fast.up.uploads.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    settings.backlog_every = std::time::Duration::from_secs(3600);
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap();
+    assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
+    assert!(main.as_ref().unwrap().up.tables.is_empty());
+    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
+    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 /// A replica database with nothing of the engine gets its tables and a
 /// trigger on every table that goes up, and every write to one is noted; a
 /// table that goes up with nothing noting it is refused.

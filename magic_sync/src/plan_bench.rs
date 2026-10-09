@@ -274,3 +274,94 @@ async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
     println!("1k products imported, 4000 replicas: {drained}");
     assert_eq!(drained.upserts, 4_000_000);
 }
+
+/// What a dashboard costs over a partition of 200 replicas holding 3M rows
+/// between them: the overview, against counting what each should hold.
+#[sqlx::test(migrations = false)]
+#[ignore = "a benchmark: just bench-mirror"]
+async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool) {
+    use crate::status::Scope;
+    let (mut conn, engine, partition, replicas) = fleet(&pool, 200).await;
+    sqlx::query(
+        "INSERT INTO fixture.t_products (id, partition_id, name)
+         SELECT uuidv7(), $1, 'p' || n FROM generate_series(1, 5000) n",
+    )
+    .bind(partition)
+    .execute(&mut *conn)
+    .await
+    .expect("a catalog");
+    let list = list_of(&mut conn, partition, 5_000).await;
+    for replica in &replicas {
+        assign(&mut conn, partition, list, *replica).await;
+    }
+    let drained = drain(&mut conn, &engine).await;
+    println!("set up: {drained}");
+    // Every replica confirmed all of it.
+    sqlx::query("UPDATE sync.held SET sequence = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("sent");
+    sqlx::query(
+        "INSERT INTO sync.replicas (replica_id, last_sent_at, last_sequence, applied_epoch, applied_sequence, applied_at)
+         SELECT r, now(), 1, (SELECT epoch FROM sync.epoch), 1, now() FROM unnest($1::uuid[]) r",
+    )
+    .bind(&replicas)
+    .execute(&mut *conn)
+    .await
+    .expect("applied");
+    sqlx::query("ANALYZE")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+
+    let time = |what: &str, started: Instant| println!("{what}: {:?}", started.elapsed());
+    for round in ["quiet", "importing", "offline"] {
+        if round == "offline" {
+            // Every replica went quiet before saying it applied any of it:
+            // every row it holds is in flight.
+            sqlx::query("UPDATE sync.replicas SET applied_sequence = 0")
+                .execute(&mut *conn)
+                .await
+                .expect("offline");
+        }
+        let started = Instant::now();
+        let overview = engine
+            .overview(&mut conn, Scope::Partition(partition), 20)
+            .await
+            .expect("overview");
+        time(&format!("{round}: overview of 200"), started);
+        println!(
+            "  states: {:?}",
+            overview.replicas.iter().fold(BTreeMap::new(), |mut m, r| {
+                *m.entry(format!("{:?}", r.state)).or_insert(0) += 1;
+                m
+            })
+        );
+        let started = Instant::now();
+        engine
+            .health(&mut conn, Scope::Partition(partition), 20)
+            .await
+            .expect("health");
+        time(&format!("{round}: health"), started);
+        let started = Instant::now();
+        engine
+            .progress(&mut conn, Scope::Replicas(&replicas[..1]))
+            .await
+            .expect("progress");
+        time(&format!("{round}: progress of one"), started);
+        let started = Instant::now();
+        engine
+            .progress(&mut conn, Scope::Partition(partition))
+            .await
+            .expect("progress");
+        time(&format!("{round}: progress of 200"), started);
+        // An import on its way: 2k renames noted, not yet planned.
+        sqlx::query(
+            "UPDATE fixture.t_products SET name = name || '!' WHERE id IN
+               (SELECT id FROM fixture.t_products LIMIT 2000)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("renames");
+    }
+}
