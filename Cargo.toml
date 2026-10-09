@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["magic_sync", "magic_sync_derive"]
+# The shop example is two programs, one per side: each its own workspace.
+exclude = ["examples"]
 
 [workspace.package]
 version = "0.1.0"

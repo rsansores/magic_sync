@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Register</title>
+<style>
+  :root { --ink: #1d2433; --muted: #6b7385; --line: #e3e6ee; --accent: #3b5bdb; --ok: #2f9e44; --off: #c92a2a; }
+  body { font: 14px/1.4 system-ui, sans-serif; color: var(--ink); margin: 0; padding: 12px; background: white; }
+  .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  button { font: inherit; padding: 5px 10px; border: 0; border-radius: 6px; background: var(--accent); color: white; cursor: pointer; }
+  button.plug { background: var(--ink); }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .note { color: var(--muted); font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="top">
+  <strong><span class="dot" id="dot"></span><span id="name"></span></strong>
+  <button class="plug" id="plug" onclick="plug()"></button>
+</div>
+<ul id="products"></ul>
+<p class="note" id="note"></p>
+<script>
+const money = c => (c / 100).toFixed(2);
+async function sell(id) {
+  await fetch('/api/sell', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ product_id: id }) });
+  refresh();
+}
+async function plug() { await fetch('/api/plug', { method: 'POST' }); refresh(); }
+async function refresh() {
+  const s = await (await fetch('/api/state')).json();
+  document.getElementById('name').textContent = s.name;
+  document.getElementById('dot').style.background = s.online ? 'var(--ok)' : 'var(--off)';
+  document.getElementById('plug').textContent = s.online ? 'Unplug' : 'Plug in';
+  document.getElementById('products').innerHTML = s.products.map(p =>
+    `<li><span>${p.name} · ${money(p.price_cents)}</span><button onclick="sell('${p.id}')">Sell</button></li>`).join('')
+    || '<li class="note">Holds no product yet.</li>';
+  const waiting = s.unsent + s.unfiled;
+  document.getElementById('note').textContent = `${s.sold} sold` +
+    (waiting ? ` · ${waiting} receipt${waiting > 1 ? 's' : ''} not at the head office yet` : ' · all at the head office');
+}
+refresh(); setInterval(refresh, 700);
+</script>
+</body>
+</html>

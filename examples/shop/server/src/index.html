@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>magic_sync — the shop</title>
+<style>
+  :root { --ink: #1d2433; --muted: #6b7385; --line: #e3e6ee; --accent: #3b5bdb; --ok: #2f9e44; --warn: #e67700; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.45 system-ui, sans-serif; color: var(--ink); margin: 0; background: #f6f7fb; }
+  header { padding: 18px 28px; background: white; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 20px; padding: 20px 28px; }
+  section { background: white; border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  th { color: var(--muted); font-weight: 500; }
+  input { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; width: 100%; }
+  button { font: inherit; padding: 6px 12px; border: 0; border-radius: 6px; background: var(--accent); color: white; cursor: pointer; }
+  button.link { background: none; color: var(--accent); padding: 0 4px; }
+  form { display: grid; grid-template-columns: 1fr 90px auto; gap: 6px; margin-bottom: 10px; }
+  .registers { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; }
+  .register h3 { margin: 0 0 6px; font-size: 14px; }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; background: var(--ok); transition: width .3s; }
+  .note { color: var(--muted); font-size: 13px; }
+  iframe { width: 100%; height: 360px; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>The head office</h1>
+  <p>Edit the catalog here. Every register holds it, and keeps working when it is unplugged.</p>
+</header>
+<main>
+  <div>
+    <section>
+      <h2>Products</h2>
+      <form id="add">
+        <input name="name" placeholder="Name" required>
+        <input name="price" placeholder="Price" type="number" step="0.01" required>
+        <button>Add</button>
+      </form>
+      <table><thead><tr><th>Name</th><th>Price</th><th></th></tr></thead><tbody id="products"></tbody></table>
+    </section>
+    <section style="margin-top:20px">
+      <h2>Receipts filed here</h2>
+      <table><thead><tr><th>Register</th><th>Qty</th><th>Total</th></tr></thead><tbody id="receipts"></tbody></table>
+    </section>
+  </div>
+  <section>
+    <h2>Registers</h2>
+    <p class="note" id="none">No register yet. Start one: <code>cargo run -- --name "Register 1" --port 8081</code> in <code>examples/shop/register</code>.</p>
+    <div class="registers" id="registers"></div>
+  </section>
+</main>
+<script>
+const money = c => (c / 100).toFixed(2);
+const frames = {};
+async function api(method, url, body) {
+  const r = await fetch(url, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+  if (!r.ok) alert(await r.text());
+}
+document.getElementById('add').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  await api('POST', '/api/products', { name: f.name.value, price_cents: Math.round(f.price.value * 100) });
+  f.reset(); refresh();
+};
+async function rename(id, name, price) {
+  const value = prompt('Name', name); if (value === null) return;
+  const cost = prompt('Price', money(price)); if (cost === null) return;
+  await api('PUT', '/api/products/' + id, { name: value, price_cents: Math.round(cost * 100) }); refresh();
+}
+async function remove(id) { await api('DELETE', '/api/products/' + id); refresh(); }
+async function refresh() {
+  const s = await (await fetch('/api/state')).json();
+  const names = Object.fromEntries(s.registers.map(r => [r.id, r.name]));
+  document.getElementById('products').innerHTML = s.products.map(p =>
+    `<tr><td>${p.name}</td><td>${money(p.price_cents)}</td><td>
+      <button class="link" onclick="rename('${p.id}', ${JSON.stringify(p.name).replace(/"/g, '&quot;')}, ${p.price_cents})">edit</button>
+      <button class="link" onclick="remove('${p.id}')">delete</button></td></tr>`).join('');
+  document.getElementById('receipts').innerHTML = s.receipts.map(r =>
+    `<tr><td>${names[r.register_id] ?? r.register_id.slice(0, 8)}</td><td>${r.quantity}</td><td>${money(r.total_cents)}</td></tr>`).join('');
+  document.getElementById('none').hidden = s.registers.length > 0;
+  const box = document.getElementById('registers');
+  for (const r of s.registers) {
+    let card = document.getElementById('r-' + r.id);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'register'; card.id = 'r-' + r.id;
+      card.innerHTML = `<h3></h3><div class="bar"><div></div></div><div class="note"></div><iframe src="${r.url}"></iframe>`;
+      box.appendChild(card);
+    }
+    const percent = r.should ? Math.round(100 * r.holds / r.should) : 100;
+    card.querySelector('h3').textContent = r.name;
+    card.querySelector('.bar > div').style.width = percent + '%';
+    card.querySelector('.note').textContent =
+      `holds ${r.holds} of ${r.should} products` + (r.in_flight ? `, ${r.in_flight} on their way` : '') +
+      (r.queued ? ` · ${r.queued} message${r.queued > 1 ? 's' : ''} waiting for it` : '');
+  }
+}
+refresh(); setInterval(refresh, 700);
+</script>
+</body>
+</html>
