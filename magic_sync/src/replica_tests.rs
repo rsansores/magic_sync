@@ -1645,6 +1645,17 @@ async fn the_suites_tables_are_their_rows(pool: SqlitePool) {
     crate::row::assert_parity::<Event>(&pool).await;
 }
 
+/// A table that is not its row fails the check that holds them together.
+#[sqlx::test(migrations = false)]
+#[should_panic(expected = "differs from its row struct")]
+async fn a_table_that_is_not_its_row_fails_parity(pool: SqlitePool) {
+    sqlx::raw_sql("CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    crate::row::assert_parity::<Event>(&pool).await;
+}
+
 /// Rows by key are the active ones: on a replica, less the retired.
 #[sqlx::test(migrations = false)]
 async fn rows_by_key_are_the_ones_not_retired(pool: SqlitePool) {
@@ -1785,6 +1796,8 @@ fn lanes_that_would_strand_a_write_are_refused() {
     }
     let fine = [lane("main", &[]), lane("fast", &["readings"])];
     check_settings(codecs(), &fine, &Outbox::default()).unwrap();
+    let every_table_named = [lane("a", &["tasks", "readings"]), lane("b", &["events"])];
+    check_settings(codecs(), &every_table_named, &Outbox::default()).unwrap();
     let tiny = Outbox {
         limits: Limits {
             rows: 10,
