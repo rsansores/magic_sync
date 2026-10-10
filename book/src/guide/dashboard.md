@@ -7,7 +7,7 @@ serves no HTTP. That is on purpose — *who may see which replicas* is your
 system's question, asked behind your login, and the engine only takes the
 answer as a scope.
 
-![The shop's head office, a register unplugged](../images/dashboard.png)
+![The shop's head office: one register refusing a product, another out of reach](../images/dashboard.png)
 
 ## The handlers
 
@@ -90,6 +90,24 @@ setInterval(async () => {
 > way; red when something waits for a fix — then the replicas, worst first,
 > the tables, and the problems, each with its reason. Clicking a replica sets
 > `selected`; you fetch its progress, and it shows table by table.
+
+## Where one row is
+
+"Which registers hold this product?" is asked next to the product, in your own
+listing — not on the dashboard, which knows rows only by key. The shop puts a
+*who holds it?* link on each product: it asks the third handler with the
+product's id, and shows the answer with `RowPlaces`:
+
+```vue
+<RowPlaces :places="places" :names="registerNames" />
+```
+
+> **What happens:** each register, and where the row stands on it — holds it,
+> holds an older version, on its way, letting it go, or set aside. In a system
+> with many listings, the same link on each listing of a table that travels
+> answers "which units hold this operator", "which hold this order".
+
+## Its look and its words
 
 Its look is CSS variables (`--msd-accent`, `--msd-ok`, …) you may set to your
 own tokens on any ancestor, and its words are English or Spanish, following

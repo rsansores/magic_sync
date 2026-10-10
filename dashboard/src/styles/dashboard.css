@@ -120,19 +120,12 @@
   font-variant-numeric: tabular-nums;
 }
 
-.msd-filters,
-.msd-lookup {
+.msd-filters {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
   margin-bottom: var(--_gap);
-}
-.msd-lookup {
-  margin-top: var(--_gap);
-}
-.msd-lookup .msd-name {
-  flex-basis: 100%;
 }
 .msd-chip {
   font: inherit;
@@ -162,15 +155,6 @@
 }
 .msd-filters .msd-input {
   margin-left: auto;
-}
-.msd-button {
-  font: inherit;
-  color: var(--_accent-fg);
-  background: var(--_accent);
-  border: 0;
-  border-radius: 6px;
-  padding: 5px 12px;
-  cursor: pointer;
 }
 .msd-link {
   font: inherit;
@@ -277,4 +261,20 @@ button.msd-item:hover {
   height: 100%;
   background: var(--_ok);
   transition: width 0.3s;
+}
+
+.msd-place {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.msd-state[data-mood='holds'] {
+  color: var(--_ok);
+}
+.msd-state[data-mood='moving'] {
+  color: var(--_warn);
+}
+.msd-state[data-mood='set_aside'] {
+  color: var(--_danger);
 }

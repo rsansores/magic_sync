@@ -110,6 +110,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // No migrations of its own: the engine sets up what the database lacks,
     // including the trigger that notes every receipt written.
     replica::install(&mut *pool.acquire().await?, codecs()).await?;
+    // `--refuse <product>`: this build has a bug that refuses one product, to
+    // see a row set aside until a fix. Started again without it, the fix is
+    // deployed, and the head office's next retry gets the product through.
+    sqlx::query("DROP TRIGGER IF EXISTS a_bug").execute(&pool).await?;
+    let refuse = arg("--refuse", "");
+    if !refuse.is_empty() {
+        let name = refuse.replace('\'', "''");
+        sqlx::raw_sql(&format!(
+            "CREATE TRIGGER a_bug BEFORE INSERT ON products WHEN NEW.name = '{name}' \
+             BEGIN SELECT RAISE(ABORT, 'this build cannot take \"{name}\"'); END"
+        ))
+        .execute(&pool)
+        .await?;
+    }
     let me: Uuid = match sqlx::query_scalar("SELECT id FROM me").fetch_optional(&pool).await? {
         Some(id) => id,
         None => {

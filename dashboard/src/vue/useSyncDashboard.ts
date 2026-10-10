@@ -8,7 +8,7 @@
 import { computed, onScopeDispose, ref, toValue, type MaybeRefOrGetter } from 'vue'
 import { progressOf, summarize, type Problem, type ReplicaRow, type TableRow } from '../core/derive'
 import { count, since, until } from '../core/format'
-import type { Overview, ReplicaId, ReplicaProgress, ReplicaState, RowState } from '../core/types'
+import type { Overview, ReplicaId, ReplicaProgress, ReplicaState } from '../core/types'
 import { createDashboardI18n, type Messages } from './i18n'
 
 /** A name for each id: a map, or a function the host answers. */
@@ -35,7 +35,7 @@ export interface SyncDashboardOptions {
   stuckAfter?: MaybeRefOrGetter<number | undefined>
 }
 
-const lookup = (names: Names | undefined, key: string) =>
+export const lookup = (names: Names | undefined, key: string) =>
   typeof names === 'function' ? names(key) : names?.[key]
 
 export function useSyncDashboard(options: SyncDashboardOptions) {
@@ -89,7 +89,6 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
   })
 
   const stateLabel = (state: ReplicaState) => t(`state.${state}`)
-  const rowStateLabel = (state: RowState) => t(`row.${state}`)
 
   /** What a replica is waiting on, in a sentence or a few. */
   function describeReplica(r: ReplicaRow): string[] {
@@ -149,7 +148,6 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
     ahead,
     plural,
     stateLabel,
-    rowStateLabel,
     describeReplica,
     describeTable,
     describeProblem,

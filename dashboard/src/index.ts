@@ -7,6 +7,11 @@ export { default as SyncDashboard } from './vue/SyncDashboard.vue'
 // its own component and draws the answers its own way.
 export { useSyncDashboard } from './vue/useSyncDashboard'
 export type { SyncDashboard as SyncDashboardState, SyncDashboardOptions, Names } from './vue/useSyncDashboard'
+
+// Where one row is: next to the row, in the host's own listing.
+export { default as RowPlaces } from './vue/RowPlaces.vue'
+export { useRowPlaces } from './vue/useRowPlaces'
+export type { RowPlacesOptions, PlaceMood } from './vue/useRowPlaces'
 export { builtinMessages } from './vue/i18n'
 export type { Messages, MessageTable, Locale } from './vue/i18n'
 

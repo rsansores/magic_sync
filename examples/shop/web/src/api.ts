@@ -20,6 +20,8 @@ export interface Register {
   id: string
   name: string
   url: string
+  /** Its line is cut: the head office cannot reach it. */
+  cut: boolean
 }
 
 export interface ShopState {
@@ -44,6 +46,7 @@ export const api = {
   editProduct: (id: string, name: string, price_cents: number) =>
     ask<void>('PUT', `/api/products/${id}`, { name, price_cents }),
   deleteProduct: (id: string) => ask<void>('DELETE', `/api/products/${id}`),
+  line: (register: string) => ask<void>('POST', `/api/registers/${register}/line`),
   overview: () => ask<Overview>('GET', '/api/sync/overview'),
   progress: (register: string) => ask<ReplicaProgress>('GET', `/api/sync/progress/${register}`),
   row: (table: string, key: string) =>

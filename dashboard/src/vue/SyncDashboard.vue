@@ -4,19 +4,18 @@
 // problems; and, for the replica the host selects, how far along it is.
 //
 // It fetches nothing. The host passes the engine's answers in, and answers
-// `update:selected` (a replica picked; pass its progress back) and `lookup`
-// (a row asked for; pass its places back).
+// `update:selected` (a replica picked; pass its progress back). Where one row
+// is belongs next to the row, in the host's own listing: `RowPlaces`.
 
 import { computed, ref } from 'vue'
 import '../styles/dashboard.css'
-import type { Overview, ReplicaProgress, ReplicaState, RowPlace } from '../core/types'
+import type { Overview, ReplicaProgress, ReplicaState } from '../core/types'
 import type { Messages } from './i18n'
 import { useSyncDashboard, type Names } from './useSyncDashboard'
 
 const props = defineProps<{
   overview: Overview | null | undefined
   progress?: ReplicaProgress | null
-  places?: RowPlace[] | null
   names?: Names
   labels?: Names
   locale?: string
@@ -26,7 +25,6 @@ const props = defineProps<{
 }>()
 
 const selected = defineModel<string | null>('selected', { default: null })
-const emit = defineEmits<{ lookup: [row: { table: string; key: string }] }>()
 
 const dash = useSyncDashboard({
   overview: () => props.overview,
@@ -60,16 +58,6 @@ const problemCount = computed(() => (summary.value ? summary.value.problems.leng
 const current = computed(() => summary.value?.replicas.find((r) => r.id === selected.value) ?? null)
 const ownProblems = computed(() => summary.value?.problems.filter((p) => p.replica === selected.value) ?? [])
 
-const picked = ref('')
-const lookupTable = computed({
-  get: () => picked.value || summary.value?.tables[0]?.table || '',
-  set: (table: string) => (picked.value = table),
-})
-const lookupKey = ref('')
-function find() {
-  if (lookupTable.value && lookupKey.value.trim())
-    emit('lookup', { table: lookupTable.value, key: lookupKey.value.trim() })
-}
 const percent = (share: number) => `${Math.floor(share * 100)}%`
 </script>
 
@@ -199,28 +187,6 @@ const percent = (share: number) => `${Math.floor(share * 100)}%`
               <span class="msd-muted">{{ dash.describeTable(tb) }}</span>
             </li>
           </ul>
-          <form class="msd-lookup" @submit.prevent="find">
-            <h3 class="msd-name">{{ t('row.title') }}</h3>
-            <select v-model="lookupTable" class="msd-input" :aria-label="t('row.table')">
-              <option v-for="tb in summary.tables" :key="tb.table" :value="tb.table">{{ tb.label }}</option>
-            </select>
-            <input
-              v-model="lookupKey"
-              class="msd-input"
-              :placeholder="t('row.key')"
-              :aria-label="t('row.key')"
-            />
-            <button type="submit" class="msd-button">{{ t('row.find') }}</button>
-          </form>
-          <template v-if="places">
-            <p v-if="places.length === 0" class="msd-muted">{{ t('row.nowhere') }}</p>
-            <ul class="msd-list">
-              <li v-for="p in places" :key="p.replica" class="msd-item msd-row-head">
-                <span class="msd-name">{{ dash.name(p.replica) }}</span>
-                <span class="msd-muted">{{ dash.rowStateLabel(p.state) }}</span>
-              </li>
-            </ul>
-          </template>
         </section>
 
         <section v-else role="tabpanel">

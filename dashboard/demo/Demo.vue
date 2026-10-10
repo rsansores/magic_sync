@@ -2,7 +2,7 @@
 // The dashboard over made-up fleets, one per situation. A host fetches these
 // answers from its own handlers; here they are made on the spot.
 import { computed, ref } from 'vue'
-import { SyncDashboard } from '../src/index'
+import { RowPlaces, SyncDashboard } from '../src/index'
 import type { Overview, ReplicaOverview, ReplicaProgress, RowPlace, TableOverview } from '../src/index'
 
 type Scenario = 'healthy' | 'catching_up' | 'attention'
@@ -12,13 +12,19 @@ const scenario = ref<Scenario>((query.get('scenario') as Scenario | null) ?? 'ca
 const locale = ref(query.get('locale') ?? 'en')
 const selected = ref<string | null>(query.get('selected'))
 const theme = query.get('theme') ?? 'light'
-const places = ref<RowPlace[] | null>(null)
 
 const now = Date.now()
 const ago = (minutes: number) => new Date(now - minutes * 60_000).toISOString()
 const id = (n: number) => `0190a1b2-0000-7000-8000-${String(n).padStart(12, '0')}`
 const FLEET = 24
 const names = Object.fromEntries(Array.from({ length: FLEET }, (_, i) => [id(i), `Register ${i + 1}`]))
+// Where one row is, as a host shows it next to the row in its own listing.
+const places: RowPlace[] = [
+  { replica: id(0), state: 'holds' },
+  { replica: id(1), state: 'on_its_way' },
+  { replica: id(2), state: 'quarantined' },
+  { replica: id(3), state: 'outdated' },
+]
 const labels = { products: 'Products', prices: 'Prices', customers: 'Customers', receipts: 'Receipts' }
 
 function replica(i: number, scenario: Scenario): ReplicaOverview {
@@ -155,15 +161,6 @@ const progress = computed<ReplicaProgress | null>(() => {
     ],
   }
 })
-
-function lookup(row: { table: string; key: string }) {
-  console.log('lookup', row)
-  places.value = [
-    { replica: id(0), state: 'holds' },
-    { replica: id(1), state: 'on_its_way' },
-    { replica: id(2), state: 'quarantined' },
-  ]
-}
 </script>
 
 <template>
@@ -182,12 +179,12 @@ function lookup(row: { table: string; key: string }) {
       v-model:selected="selected"
       :overview="overview"
       :progress="progress"
-      :places="places"
       :names="names"
       :labels="labels"
       :locale="locale"
-      @lookup="lookup"
     />
+    <h3>Who holds “Coffee”?</h3>
+    <RowPlaces :places="places" :names="names" :locale="locale" />
   </main>
 </template>
 

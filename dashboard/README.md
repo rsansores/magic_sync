@@ -46,13 +46,20 @@ const selected = ref<string | null>(null)
 | --------------------------- | -------------------------------------------------------------------------------------------------- |
 | `overview`                  | `Engine::overview`'s answer; `null` while loading                                                  |
 | `progress`                  | `Engine::progress`'s answer for the selected replica                                               |
-| `places`                    | `Engine::row_progress`'s answer, after a `lookup`                                                  |
 | `names`, `labels`           | your names for replicas and tables: a map, or a function                                           |
 | `v-model:selected`          | the replica being looked at; keep it in your URL if you like                                       |
 | `locale`, `messages`        | see below                                                                                          |
 | `silentAfter`, `stuckAfter` | when a replica is "not answering" (15 min) and when waiting changes need attention (10 min), in ms |
 
-It emits `lookup` with `{ table, key }` when someone asks where a row is.
+## Where one row is
+
+"Which replicas hold this product?" belongs next to the product, in your own
+listing: ask `Engine::row_progress` with its key, and show the answer with
+`RowPlaces` (or `useRowPlaces`, without looks):
+
+```vue
+<RowPlaces :places="places" :names="registerNames" />
+```
 
 ### Its look
 

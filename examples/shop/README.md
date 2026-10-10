@@ -9,6 +9,8 @@ it, and the rest of [the book](https://rsansores.github.io/magic_sync/) for how 
   engine's answers for the dashboard
 - `web/` — the head office's page: a Vue app with the sync dashboard
   (`magic_sync_dashboard`); built with `pnpm install && pnpm build`, served by
-  `server/`. Outside this repository, depend on `magic_sync_dashboard` from
-  npm instead of `file:../../../dashboard`
+  `server/`. It takes the dashboard as a copy of `../../../dashboard` made at
+  install: after changing the dashboard, build it and install again
+  (`rm -rf node_modules && pnpm install`). Outside this repository, depend on
+  `magic_sync_dashboard` from npm
 - `register/` — a register: sells, works unplugged, sends its receipts up

@@ -2,13 +2,15 @@
 // The head office: the catalog, the receipts the registers sent, and the
 // sync dashboard over the registers, each register's own page beside it.
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { SyncDashboard, type Overview, type ReplicaProgress, type RowPlace } from 'magic_sync_dashboard'
+import { RowPlaces, SyncDashboard, type Overview, type ReplicaProgress, type RowPlace } from 'magic_sync_dashboard'
 import { api, type Product, type ShopState } from './api'
 
 const state = ref<ShopState | null>(null)
 const overview = ref<Overview | null>(null)
 const selected = ref<string | null>(null)
 const progress = ref<ReplicaProgress | null>(null)
+// The product whose registers are shown, and where it is on each.
+const holding = ref<string | null>(null)
 const places = ref<RowPlace[] | null>(null)
 const error = ref('')
 
@@ -20,6 +22,7 @@ async function refresh() {
   try {
     ;[state.value, overview.value] = await Promise.all([api.state(), api.overview()])
     progress.value = selected.value ? await api.progress(selected.value) : null
+    places.value = holding.value ? await api.row('products', holding.value) : null
     error.value = ''
   } catch (e) {
     error.value = String(e)
@@ -28,34 +31,47 @@ async function refresh() {
 refresh()
 const timer = setInterval(refresh, 1000)
 onUnmounted(() => clearInterval(timer))
-watch(selected, refresh)
+watch([selected, holding], refresh)
 
-async function find(row: { table: string; key: string }) {
-  places.value = await api.row(row.table, row.key)
+// Every action says what went wrong, rather than nothing.
+async function act(action: () => Promise<void>) {
+  try {
+    await action()
+    await refresh()
+  } catch (e) {
+    error.value = String(e)
+  }
+}
+function cutLine(register: string) {
+  return act(() => api.line(register))
+}
+function whoHolds(p: Product) {
+  holding.value = holding.value === p.id ? null : p.id
 }
 
 const money = (cents: number) => (cents / 100).toFixed(2)
 const newName = ref('')
 const newPrice = ref('')
-async function add() {
-  await api.addProduct(newName.value, Math.round(Number(newPrice.value) * 100))
-  newName.value = ''
-  newPrice.value = ''
-  refresh()
+function add() {
+  return act(async () => {
+    await api.addProduct(newName.value, Math.round(Number(newPrice.value) * 100))
+    newName.value = ''
+    newPrice.value = ''
+  })
 }
 const editing = ref<{ id: string; name: string; price: string } | null>(null)
 function edit(p: Product) {
   editing.value = { id: p.id, name: p.name, price: money(p.price_cents) }
 }
-async function save() {
+function save() {
   const e = editing.value!
-  await api.editProduct(e.id, e.name, Math.round(Number(e.price) * 100))
-  editing.value = null
-  refresh()
+  return act(async () => {
+    await api.editProduct(e.id, e.name, Math.round(Number(e.price) * 100))
+    editing.value = null
+  })
 }
-async function remove(p: Product) {
-  await api.deleteProduct(p.id)
-  refresh()
+function remove(p: Product) {
+  return act(() => api.deleteProduct(p.id))
 }
 
 // A register's page, on the host this page was opened with.
@@ -83,21 +99,28 @@ function pageOf(url: string) {
         </form>
         <table>
           <tr><th>Name</th><th>Price</th><th></th></tr>
-          <tr v-for="p in state?.products" :key="p.id">
-            <template v-if="editing?.id === p.id">
-              <td><input v-model="editing.name" /></td>
-              <td><input v-model="editing.price" type="number" step="0.01" /></td>
-              <td><button class="link" @click="save">save</button></td>
-            </template>
-            <template v-else>
-              <td>{{ p.name }}</td>
-              <td>{{ money(p.price_cents) }}</td>
-              <td>
-                <button class="link" @click="edit(p)">edit</button>
-                <button class="link" @click="remove(p)">delete</button>
-              </td>
-            </template>
-          </tr>
+          <template v-for="p in state?.products" :key="p.id">
+            <tr>
+              <template v-if="editing?.id === p.id">
+                <td><input v-model="editing.name" /></td>
+                <td><input v-model="editing.price" type="number" step="0.01" /></td>
+                <td><button class="link" @click="save">save</button></td>
+              </template>
+              <template v-else>
+                <td>{{ p.name }}</td>
+                <td>{{ money(p.price_cents) }}</td>
+                <td>
+                  <button class="link" @click="edit(p)">edit</button>
+                  <button class="link" @click="remove(p)">delete</button>
+                  <button class="link" @click="whoHolds(p)">who holds it?</button>
+                </td>
+              </template>
+            </tr>
+            <!-- Where this product is, register by register: asked next to it. -->
+            <tr v-if="holding === p.id">
+              <td colspan="3"><RowPlaces :places="places" :names="names" /></td>
+            </tr>
+          </template>
         </table>
       </section>
       <section>
@@ -115,16 +138,14 @@ function pageOf(url: string) {
     <div class="column">
       <section>
         <h2>Sync</h2>
-        <!-- An unplugged register is "not answering" after 30 s, not 15 min: it is a demo. -->
+        <!-- A register unplugged is "not answering" after 30 s, not 15 min: it is a demo. -->
         <SyncDashboard
           v-model:selected="selected"
           :overview="overview"
           :progress="progress"
-          :places="places"
           :names="names"
           :labels="labels"
           :silent-after="30_000"
-          @lookup="find"
         />
       </section>
       <section>
@@ -135,7 +156,13 @@ function pageOf(url: string) {
         </p>
         <div class="registers">
           <figure v-for="r in state?.registers" :key="r.id">
-            <figcaption>{{ r.name }}</figcaption>
+            <figcaption>
+              {{ r.name }}
+              <!-- A demo fault: the head office cannot reach it. -->
+              <button class="link" @click="cutLine(r.id)">
+                {{ r.cut ? 'mend the line' : 'cut the line' }}
+              </button>
+            </figcaption>
             <iframe :src="pageOf(r.url)" :title="r.name" />
           </figure>
         </div>
