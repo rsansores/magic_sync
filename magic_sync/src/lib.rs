@@ -23,6 +23,13 @@ compile_error!(
     "magic_sync is built for one side: enable `postgres` (the server's) or `sqlite` (a replica's)"
 );
 
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
+compile_error!(
+    "magic_sync is built for one side, and this build enables both `postgres` and `sqlite`: \
+     a crate that needs the server's side and one that needs a replica's were built together \
+     (one workspace, or one test crate) — build each side in a workspace of its own"
+);
+
 pub mod dialect;
 pub mod envelope;
 mod error;

@@ -1,12 +1,18 @@
 /// What the engine can fail with.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
-    #[error("{0}")]
+    #[error(transparent)]
     Database(#[from] sqlx::Error),
-    /// A declaration the schema cannot honour, or data that does not fit what
-    /// a table declares: a programming error, never a storage failure.
+    /// A declaration the schema cannot honour, or a call the engine cannot
+    /// carry out as made: a programming error, never the data's.
     #[error("{0}")]
     Misuse(String),
+    /// Data that arrived and is not what its table declares: a row or a key
+    /// that does not decode, a message that breaks the protocol. Set aside
+    /// rather than retried: the same bytes fail the same way.
+    #[error("`{table}`: {reason}")]
+    Malformed { table: String, reason: String },
     /// The transport refused or could not take a message.
     #[error("{reason}")]
     Transport { reason: String, transient: bool },
@@ -32,7 +38,7 @@ impl Error {
     pub fn is_transient(&self) -> bool {
         match self {
             Error::Database(e) => is_transient_sqlx(e),
-            Error::Misuse(_) => false,
+            Error::Misuse(_) | Error::Malformed { .. } => false,
             Error::Transport { transient, .. } | Error::Host { transient, .. } => *transient,
             // The same message goes through once this side is updated.
             Error::Protocol { .. } => true,
