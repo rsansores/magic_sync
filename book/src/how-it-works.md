@@ -203,10 +203,11 @@ message is set aside at loading, like one that does not encode (section 6).
 Each row travels with its key, so a replica that cannot even decode a row can
 still say which one it was.
 
-**Every message is numbered.** The relay draws a number from a PostgreSQL
-sequence at the start of each pass and numbers the pass's messages from it. A
-sequence never goes backwards, whichever relay draws from it, and is not
-rolled back with a transaction. A replica applies nothing at or below the last
+**Every message is numbered.** Once a pass is planned, the relay draws one
+number per message from a PostgreSQL sequence, and gives them out in the
+order the messages go. A sequence never goes backwards, whichever relay draws
+from it, and is not rolled back with a transaction, so no two messages ever
+share a number. A replica applies nothing at or below the last
 number it applied. That protects against a message delivered twice, and
 against a relay that lost its lock and sends a stale message late: its numbers
 are lower than the new relay's, so the replica drops them. Messages also carry
@@ -317,11 +318,12 @@ fixed:
 |---|---|---|
 | Planning, on one note | halves the batch until the failing note is alone, parks it (`parked_at`), and plans the rest | parked notes are unparked when the relay starts (usually after a deploy) and on a timer |
 | Encoding a row, on the server | leaves the row out of what is sent and recorded, and **quarantines** it for every replica that was owed it. A replica keeps whatever copy it has | quarantined rows are noted again, for their replica alone, when the relay starts and on a timer; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
-| The transport, for one replica | that replica waits out a backoff (`sync.replicas`); what it is owed is noted again **for it alone**, as of the transactions that first noted it; every other replica carries on | sent when its backoff ends |
+| The transport, for one replica — unreachable, refusing a message for good, or not answering within `send_timeout` | that replica waits out a backoff (`sync.replicas`, the refusal in `last_error`) and is sent nothing more that pass; everything it is owed — rows, deletes, a snapshot — is noted again **for it alone**, as of the transactions that first noted it; owed more than a pass plans, it is provisioned again instead; every other replica carries on | sent when its backoff ends |
 | A row larger than any message may be | left out at loading and **quarantined**, as one that does not encode | as above, once a fix makes it smaller or the limit larger |
-| The transport, refusing a message for good | what the message carried is quarantined for that replica | as above |
 | A replica, taking a row | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`) and reports it in an `Up`; the server stops counting it as held and quarantines it | a fix deployed on either side lets the retry through |
-| The server, filing an uploaded row | the row is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer |
+| The server, filing an uploaded row or delete | the row, or the delete, is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer |
+| The server, filing an upload as a whole | the upload is kept whole in `sync.inbox` and answered, so the replica does not send it again for nothing | as above |
+| The transport, losing the last messages it was sent | a replica that leaves them unconfirmed while nothing newer goes to it is provisioned again after `unconfirmed_after`, then after twice as long while it stays silent | by itself |
 | Anything nobody foresaw | see below | |
 
 ### The backstop: digests
@@ -329,8 +331,8 @@ fixed:
 Every so often, each replica reports a **digest** of what it holds of every
 table: how many rows, and a fingerprint of their keys (FNV-1a over the sorted
 keys; rows it retired or could not take are left out). The server compares it
-with what it records the replica holds (leaving out the rows it quarantined
-for it). It only compares once the replica has applied every message recorded
+with what it records the replica holds (leaving out the rows the replica
+refused, as it does). It only compares once the replica has applied every message recorded
 for it, so a message on its way is never mistaken for drift. If they differ,
 the replica is provisioned again from scratch.
 
@@ -452,9 +454,10 @@ the rest — stay public, for a host that needs to drive the engine itself.
 | [`wire`] | the codec: a table's rows encoded as its own message, and applied by the rules its row declares |
 | [`envelope`] | the messages between server and replica, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
 | [`plan`] | the planner and the notes (server) |
-| [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, the inbox (server) |
+| [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, provisioning a silent replica again (server) |
+| [`filing`] | what a replica sends up, filed: its rows, its rejections, its acknowledgement, its digests, its backlog; the inbox (server) |
 | [`status`] | what the engine answers about itself: the overview, health, progress, where a row is (server) |
-| [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica), and filing uploads (server) |
+| [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica) |
 | [`dialect`] | the few things PostgreSQL and SQLite spell differently |
 | [`run`] | the runners: [`Server`] (the relay under its lock, retries, filing and answering uploads) and [`Replica`] (receiving, and the way up) |
 
@@ -501,7 +504,7 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`envelope::ToReplica`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.ToReplica.html
 [`envelope::Up`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Up.html
 [`replica::apply`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.apply.html
-[`replica::file`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.file.html
+[`filing::file`]: https://docs.rs/magic_sync/latest/magic_sync/filing/fn.file.html
 [`Error::is_transient`]: https://docs.rs/magic_sync/latest/magic_sync/enum.Error.html#method.is_transient
 [`plan::Engine::overview`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.overview
 [`plan::Engine::health`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.health
@@ -519,6 +522,7 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`envelope`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/index.html
 [`plan`]: https://docs.rs/magic_sync/latest/magic_sync/plan/index.html
 [`relay`]: https://docs.rs/magic_sync/latest/magic_sync/relay/index.html
+[`filing`]: https://docs.rs/magic_sync/latest/magic_sync/filing/index.html
 [`status`]: https://docs.rs/magic_sync/latest/magic_sync/status/index.html
 [`replica`]: https://docs.rs/magic_sync/latest/magic_sync/replica/index.html
 [`dialect`]: https://docs.rs/magic_sync/latest/magic_sync/dialect/index.html

@@ -1,7 +1,6 @@
 //! A replica's side: what the server sends, applied table by table through
-//! the codecs; what the replica wrote, gathered to go up; and, on the server,
-//! what a replica sent, filed. Every function works in the caller's
-//! transaction and names no table — the codecs do.
+//! the codecs, and what the replica wrote, gathered to go up. Every function
+//! works in the caller's transaction and names no table — the codecs do.
 
 use crate::envelope::{self, Body, Down, EndSnapshot, ToReplica, Up};
 use crate::row::{key_text, Conn, Key};
@@ -413,7 +412,7 @@ pub async fn reported(conn: &mut Conn, rejected: &[envelope::Rejected]) -> Resul
 
 /// The keys of `wire` that parse as `codec`'s; one that does not is logged
 /// and left out.
-fn keys_of<P: Sync + 'static>(codec: &Codec<P>, wire: &[envelope::Key]) -> Vec<Key> {
+pub(crate) fn keys_of<P: Sync + 'static>(codec: &Codec<P>, wire: &[envelope::Key]) -> Vec<Key> {
     wire.iter()
         .filter_map(|key| match codec.key(&key.parts) {
             Ok(key) => Some(key),
@@ -924,7 +923,7 @@ pub async fn outbox<P: Sync + 'static>(
     }))
 }
 
-/// The transport took `outgoing`: its notes wait for the server's [`Filed`],
+/// The transport took `outgoing`: its notes wait for the server's [`Filed`](envelope::Filed),
 /// its rejections are reported, and the server knows what was applied.
 pub async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
     sent(conn, &outgoing.notes, &outgoing.up).await?;
@@ -985,112 +984,6 @@ pub async fn digests<P: Sync + 'static>(
         protocol: envelope::PROTOCOL,
         ..Up::default()
     })
-}
-
-/// One table of an upload, as the server filed it.
-#[derive(Debug)]
-pub struct Filed {
-    pub table: String,
-    pub written: Vec<Key>,
-    pub gone: Vec<Key>,
-}
-
-/// A row a replica uploaded that the server could not file, as it came.
-#[derive(Debug)]
-pub struct Unfiled {
-    pub table: String,
-    pub bytes: Vec<u8>,
-    pub reason: String,
-}
-
-/// The server filing what `sender` uploaded, in the caller's transaction:
-/// each table by its codec's rules, under `sender` and what the server knows
-/// of it (`known`), whatever the rows say. A row it cannot file — a table
-/// this server does not mirror, a row that does not decode, one the database
-/// refuses for its data — is kept as it came in the server's inbox, to be
-/// filed again once a fix is deployed; a storage failure is the error, and so
-/// is an upload of a later protocol than this build speaks.
-pub async fn file<P: Sync + 'static>(
-    conn: &mut Conn,
-    codecs: &[Codec<P>],
-    upload: &Up,
-    sender: Uuid,
-    known: &P,
-) -> Result<Vec<Filed>, Error> {
-    if upload.protocol > envelope::PROTOCOL {
-        return Err(Error::Protocol {
-            theirs: upload.protocol,
-            ours: envelope::PROTOCOL,
-        });
-    }
-    let mut filed = Vec::new();
-    let mut unfiled = Vec::new();
-    for table in &upload.tables {
-        let set_aside = |at: usize, reason: &str| Unfiled {
-            table: table.table.clone(),
-            bytes: table.upserts[at].clone(),
-            reason: reason.to_owned(),
-        };
-        let Some(codec) = codec_of(codecs, &table.table) else {
-            let why = "a table this server does not mirror";
-            unfiled.extend((0..table.upserts.len()).map(|at| set_aside(at, why)));
-            continue;
-        };
-        let taken = match codec
-            .apply_up(conn, table.upserts.clone(), sender, known)
-            .await
-        {
-            Ok(taken) => taken,
-            Err(e) if !e.is_transient() => {
-                let why = e.to_string();
-                unfiled.extend((0..table.upserts.len()).map(|at| set_aside(at, &why)));
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        unfiled.extend(taken.rejected.iter().map(|(at, why)| set_aside(*at, why)));
-        let offered = keys_of(codec, &table.deletes);
-        let gone = if offered.is_empty() {
-            Vec::new()
-        } else {
-            match codec.delete_up(conn, &offered, sender).await {
-                Ok(gone) => gone,
-                Err(e) if !e.is_transient() => {
-                    tracing::error!(table = table.table, "upload: deletes refused: {e}");
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        filed.push(Filed {
-            table: table.table.clone(),
-            written: taken.held,
-            gone,
-        });
-    }
-    #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
-    {
-        crate::relay::hold(conn, sender, &unfiled).await?;
-        // What it refused first: a row it applied a message of and refused
-        // is not held, and stays in quarantine.
-        crate::relay::rejected(conn, sender, &upload.rejected).await?;
-        if upload.sequence > 0 {
-            crate::relay::acknowledge(conn, sender, &upload.epoch, upload.sequence).await?;
-        }
-        crate::relay::compare(conn, sender, upload).await?;
-        if let Some(backlog) = &upload.backlog {
-            crate::relay::backlog(conn, sender, backlog).await?;
-        }
-    }
-    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-    for row in &unfiled {
-        tracing::error!(
-            table = row.table,
-            reason = row.reason,
-            "upload: a row not filed"
-        );
-    }
-    Ok(filed)
 }
 
 #[cfg(all(test, feature = "sqlite", not(feature = "postgres")))]

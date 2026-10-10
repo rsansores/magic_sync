@@ -186,7 +186,10 @@ The replica **must** tell the server the `(epoch, sequence)` of the last
 message it applied, in an `Up` that carries them in `epoch` and `sequence`.
 It may do so after every message, or once for several (a replica that
 applied messages 5, 6 and 7 reports 7). It should do so within seconds of
-applying, and again whenever it applied something new.
+applying, and again whenever it applied something new. `sequence` 0 says it
+has applied nothing yet. The server ignores a report of another epoch, one
+behind the last it heard, and one past the last message it records sending
+the replica.
 
 ---
 
@@ -203,8 +206,11 @@ A row the replica could not take (4.1) is a **rejection**: the table, the key
   carries the row and it applies): a digest (section 8) leaves rejected rows
   out, as the server leaves out the rows it set aside for the replica.
 
-On a rejection, the server stops counting the row as held and sets it aside
-for that replica. It sends it again when the relay restarts or on a timer,
+On a rejection of a row it records sending the replica, the server stops
+counting the row as held and sets it aside for that replica. The key is read
+as its table's key (section 3) whatever its spelling. A rejection of anything
+else — a table the server does not send, no key or one that is not the
+table's, a row the replica was never sent — is malformed and left out. It sends it again when the relay restarts or on a timer,
 which is after a deploy on either side has had the chance to fix the cause.
 Nobody repairs the row by hand.
 
@@ -228,9 +234,12 @@ For a table the replica writes and the server mirrors:
    server files the same rows idempotently.
 
 The server files an upload under **the replica it came from** (the transport
-says which), whatever the rows themselves claim. A row the server cannot file
-is kept on the server, not lost, and filed later; it still counts as filed for
-`Filed`.
+says which), whatever the rows themselves claim. A row the server cannot file,
+or a delete its database refuses, is kept on the server, not lost, and filed
+later; so is a whole upload whose filing fails for a reason a resend cannot
+cure. Either still counts as filed for `Filed`. Deletes of a table not keyed
+by the replica, and keys that are not the table's, are malformed and left
+out.
 
 A replica **may** say what it wrote and the server has not filed yet, in
 `Up.backlog`: per table, rows not sent yet (`unsent`) and rows sent and not
@@ -275,8 +284,12 @@ Test vectors: no keys → `0xcbf29ce484222325`; the single key `a` →
 
 The server compares a digest only when the replica has applied every message
 recorded for it (the same epoch and last sequence). If they differ, it
-provisions the replica again from scratch (4.2). A replica that skips digests
-loses only this safety net.
+provisions the replica again from scratch (4.2). Digests that differ again
+within a day of the provisioning they caused are a bug no provisioning cures:
+the server logs them and does not act on them. A digest of a table the server
+does not send the replica, or two digests of one table, are malformed: none
+of that `Up`'s digests is compared. A replica that skips digests loses only
+this safety net.
 
 ---
 
@@ -286,7 +299,11 @@ loses only this safety net.
   the row, as the row is at sending time.
 - A row is sent with every row it points at that the replica lacks, and is
   taken back only once nothing the replica keeps points at it.
-- Messages are numbered and only ever rise within an epoch.
+- Every message carries a number of its own, and the numbers a replica is
+  sent rise within an epoch in the order it is sent them.
+- A replica that leaves the last messages it was sent unconfirmed, while
+  nothing newer goes to it, is provisioned again after a while: the transport
+  may have lost them.
 - A row the server cannot send to a replica, or that a replica rejected, is
   set aside and sent again after a fix: it is never silently dropped.
 - An upload is answered with `Filed` only after the transaction that filed it

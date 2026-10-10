@@ -117,7 +117,8 @@ CREATE TABLE sync.replicas (
     applied_at       TIMESTAMPTZ,
     waiting_since    TIMESTAMPTZ,
     backlog          JSONB,
-    backlog_at       TIMESTAMPTZ
+    backlog_at       TIMESTAMPTZ,
+    drifted_at       TIMESTAMPTZ
 );
 
 COMMENT ON TABLE sync.replicas IS
@@ -129,15 +130,23 @@ COMMENT ON COLUMN sync.replicas.waiting_since IS
 COMMENT ON COLUMN sync.replicas.backlog IS
     'What the replica last said it wrote and the server has not filed, per table '
     '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
+COMMENT ON COLUMN sync.replicas.last_error IS
+    'Why the last send to it failed — the network, or a message the transport refuses for '
+    'good — while failures counts on. NULL once a send gets through.';
+COMMENT ON COLUMN sync.replicas.drifted_at IS
+    'When its digests last differed from what the server records and it was provisioned '
+    'again for it. Digests that differ again within a day are a bug no provisioning cures: '
+    'they are logged, and it is not provisioned again before the day is out.';
 
 -- Rows a replica should hold that the engine could not get to it for a reason
--- a retry cannot change: a row that does not encode, a message the transport
--- refuses, a row the replica refused. Each is tried again on a timer and when
--- the relay starts, and leaves when the replica holds it.
+-- a retry cannot change: a row that does not encode or fits no message, a row
+-- the replica refused. Each is tried again on a timer and when the relay
+-- starts, and leaves when the replica holds it.
 CREATE TABLE sync.quarantine (
     replica_id UUID        NOT NULL,
     relation   TEXT        NOT NULL,
     row_key    TEXT        NOT NULL,
+    cause      TEXT        NOT NULL CHECK (cause IN ('server', 'replica')),
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -149,18 +158,22 @@ CREATE TABLE sync.quarantine (
 COMMENT ON TABLE sync.quarantine IS
     'Rows a replica should hold and does not, for a reason a retry cannot change. Never '
     'repaired by hand: a deploy that fixes the cause lets the next retry through.';
+COMMENT ON COLUMN sync.quarantine.cause IS
+    'server: the server could not send the row, and the replica keeps whatever version it '
+    'had. replica: the replica refused it, and leaves it out of its digests, as the server '
+    'does when it compares them.';
 COMMENT ON COLUMN sync.quarantine.carried IS
     'The message that carried the row again since it was set aside: once the replica says it '
     'applied it, the row leaves the quarantine. NULL: not carried since.';
 
--- Rows a replica uploaded that the server could not file, kept as they came:
--- the replica may have let go of them since. Filed again on a timer and when
--- the relay starts, and gone once filed.
+-- What replicas uploaded that the server could not file, kept as it came: the
+-- replica may have let go of it since. Filed again on a timer and when the
+-- relay starts, and gone once filed.
 CREATE TABLE sync.inbox (
     id         BIGSERIAL   PRIMARY KEY,
     replica_id UUID        NOT NULL,
-    relation   TEXT        NOT NULL,
-    row_bytes  BYTEA       NOT NULL,
+    relation   TEXT,
+    upload     BYTEA       NOT NULL,
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -168,11 +181,18 @@ CREATE TABLE sync.inbox (
 );
 
 CREATE INDEX inbox_replica ON sync.inbox (replica_id);
+-- The same part of an upload kept twice — the replica sent it again — is one.
+CREATE UNIQUE INDEX inbox_once ON sync.inbox (replica_id, md5(upload));
 
 COMMENT ON TABLE sync.inbox IS
-    'Rows replicas uploaded that the server could not file for a reason a retry cannot '
-    'change: a table it does not mirror, a row that does not decode, one its database '
-    'refuses. Never repaired by hand: a deploy that fixes the cause lets the next retry file it.';
+    'What replicas uploaded that the server could not file for a reason a retry cannot '
+    'change: a table it does not mirror, a row that does not decode, a row or a delete its '
+    'database refuses — or a whole upload, when filing it failed as a whole. Never repaired '
+    'by hand: a deploy that fixes the cause lets the next retry file it.';
+COMMENT ON COLUMN sync.inbox.relation IS
+    'The table, for one row or one delete. NULL: a whole upload.';
+COMMENT ON COLUMN sync.inbox.upload IS
+    'An Up, as protobuf: the upload as it came, or one table''s row or delete of it.';
 
 -- A truncate would take rows away without a note, and every replica would
 -- keep them.

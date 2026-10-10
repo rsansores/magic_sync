@@ -50,8 +50,8 @@ needs from a transport:
 > after it acknowledged the previous one.
 
 With NATS JetStream, that is a durable pull consumer per replica with
-`max_ack_pending = 1`. `id` is the same for the same message sent again, for a
-transport that deduplicates.
+`max_ack_pending = 1`. `id` names the message, one of its own for every
+message the engine sends, for a transport that deduplicates a send it retries.
 
 When sending fails, say whether a retry may help:
 
@@ -60,12 +60,12 @@ Err(Error::Transport { reason: e.to_string(), transient: true })   // the networ
 Err(Error::Transport { reason: e.to_string(), transient: false })  // this message, never
 ```
 
-> **What happens:** a transient failure leaves that replica waiting out a
-> backoff while every other replica carries on; what it is owed is noted
-> again for it alone. A permanent one sets the message's rows aside for that
-> replica until a fix is deployed. The engine never hands a transport a
-> message larger than its limit: a row too big for any message is set aside
-> instead.
+> **What happens:** either way, that replica waits out a backoff while every
+> other replica carries on, and everything it is owed is noted again for it
+> alone; a refusal shows in its `last_error`. A send that does not answer
+> within `send_timeout` is a transient failure. The engine never hands a
+> transport a message larger than its limit: a row too big for any message is
+> set aside instead.
 
 ## Building and running it
 
@@ -106,8 +106,11 @@ refuses to start on a database that is not set up.
 >   *deploy a fix* (a bug), never *go fix the data*.
 
 `Settings` holds the knobs: message size limits, notes per pass, the lock's
-key, how often it retries and prunes, and `role` — a role every transaction of
-the engine's own assumes, when your connecting role has less than it needs.
+key, how often it retries and prunes, how long a send may take and how long
+a replica it failed to waits, how long a replica may leave what it was sent
+unconfirmed before it is provisioned again, and `role` — a role every
+transaction of the engine's own assumes, when your connecting role has less
+than it needs.
 
 ## What replicas send up
 
@@ -123,7 +126,9 @@ async fn up(State(app): State<App>, Path(register): Path<Uuid>, body: Bytes) -> 
 ```
 
 An error means the message must come again (the database is away, or it
-speaks a later protocol than this build); filing it again is harmless.
+speaks a later protocol than this build); filing it again is harmless. Any
+other failure is no reason to send it again: the upload is kept whole, it is
+answered, and it is filed again after a deploy.
 
 > **What happens:** the rows are filed in a transaction, each by its codec's
 > rules — a record kept from its first delivery, the replica's columns of a

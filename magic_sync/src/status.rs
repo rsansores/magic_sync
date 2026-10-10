@@ -243,11 +243,13 @@ pub struct Quarantined {
     pub attempts: i32,
 }
 
-/// A row a replica sent that the server could not file.
+/// What a replica sent that the server could not file: a row, a delete, or a
+/// whole upload.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Unfiled {
     pub id: i64,
     pub replica: Uuid,
+    /// Empty for a whole upload kept as it came.
     pub table: String,
     pub reason: String,
     pub first_at: DateTime<Utc>,
@@ -623,7 +625,7 @@ impl Engine {
                 .fetch_one(&mut *conn)
                 .await?,
             first: sqlx::query_as(&format!(
-                "SELECT id, replica_id AS replica, relation AS table, reason, \
+                "SELECT id, replica_id AS replica, coalesce(relation, '') AS table, reason, \
                         first_at, last_at, attempts \
                    FROM sync.inbox WHERE {mine} ORDER BY id LIMIT $2"
             ))
@@ -825,7 +827,7 @@ impl Engine {
         .await?;
         let unfiled: Vec<Counted> = sqlx::query_as(
             "SELECT relation, replica_id, count(*) FROM sync.inbox \
-              WHERE replica_id = ANY($1) GROUP BY 1, 2",
+              WHERE replica_id = ANY($1) AND relation IS NOT NULL GROUP BY 1, 2",
         )
         .bind(&ids)
         .fetch_all(&mut *conn)

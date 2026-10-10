@@ -7,10 +7,10 @@
 //! What the host knows and the engine does not — who a replica is, and the
 //! transaction its uploads are filed in — it says through [`Senders`].
 
-use crate::envelope::{Body, Filed, Limits, Up};
+use crate::envelope::{self, Body, Filed, Limits, Up};
+use crate::filing;
 use crate::plan::{Engine, Replicas};
 use crate::relay::{self, Relay, Transport};
-use crate::replica;
 use crate::row::Table;
 use crate::wire::Codec;
 use crate::Error;
@@ -73,6 +73,14 @@ pub struct Settings {
     pub idle: Duration,
     /// How long it waits after a failure, doubling up to the second.
     pub backoff: (Duration, Duration),
+    /// How long one send may take before its replica counts as unreachable.
+    pub send_timeout: Duration,
+    /// How long a replica a send failed to waits before it is tried again,
+    /// doubling with every failure in a row up to the second.
+    pub replica_backoff: (Duration, Duration),
+    /// How long a replica may leave a message unconfirmed, with nothing sent
+    /// to it since, before it is provisioned again ([`relay::heal`]).
+    pub unconfirmed_after: Duration,
     /// How often a process that is not the relay asks for the lock.
     pub standby: Duration,
     /// How often what was set aside is tried again, besides when the relay
@@ -99,6 +107,9 @@ impl Default for Settings {
             role: None,
             idle: Duration::from_secs(1),
             backoff: (Duration::from_secs(1), Duration::from_secs(60)),
+            send_timeout: Duration::from_secs(30),
+            replica_backoff: (Duration::from_secs(2), Duration::from_secs(15 * 60)),
+            unconfirmed_after: Duration::from_secs(60 * 60),
             standby: Duration::from_secs(30),
             retry_every: Duration::from_secs(60 * 60),
             prune_after: Duration::from_secs(30 * 24 * 60 * 60),
@@ -207,9 +218,12 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// for it and answered once that commits. An error means the message must
     /// come again: the database or the transport is away, or the message
     /// speaks a later protocol than this build. Filing it again is harmless.
+    /// Anything else that fails is no reason to send it again — the same
+    /// bytes would fail the same way — so the upload is kept whole in the
+    /// inbox, answered, and filed again after a deploy.
     ///
     /// Answers what was filed, per table, for the host to act on.
-    pub async fn receive(&self, replica: Uuid, bytes: &[u8]) -> Result<Vec<replica::Filed>, Error> {
+    pub async fn receive(&self, replica: Uuid, bytes: &[u8]) -> Result<Vec<filing::Filed>, Error> {
         use prost::Message as _;
         let up = match Up::decode(bytes) {
             Ok(up) => up,
@@ -218,26 +232,52 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 return Ok(Vec::new());
             }
         };
-        let Some(known) = self.senders.known(replica).await? else {
-            tracing::warn!(%replica, "sync: an upload from no replica this server knows — dropped");
-            return Ok(Vec::new());
+        if up.protocol > envelope::PROTOCOL {
+            return Err(Error::Protocol {
+                theirs: up.protocol,
+                ours: envelope::PROTOCOL,
+            });
+        }
+        let filed = match self.file(replica, &up).await {
+            Ok(Some(filed)) => filed,
+            Ok(None) => {
+                tracing::warn!(%replica, "sync: an upload from no replica this server knows — dropped");
+                return Ok(Vec::new());
+            }
+            Err(e) if e.is_transient() => return Err(e),
+            Err(e) => {
+                let mut tx = self.begin().await?;
+                filing::keep_whole(&mut tx, replica, bytes, &e.to_string()).await?;
+                tx.commit().await?;
+                Vec::new()
+            }
         };
-        let mut tx = self.senders.filing(&known).await?;
-        let filed = replica::file(&mut tx, self.codecs, &up, replica, &known).await?;
-        tx.commit().await?;
         if let Some(last) = up.uploads.iter().max() {
             let answer = Body::Filed(Filed {
                 uploads: up.uploads.clone(),
             });
-            self.transport
-                .send(
-                    replica,
-                    answer.encoded(),
-                    &format!("filed-{replica}-{last}"),
-                )
-                .await?;
+            let id = format!("filed-{replica}-{last}");
+            match self.transport.send(replica, answer.encoded(), &id).await {
+                Err(e) if e.is_transient() => return Err(e),
+                Err(e) => {
+                    tracing::error!(%replica, "sync: the transport refuses an upload's answer — the replica sends it again: {e}")
+                }
+                Ok(()) => {}
+            }
         }
         Ok(filed)
+    }
+
+    /// Files `up` from `replica` in the transaction the host gives for it;
+    /// `None` for a replica the host does not know.
+    async fn file(&self, replica: Uuid, up: &Up) -> Result<Option<Vec<filing::Filed>>, Error> {
+        let Some(known) = self.senders.known(replica).await? else {
+            return Ok(None);
+        };
+        let mut tx = self.senders.filing(&known).await?;
+        let filed = filing::file(&mut tx, self.codecs, up, replica, &known).await?;
+        tx.commit().await?;
+        Ok(Some(filed))
     }
 
     /// One pass now, as the relay, for a host's tests or a tool: what was
@@ -258,6 +298,8 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
             codecs: self.codecs,
             limits: self.settings.limits,
             batch: self.settings.batch,
+            timeout: self.settings.send_timeout,
+            backoff: self.settings.replica_backoff,
         };
         let prepared = {
             let mut tx = self.begin().await?;
@@ -290,30 +332,34 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         tracing::info!("sync: this process runs the relay");
         let (min, max) = self.settings.backoff;
         let mut backoff = min;
-        // None: due now. Taking the lock is usually a deploy, which may have
-        // fixed what was set aside.
-        let (mut retried, mut pruned, mut watched) = (None, None, None);
+        // Due now: taking the lock is usually a deploy, which may have fixed
+        // what was set aside. A step that failed is due again after the
+        // longest backoff, not on every pass.
+        let now = Instant::now();
+        let (mut retry_at, mut prune_at, mut watch_at) = (now, now, now);
         loop {
             if !lock.still_held().await {
                 tracing::error!("sync: the relay's lock is gone — standing by");
                 return;
             }
-            if due(retried, self.settings.retry_every) {
-                match self.retry(&mut lock).await {
-                    Ok(()) => retried = Some(Instant::now()),
-                    Err(e) => tracing::warn!("sync: trying again what was set aside failed: {e}"),
-                }
+            if Instant::now() >= retry_at {
+                retry_at = Instant::now()
+                    + match self.retry(&mut lock).await {
+                        Ok(()) => self.settings.retry_every,
+                        Err(e) => {
+                            tracing::warn!("sync: trying again what was set aside failed: {e}");
+                            max
+                        }
+                    };
             }
-            if due(
-                pruned,
-                self.settings.prune_after.min(Duration::from_secs(60 * 60)),
-            ) {
+            if Instant::now() >= prune_at {
                 self.prune().await;
-                pruned = Some(Instant::now());
+                prune_at =
+                    Instant::now() + self.settings.prune_after.min(Duration::from_secs(60 * 60));
             }
-            if due(watched, self.settings.watch_every) {
-                self.watch().await;
-                watched = Some(Instant::now());
+            if Instant::now() >= watch_at {
+                self.watch(&mut lock).await;
+                watch_at = Instant::now() + self.settings.watch_every;
             }
             match self.pass(&mut lock).await {
                 Ok(done) => {
@@ -325,7 +371,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 Err(e) => {
                     tracing::error!("sync: a pass failed, and runs again: {e}");
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max);
+                    backoff = backoff.saturating_mul(2).min(max);
                 }
             }
         }
@@ -344,7 +390,8 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     }
 
     /// Plans the parked notes again, sends the quarantine again, and files
-    /// the inbox again.
+    /// the inbox again, all of it: an upload that fails again holds back no
+    /// other.
     async fn retry(&self, lock: &mut Lock) -> Result<(), Error> {
         let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
         let unparked = relay::unpark(&mut tx).await?;
@@ -353,25 +400,51 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         if unparked + retried > 0 {
             tracing::info!(unparked, retried, "sync: trying again what was set aside");
         }
-        let waiting = {
-            let mut tx = self.begin().await?;
-            relay::inbox(&mut tx, self.settings.batch).await?
-        };
-        let mut filed = 0;
-        for row in &waiting {
-            let Some(known) = self.senders.known(row.replica_id).await? else {
-                continue;
+        let through = filing::newest(&mut *self.begin().await?).await?;
+        let (mut after, mut filed) = (0, 0);
+        loop {
+            let kept = filing::inbox(
+                &mut *self.begin().await?,
+                after,
+                through,
+                self.settings.batch,
+            )
+            .await?;
+            let Some(last) = kept.last() else {
+                break;
             };
-            let mut tx = self.senders.filing(&known).await?;
-            if relay::refile(&mut tx, self.codecs, row, &known).await? {
-                filed += 1;
+            after = last.id;
+            for kept in &kept {
+                match self.refile(kept).await {
+                    Ok(all) => filed += usize::from(all),
+                    Err(e) if e.is_transient() && !matches!(e, Error::Protocol { .. }) => {
+                        return Err(e)
+                    }
+                    Err(e) => {
+                        let mut tx = self.begin().await?;
+                        filing::failed_again(&mut tx, kept, &e.to_string()).await?;
+                        tx.commit().await?;
+                    }
+                }
             }
-            tx.commit().await?;
         }
         if filed > 0 {
-            tracing::info!(filed, "sync: uploaded rows filed after all");
+            tracing::info!(filed, "sync: uploads filed after all");
         }
         Ok(())
+    }
+
+    /// Files `kept` again, in the transaction the host gives for its
+    /// replica; answers whether all of it was filed. One whose replica the
+    /// host no longer knows waits.
+    async fn refile(&self, kept: &filing::Kept) -> Result<bool, Error> {
+        let Some(known) = self.senders.known(kept.replica_id).await? else {
+            return Ok(false);
+        };
+        let mut tx = self.senders.filing(&known).await?;
+        let all = filing::refile(&mut tx, self.codecs, kept, &known).await?;
+        tx.commit().await?;
+        Ok(all)
     }
 
     async fn prune(&self) {
@@ -389,9 +462,27 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         }
     }
 
-    /// Logs whatever in the engine's health needs someone: each one means
-    /// wait (the network) or deploy a fix (a bug), never repair data.
-    async fn watch(&self) {
+    /// Provisions again the replicas that have left messages unconfirmed
+    /// too long ([`relay::heal`]), and logs whatever in the engine's health
+    /// needs someone: each one means wait (the network) or deploy a fix (a
+    /// bug), never repair data.
+    async fn watch(&self, lock: &mut Lock) {
+        let healed = async {
+            let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
+            let healed =
+                relay::heal(&mut tx, &self.engine, self.settings.unconfirmed_after).await?;
+            tx.commit().await?;
+            Ok::<_, Error>(healed)
+        }
+        .await;
+        match healed {
+            Ok(0) => {}
+            Ok(healed) => tracing::warn!(
+                healed,
+                "sync: replicas silent on what they were sent — provisioned again"
+            ),
+            Err(e) => tracing::warn!("sync: provisioning again the silent replicas failed: {e}"),
+        }
         let health = async {
             let mut tx = self.begin().await?;
             self.engine
@@ -453,16 +544,18 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
 /// A transaction that assumes `role`, when there is one.
 async fn begin(pool: &PgPool, role: Option<&str>) -> Result<Transaction<'static, Postgres>, Error> {
     let mut tx = pool.begin().await?;
-    if let Some(role) = role {
-        sqlx::query(&format!("SET LOCAL ROLE {role}"))
-            .execute(&mut *tx)
-            .await?;
-    }
+    assume(&mut tx, role).await?;
     Ok(tx)
 }
 
-fn due(last: Option<Instant>, every: Duration) -> bool {
-    last.is_none_or(|at| at.elapsed() >= every)
+async fn assume(conn: &mut PgConnection, role: Option<&str>) -> Result<(), Error> {
+    if let Some(role) = role {
+        let quoted = format!("\"{}\"", role.replace('"', "\"\""));
+        sqlx::query(&format!("SET LOCAL ROLE {quoted}"))
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Proof that this process runs the relay: a connection holding the
@@ -473,14 +566,15 @@ struct Lock {
 
 impl Lock {
     async fn take(pool: &PgPool, key: i64) -> Result<Option<Lock>, Error> {
-        let mut conn = pool.acquire().await?;
+        // Detached before it asks: dropped mid-question, the connection
+        // closes and lets go of a lock it may have got, rather than going
+        // back to the pool holding it.
+        let mut conn = pool.acquire().await?.detach();
         let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(key)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut conn)
             .await?;
-        Ok(taken.then(|| Lock {
-            conn: conn.detach(),
-        }))
+        Ok(taken.then_some(Lock { conn }))
     }
 
     /// Lets the lock go now, rather than when the connection's end reaches
@@ -505,11 +599,7 @@ impl Lock {
     /// one that took it.
     async fn fenced(&mut self, role: Option<&str>) -> Result<Transaction<'_, Postgres>, Error> {
         let mut tx = self.conn.begin().await?;
-        if let Some(role) = role {
-            sqlx::query(&format!("SET LOCAL ROLE {role}"))
-                .execute(&mut *tx)
-                .await?;
-        }
+        assume(&mut tx, role).await?;
         Ok(tx)
     }
 }

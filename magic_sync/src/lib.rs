@@ -34,6 +34,8 @@ pub mod dialect;
 pub mod envelope;
 mod error;
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+pub mod filing;
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 pub mod plan;
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 pub mod relay;
