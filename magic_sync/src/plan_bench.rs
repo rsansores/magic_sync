@@ -1,7 +1,8 @@
 //! What the engine costs on the operations that move many rows at once, on the
-//! schema the engine's tests use. Ignored by default; `just bench-mirror` runs
-//! them and prints the timings. Each measures the database work of planning
-//! and recording — what the relay does besides encoding and publishing.
+//! schema the engine's tests use. Ignored by default; the command in
+//! CONTRIBUTING.md runs them and prints the timings. Most measure the database
+//! work of planning and recording — what the relay does besides encoding and
+//! publishing — and one what a dashboard's reads cost.
 
 use super::plan_tests::{tables, REPLICAS, SCHEMA};
 use super::*;
@@ -150,7 +151,7 @@ async fn assign(conn: &mut Conn, partition: Uuid, list: Uuid, replica: Uuid) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_list_of_20k_given_to_a_unit(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let list = list_of(&mut conn, partition, 20_000).await;
@@ -163,7 +164,7 @@ async fn bench_a_list_of_20k_given_to_a_unit(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_list_of_10k_swapped_for_one_of_8k(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let old = list_of(&mut conn, partition, 10_000).await;
@@ -184,7 +185,7 @@ async fn bench_a_list_of_10k_swapped_for_one_of_8k(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_10k_products_imported_for_100_units(pool: crate::DbPool) {
     let (mut conn, engine, partition, _) = fleet(&pool, 100).await;
     sqlx::query(
@@ -201,7 +202,7 @@ async fn bench_10k_products_imported_for_100_units(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let list = list_of(&mut conn, partition, 10_000).await;
@@ -225,7 +226,7 @@ async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 10).await;
     let list = Uuid::now_v7();
@@ -259,7 +260,7 @@ async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbP
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
     let (mut conn, engine, partition, _) = fleet(&pool, 4000).await;
     sqlx::query(
@@ -273,4 +274,95 @@ async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
     let drained = drain(&mut conn, &engine).await;
     println!("1k products imported, 4000 replicas: {drained}");
     assert_eq!(drained.upserts, 4_000_000);
+}
+
+/// What a dashboard costs over a partition of 200 replicas holding 3M rows
+/// between them: the overview, against counting what each should hold.
+#[sqlx::test(migrations = false)]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
+async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool) {
+    use crate::status::Scope;
+    let (mut conn, engine, partition, replicas) = fleet(&pool, 200).await;
+    sqlx::query(
+        "INSERT INTO fixture.t_products (id, partition_id, name)
+         SELECT uuidv7(), $1, 'p' || n FROM generate_series(1, 5000) n",
+    )
+    .bind(partition)
+    .execute(&mut *conn)
+    .await
+    .expect("a catalog");
+    let list = list_of(&mut conn, partition, 5_000).await;
+    for replica in &replicas {
+        assign(&mut conn, partition, list, *replica).await;
+    }
+    let drained = drain(&mut conn, &engine).await;
+    println!("set up: {drained}");
+    // Every replica confirmed all of it.
+    sqlx::query("UPDATE sync.held SET sequence = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("sent");
+    sqlx::query(
+        "INSERT INTO sync.replicas (replica_id, last_sent_at, last_sequence, applied_epoch, applied_sequence, applied_at)
+         SELECT r, now(), 1, (SELECT epoch FROM sync.epoch), 1, now() FROM unnest($1::uuid[]) r",
+    )
+    .bind(&replicas)
+    .execute(&mut *conn)
+    .await
+    .expect("applied");
+    sqlx::query("ANALYZE")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+
+    let time = |what: &str, started: Instant| println!("{what}: {:?}", started.elapsed());
+    for round in ["quiet", "importing", "offline"] {
+        if round == "offline" {
+            // Every replica went quiet before saying it applied any of it:
+            // every row it holds is in flight.
+            sqlx::query("UPDATE sync.replicas SET applied_sequence = 0")
+                .execute(&mut *conn)
+                .await
+                .expect("offline");
+        }
+        let started = Instant::now();
+        let overview = engine
+            .overview(&mut conn, Scope::Partition(partition), 20)
+            .await
+            .expect("overview");
+        time(&format!("{round}: overview of 200"), started);
+        println!(
+            "  states: {:?}",
+            overview.replicas.iter().fold(BTreeMap::new(), |mut m, r| {
+                *m.entry(format!("{:?}", r.state)).or_insert(0) += 1;
+                m
+            })
+        );
+        let started = Instant::now();
+        engine
+            .health(&mut conn, Scope::Partition(partition), 20)
+            .await
+            .expect("health");
+        time(&format!("{round}: health"), started);
+        let started = Instant::now();
+        engine
+            .progress(&mut conn, Scope::Replicas(&replicas[..1]))
+            .await
+            .expect("progress");
+        time(&format!("{round}: progress of one"), started);
+        let started = Instant::now();
+        engine
+            .progress(&mut conn, Scope::Partition(partition))
+            .await
+            .expect("progress");
+        time(&format!("{round}: progress of 200"), started);
+        // An import on its way: 2k renames noted, not yet planned.
+        sqlx::query(
+            "UPDATE fixture.t_products SET name = name || '!' WHERE id IN
+               (SELECT id FROM fixture.t_products LIMIT 2000)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("renames");
+    }
 }

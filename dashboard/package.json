@@ -1,0 +1,83 @@
+{
+  "name": "magic_sync_dashboard",
+  "version": "0.1.0",
+  "description": "The magic_sync dashboard for Vue 3: is every replica holding what it should, which tables are on their way, and what waits for a fix — headless, or ready-made.",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://rsansores.github.io/magic_sync/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rsansores/magic_sync.git",
+    "directory": "dashboard"
+  },
+  "bugs": {
+    "url": "https://github.com/rsansores/magic_sync/issues"
+  },
+  "keywords": [
+    "sync",
+    "replication",
+    "offline-first",
+    "dashboard",
+    "vue"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.5.0",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "files": [
+    "dist",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "module": "./dist/dashboard.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/dashboard.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core.js"
+    },
+    "./styles.css": "./dist/dashboard.css",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "dev": "vite --host --port 5199",
+    "build": "vite build && vue-tsc -p tsconfig.build.json",
+    "prepack": "cp ../LICENSE-MIT ../LICENSE-APACHE . && pnpm run build",
+    "test": "vitest run",
+    "type-check": "vue-tsc --noEmit",
+    "lint": "eslint --max-warnings 0 \"src/**/*.{ts,vue}\" \"demo/**/*.{ts,vue}\"",
+    "format": "prettier --write \"src/**/*.{ts,vue,css,json}\" \"demo/**/*.{ts,vue}\" \"*.{json,js,ts,md}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,vue,css,json}\" \"demo/**/*.{ts,vue}\" \"*.{json,js,ts,md}\"",
+    "knip": "knip"
+  },
+  "peerDependencies": {
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.4",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "eslint": "^10.12.0",
+    "eslint-plugin-vue": "^10.11.1",
+    "globals": "^17.13.0",
+    "knip": "^6.40.0",
+    "prettier": "^3.9.9",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.71.1",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3",
+    "vue": "^3.5.43",
+    "vue-eslint-parser": "^10.4.1",
+    "vue-tsc": "^3.3.12"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

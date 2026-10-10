@@ -1,0 +1,15 @@
+{
+  // Emits the public .d.ts files into dist/ for the published package. The
+  // base tsconfig.json is the type-check/IDE config (noEmit); this one turns
+  // emission on and narrows the input to shippable source.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue"],
+  "exclude": ["src/**/*.test.ts"]
+}

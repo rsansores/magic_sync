@@ -348,9 +348,10 @@ where
         Ok((written, refused))
     }
 
-    /// One write in a savepoint: a constraint refusal comes back as the inner
-    /// error with the transaction still usable; any other failure is the
-    /// outer one.
+    /// One write in a savepoint: a refusal — a constraint, a trigger, any
+    /// error retrying would meet again — comes back as the inner error with
+    /// the transaction still usable, for the rows to be tried one by one; a
+    /// transient failure is the outer one, and the whole write goes again.
     async fn attempt(
         conn: &mut Conn,
         rows: Vec<R>,
@@ -369,7 +370,7 @@ where
             .execute(&mut *conn)
             .await?;
         match result {
-            Err(e) if row::is_constraint_violation(&e) => Ok(Err(e)),
+            Err(e) if !e.is_transient() => Ok(Err(e)),
             other => other.map(Ok),
         }
     }

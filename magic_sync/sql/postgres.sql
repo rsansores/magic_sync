@@ -33,7 +33,9 @@ CREATE TABLE sync.notes (
     last_error   TEXT
 );
 
-CREATE INDEX notes_pending ON sync.notes (id) WHERE done_at IS NULL AND parked_at IS NULL;
+-- Every read of what is not done yet — the relay's, and a dashboard's, parked
+-- notes included — stays among those, however many done ones wait to be pruned.
+CREATE INDEX notes_undone ON sync.notes (id) WHERE done_at IS NULL;
 
 COMMENT ON TABLE sync.notes IS
     'Every change to a mirrored table or a group table, and every replica to provision '
@@ -112,12 +114,21 @@ CREATE TABLE sync.replicas (
     last_sequence    BIGINT,
     applied_epoch    UUID,
     applied_sequence BIGINT,
-    applied_at       TIMESTAMPTZ
+    applied_at       TIMESTAMPTZ,
+    waiting_since    TIMESTAMPTZ,
+    backlog          JSONB,
+    backlog_at       TIMESTAMPTZ
 );
 
 COMMENT ON TABLE sync.replicas IS
     'How sending to each replica is going: consecutive failures, when it is tried again, '
     'when it was last sent to, and the last message it acknowledged applying.';
+COMMENT ON COLUMN sync.replicas.waiting_since IS
+    'While it has messages it has not said it applied: since when it has not moved — the '
+    'first send it did not confirm, or the last confirmation that left it behind. NULL: caught up.';
+COMMENT ON COLUMN sync.replicas.backlog IS
+    'What the replica last said it wrote and the server has not filed, per table '
+    '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
 
 -- Rows a replica should hold that the engine could not get to it for a reason
 -- a retry cannot change: a row that does not encode, a message the transport
@@ -131,12 +142,16 @@ CREATE TABLE sync.quarantine (
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempts   INTEGER     NOT NULL DEFAULT 1,
+    carried    BIGINT,
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
 COMMENT ON TABLE sync.quarantine IS
     'Rows a replica should hold and does not, for a reason a retry cannot change. Never '
     'repaired by hand: a deploy that fixes the cause lets the next retry through.';
+COMMENT ON COLUMN sync.quarantine.carried IS
+    'The message that carried the row again since it was set aside: once the replica says it '
+    'applied it, the row leaves the quarantine. NULL: not carried since.';
 
 -- Rows a replica uploaded that the server could not file, kept as they came:
 -- the replica may have let go of them since. Filed again on a timer and when
@@ -151,6 +166,8 @@ CREATE TABLE sync.inbox (
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempts   INTEGER     NOT NULL DEFAULT 1
 );
+
+CREATE INDEX inbox_replica ON sync.inbox (replica_id);
 
 COMMENT ON TABLE sync.inbox IS
     'Rows replicas uploaded that the server could not file for a reason a retry cannot '

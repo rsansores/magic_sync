@@ -67,6 +67,22 @@ message Up {
   repeated uint64 uploads = 7;
   // The version of the protocol the replica speaks.
   uint32 protocol = 8;
+  // What the replica wrote that the server has not filed, when it says: on
+  // the first lane, when it changed. Absent: it did not say this time.
+  Backlog backlog = 9;
+}
+
+// What a replica wrote that the server has not filed yet.
+message Backlog {
+  repeated TableBacklog tables = 1;
+}
+
+// One table's part of a backlog: rows not sent yet, and rows sent the server
+// has not said it filed.
+message TableBacklog {
+  string table = 1;
+  uint64 unsent = 2;
+  uint64 unfiled = 3;
 }
 
 // A row a replica could not take.

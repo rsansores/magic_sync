@@ -1,0 +1,9 @@
+# pnpm 11 settings for this package.
+#
+# Recent releases allowed past pnpm's minimum-release-age supply-chain gate,
+# each one reviewed when it was added. Drop an entry once the release is old
+# enough to pass the gate on its own.
+minimumReleaseAgeExclude:
+  - knip@6.40.0
+# Don't re-run `pnpm install` before every `pnpm run` / `pnpm exec`.
+verifyDepsBeforeRun: false

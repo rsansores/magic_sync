@@ -591,19 +591,6 @@ fn is_foreign_key_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_foreign_key_violation())
 }
 
-/// Whether a write was refused by a constraint on the data (unique, foreign
-/// key, not null, check): the rows, not the database, are at fault.
-pub fn is_constraint_violation(e: &Error) -> bool {
-    use sqlx::error::ErrorKind;
-    matches!(e, Error::Database(sqlx::Error::Database(db)) if matches!(
-        db.kind(),
-        ErrorKind::UniqueViolation
-            | ErrorKind::ForeignKeyViolation
-            | ErrorKind::NotNullViolation
-            | ErrorKind::CheckViolation
-    ))
-}
-
 /// Every key the table holds that is not retired.
 pub async fn live_keys<R: Row>(exec: &mut Conn) -> Result<Vec<Key>, Error> {
     let kinds = key_kinds::<R>();

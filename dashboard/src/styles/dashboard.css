@@ -1,0 +1,280 @@
+/* The ready-made dashboard's look, every value a variable: a host sets the
+   --msd-* variables, on .msd or any ancestor, to its own tokens. */
+
+.msd {
+  /* Each look reads its --msd-* variable, set here or on any ancestor, and
+     falls back to its default. */
+  --_fg: var(--msd-fg, #1d2433);
+  --_muted: var(--msd-muted, #6b7385);
+  --_bg: var(--msd-bg, transparent);
+  --_card: var(--msd-card, #ffffff);
+  --_border: var(--msd-border, #e3e6ee);
+  --_accent: var(--msd-accent, #3b5bdb);
+  --_accent-fg: var(--msd-accent-fg, #ffffff);
+  --_ok: var(--msd-ok, #2f9e44);
+  --_warn: var(--msd-warn, #e67700);
+  --_danger: var(--msd-danger, #e03131);
+  --_ok-soft: var(--msd-ok-soft, #ebfbee);
+  --_warn-soft: var(--msd-warn-soft, #fff4e6);
+  --_danger-soft: var(--msd-danger-soft, #fff5f5);
+  --_radius: var(--msd-radius, 10px);
+  --_gap: var(--msd-gap, 12px);
+
+  font: var(--msd-font, inherit);
+  color: var(--_fg);
+  background: var(--_bg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--_gap);
+  min-width: 0;
+}
+
+.msd *,
+.msd *::before,
+.msd *::after {
+  box-sizing: border-box;
+}
+
+.msd-title,
+.msd-line,
+.msd-list,
+.msd-name {
+  margin: 0;
+}
+
+.msd-banner {
+  display: flex;
+  gap: var(--_gap);
+  align-items: flex-start;
+  padding: 14px 16px;
+  border-radius: var(--_radius);
+  border: 1px solid var(--_border);
+  background: var(--_card);
+}
+.msd-banner[data-mood='healthy'] {
+  background: var(--_ok-soft);
+  border-color: var(--_ok);
+  --_mood: var(--_ok);
+}
+.msd-banner[data-mood='catching_up'] {
+  background: var(--_warn-soft);
+  border-color: var(--_warn);
+  --_mood: var(--_warn);
+}
+.msd-banner[data-mood='attention'] {
+  background: var(--_danger-soft);
+  border-color: var(--_danger);
+  --_mood: var(--_danger);
+}
+.msd-title {
+  font-size: 1.05em;
+  font-weight: 600;
+}
+.msd-line {
+  color: var(--_muted);
+}
+
+.msd-dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin-top: 0.35em;
+  border-radius: 50%;
+  background: var(--_mood, var(--_muted));
+}
+.msd-dot-small {
+  width: 8px;
+  height: 8px;
+  margin-top: 0;
+}
+.msd-dot-small[data-mood='healthy'] {
+  --_mood: var(--_ok);
+}
+.msd-dot-small[data-mood='catching_up'] {
+  --_mood: var(--_warn);
+}
+.msd-dot-small[data-mood='attention'] {
+  --_mood: var(--_danger);
+}
+
+.msd-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--_border);
+}
+.msd-tab {
+  font: inherit;
+  color: var(--_muted);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.msd-tab[aria-selected='true'] {
+  color: var(--_fg);
+  border-bottom-color: var(--_accent);
+}
+.msd-count {
+  color: var(--_muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.msd-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: var(--_gap);
+}
+.msd-chip {
+  font: inherit;
+  color: var(--_fg);
+  background: var(--_card);
+  border: 1px solid var(--_border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.msd-chip[aria-pressed='true'] {
+  border-color: var(--_accent);
+  color: var(--_accent);
+}
+.msd-chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.msd-input {
+  font: inherit;
+  color: var(--_fg);
+  background: var(--_card);
+  border: 1px solid var(--_border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  min-width: 0;
+}
+.msd-filters .msd-input {
+  margin-left: auto;
+}
+.msd-link {
+  font: inherit;
+  color: var(--_accent);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.msd-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.msd-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--_border);
+  border-radius: var(--_radius);
+  background: var(--_card);
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+button.msd-item {
+  cursor: pointer;
+}
+button.msd-item:hover {
+  border-color: var(--_accent);
+}
+.msd-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-direction: row;
+  justify-content: flex-start;
+}
+.msd-name {
+  font-weight: 600;
+  font-size: 1em;
+  overflow-wrap: anywhere;
+}
+.msd-muted {
+  color: var(--_muted);
+  margin: 0;
+}
+.msd-note {
+  color: var(--_muted);
+  font-size: 0.9em;
+}
+
+.msd-state {
+  flex: none;
+  font-size: 0.8em;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--_muted);
+  background: var(--_bg);
+  border: 1px solid currentColor;
+}
+.msd-state[data-state='synced'] {
+  color: var(--_ok);
+}
+.msd-state[data-state='catching_up'] {
+  color: var(--_warn);
+}
+.msd-state[data-state='unreachable'],
+.msd-state[data-state='awaiting_fix'] {
+  color: var(--_danger);
+}
+
+.msd-problem code {
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+.msd-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.msd-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--_gap);
+}
+.msd-progress .msd-bar {
+  flex: 1;
+}
+.msd-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--_border);
+  overflow: hidden;
+}
+.msd-bar > div {
+  height: 100%;
+  background: var(--_ok);
+  transition: width 0.3s;
+}
+
+.msd-place {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.msd-state[data-mood='holds'] {
+  color: var(--_ok);
+}
+.msd-state[data-mood='moving'] {
+  color: var(--_warn);
+}
+.msd-state[data-mood='set_aside'] {
+  color: var(--_danger);
+}

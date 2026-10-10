@@ -12,13 +12,15 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use magic_sync::relay::Transport;
 use magic_sync::run::server::{Anyone, Settings};
+use magic_sync::status::{Overview, ReplicaProgress, RowPlace, Scope};
 use magic_sync::{Error, Server};
 use serde::{Deserialize, Serialize};
 use shop_rows::{codecs, Product, Receipt, REGISTERS};
 use sqlx::PgPool;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 const SCHEMA: &str = "
@@ -45,13 +47,29 @@ CREATE TABLE IF NOT EXISTS shop.receipts (
 );
 ";
 
-/// A queue of messages per register.
+/// A queue of messages per register, and the registers whose line is cut:
+/// sending to one of those fails, as a network would.
 #[derive(Clone, Default)]
-struct Queues(Arc<Mutex<HashMap<Uuid, VecDeque<Vec<u8>>>>>);
+struct Queues {
+    messages: Arc<Mutex<HashMap<Uuid, VecDeque<Vec<u8>>>>>,
+    cut: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+impl Queues {
+    fn is_cut(&self, register: Uuid) -> bool {
+        self.cut.lock().unwrap().contains(&register)
+    }
+}
 
 impl Transport for Queues {
     async fn send(&self, register: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
-        self.0
+        if self.is_cut(register) {
+            return Err(Error::Transport {
+                reason: "the line to it is cut".to_owned(),
+                transient: true,
+            });
+        }
+        self.messages
             .lock()
             .unwrap()
             .entry(register)
@@ -93,6 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Anyone(pool.clone()),
             Settings {
                 idle: Duration::from_millis(200),
+                // A fix deployed (a register restarted without its bug) gets
+                // through within seconds, not the hour a real server waits.
+                retry_every: Duration::from_secs(10),
                 ..Settings::default()
             },
         )
@@ -107,15 +128,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queues,
     };
     let router = Router::new()
-        .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/api/state", get(state))
+        .route("/api/sync/overview", get(overview))
+        .route("/api/sync/progress/{register}", get(progress))
+        .route("/api/sync/rows/{table}/{key}", get(row))
         .route("/api/products", post(add_product))
         .route("/api/products/{id}", put(edit_product).delete(delete_product))
         .route("/api/registers", post(register))
+        .route("/api/registers/{register}/line", post(line))
         .route("/sync/{register}/next", get(next))
         .route("/sync/{register}/ack", post(ack))
         .route("/sync/{register}/up", post(up))
-        .with_state(app);
+        .with_state(app)
+        // The page: the Vue app in ../web, built.
+        .fallback_service(ServeDir::new(PAGE).fallback(get(unbuilt)));
     // `--bind 0.0.0.0:8080` to reach it from another machine: it has no login.
     let args: Vec<String> = std::env::args().collect();
     let bind = args
@@ -129,21 +155,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Where the page is built to.
+const PAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/dist");
+
+async fn unbuilt() -> Html<&'static str> {
+    Html(
+        "<p>The page is not built yet: in <code>examples/shop/web</code>, run \
+         <code>pnpm install && pnpm build</code>, then reload.</p>",
+    )
+}
+
 fn fail(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::FromRow)]
 struct RegisterState {
     id: Uuid,
     name: String,
     url: String,
-    /// Products it confirmed it holds, of the ones it should.
-    holds: i64,
-    should: i64,
-    in_flight: i64,
-    /// Messages waiting in its queue.
-    queued: usize,
+    /// Its line is cut: the head office cannot reach it.
+    #[sqlx(skip)]
+    cut: bool,
 }
 
 #[derive(Serialize)]
@@ -162,42 +195,66 @@ async fn state(State(app): State<App>) -> Result<Json<ShopState>, (StatusCode, S
         .fetch_all(&app.pool)
         .await
         .map_err(fail)?;
-    let known: Vec<(Uuid, String, String)> =
+    let mut registers: Vec<RegisterState> =
         sqlx::query_as("SELECT id, name, url FROM shop.registers ORDER BY name")
             .fetch_all(&app.pool)
             .await
             .map_err(fail)?;
-    let mut tx = app.server.begin().await.map_err(fail)?;
-    let progress = app
-        .server
-        .engine()
-        .progress(&mut tx, magic_sync::plan::Scope::All)
-        .await
-        .map_err(fail)?;
-    let queues = app.queues.0.lock().unwrap().clone();
-    let registers = known
-        .into_iter()
-        .map(|(id, name, url)| {
-            let products = progress
-                .iter()
-                .find(|p| p.replica == id)
-                .and_then(|p| p.tables.iter().find(|t| t.table == "products"));
-            RegisterState {
-                id,
-                name,
-                url,
-                holds: products.map_or(0, |t| t.up_to_date()),
-                should: products.map_or(0, |t| t.should),
-                in_flight: products.map_or(0, |t| t.in_flight),
-                queued: queues.get(&id).map_or(0, VecDeque::len),
-            }
-        })
-        .collect();
+    for register in &mut registers {
+        register.cut = app.queues.is_cut(register.id);
+    }
     Ok(Json(ShopState {
         products,
         receipts,
         registers,
     }))
+}
+
+// What the dashboard reads: the engine's answers, as they are. A shop with a
+// login would ask them over the registers the caller may see
+// (`Scope::Replicas`); this one has none, so every register.
+
+async fn overview(State(app): State<App>) -> Result<Json<Overview>, (StatusCode, String)> {
+    let mut tx = app.server.begin().await.map_err(fail)?;
+    let overview = app
+        .server
+        .engine()
+        .overview(&mut tx, Scope::All, 20)
+        .await
+        .map_err(fail)?;
+    Ok(Json(overview))
+}
+
+async fn progress(
+    State(app): State<App>,
+    Path(register): Path<Uuid>,
+) -> Result<Json<ReplicaProgress>, (StatusCode, String)> {
+    let mut tx = app.server.begin().await.map_err(fail)?;
+    let progress = app
+        .server
+        .engine()
+        .progress(&mut tx, Scope::Replicas(&[register]))
+        .await
+        .map_err(fail)?;
+    progress
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("no register {register}")))
+}
+
+async fn row(
+    State(app): State<App>,
+    Path((table, key)): Path<(String, String)>,
+) -> Result<Json<Vec<RowPlace>>, (StatusCode, String)> {
+    let mut tx = app.server.begin().await.map_err(fail)?;
+    let places = app
+        .server
+        .engine()
+        .row_progress(&mut tx, Scope::All, &table, &key)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(places))
 }
 
 #[derive(Deserialize)]
@@ -289,12 +346,25 @@ async fn register(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Cuts the line to a register, or mends it: a demo of a replica the server
+/// cannot reach.
+async fn line(State(app): State<App>, Path(register): Path<Uuid>) -> StatusCode {
+    let mut cut = app.queues.cut.lock().unwrap();
+    if !cut.remove(&register) {
+        cut.insert(register);
+    }
+    StatusCode::NO_CONTENT
+}
+
 /// The register's next message, left at the head of its queue until it
 /// acknowledges it.
 async fn next(State(app): State<App>, Path(register): Path<Uuid>) -> impl IntoResponse {
+    if app.queues.is_cut(register) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     match app
         .queues
-        .0
+        .messages
         .lock()
         .unwrap()
         .get(&register)
@@ -306,7 +376,7 @@ async fn next(State(app): State<App>, Path(register): Path<Uuid>) -> impl IntoRe
 }
 
 async fn ack(State(app): State<App>, Path(register): Path<Uuid>) -> StatusCode {
-    if let Some(queue) = app.queues.0.lock().unwrap().get_mut(&register) {
+    if let Some(queue) = app.queues.messages.lock().unwrap().get_mut(&register) {
         queue.pop_front();
     }
     StatusCode::NO_CONTENT
@@ -318,6 +388,9 @@ async fn up(
     Path(register): Path<Uuid>,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if app.queues.is_cut(register) {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "the line is cut".to_owned()));
+    }
     app.server
         .receive(register, &body)
         .await

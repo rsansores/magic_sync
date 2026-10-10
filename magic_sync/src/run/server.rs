@@ -394,7 +394,9 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     async fn watch(&self) {
         let health = async {
             let mut tx = self.begin().await?;
-            relay::health(&mut tx, 5).await
+            self.engine
+                .health(&mut tx, crate::status::Scope::All, 5)
+                .await
         }
         .await;
         let health = match health {
@@ -404,42 +406,42 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 return;
             }
         };
-        if health
+        let waited = health
             .oldest
-            .is_some_and(|age| age > self.settings.stuck_after)
-        {
+            .and_then(|at| (chrono::Utc::now() - at).to_std().ok());
+        if waited.is_some_and(|age| age > self.settings.stuck_after) {
             tracing::error!(
                 pending = health.pending,
-                oldest_minutes = health.oldest.map(|a| a.as_secs() / 60),
+                oldest_minutes = waited.map(|a| a.as_secs() / 60),
                 "sync ALARM: the backlog is not draining"
             );
         }
-        for note in &health.parked {
+        for note in &health.parked.first {
             tracing::error!(
                 note = note.id,
                 kind = note.kind,
-                table = note.relation,
-                key = note.row_key,
+                table = note.table,
+                key = note.key,
                 attempts = note.attempts,
                 error = note.last_error,
                 "sync ALARM: a parked note — deploy a fix; it is planned again on start"
             );
         }
-        if health.quarantined > 0 {
+        if health.quarantine.total > 0 {
             tracing::error!(
-                rows = health.quarantined,
+                rows = health.quarantine.total,
                 "sync ALARM: rows in quarantine — deploy a fix; they are sent again on start"
             );
         }
-        if health.unfiled > 0 {
+        if health.inbox.total > 0 {
             tracing::error!(
-                rows = health.unfiled,
+                rows = health.inbox.total,
                 "sync ALARM: uploaded rows not filed — deploy a fix; they are filed again on start"
             );
         }
-        for replica in &health.failing {
+        for replica in &health.failing.first {
             tracing::warn!(
-                replica = %replica.replica_id,
+                replica = %replica.replica,
                 failures = replica.failures,
                 error = replica.last_error,
                 "sync: a replica keeps failing to be reached — it waits, the others carry on"

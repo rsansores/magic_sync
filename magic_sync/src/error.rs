@@ -46,24 +46,57 @@ fn is_transient_sqlx(e: &sqlx::Error) -> bool {
         | sqlx::Error::PoolTimedOut
         | sqlx::Error::PoolClosed
         | sqlx::Error::WorkerCrashed => true,
-        // Serialization failure, deadlock, shutdown, too many connections,
-        // and the connection exceptions.
-        sqlx::Error::Database(db) => matches!(
-            db.code().as_deref(),
-            Some(
-                "40001"
-                    | "40P01"
-                    | "57P01"
-                    | "57P02"
-                    | "57P03"
-                    | "53300"
-                    | "08000"
-                    | "08003"
-                    | "08006"
-            )
-        ),
+        sqlx::Error::Database(db) => db.code().as_deref().is_some_and(is_transient_code),
         _ => false,
     }
+}
+
+/// PostgreSQL: serialization failure, deadlock, a lock or statement timeout,
+/// shutdown, the server out of disk, memory or connections, and the
+/// connection exceptions — each the machine's, not the rows'.
+#[cfg(feature = "postgres")]
+fn is_transient_code(code: &str) -> bool {
+    matches!(
+        code,
+        "40001"
+            | "40P01"
+            | "55P03"
+            | "57014"
+            | "57P01"
+            | "57P02"
+            | "57P03"
+            | "53100"
+            | "53200"
+            | "53300"
+            | "53400"
+            | "08000"
+            | "08001"
+            | "08003"
+            | "08004"
+            | "08006"
+    )
+}
+
+/// SQLite: the database busy or locked by another connection, out of
+/// memory, read-only, interrupted, an I/O error, a full disk, a file it
+/// cannot open — each the machine's, not the rows'. The primary result code
+/// is the extended one's low byte.
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+fn is_transient_code(code: &str) -> bool {
+    const BUSY: i32 = 5;
+    const LOCKED: i32 = 6;
+    const NOMEM: i32 = 7;
+    const READONLY: i32 = 8;
+    const INTERRUPT: i32 = 9;
+    const IOERR: i32 = 10;
+    const FULL: i32 = 13;
+    const CANTOPEN: i32 = 14;
+    code.parse::<i32>().is_ok_and(|c| {
+        matches!(
+            c & 0xff,
+            BUSY | LOCKED | NOMEM | READONLY | INTERRUPT | IOERR | FULL | CANTOPEN
+        )
+    })
 }
 
 #[cfg(test)]
@@ -80,6 +113,15 @@ mod tests {
         .is_transient());
         assert!(!Error::Misuse("a key that does not parse".into()).is_transient());
         assert!(!Error::Database(sqlx::Error::RowNotFound).is_transient());
+        // A busy or locked database is the machine's; a refused row is not.
+        #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+        {
+            assert!(is_transient_code("5"));
+            assert!(is_transient_code("517"));
+            assert!(is_transient_code("6"));
+            assert!(!is_transient_code("1811"));
+            assert!(!is_transient_code("2067"));
+        }
         assert!(!Error::Transport {
             reason: "message too large".into(),
             transient: false

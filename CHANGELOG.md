@@ -13,3 +13,13 @@ The first release: the engine extracted from the system it was built in.
   schema and triggers; a schema version both sides check.
 - The replica protocol (`PROTOCOL.md`, `proto/sync.proto`), version 1.
 - The shop example: a head office and its registers, each with a page.
+- `status`: what the engine answers about itself, for a dashboard — the
+  overview (each replica's state and each table's, without counting what any
+  replica should hold), health over a scope, progress, where one row is. Every
+  read takes a scope and counts live replicas only; every answer serializes.
+- `Up.backlog`: a replica says what it wrote and the server has not filed,
+  and the server shows it.
+- `magic_sync_dashboard` (npm): the dashboard for Vue 3 — a ready-made
+  component styled through CSS variables, and the same without its looks
+  (`useSyncDashboard`) for a host with its own design system. English and
+  Spanish; it fetches nothing.

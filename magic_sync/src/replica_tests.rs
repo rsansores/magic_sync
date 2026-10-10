@@ -178,6 +178,37 @@ async fn a_table_this_build_does_not_mirror_is_rejected_row_by_row(pool: crate::
     );
 }
 
+/// A row this build refuses — a trigger, here, as a bug would — is the only
+/// one left out: the rows sent with it are taken.
+#[sqlx::test(migrations = false)]
+async fn a_row_a_trigger_refuses_is_the_only_one_rejected(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER a_bug BEFORE INSERT ON items WHEN NEW.name = 'poison' \
+         BEGIN SELECT RAISE(ABORT, 'this build cannot take it'); END",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let (good, bytes) = item("good");
+    apply(
+        &mut conn,
+        &codecs(),
+        &down("items", "e", 1, vec![(good, bytes), item("poison")]),
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM items")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(names, vec!["good".to_owned()]);
+    let reported = rejections(&mut conn, 10).await.unwrap();
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].reason.contains("cannot take it"));
+}
+
 async fn reported_up(conn: &mut Conn, rejected: &[envelope::Rejected]) {
     reported(conn, rejected).await.unwrap();
 }
@@ -403,6 +434,87 @@ async fn the_outbox_says_each_thing_once_on_its_lane(pool: crate::DbPool) {
     );
 }
 
+/// The replica tells the server what it wrote and the server has not filed:
+/// with the rows it sends, at once when that starts or empties, and while it
+/// grows, no more often than it was told to.
+#[sqlx::test(migrations = false)]
+async fn the_backlog_is_said_when_it_changes(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = codecs();
+    let lanes = [
+        Lane {
+            name: "main",
+            tables: &[],
+        },
+        Lane {
+            name: "fast",
+            tables: &["items"],
+        },
+    ];
+    let mut settings = Outbox::default();
+    let me = Uuid::now_v7();
+    let note = |key: Uuid| {
+        sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', $1)")
+            .bind(key.simple().to_string())
+    };
+    let said = |o: &Option<Outgoing>| {
+        o.as_ref().and_then(|o| o.up.backlog.clone()).map(|b| {
+            b.tables
+                .into_iter()
+                .map(|t| (t.table, t.unsent, t.unfiled))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    note(Uuid::now_v7()).execute(&mut *conn).await.unwrap();
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap();
+    assert_eq!(said(&main), Some(vec![("items".into(), 1, 0)]), "it starts");
+    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
+
+    note(Uuid::now_v7()).execute(&mut *conn).await.unwrap();
+    assert!(
+        outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+            .await
+            .unwrap()
+            .is_none(),
+        "it grows, and was said a moment ago"
+    );
+    settings.backlog_every = std::time::Duration::ZERO;
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap();
+    assert_eq!(said(&main), Some(vec![("items".into(), 2, 0)]), "when due");
+    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
+
+    let fast = outbox(&mut conn, &codecs, me, &lanes, 1, &settings, false)
+        .await
+        .unwrap()
+        .expect("the rows");
+    assert!(fast.up.backlog.is_none(), "the main lane says it");
+    delivered(&mut conn, &fast).await.unwrap();
+    filed(
+        &mut conn,
+        &envelope::Filed {
+            uploads: fast.up.uploads.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    settings.backlog_every = std::time::Duration::from_secs(3600);
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap();
+    assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
+    assert!(main.as_ref().unwrap().up.tables.is_empty());
+    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
+    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 /// A replica database with nothing of the engine gets its tables and a
 /// trigger on every table that goes up, and every write to one is noted; a
 /// table that goes up with nothing noting it is refused.
@@ -471,4 +583,102 @@ async fn a_json_table_is_applied_like_any_other(pool: crate::DbPool) {
         .await
         .unwrap();
     assert_eq!(names(&mut conn).await, vec!["as json"]);
+}
+
+/// A replica does not confirm a message while refusals of it are still to
+/// report: the server would take the refused rows for applied.
+#[sqlx::test(migrations = false)]
+async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = codecs();
+    let lanes = [Lane {
+        name: "main",
+        tables: &[],
+    }];
+    let settings = Outbox {
+        rejections: 1,
+        ..Outbox::default()
+    };
+    let me = Uuid::now_v7();
+    let broken = |name: &str| {
+        let (id, bytes) = item(name);
+        (id, bytes[..3].to_vec())
+    };
+    apply(
+        &mut conn,
+        &codecs,
+        &down("items", "e", 7, vec![broken("one"), broken("two")]),
+    )
+    .await
+    .unwrap();
+
+    let first = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("a refusal to report");
+    assert_eq!((first.up.rejected.len(), first.up.sequence), (1, 0));
+    delivered(&mut conn, &first).await.unwrap();
+    let last = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("the other refusal, and the confirmation");
+    assert_eq!((last.up.rejected.len(), last.up.sequence), (1, 7));
+}
+
+/// A backlog that is not empty is said again now and then, unchanged, and
+/// at once to a server installed again: either may have lost it.
+#[sqlx::test(migrations = false)]
+async fn a_backlog_not_empty_is_said_again(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = codecs();
+    let lanes = [
+        Lane {
+            name: "main",
+            tables: &[],
+        },
+        Lane {
+            name: "fast",
+            tables: &["items"],
+        },
+    ];
+    let mut settings = Outbox::default();
+    let me = Uuid::now_v7();
+    sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', 'k')")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("it starts");
+    delivered(&mut conn, &main).await.unwrap();
+    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .is_none());
+
+    settings.backlog_every = std::time::Duration::ZERO;
+    let again = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("unchanged, said again");
+    assert!(again.up.backlog.is_some());
+    delivered(&mut conn, &again).await.unwrap();
+
+    settings.backlog_every = std::time::Duration::from_secs(3600);
+    apply(&mut conn, &codecs, &down("items", "first", 1, vec![]))
+        .await
+        .unwrap();
+    apply(
+        &mut conn,
+        &codecs,
+        &down("items", "installed again", 1, vec![]),
+    )
+    .await
+    .unwrap();
+    let told = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("a new server hears it");
+    assert!(told.up.backlog.is_some());
 }

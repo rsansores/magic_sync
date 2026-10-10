@@ -20,10 +20,11 @@ postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 magic_sync_derive = { version = "=0.1.0", path = "../magic_sync_derive" }
 magic_map = { version = "0.5.1", features = ["uuid", "chrono", "decimal", "json"] }
 prost = "0.14"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "macros", "chrono", "uuid", "rust_decimal", "json"] }
 thiserror = "1.0"

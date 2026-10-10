@@ -25,6 +25,16 @@ docker run -d --name shop-postgres -p 5433:5432 \
 
 ## 2. The head office
 
+Its page is a Vue app (`examples/shop/web`) over the engine's dashboard, so it
+is built once, with Node 20 or later and [pnpm](https://pnpm.io):
+
+```sh
+(cd dashboard && pnpm install && pnpm build)
+(cd examples/shop/web && pnpm install && pnpm build)
+```
+
+Then the head office itself:
+
 ```sh
 cd examples/shop/server
 cargo run
@@ -57,14 +67,30 @@ cargo run -- --name "Register 1" --port 8081 --bind 0.0.0.0       # a register
 ## 4. Things to try
 
 - **Add a product** at the head office. Both registers have it within a
-  second; the bar over each says how many products it has *confirmed* it
-  holds.
+  second, and the dashboard stays green: *everything is in sync*.
 - **Unplug Register 2** (its *Unplug* button). Sell a few things on it: it
   keeps selling, and says how many receipts are not at the head office yet.
-  Change a price and add a product at the head office: Register 2's bar falls
-  behind, and a message waits for it.
-- **Plug it back in.** Its receipts reach the head office, and it catches up
-  with the catalog, in order.
+  Change a price and add a product at the head office: the dashboard turns
+  amber, *catching up*, and after half a minute says Register 2 is not
+  answering. Click it to see how far along it is, table by table.
+- **Plug it back in.** Its receipts reach the head office, it catches up
+  with the catalog, in order, and the dashboard turns green again.
+- **Ask where a product is.** *who holds it?* next to a product lists each
+  register and where that product stands on it: holds it, on its way, set
+  aside. That is the question to answer next to a row, in your own listings.
+- **Break something.** Start a register with a bug that refuses one product:
+
+  ```sh
+  cargo run -- --name "Register 3" --port 8083 --refuse "Tea"
+  ```
+
+  Add *Tea* at the head office: Register 3 turns red, *needs a fix*, the
+  Problems tab says why, and every other product still reaches it. Stop it
+  and start it again without `--refuse` — the fix deployed — and within
+  seconds the head office's retry gets *Tea* through and the page is green.
+- **Lose a register.** *cut the line* under a register makes every send to it
+  fail, as a network would: it turns *unreachable*, and the head office tries
+  it again, waiting longer each time. *mend the line*, and it catches up.
 - **Delete a product a register has sold.** That register keeps the product
   for its receipts — it *retires* it: out of the list, still there for what
   points at it — and the other deletes it.

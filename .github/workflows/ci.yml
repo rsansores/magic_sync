@@ -75,8 +75,45 @@ jobs:
           workspaces: |
             examples/shop/server
             examples/shop/register
+      # The head office's page: a Vue app over the dashboard, built from source.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: dashboard/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile --ignore-scripts && pnpm build
+        working-directory: dashboard
+      - run: pnpm install --frozen-lockfile --ignore-scripts && pnpm build
+        working-directory: examples/shop/web
       - run: cargo build --locked --manifest-path examples/shop/server/Cargo.toml
       - run: cargo build --locked --manifest-path examples/shop/register/Cargo.toml
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v5
+      # The pnpm version comes from package.json's `packageManager`.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: dashboard/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: dashboard/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm type-check
+      - run: pnpm knip
+      # Reads the engine's answers from src/core/contract/, which the engine's
+      # own test keeps equal to what it serializes.
+      - run: pnpm test
+      - run: pnpm build
 
   book:
     runs-on: ubuntu-latest

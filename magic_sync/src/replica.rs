@@ -296,12 +296,21 @@ async fn newer(conn: &mut Conn, epoch: &str, sequence: u64) -> Result<bool, Erro
         sqlx::query_as("SELECT epoch, sequence FROM sync_applied WHERE id = 1")
             .fetch_optional(&mut *conn)
             .await?;
-    if last.is_some_and(|(e, s)| e == epoch && sequence <= s) {
+    if last
+        .as_ref()
+        .is_some_and(|(e, s)| e == epoch && sequence <= *s)
+    {
         tracing::info!(
             sequence,
             "sync: a message at or below the last applied — nothing to do"
         );
         return Ok(false);
+    }
+    // A server installed again knows nothing it was told: say it again.
+    if last.is_some_and(|(e, _)| e != epoch) {
+        sqlx::query("DELETE FROM sync_backlog")
+            .execute(&mut *conn)
+            .await?;
     }
     sqlx::query(
         "INSERT INTO sync_applied (id, epoch, sequence) VALUES (1, $1, $2) \
@@ -692,7 +701,7 @@ pub async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Err
 /// How far this replica is from having sent the server what it wrote, per
 /// table: rows noted and not sent yet, and rows sent the server has not said
 /// it filed.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct UpProgress {
     pub table: String,
     pub unsent: i64,
@@ -709,6 +718,70 @@ pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
     )
     .fetch_all(&mut *conn)
     .await?)
+}
+
+/// The backlog to tell the server: when it changed since it was last told —
+/// with a message going anyway, when it empties or starts, or when the last
+/// time is `backlog_every` ago — and, while it is not empty, every
+/// `backlog_every` even unchanged.
+async fn backlog_due(
+    conn: &mut Conn,
+    settings: &Outbox,
+    sending: bool,
+) -> Result<Option<envelope::Backlog>, Error> {
+    let now = progress(conn).await?;
+    let told: Option<(sqlx::types::Json<Vec<UpProgress>>, i64)> =
+        sqlx::query_as("SELECT backlog, reported_at FROM sync_backlog WHERE id = 1")
+            .fetch_optional(&mut *conn)
+            .await?;
+    let (before, at) = match told {
+        Some((backlog, at)) => (Some(backlog.0), at),
+        None => (None, 0),
+    };
+    let every = i64::try_from(settings.backlog_every.as_secs()).unwrap_or(i64::MAX);
+    let stale = chrono::Utc::now().timestamp() - at >= every;
+    let due = if before.as_ref() == Some(&now) {
+        // Unchanged: said again now and then while not empty, should the
+        // server have lost it.
+        !now.is_empty() && stale
+    } else {
+        let edge = now.is_empty() || before.as_ref().is_none_or(Vec::is_empty);
+        sending || edge || stale
+    };
+    Ok(due.then(|| envelope::Backlog {
+        tables: now
+            .into_iter()
+            .map(|t| envelope::TableBacklog {
+                table: t.table,
+                unsent: u64::try_from(t.unsent).unwrap_or_default(),
+                unfiled: u64::try_from(t.unfiled).unwrap_or_default(),
+            })
+            .collect(),
+    }))
+}
+
+/// The server was told `backlog`.
+async fn told(conn: &mut Conn, backlog: &envelope::Backlog) -> Result<(), Error> {
+    let tables: Vec<UpProgress> = backlog.tables.iter().map(UpProgress::from).collect();
+    sqlx::query(
+        "INSERT INTO sync_backlog (id, backlog, reported_at) VALUES (1, $1, $2) \
+         ON CONFLICT (id) DO UPDATE SET backlog = EXCLUDED.backlog, reported_at = EXCLUDED.reported_at",
+    )
+    .bind(sqlx::types::Json(tables))
+    .bind(chrono::Utc::now().timestamp())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+impl From<&envelope::TableBacklog> for UpProgress {
+    fn from(table: &envelope::TableBacklog) -> Self {
+        UpProgress {
+            table: table.table.clone(),
+            unsent: i64::try_from(table.unsent).unwrap_or(i64::MAX),
+            unfiled: i64::try_from(table.unfiled).unwrap_or(i64::MAX),
+        }
+    }
 }
 
 /// Which of a replica's writes one stream of uploads carries. A replica may
@@ -732,6 +805,10 @@ pub struct Outbox {
     pub resend_after: std::time::Duration,
     /// Rejections per message.
     pub rejections: i64,
+    /// How often, at most, the replica tells the server its backlog while it
+    /// grows — and how often it says it again, unchanged, while it is not
+    /// empty; it says at once when it empties, or starts.
+    pub backlog_every: std::time::Duration,
 }
 
 impl Default for Outbox {
@@ -740,6 +817,7 @@ impl Default for Outbox {
             notes: 500,
             resend_after: std::time::Duration::from_secs(600),
             rejections: 500,
+            backlog_every: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -808,7 +886,13 @@ pub async fn outbox<P: Sync + 'static>(
         upload(conn, codecs, replica, &notes).await?
     };
     if lane == 0 {
-        up.rejected = rejections(conn, settings.rejections).await?;
+        // One over the cap says whether this message reports them all: the
+        // server must hear of a refusal before the message it refused is
+        // confirmed, or it would take the refused row for applied.
+        let mut rejected = rejections(conn, settings.rejections + 1).await?;
+        let all_reported = rejected.len() as i64 <= settings.rejections;
+        rejected.truncate(usize::try_from(settings.rejections).unwrap_or(usize::MAX));
+        up.rejected = rejected;
         if digests {
             up.digests = self::digests(conn, codecs, replica).await?.digests;
         }
@@ -816,7 +900,7 @@ pub async fn outbox<P: Sync + 'static>(
             sqlx::query_as("SELECT epoch, sequence, acknowledged FROM sync_applied WHERE id = 1")
                 .fetch_optional(&mut *conn)
                 .await?;
-        if let Some((epoch, sequence, acknowledged)) = applied {
+        if let (Some((epoch, sequence, acknowledged)), true) = (applied, all_reported) {
             // The last applied goes with digests always (they are compared
             // against it), and otherwise when the server has not heard of it.
             if sequence > acknowledged || !up.digests.is_empty() {
@@ -825,8 +909,14 @@ pub async fn outbox<P: Sync + 'static>(
             }
         }
     }
-    let empty =
-        up.tables.is_empty() && up.rejected.is_empty() && up.digests.is_empty() && up.sequence == 0;
+    let sending = !up.tables.is_empty()
+        || !up.rejected.is_empty()
+        || !up.digests.is_empty()
+        || up.sequence > 0;
+    if lane == 0 {
+        up.backlog = backlog_due(conn, settings, sending).await?;
+    }
+    let empty = !sending && up.backlog.is_none();
     Ok((!empty).then_some(Outgoing {
         lane: this.name,
         up,
@@ -839,6 +929,9 @@ pub async fn outbox<P: Sync + 'static>(
 pub async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
     sent(conn, &outgoing.notes, &outgoing.up).await?;
     reported(conn, &outgoing.up.rejected).await?;
+    if let Some(backlog) = &outgoing.up.backlog {
+        told(conn, backlog).await?;
+    }
     if outgoing.up.sequence > 0 {
         acknowledged(conn, outgoing.up.sequence).await?;
     }
@@ -978,11 +1071,16 @@ pub async fn file<P: Sync + 'static>(
     #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
     {
         crate::relay::hold(conn, sender, &unfiled).await?;
+        // What it refused first: a row it applied a message of and refused
+        // is not held, and stays in quarantine.
+        crate::relay::rejected(conn, sender, &upload.rejected).await?;
         if upload.sequence > 0 {
             crate::relay::acknowledge(conn, sender, &upload.epoch, upload.sequence).await?;
         }
-        crate::relay::rejected(conn, sender, &upload.rejected).await?;
         crate::relay::compare(conn, sender, upload).await?;
+        if let Some(backlog) = &upload.backlog {
+            crate::relay::backlog(conn, sender, backlog).await?;
+        }
     }
     #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     for row in &unfiled {
