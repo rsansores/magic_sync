@@ -57,15 +57,17 @@ fn is_transient_sqlx(e: &sqlx::Error) -> bool {
     }
 }
 
-/// PostgreSQL: serialization failure, deadlock, a lock or statement timeout,
-/// shutdown, the server out of disk, memory or connections, and the
-/// connection exceptions — each the machine's, not the rows'.
+/// PostgreSQL: serialization failure, deadlock, a statement whose completion
+/// is unknown, a lock or statement timeout, shutdown, the server out of disk,
+/// memory or connections, a system or I/O error, and the connection
+/// exceptions — each the machine's, not the rows'.
 #[cfg(feature = "postgres")]
 fn is_transient_code(code: &str) -> bool {
     matches!(
         code,
         "40001"
             | "40P01"
+            | "40003"
             | "55P03"
             | "57014"
             | "57P01"
@@ -75,11 +77,15 @@ fn is_transient_code(code: &str) -> bool {
             | "53200"
             | "53300"
             | "53400"
+            | "58000"
+            | "58030"
             | "08000"
             | "08001"
             | "08003"
             | "08004"
             | "08006"
+            | "08007"
+            | "08P01"
     )
 }
 
@@ -119,6 +125,14 @@ mod tests {
         .is_transient());
         assert!(!Error::Misuse("a key that does not parse".into()).is_transient());
         assert!(!Error::Database(sqlx::Error::RowNotFound).is_transient());
+        // The server's own failures: an I/O error, a statement whose fate
+        // is unknown, a broken connection protocol.
+        #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+        for code in ["58030", "58000", "40003", "08P01", "08007"] {
+            assert!(is_transient_code(code), "{code}");
+        }
+        #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+        assert!(!is_transient_code("23505"), "a duplicate is the rows'");
         // A busy or locked database is the machine's; a refused row is not.
         #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
         {
