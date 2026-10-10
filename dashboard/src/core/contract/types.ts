@@ -145,9 +145,14 @@ export type Parked = { id: number, kind: NoteKind, table: string | null, key: st
 export type Quarantined = { replica: string, table: string, key: string, reason: string, first_at: string, last_at: string, attempts: number, };
 
 /**
- * A row a replica sent that the server could not file.
+ * What a replica sent that the server could not file: a row, a delete, or a
+ * whole upload.
  */
-export type Unfiled = { id: number, replica: string, table: string, reason: string, first_at: string, last_at: string, attempts: number, };
+export type Unfiled = { id: number, replica: string, 
+/**
+ * Empty for a whole upload kept as it came.
+ */
+table: string, reason: string, first_at: string, last_at: string, attempts: number, };
 
 /**
  * A replica sends to keep failing to.
