@@ -701,6 +701,7 @@ pub async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Err
 /// table: rows noted and not sent yet, and rows sent the server has not said
 /// it filed.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct UpProgress {
     pub table: String,
     pub unsent: i64,

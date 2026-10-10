@@ -108,12 +108,14 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm format:check
       - run: pnpm lint
+      # Checks the engine's answers in src/core/contract/fixtures/ against the
+      # types generated from the engine's own, both of which the engine's
+      # tests keep equal to what it serializes.
       - run: pnpm type-check
       - run: pnpm knip
-      # Reads the engine's answers from src/core/contract/, which the engine's
-      # own test keeps equal to what it serializes.
       - run: pnpm test
-      - run: pnpm build
+      # Builds, then lints the packed tarball as npm and TypeScript read it.
+      - run: pnpm check:pack
 
   book:
     runs-on: ubuntu-latest

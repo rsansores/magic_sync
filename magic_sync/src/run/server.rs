@@ -485,6 +485,9 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         }
         let health = async {
             let mut tx = self.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *tx)
+                .await?;
             self.engine
                 .health(&mut tx, crate::status::Scope::All, 5)
                 .await
@@ -510,7 +513,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         for note in &health.parked.first {
             tracing::error!(
                 note = note.id,
-                kind = note.kind,
+                kind = ?note.kind,
                 table = note.table,
                 key = note.key,
                 attempts = note.attempts,

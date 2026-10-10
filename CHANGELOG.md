@@ -14,12 +14,14 @@ The first release: the engine extracted from the system it was built in.
 - The replica protocol (`PROTOCOL.md`, `proto/sync.proto`), version 1.
 - The shop example: a head office and its registers, each with a page.
 - `status`: what the engine answers about itself, for a dashboard — the
-  overview (each replica's state and each table's, without counting what any
-  replica should hold), health over a scope, progress, where one row is. Every
-  read takes a scope and counts live replicas only; every answer serializes.
+  overview (replicas counted per state and the worst listed, each table's
+  state, without counting what any replica should hold), a paged listing of
+  the replicas, health over a scope, progress, where one row is. Every read
+  takes a scope, counts live replicas only and is one snapshot; every answer
+  serializes as JSON of a versioned contract, with the server's time.
 - `Up.backlog`: a replica says what it wrote and the server has not filed,
   and the server shows it.
 - `magic_sync_dashboard` (npm): the dashboard for Vue 3 — a ready-made
   component styled through CSS variables, and the same without its looks
   (`useSyncDashboard`) for a host with its own design system. English and
-  Spanish; it fetches nothing.
+  Spanish; it fetches nothing. Its types are generated from the engine's.

@@ -2,16 +2,28 @@
 // The head office: the catalog, the receipts the registers sent, and the
 // sync dashboard over the registers, each register's own page beside it.
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { RowPlaces, SyncDashboard, type Overview, type ReplicaProgress, type RowPlace } from 'magic_sync_dashboard'
+import {
+  RowPlaces,
+  SyncDashboard,
+  type Listing,
+  type Overview,
+  type Progress,
+  type ReplicaState,
+  type RowProgress,
+} from 'magic_sync_dashboard'
 import { api, type Product, type ShopState } from './api'
 
 const state = ref<ShopState | null>(null)
 const overview = ref<Overview | null>(null)
 const selected = ref<string | null>(null)
-const progress = ref<ReplicaProgress | null>(null)
+const progress = ref<Progress | null>(null)
+// The replicas listed, a page at a time, in the state picked.
+const filter = ref<ReplicaState | null>(null)
+const offset = ref(0)
+const listing = ref<Listing | null>(null)
 // The product whose registers are shown, and where it is on each.
 const holding = ref<string | null>(null)
-const places = ref<RowPlace[] | null>(null)
+const places = ref<RowProgress | null>(null)
 const error = ref('')
 
 // The dashboard's names for what the engine knows by id.
@@ -20,7 +32,11 @@ const labels = { products: 'Products', receipts: 'Receipts' }
 
 async function refresh() {
   try {
-    ;[state.value, overview.value] = await Promise.all([api.state(), api.overview()])
+    ;[state.value, overview.value, listing.value] = await Promise.all([
+      api.state(),
+      api.overview(),
+      api.listing(filter.value, offset.value),
+    ])
     progress.value = selected.value ? await api.progress(selected.value) : null
     places.value = holding.value ? await api.row('products', holding.value) : null
     error.value = ''
@@ -31,7 +47,7 @@ async function refresh() {
 refresh()
 const timer = setInterval(refresh, 1000)
 onUnmounted(() => clearInterval(timer))
-watch([selected, holding], refresh)
+watch([selected, holding, filter, offset], refresh)
 
 // Every action says what went wrong, rather than nothing.
 async function act(action: () => Promise<void>) {
@@ -128,7 +144,7 @@ function pageOf(url: string) {
         <table>
           <tr><th>Register</th><th>Qty</th><th>Total</th></tr>
           <tr v-for="r in state?.receipts" :key="r.id">
-            <td>{{ names[r.register_id] ?? r.register_id.slice(0, 8) }}</td>
+            <td>{{ names[r.register_id] ?? r.register_id.slice(-12) }}</td>
             <td>{{ r.quantity }}</td>
             <td>{{ money(r.total_cents) }}</td>
           </tr>
@@ -141,8 +157,12 @@ function pageOf(url: string) {
         <!-- A register unplugged is "not answering" after 30 s, not 15 min: it is a demo. -->
         <SyncDashboard
           v-model:selected="selected"
+          v-model:filter="filter"
+          v-model:offset="offset"
           :overview="overview"
+          :listing="listing"
           :progress="progress"
+          :page-size="20"
           :names="names"
           :labels="labels"
           :silent-after="30_000"

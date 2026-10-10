@@ -2,8 +2,16 @@
 // The dashboard over made-up fleets, one per situation. A host fetches these
 // answers from its own handlers; here they are made on the spot.
 import { computed, ref } from 'vue'
-import { RowPlaces, SyncDashboard } from '../src/index'
-import type { Overview, ReplicaOverview, ReplicaProgress, RowPlace, TableOverview } from '../src/index'
+import { RowPlaces, SyncDashboard } from '../src/index.js'
+import {
+  CONTRACT,
+  type Overview,
+  type Progress,
+  type ReplicaOverview,
+  type ReplicaState,
+  type RowProgress,
+  type TableOverview,
+} from '../src/index.js'
 
 type Scenario = 'healthy' | 'catching_up' | 'attention'
 // ?scenario=attention&locale=es&selected=<id> opens the demo on a situation.
@@ -19,12 +27,15 @@ const id = (n: number) => `0190a1b2-0000-7000-8000-${String(n).padStart(12, '0')
 const FLEET = 24
 const names = Object.fromEntries(Array.from({ length: FLEET }, (_, i) => [id(i), `Register ${i + 1}`]))
 // Where one row is, as a host shows it next to the row in its own listing.
-const places: RowPlace[] = [
-  { replica: id(0), state: 'holds' },
-  { replica: id(1), state: 'on_its_way' },
-  { replica: id(2), state: 'quarantined' },
-  { replica: id(3), state: 'outdated' },
-]
+const places: RowProgress = {
+  contract: CONTRACT,
+  places: [
+    { replica: id(0), state: 'holds' },
+    { replica: id(1), state: 'on_its_way' },
+    { replica: id(2), state: 'quarantined' },
+    { replica: id(3), state: 'outdated' },
+  ],
+}
 const labels = { products: 'Products', prices: 'Prices', customers: 'Customers', receipts: 'Receipts' }
 
 function replica(i: number, scenario: Scenario): ReplicaOverview {
@@ -86,7 +97,17 @@ function table(name: string, scenario: Scenario): TableOverview {
 const overview = computed<Overview>(() => {
   const s = scenario.value
   const attention = s === 'attention'
+  const severity: ReplicaState[] = ['awaiting_fix', 'unreachable', 'catching_up', 'synced']
+  const replicas = Array.from({ length: FLEET }, (_, i) => replica(i, s)).sort(
+    (a, b) => severity.indexOf(a.state) - severity.indexOf(b.state),
+  )
+  const states = { awaiting_fix: 0, unreachable: 0, catching_up: 0, synced: 0 }
+  for (const r of replicas) states[r.state] += 1
   return {
+    contract: CONTRACT,
+    now: new Date(now).toISOString(),
+    states,
+    replicas: { total: replicas.length, first: replicas.slice(0, 20) },
     health: {
       healthy: !attention,
       pending: s === 'healthy' ? 0 : 120,
@@ -121,43 +142,47 @@ const overview = computed<Overview>(() => {
           : [],
       },
     },
-    replicas: Array.from({ length: FLEET }, (_, i) => replica(i, s)),
     tables: Object.keys(labels).map((name) => table(name, s)),
   }
 })
 
-const progress = computed<ReplicaProgress | null>(() => {
+const progress = computed<Progress | null>(() => {
   if (!selected.value) return null
-  const behind = overview.value.replicas.find((r) => r.replica === selected.value)?.state !== 'synced'
+  const behind = overview.value.replicas.first.find((r) => r.replica === selected.value)?.state !== 'synced'
   return {
-    replica: selected.value,
-    tables: [
+    contract: CONTRACT,
+    replicas: [
       {
-        table: 'products',
-        should: 1_200,
-        holds: 1_200,
-        outdated: 0,
-        in_flight: 0,
-        to_remove: 0,
-        quarantined: 0,
-      },
-      {
-        table: 'prices',
-        should: 3_400,
-        holds: behind ? 2_560 : 3_400,
-        outdated: 0,
-        in_flight: behind ? 840 : 0,
-        to_remove: 0,
-        quarantined: 0,
-      },
-      {
-        table: 'customers',
-        should: 5_000,
-        holds: 5_000,
-        outdated: behind ? 12 : 0,
-        in_flight: 0,
-        to_remove: 0,
-        quarantined: 0,
+        replica: selected.value,
+        tables: [
+          {
+            table: 'products',
+            should: 1_200,
+            holds: 1_200,
+            outdated: 0,
+            in_flight: 0,
+            to_remove: 0,
+            quarantined: 0,
+          },
+          {
+            table: 'prices',
+            should: 3_400,
+            holds: behind ? 2_560 : 3_400,
+            outdated: 0,
+            in_flight: behind ? 840 : 0,
+            to_remove: 0,
+            quarantined: 0,
+          },
+          {
+            table: 'customers',
+            should: 5_000,
+            holds: 5_000,
+            outdated: behind ? 12 : 0,
+            in_flight: 0,
+            to_remove: 0,
+            quarantined: 0,
+          },
+        ],
       },
     ],
   }

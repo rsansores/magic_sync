@@ -1,19 +1,20 @@
 /* The ready-made dashboard's look, every value a variable: a host sets the
-   --msd-* variables, on .msd or any ancestor, to its own tokens. */
+   --msd-* variables, on .msd or any ancestor, to its own tokens. The
+   defaults keep every text at a contrast of 4.5:1 or more against the
+   surface it is drawn on (src/styles/contrast.test.ts). */
 
 .msd {
   /* Each look reads its --msd-* variable, set here or on any ancestor, and
      falls back to its default. */
   --_fg: var(--msd-fg, #1d2433);
-  --_muted: var(--msd-muted, #6b7385);
+  --_muted: var(--msd-muted, #5c6475);
   --_bg: var(--msd-bg, transparent);
   --_card: var(--msd-card, #ffffff);
   --_border: var(--msd-border, #e3e6ee);
   --_accent: var(--msd-accent, #3b5bdb);
-  --_accent-fg: var(--msd-accent-fg, #ffffff);
-  --_ok: var(--msd-ok, #2f9e44);
-  --_warn: var(--msd-warn, #e67700);
-  --_danger: var(--msd-danger, #e03131);
+  --_ok: var(--msd-ok, #237032);
+  --_warn: var(--msd-warn, #a65200);
+  --_danger: var(--msd-danger, #c92a2a);
   --_ok-soft: var(--msd-ok-soft, #ebfbee);
   --_warn-soft: var(--msd-warn-soft, #fff4e6);
   --_danger-soft: var(--msd-danger-soft, #fff5f5);
@@ -103,6 +104,8 @@
   border-bottom: 1px solid var(--_border);
 }
 .msd-tab {
+  display: flex;
+  gap: 6px;
   font: inherit;
   color: var(--_muted);
   background: none;
@@ -135,26 +138,26 @@
   border-radius: 999px;
   padding: 3px 10px;
   cursor: pointer;
+  display: inline-flex;
+  gap: 6px;
 }
 .msd-chip[aria-pressed='true'] {
   border-color: var(--_accent);
   color: var(--_accent);
 }
-.msd-chip:disabled {
-  opacity: 0.45;
+.msd-chip[aria-disabled='true'] {
+  color: var(--_muted);
   cursor: default;
 }
-.msd-input {
-  font: inherit;
-  color: var(--_fg);
-  background: var(--_card);
-  border: 1px solid var(--_border);
-  border-radius: 6px;
-  padding: 4px 8px;
-  min-width: 0;
+.msd-pager {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: var(--_gap);
 }
-.msd-filters .msd-input {
-  margin-left: auto;
+.msd-error {
+  color: var(--_danger);
+  margin: 0;
 }
 .msd-link {
   font: inherit;

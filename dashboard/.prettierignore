@@ -3,5 +3,5 @@ dist
 coverage
 node_modules
 pnpm-lock.yaml
-# Written by the engine's contract test (magic_sync/src/relay_tests.rs).
+# Written by the engine's tests (magic_sync/src/status.rs, status_tests.rs).
 src/core/contract

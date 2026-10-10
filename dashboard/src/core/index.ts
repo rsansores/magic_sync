@@ -1,17 +1,33 @@
 // magic_sync_dashboard/core: the engine's answers, typed, and what a
-// dashboard works out from them — no framework.
+// dashboard works out from them and says — no framework.
 
-export type * from './types'
-export { summarize, progressOf, nameOf } from './derive'
+export * from './contract/types.js'
+export { summarize, pageOf, progressOf, nameOf, readsContract } from './derive.js'
 export type {
   Mood,
   SummaryOptions,
   Summary,
   ReplicaRow,
+  ReplicaPage,
   TableRow,
   Problem,
   ProblemKind,
   TableShare,
   ProgressSummary,
-} from './derive'
-export { since, until, count } from './format'
+} from './derive.js'
+export {
+  mismatchOf,
+  bannerOf,
+  describeReplica,
+  describeTable,
+  describeProblem,
+  describeShare,
+  tableMood,
+  percent,
+} from './describe.js'
+export type { Speech, Banner, ProblemText } from './describe.js'
+export { parseTimestamp, serverNow } from './time.js'
+export { since, until, count, normalizeLocale } from './format.js'
+export { builtinMessages, translator } from './i18n.js'
+export type { Messages, MessageTable, Message, Plural, Locale, Translate } from './i18n.js'
+export { tabAfter } from './tabs.js'

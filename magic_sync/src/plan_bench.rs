@@ -331,13 +331,7 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
             .await
             .expect("overview");
         time(&format!("{round}: overview of 200"), started);
-        println!(
-            "  states: {:?}",
-            overview.replicas.iter().fold(BTreeMap::new(), |mut m, r| {
-                *m.entry(format!("{:?}", r.state)).or_insert(0) += 1;
-                m
-            })
-        );
+        println!("  states: {:?}", overview.states);
         let started = Instant::now();
         engine
             .health(&mut conn, Scope::Partition(partition), 20)

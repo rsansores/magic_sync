@@ -155,6 +155,9 @@ CREATE TABLE sync.quarantine (
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
+-- Where one row stands reads its quarantine by the row, over every replica.
+CREATE INDEX quarantine_row ON sync.quarantine (relation, row_key);
+
 COMMENT ON TABLE sync.quarantine IS
     'Rows a replica should hold and does not, for a reason a retry cannot change. Never '
     'repaired by hand: a deploy that fixes the cause lets the next retry through.';

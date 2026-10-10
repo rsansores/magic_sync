@@ -370,7 +370,7 @@ async fn a_replica_the_transport_cannot_reach_waits_while_the_others_carry_on(po
         )
         .await
         .unwrap();
-    let status = &overview.replicas[0];
+    let status = &overview.replicas.first[0];
     assert_eq!(
         (status.owed, status.failures, status.state),
         (1, 1, ReplicaState::Unreachable)
@@ -1396,7 +1396,7 @@ async fn a_change_set_aside_stays_set_aside_until_the_change_itself_is_applied(
         "it confirmed the old version, not this one"
     );
     let overview = world.overview(Scope::Replicas(&[a])).await;
-    assert_eq!(overview.replicas[0].state, ReplicaState::AwaitingFix);
+    assert_eq!(overview.replicas.first[0].state, ReplicaState::AwaitingFix);
 
     // The fix deployed: carried again, and applied.
     BUGGY.set(false);

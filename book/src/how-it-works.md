@@ -350,9 +350,9 @@ should be. Per replica, one state:
 | State | Means |
 |---|---|
 | `synced` | it holds what it should, and the server filed everything it last said it wrote |
-| `catching_up` | changes are on their way to it (noted and not yet planned, or in a message it has not confirmed) or from it (its backlog) |
+| `catching_up` | changes are on their way to it (noted and not yet planned, held back by a parked note that may concern it, or in a message it has not confirmed) or from it (its backlog) |
 | `unreachable` | sends to it fail; it is tried again after a backoff |
-| `awaiting_fix` | something is set aside for it until a fix: a row in quarantine, a parked note, an upload in the inbox |
+| `awaiting_fix` | something of its own is set aside until a fix: a row in quarantine, a parked note owed to it alone, an upload of its in the inbox |
 
 It never counts the rows a replica should hold: it reads only what the engine
 records, so it costs little for a fleet — a few milliseconds for 200 replicas
@@ -360,8 +360,10 @@ holding 3 million rows, while they are caught up; the rows still on their way
 are counted one by one, about a fifth of a second when every replica has all
 of them unconfirmed — and it is exact all the same. A change a replica lacks is in one of three places — a note not
 yet planned, a message it has not confirmed, or set aside — and each is
-recorded. Per table, the same figures over the scope's replicas say which
-tables are not where they should be yet.
+recorded. It counts every replica per state and lists the worst up to a
+limit; [`plan::Engine::listing`] pages through the rest. Per table, the same
+figures over the scope's replicas say which tables are not where they should
+be yet. Every read is one snapshot, and carries the server's `now`.
 
 [`plan::Engine::progress`] answers how far along: for a few replicas, per
 table:
@@ -371,8 +373,8 @@ table:
 | `should` | rows its rules say it should hold |
 | `holds` | rows it should hold and **confirmed** it holds |
 | `outdated` | of those, rows changed since (a newer version is on its way or owed) |
-| `in_flight` | rows sent and not confirmed yet |
-| `to_remove` | rows it holds and should no longer |
+| `in_flight` | rows it should hold, sent and not confirmed yet |
+| `to_remove` | rows it was sent and should no longer hold |
 | `quarantined` | rows set aside for it until a fix |
 
 `holds - outdated` of `should` is the replica's progress bar, the way a music
@@ -394,7 +396,8 @@ many notes are pending and since when, the parked notes, the rows in
 quarantine and why, the uploads in the inbox and why, and the replicas a send
 keeps failing to. Each of these means one of two things: wait (the
 infrastructure is down), or deploy a fix (a bug). Never "go fix the data".
-When there are none, the engine is healthy — the normal state.
+When nothing waits for a fix, the engine is healthy — the normal state; a
+replica out of reach is listed, and waited for.
 
 ---
 
@@ -509,6 +512,7 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`plan::Engine::overview`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.overview
 [`plan::Engine::health`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.health
 [`plan::Engine::progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.progress
+[`plan::Engine::listing`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.listing
 [`plan::Engine::row_progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.row_progress
 [`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.new
 [`plan::Replicas`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Replicas.html

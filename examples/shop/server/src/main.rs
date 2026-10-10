@@ -5,14 +5,14 @@
 //! the last: a queue per register, held in memory, read over HTTP.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post, put};
 use axum::Router;
 use magic_sync::relay::Transport;
 use magic_sync::run::server::{Anyone, Settings};
-use magic_sync::status::{Overview, ReplicaProgress, RowPlace, Scope};
+use magic_sync::status::{Listing, Overview, Progress, ReplicaState, RowProgress, Scope};
 use magic_sync::{Error, Server};
 use serde::{Deserialize, Serialize};
 use shop_rows::{codecs, Product, Receipt, REGISTERS};
@@ -130,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = Router::new()
         .route("/api/state", get(state))
         .route("/api/sync/overview", get(overview))
+        .route("/api/sync/replicas", get(listing))
         .route("/api/sync/progress/{register}", get(progress))
         .route("/api/sync/rows/{table}/{key}", get(row))
         .route("/api/products", post(add_product))
@@ -212,46 +213,64 @@ async fn state(State(app): State<App>) -> Result<Json<ShopState>, (StatusCode, S
 
 // What the dashboard reads: the engine's answers, as they are. A shop with a
 // login would ask them over the registers the caller may see
-// (`Scope::Replicas`); this one has none, so every register.
+// (`Scope::Replicas`); this one has none, so every register. Each read is one
+// snapshot of its own, so each takes a connection, not a transaction.
 
 async fn overview(State(app): State<App>) -> Result<Json<Overview>, (StatusCode, String)> {
-    let mut tx = app.server.begin().await.map_err(fail)?;
+    let mut conn = app.pool.acquire().await.map_err(fail)?;
     let overview = app
         .server
         .engine()
-        .overview(&mut tx, Scope::All, 20)
+        .overview(&mut conn, Scope::All, 20)
         .await
         .map_err(fail)?;
     Ok(Json(overview))
 }
 
+#[derive(Deserialize)]
+struct Page {
+    state: Option<ReplicaState>,
+    #[serde(default)]
+    offset: u32,
+}
+
+async fn listing(
+    State(app): State<App>,
+    Query(page): Query<Page>,
+) -> Result<Json<Listing>, (StatusCode, String)> {
+    let mut conn = app.pool.acquire().await.map_err(fail)?;
+    let listing = app
+        .server
+        .engine()
+        .listing(&mut conn, Scope::All, page.state, page.offset, 20)
+        .await
+        .map_err(fail)?;
+    Ok(Json(listing))
+}
+
 async fn progress(
     State(app): State<App>,
     Path(register): Path<Uuid>,
-) -> Result<Json<ReplicaProgress>, (StatusCode, String)> {
-    let mut tx = app.server.begin().await.map_err(fail)?;
+) -> Result<Json<Progress>, (StatusCode, String)> {
+    let mut conn = app.pool.acquire().await.map_err(fail)?;
     let progress = app
         .server
         .engine()
-        .progress(&mut tx, Scope::Replicas(&[register]))
+        .progress(&mut conn, Scope::Replicas(&[register]))
         .await
         .map_err(fail)?;
-    progress
-        .into_iter()
-        .next()
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no register {register}")))
+    Ok(Json(progress))
 }
 
 async fn row(
     State(app): State<App>,
     Path((table, key)): Path<(String, String)>,
-) -> Result<Json<Vec<RowPlace>>, (StatusCode, String)> {
-    let mut tx = app.server.begin().await.map_err(fail)?;
+) -> Result<Json<RowProgress>, (StatusCode, String)> {
+    let mut conn = app.pool.acquire().await.map_err(fail)?;
     let places = app
         .server
         .engine()
-        .row_progress(&mut tx, Scope::All, &table, &key)
+        .row_progress(&mut conn, Scope::All, &table, &key)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(places))
