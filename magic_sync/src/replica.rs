@@ -328,7 +328,7 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
         )));
     };
     for script in due {
-        sqlx::raw_sql(script).execute(&mut *tx).await?;
+        sqlx::Executor::execute(&mut *tx, *script).await?;
     }
     let ours: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'sync\\_%' ESCAPE '\\'",
@@ -336,12 +336,12 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
     .fetch_all(&mut *tx)
     .await?;
     for name in ours {
-        sqlx::raw_sql(&format!("DROP TRIGGER {}", ident(&name)))
+        sqlx::query(&format!("DROP TRIGGER {}", ident(&name)))
             .execute(&mut *tx)
             .await?;
     }
     for trigger in generated(codecs) {
-        sqlx::raw_sql(&trigger.sql).execute(&mut *tx).await?;
+        sqlx::query(&trigger.sql).execute(&mut *tx).await?;
     }
     check(&mut tx, codecs).await?;
     tx.commit().await?;
@@ -490,12 +490,14 @@ async fn numbered(
         return Ok(Err(Received::AlreadyApplied));
     }
     if last.is_some_and(|(e, _)| e != epoch) {
-        sqlx::raw_sql(
-            "DELETE FROM sync_backlog; DELETE FROM sync_snapshots; DELETE FROM sync_snapshot_keys; \
-             UPDATE sync_rejections SET reported_at = NULL, sequence = 0",
-        )
-        .execute(&mut *conn)
-        .await?;
+        for forgotten in [
+            "DELETE FROM sync_backlog",
+            "DELETE FROM sync_snapshots",
+            "DELETE FROM sync_snapshot_keys",
+            "UPDATE sync_rejections SET reported_at = NULL, sequence = 0",
+        ] {
+            sqlx::query(forgotten).execute(&mut *conn).await?;
+        }
     }
     sqlx::query(
         "INSERT INTO sync_applied (id, epoch, sequence) VALUES (1, $1, $2) \

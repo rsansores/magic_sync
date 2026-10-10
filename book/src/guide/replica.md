@@ -13,7 +13,7 @@ use magic_sync::{replica, Replica};
 
 replica::install(&mut *pool.acquire().await?, codecs()).await?;   // no migrations of your own
 
-let replica = Arc::new(Replica::new(pool.clone(), codecs(), me, Http { … }, Settings::default()));
+let replica = Arc::new(Replica::new(pool.clone(), codecs(), me, Http { … }, Settings::default()).await?);
 let up = replica.clone();
 tokio::spawn(async move { up.run(std::future::pending()).await });
 ```

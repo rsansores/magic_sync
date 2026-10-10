@@ -27,8 +27,10 @@ fn place_receipt(receipt: &mut Receipt, register: Uuid, _: &()) {
 
 ## JSON or protobuf
 
-`Codec::json` sends a row as its serde shape: nothing else to declare. That is
-the simple way, and the one to start with.
+`Codec::json` sends a row as a JSON object of its columns, each value as its
+field's serde writes it — a 64-bit integer as its decimal text, which a
+reader holding numbers as doubles would otherwise round: nothing else to
+declare. That is the simple way, and the one to start with.
 
 `Codec::new` sends it as a protobuf message of your own, with a mapping each
 way — smaller on the wire, and a schema a replica in another language can

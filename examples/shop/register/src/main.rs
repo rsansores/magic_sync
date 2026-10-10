@@ -148,7 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             idle: Duration::from_millis(300),
             ..Settings::default()
         },
-    ));
+    )
+    .await?);
     let up = replica.clone();
     tokio::spawn(async move { up.run(std::future::pending()).await });
     tokio::spawn(receive(client.clone(), server.clone(), me, replica.clone(), online.clone()));

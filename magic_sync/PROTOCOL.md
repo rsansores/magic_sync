@@ -6,7 +6,8 @@ replica (`src/replica.rs`, on SQLite) is one implementation of it; this
 document is the contract that one follows, and any other must.
 
 The messages are in [`proto/sync.proto`](proto/sync.proto). Generate code for
-your language from it; a test keeps it identical to the engine's types.
+your language from it; the engine's own types are generated from it too, and
+a test fails while they differ.
 
 The words **must**, **must not** and **should** mean what they mean in RFCs.
 
@@ -43,6 +44,9 @@ The server sends one kind of message, `ToReplica`, which carries a `Down`, an
 `EndSnapshot` or a `Filed`. A replica sends one kind, `Up`. So a transport
 carries bytes and nothing else: it never needs to know what is inside.
 
+A message the transport carries has a size limit of its own; a replica must
+keep every `Up` within it (section 7).
+
 A **transport acknowledgement** (section 5.1) is what makes the transport
 deliver the next message. It is not the same as telling the server what was
 applied (section 5.2).
@@ -63,8 +67,17 @@ A row's **key** is its primary key, as text, in key order:
 - an integer part: decimal;
 - the parts joined by `|` where a single text is needed (`a1b2…|3`).
 
-A replica should send keys in the same form. The server also accepts a UUID
-part without hyphens.
+This is the one form keys are compared in, and every key a side writes into
+a message **must** be in it. A side reading a key parses each part as its
+column types it and writes it back in this form before using it (a UUID that
+came uppercase or without hyphens is the same key); a key that does not
+parse is malformed.
+
+A table that travels as **JSON** is a JSON object with one member per column,
+named as the column, each value as the column's type writes it in JSON —
+except a 64-bit integer, which is its decimal text (`"9007199254740993"`): a
+JSON number would be rounded by a reader that holds numbers as doubles. A
+decimal is its text, a UUID its canonical form, an instant RFC 3339.
 
 ---
 
@@ -82,10 +95,17 @@ document its sender speaks (now `1`).
   behind it waits too, which is right, because they speak the same version.
 - The server does the same with an `Up` of a later protocol than its own.
 
-Bytes that do not decode as a `ToReplica` at all, or one with no body, carry
-nothing a replica can act on: it **should** log them and acknowledge them, so
-they do not hold back the queue. The digests (section 8) find whatever they
-carried, if it mattered.
+A message that is **malformed** — bytes that do not decode as a `ToReplica`;
+one of the replica's own protocol or earlier whose body it does not know, or
+that has none; a sequence or an epoch no server sends (4.1) — carries nothing
+a replica can act on: it **must** apply none of it, **should** log it, and
+**must** acknowledge it, so it does not hold back the queue. The digests
+(section 8) find whatever it carried, if it mattered.
+
+What changes the protocol's number: a new kind of body, or a field whose
+meaning changes. What does not: a new field. A side **must** ignore fields it
+does not know, so a message with a field added means to a side that predates
+it what it meant before.
 
 ### 4.1 `Down`: rows to hold, rows to let go
 
@@ -100,8 +120,12 @@ The replica keeps the `(epoch, sequence)` of the last message it applied:
   it to the transport (it is a redelivery, or a message from a server process
   that lost its leadership);
 - a different `epoch`: the server was installed again. The replica applies
-  the message and keeps its numbers from now on;
-- `sequence` 0: an unnumbered message, always applied.
+  the message and keeps its numbers from now on. Epochs are not ordered: any
+  other one is a new installation. The replica forgets the snapshot it was
+  following (4.2), and says again its backlog and its rejections, which that
+  server never heard;
+- `sequence` 0, one above 2^63 − 1, or an `epoch` that is not a UUID: no
+  server numbers a message so. The message is malformed (4.0).
 
 Then the replica applies `tables` **in the order given**. The server puts
 parents' rows before their children's, and children's deletes before their
@@ -109,24 +133,35 @@ parents', so in that order no row ever points at a row the replica lacks.
 
 For each `Table`:
 
+A table the replica holds from the server is one the server writes: a
+catalog, or a table written on both sides. Rows of any other table — a
+record of the replica's own, a table it does not know — are rejected, and
+their deletes ignored.
+
 1. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
-   message; `keys[i]` is the key of `upserts[i]`. For each row:
+   message; `keys[i]` is the key of `upserts[i]`, and there **must** be one
+   key per upsert. For each row:
    - insert it, or overwrite the stored row with the same key;
    - **unless** the table has a version column (an `updated_at`) and the
      stored row's version is **newer** than the incoming one: then keep the
-     stored row (an equal version is applied);
+     stored row (an equal version is applied). Versions compare as what they
+     are — numbers as numbers, instants as instants, whatever text form each
+     was stored in;
    - columns the replica owns in a table written by both sides are **not**
      overwritten;
    - a row the replica had retired (4.3) becomes live again.
 2. **Deletes.** For each key in `deletes`: delete the row. If a row of the
-   replica's own points at it (the delete would break a foreign key), retire
-   it instead (4.3).
+   replica's own points at it — through a foreign key that would refuse the
+   delete, whether checked at once or at commit — retire it instead (4.3);
+   where the table has nothing to retire it by, or the database refuses to
+   let it go, keep it and record a rejection (section 6).
 
-**A row the replica cannot take does not fail the message.** If a row does
-not decode, if the replica's database refuses it for its data (a constraint),
-or if the replica does not know the table at all, the replica **must** leave
-that row out, apply everything else, and record a **rejection** (section 6)
-in the same transaction. Only a failure of the replica's own storage (the
+**A row the replica cannot take, or let go of, does not fail the message.**
+If a row does not decode, if the replica's database refuses it for its data
+(a constraint, a trigger), or if the replica does not know the table at all,
+the replica **must** leave that row as it was, apply everything else, and
+record a **rejection** (section 6) in the same transaction. Nothing a message
+carries fails it. Only a failure of the replica's own storage (the
 database is unavailable, the disk is full) fails the message: then the replica
 **must not** acknowledge it, and it will be delivered again.
 
@@ -134,19 +169,25 @@ database is unavailable, the disk is full) fails the message: then the replica
 
 When the server provisions a replica from scratch, it sends everything the
 replica should hold in `Down` messages that carry a `snapshot_id`, then an
-`EndSnapshot` naming the tables the snapshot covered.
+`EndSnapshot` naming the tables the snapshot covered. A snapshot of nothing
+is its `EndSnapshot` alone.
 
-- While applying a `Down` with a `snapshot_id`, the replica **must** remember
-  the key of every row it took, per table.
-- A `snapshot_id` is a UUID v7: a larger one began later. A `Down` of a newer
-  snapshot supersedes an older one in progress: the replica forgets what the
-  older one named.
-- On `EndSnapshot` for the snapshot in progress, the replica **must** let go
-  of every row of the named tables that the snapshot did not name (delete, or
-  retire as in 4.3), children before parents: **in reverse** of the order the
-  tables are listed.
-- An `EndSnapshot` for a snapshot that already ended, or that a newer one
-  superseded, changes nothing.
+- A snapshot **begins with its first message, whichever it is**. A snapshot
+  id the replica has not seen, on a message newer than the last applied
+  (4.1), begins it and supersedes the one in progress: the replica forgets
+  what the older one named. Snapshots are ordered by the sequence of the
+  messages that carry them, never by their ids.
+- While applying a `Down` of the snapshot in progress, the replica **must**
+  remember the key of every row it took, per table.
+- On `EndSnapshot` for the snapshot in progress — or for one never seen,
+  which it begins and ends, having named nothing — the replica **must** let
+  go of every row of the named tables that the snapshot did not name (delete,
+  or retire as in 4.3), children before parents: **in reverse** of the order
+  the tables are listed. The rejections it recorded for those tables before
+  the snapshot began are forgotten: the snapshot sent again what it should
+  hold.
+- A `Down` of a snapshot that ended, or was superseded, names nothing; its
+  rows still apply. Its `EndSnapshot` changes nothing.
 - `EndSnapshot` carries a `sequence` and `epoch` and follows the same rule as
   `Down` (4.1).
 
@@ -161,7 +202,9 @@ retired row the server sends again becomes live.
 ### 4.4 `Filed`
 
 The server answers each upload (section 7) once it has filed it. On `Filed`,
-the replica **must** forget the notes those uploads carried.
+the replica **must** forget the notes those uploads carried — the ones whose
+latest send carried that number, and no other: a note sent again since is
+forgotten only on the answer to that send.
 
 ---
 
@@ -195,16 +238,19 @@ the replica.
 
 ## 6. Rejections
 
-A row the replica could not take (4.1) is a **rejection**: the table, the key
-(from `keys[i]`, if the row did not even decode), and why.
+A row the replica could not take, or could not let go of (4.1), is a
+**rejection**: the table, the key — **required**, in the form of section 3:
+read off the row, or from `keys[i]` if the row did not even decode — and why.
+A row whose key cannot be told is logged and not reported.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.
 - It **must** report each rejection to the server in an `Up` (`rejected`), and
   should do so promptly.
 - It **must** keep the rejection until it takes the row (a later message
-  carries the row and it applies): a digest (section 8) leaves rejected rows
-  out, as the server leaves out the rows it set aside for the replica.
+  carries the row and it applies) or lets go of it (a delete, or a snapshot
+  that does not name it): a digest (section 8) leaves rejected rows out, as
+  the server leaves out the rows it set aside for the replica.
 
 On a rejection of a row it records sending the replica, the server stops
 counting the row as held and sets it aside for that replica. The key is read
@@ -221,14 +267,28 @@ Nobody repairs the row by hand.
 For a table the replica writes and the server mirrors:
 
 1. **Note** every insert, update and delete in the writing transaction: the
-   table and the key. (A trigger is the only way no write path can forget.)
+   table and the key — on an update that changes the key, the old key too,
+   which is gone. (A trigger is the only way no write path can forget.)
+   What the replica writes while applying what the server sent is not
+   noted: it is the server's already. A row of a table written on both sides
+   begins on the server; the replica edits only its own columns of it, and
+   only those edits go up. A record without a version is history, written
+   once.
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only
      for a table keyed by the replica that wrote it: history a replica pruned
      is not the server's to delete;
-   - in `uploads`, the number of this upload: the highest note it carries.
-     The same notes sent again carry the same number.
+   - one key per row in `tables[].keys`;
+   - upserts parents first, in the order the tables point at one another,
+     then deletes children first;
+   - in `uploads`, the number of this upload: a **fresh** one on every send,
+     resends included, from 1 to 2^63 − 1, never reused (a counter the
+     replica keeps);
+   - within the transport's size limit: what does not fit waits for the next
+     upload. A row that can never fit, or that the transport refuses for
+     good, is set aside — kept, counted in the backlog, never sent until the
+     replica runs again with a build that may send it.
 3. **Wait for `Filed`** (4.4) naming that upload, then forget its notes. An
    upload not answered after a while (minutes) should be sent again; the
    server files the same rows idempotently.
@@ -242,8 +302,8 @@ by the replica, and keys that are not the table's, are malformed and left
 out.
 
 A replica **may** say what it wrote and the server has not filed yet, in
-`Up.backlog`: per table, rows not sent yet (`unsent`) and rows sent and not
-yet `Filed` (`unfiled`). The server keeps the last one it was told, with the
+`Up.backlog`: per table, rows not sent yet (`unsent`), rows sent and not
+yet `Filed` (`unfiled`), and rows set aside (`set_aside`). The server keeps the last one it was told, with the
 time, and shows the replica as catching up while it is not empty. Say it
 when it changes — at once when it empties — and not on every write; say it
 again now and then while it is not empty, and to a server whose epoch
@@ -251,8 +311,13 @@ changed, either of which may have lost it. An `Up` without `backlog` leaves
 the last one standing. A replica that never says leaves the server with
 nothing to show, and nothing breaks.
 
-A replica's `Up`s on one lane reach the server in the order it sent them: the
-backlog an earlier one carried must not arrive after a later one's.
+A replica may send its writes on several **lanes** — streams of `Up`s the
+transport keeps apart, each carrying the writes of some of its tables, so a
+table that writes often never waits behind the rest. Every table that goes up
+is on exactly one lane. Rejections, the last applied message, digests and
+the backlog go on the first. A replica's `Up`s on one lane reach the server
+in the order it sent them: the backlog an earlier one carried must not arrive
+after a later one's.
 
 One `Up` may carry several of these at once: rows, rejections, digests, the
 backlog, and the last applied message.
@@ -350,17 +415,23 @@ A replica implementation is complete when:
 - [ ] it reads every message as a `ToReplica`, leaves one of a later protocol
       unacknowledged, and sets `protocol` on every `Up`;
 - [ ] it applies a `Down` in one transaction, tables in the order given;
-- [ ] it ignores a message at or below the last applied in the same epoch, and
-      starts over on a new epoch;
-- [ ] it keeps a newer stored version over an older incoming one;
+- [ ] it ignores a message at or below the last applied in the same epoch,
+      starts over on a new epoch, and acknowledges without applying a
+      malformed message (4.0, 4.1);
+- [ ] it keeps a newer stored version over an older incoming one, comparing
+      versions as what they are;
 - [ ] it never overwrites the columns it owns;
 - [ ] it retires a row it cannot delete, and revives a retired row sent again;
-- [ ] it follows snapshots and sweeps on their end, in reverse table order;
-- [ ] it leaves out and records, in the same transaction, a row it cannot take;
+- [ ] it follows snapshots by sequence, begins one with its first message —
+      an `EndSnapshot` included — and sweeps on its end, in reverse table
+      order;
+- [ ] it leaves as it was and records, in the same transaction, a row it
+      cannot take or let go of;
 - [ ] it reports rejections, and keeps them until it takes the row;
 - [ ] it acknowledges the transport only after committing;
 - [ ] it reports the last applied `(epoch, sequence)` to the server;
 - [ ] it notes its own writes in the writing transaction, uploads them as they
-      are, numbers each upload, and forgets the notes on `Filed`;
+      are within the transport's limit, gives every send a fresh number, and
+      forgets on `Filed` only the notes that send carried;
 - [ ] it reports digests with the fingerprint above (optional, recommended);
 - [ ] it says its backlog when it changes (optional, recommended).

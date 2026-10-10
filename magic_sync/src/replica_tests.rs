@@ -1632,3 +1632,33 @@ fn a_json_row_carries_its_columns_by_name_and_big_integers_as_text() {
     .unwrap();
     assert_eq!(event, serde_json::json!({"id": Uuid::nil(), "what": "w"}));
 }
+
+/// A host spawns what a replica runs, so its futures are `Send` — which one
+/// statement holding a borrow across an await quietly stops them being.
+#[sqlx::test(migrations = false)]
+async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
+    fn spawnable<T: Send>(_: T) {}
+    let w = world(pool).await;
+    spawnable(w.replica.receive(&[]));
+    spawnable(w.replica.send_lane(0, true));
+    spawnable(w.replica.run(std::future::pending()));
+    spawnable(Replica::new(
+        w.pool.clone(),
+        codecs(),
+        w.me,
+        w.uplink.clone(),
+        Settings::default(),
+    ));
+    let mut conn = w.pool.acquire().await.unwrap();
+    spawnable(receive(&mut conn, codecs(), &[]));
+    let settings = Outbox::default();
+    spawnable(outbox(
+        &mut conn,
+        codecs(),
+        &Settings::default().lanes,
+        0,
+        &settings,
+        true,
+    ));
+    spawnable(install(&mut conn, codecs()));
+}

@@ -113,7 +113,7 @@ catalogue, so this needs no declaration: the schema already says it.
 
 ### The codec
 
-A table travels in its own encoding: the row's serde shape as JSON
+A table travels in its own encoding: JSON, an object of its columns
 (`Codec::json`), or a protobuf message of its own with a mapping each way
 (`Codec::new`). A [`wire::Codec`] erases the row type so the engine can hold
 every table in one list. The engine never names a table; it dispatches on the
@@ -286,11 +286,15 @@ row that is gone by then goes as its key, but only for a table keyed by its
 replica (`ORIGIN`): history a replica pruned before it went up is not the
 server's to delete.
 
-Each upload is numbered by the highest note it carries. The server answers
-every upload it filed with a `Filed` message, after its transaction commits,
-and the replica lets go of those notes. An upload the server does not answer
-goes again after a while. So the replica always knows what it wrote that has
-not reached the server yet.
+Every send of an upload draws a number of its own, a resend included. The
+server answers every upload it filed with a `Filed` message, after its
+transaction commits, and the replica lets go of the notes that send carried —
+a note sent again since waits for the answer to that send, so a late answer
+never forgets a write it did not carry. An upload the server does not answer
+goes again after a while. An upload stays within the transport's size; a row
+that can never fit, or that the transport refuses for good, is set aside and
+counted in the backlog until the replica runs again. So the replica always
+knows what it wrote that has not reached the server yet.
 
 The same `Up` carries everything else a replica has to tell the server: the
 rows it could not take, the last message it applied, and, hourly, its

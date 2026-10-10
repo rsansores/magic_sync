@@ -34,7 +34,7 @@ tokio::spawn(async move { server.run(shutdown).await });
 ```rust
 // A replica (feature `sqlite`): hand it what arrives; acknowledge it to your
 // transport once `receive` returned Ok.
-let replica = magic_sync::Replica::new(sqlite, codecs(), my_id, my_uplink, Settings::default());
+let replica = magic_sync::Replica::new(sqlite, codecs(), my_id, my_uplink, Settings::default()).await?;
 replica.receive(&bytes).await?;
 ```
 

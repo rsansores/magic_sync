@@ -201,11 +201,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// recorded in another. Answers whether one went. A message the uplink
     /// refuses for good has its rows set aside rather than offered for ever.
     pub async fn send_lane(&self, lane: usize, digests: bool) -> Result<bool, Error> {
-        let mut conn = self.pool.acquire().await?;
-        let Some(id) = self.identity.id(&mut conn).await? else {
+        let Some(id) = self.identity.id(&mut *self.pool.acquire().await?).await? else {
             return Ok(false);
         };
-        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outgoing = replica::outbox(
             &mut tx,
             self.codecs,
@@ -220,7 +219,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             return Ok(false);
         };
         let sent = self.uplink.send(id, outgoing.lane, outgoing.bytes()).await;
-        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         match sent {
             Ok(()) => replica::delivered(&mut tx, &outgoing).await?,
             Err(e) if !e.is_transient() && outgoing.rows() > 0 => {

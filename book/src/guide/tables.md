@@ -120,21 +120,27 @@ CREATE TABLE receipts (
 > sets `retired_at` instead: the product stays for the receipt, and your
 > screens leave retired rows out. Offered again, it is live again.
 
-Same two ways for the engine's part: [`magic_sync::replica::install`] creates
-the engine's tables and a trigger noting every write to each table that goes
-up; or your migrations run [`magic_sync::SQLITE_SCHEMA`] and declare the
-triggers themselves:
+Same two ways for the engine's part: [`magic_sync::replica::install`] applies
+the engine's tables and its triggers in one transaction; or your migrations
+run [`magic_sync::SQLITE_SCHEMA`] and the script
+[`magic_sync::replica::triggers`] writes for your codecs — print it once and
+paste it into the migration that creates the tables, and again when a table
+is added or changes how it travels:
 
-```sql
-CREATE TRIGGER sync_note_receipts AFTER INSERT ON receipts BEGIN
-    INSERT INTO sync_notes (relation, row_key) VALUES ('receipts', lower(hex(NEW.id)));
-END;
+```rust
+println!("{}", magic_sync::replica::triggers(codecs()));
 ```
 
-…and a test runs [`magic_sync::replica::check`] over the database your
-migrations build, so a table that goes up and notes nothing fails it.
+The triggers note every insert, update and delete of a table that goes up
+(an update that changes the key notes the old key too), refuse a write the
+engine did not make to a table the server sends, let a row of a two-way table
+begin only on the server, and refuse an update of history (a record without
+a version). `Replica::new` runs [`magic_sync::replica::check`], which refuses
+a database whose triggers are not exactly these; a test of yours runs it too,
+over the database your migrations build.
 
 [`magic_sync::POSTGRES_SCHEMA`]: https://docs.rs/magic_sync/latest/magic_sync/constant.POSTGRES_SCHEMA.html
 [`magic_sync::SQLITE_SCHEMA`]: https://docs.rs/magic_sync/latest/magic_sync/constant.SQLITE_SCHEMA.html
 [`magic_sync::replica::install`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.install.html
 [`magic_sync::replica::check`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.check.html
+[`magic_sync::replica::triggers`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.triggers.html
