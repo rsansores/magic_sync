@@ -316,11 +316,11 @@ fixed:
 | What fails | What the engine does | How it heals |
 |---|---|---|
 | Planning, on one note | halves the batch until the failing note is alone, parks it (`parked_at`), and plans the rest | parked notes are unparked when the relay starts (usually after a deploy) and on a timer |
-| Encoding a row, on the server | leaves the row out of what is sent and recorded, and **quarantines** it for every replica that was owed it. A replica keeps whatever copy it has | quarantined rows are noted again, for their replica alone, when the relay starts and on a timer; a row leaves the quarantine once its replica holds it, or once it is owed to no one |
+| Encoding a row, on the server | leaves the row out of what is sent and recorded, and **quarantines** it for every replica that was owed it. A replica keeps whatever copy it has | quarantined rows are noted again, for their replica alone, when the relay starts and on a timer; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
 | The transport, for one replica | that replica waits out a backoff (`sync.replicas`); what it is owed is noted again **for it alone**, as of the transactions that first noted it; every other replica carries on | sent when its backoff ends |
 | A row larger than any message may be | left out at loading and **quarantined**, as one that does not encode | as above, once a fix makes it smaller or the limit larger |
 | The transport, refusing a message for good | what the message carried is quarantined for that replica | as above |
-| A replica, taking a row | the replica notes it in the same transaction (`sync_rejections`) and reports it in an `Up`; the server stops counting it as held and quarantines it | a fix deployed on either side lets the retry through |
+| A replica, taking a row | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`) and reports it in an `Up`; the server stops counting it as held and quarantines it | a fix deployed on either side lets the retry through |
 | The server, filing an uploaded row | the row is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer |
 | Anything nobody foresaw | see below | |
 

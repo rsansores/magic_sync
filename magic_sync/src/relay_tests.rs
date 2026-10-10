@@ -5,7 +5,7 @@
 use super::*;
 use crate::plan::Replicas;
 use crate::row::Table;
-use crate::status::{ReplicaState, Scope};
+use crate::status::{ReplicaState, RowState, Scope};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use prost::Message as _;
 use std::sync::Mutex;
@@ -235,6 +235,11 @@ async fn a_row_that_does_not_encode_waits_in_quarantine_and_holds_back_nothing(
     let delivered = wire.delivered();
     assert_eq!(delivered[&a], names(&["poison"]));
     assert_eq!(delivered[&b], names(&["poison"]));
+    for replica in [a, b] {
+        world
+            .acknowledge(replica, world.last_sent(replica).await)
+            .await;
+    }
     assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
     assert_eq!(world.held(a).await, 2);
     BUGGY.set(true);
@@ -447,6 +452,12 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
     let delivered = wire.delivered();
     assert_eq!(delivered[&a], names(&["refused"]));
     assert!(!delivered.contains_key(&b));
+    assert_eq!(
+        world.count("SELECT count(*) FROM sync.quarantine").await,
+        1,
+        "set aside until it says it took it"
+    );
+    world.acknowledge(a, world.last_sent(a).await).await;
     assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
     assert_eq!(world.held(a).await, 1);
 }
@@ -759,6 +770,13 @@ async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(poo
                 holds, should,
                 "seed {seed:#x}: {replica} holds other than it should"
             );
+            let last = chaos
+                .replicas
+                .lock()
+                .unwrap()
+                .get(&replica)
+                .map_or(0, |m| m.last);
+            world.acknowledge(replica, last).await;
         }
         assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
         assert_eq!(
@@ -846,7 +864,7 @@ async fn a_pass_that_sent_but_never_recorded_is_sent_again(pool: crate::DbPool) 
 #[sqlx::test(migrations = false)]
 async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
     use crate::envelope::Up;
-    use crate::status::RowState;
+
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
@@ -938,6 +956,17 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
 }
 
 impl World {
+    /// The last message sent to `replica`.
+    async fn last_sent(&self, replica: Uuid) -> u64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT last_sequence FROM sync.replicas WHERE replica_id = $1",
+        )
+        .bind(replica)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap() as u64
+    }
+
     /// `replica` says it applied every message up to `sequence`.
     async fn acknowledge(&self, replica: Uuid, sequence: u64) {
         let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
@@ -1476,4 +1505,48 @@ impl Stable {
         }
         out
     }
+}
+
+/// A change owed to one replica alone, after a send to it failed, outdates
+/// only that replica's copy: the others, sent it already, hold it as it is —
+/// even while an older transaction keeps their horizon behind the change.
+#[sqlx::test(migrations = false)]
+async fn a_change_owed_to_one_replica_outdates_no_other(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, b] = world.replicas;
+    let wire = Fake::default();
+    wire.failing.lock().unwrap().insert(a, true);
+    let mut older = world.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *older)
+        .await
+        .unwrap();
+    let one = world.item("one").await;
+    world.pass(&wire).await;
+    let last: i64 =
+        sqlx::query_scalar("SELECT last_sequence FROM sync.replicas WHERE replica_id = $1")
+            .bind(b)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    world.acknowledge(b, last as u64).await;
+
+    let mut conn = world.pool.acquire().await.unwrap();
+    let progress = world
+        .engine
+        .progress(&mut conn, Scope::Replicas(&[b]))
+        .await
+        .unwrap();
+    assert_eq!(
+        (progress[0].tables[0].holds, progress[0].tables[0].outdated),
+        (1, 0),
+        "{progress:?}"
+    );
+    let places = world
+        .engine
+        .row_progress(&mut conn, Scope::Replicas(&[b]), "items", &one.to_string())
+        .await
+        .unwrap();
+    assert_eq!(places[0].state, RowState::Holds);
+    older.rollback().await.unwrap();
 }

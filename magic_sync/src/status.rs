@@ -354,14 +354,16 @@ impl Engine {
             });
             let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
                 "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
-                 p AS (SELECT DISTINCT ON (n.row_key) n.row_key, n.xid FROM sync.notes n \
+                 p AS (SELECT DISTINCT ON (n.row_key, n.scope) n.row_key, n.scope, n.xid FROM sync.notes n \
                         WHERE n.done_at IS NULL AND n.kind = 'row' AND n.relation = $1 \
-                        ORDER BY n.row_key, n.xid DESC), \
+                        ORDER BY n.row_key, n.scope, n.xid DESC), \
                  h AS (SELECT h.replica_id, h.row_key AS key, \
                               coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = $3, false) AS confirmed, \
-                              coalesce(p.xid >= h.horizon, false) AS outdated \
+                              coalesce(everyone.xid >= h.horizon, false) \
+                                OR coalesce(mine.xid >= h.horizon, false) AS outdated \
                          FROM sync.held h LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-                         LEFT JOIN p ON p.row_key = h.row_key \
+                         LEFT JOIN p everyone ON everyone.row_key = h.row_key AND everyone.scope IS NULL \
+                         LEFT JOIN p mine ON mine.row_key = h.row_key AND mine.scope = h.replica_id \
                         WHERE h.relation = $1 AND h.replica_id = ANY($2)) \
                  SELECT coalesce(w.replica_id, h.replica_id), \
                         count(w.key) + CASE WHEN $4 THEN count(h.key) ELSE 0 END, \
@@ -436,7 +438,8 @@ impl Engine {
             "SELECT h.replica_id, \
                     coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = e.epoch, false), \
                     EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
-                             AND n.relation = h.relation AND n.row_key = h.row_key AND n.xid >= h.horizon) \
+                             AND n.relation = h.relation AND n.row_key = h.row_key AND n.xid >= h.horizon \
+                             AND (n.scope IS NULL OR n.scope = h.replica_id)) \
                FROM sync.held h CROSS JOIN sync.epoch e \
                LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
               WHERE h.relation = $1 AND h.row_key = $2",

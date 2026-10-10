@@ -1050,10 +1050,12 @@ pub async fn file<P: Sync + 'static>(
     #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
     {
         crate::relay::hold(conn, sender, &unfiled).await?;
+        // What it refused first: a row it applied a message of and refused
+        // is not held, and stays in quarantine.
+        crate::relay::rejected(conn, sender, &upload.rejected).await?;
         if upload.sequence > 0 {
             crate::relay::acknowledge(conn, sender, &upload.epoch, upload.sequence).await?;
         }
-        crate::relay::rejected(conn, sender, &upload.rejected).await?;
         crate::relay::compare(conn, sender, upload).await?;
         if let Some(backlog) = &upload.backlog {
             crate::relay::backlog(conn, sender, backlog).await?;

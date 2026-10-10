@@ -330,10 +330,6 @@ impl<P: Sync + 'static> Relay<'_, P> {
         };
         for group in &sent.groups {
             self.engine.record(conn, &group.delta).await?;
-            for replica in Engine::replicas(&group.delta) {
-                let keys = group.delta.upserted(replica);
-                release(conn, self.engine, replica, &keys).await?;
-            }
             settle(conn, self.engine, group).await?;
             outcome.quarantined += group.loaded.failed.len();
             quarantine(conn, &group.loaded.failed).await?;
@@ -495,6 +491,19 @@ pub async fn acknowledge(
     .bind(replica)
     .bind(epoch)
     .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
+    .execute(&mut *conn)
+    .await?;
+    // A row set aside for it leaves the quarantine once it confirms holding
+    // it, not when it is sent again: it may refuse it again.
+    sqlx::query(
+        "DELETE FROM sync.quarantine q USING sync.held h, sync.replicas r \
+          WHERE q.replica_id = $1 AND h.replica_id = q.replica_id \
+            AND h.relation = q.relation AND h.row_key = q.row_key \
+            AND r.replica_id = q.replica_id AND r.applied_epoch = $2 \
+            AND h.sequence <= r.applied_sequence",
+    )
+    .bind(replica)
+    .bind(epoch)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -756,30 +765,6 @@ async fn settle(conn: &mut Conn, engine: &Engine, group: &Group) -> Result<(), E
         .execute(&mut *conn)
         .await?;
     }
-    Ok(())
-}
-
-/// Rows a replica now holds leave the quarantine.
-async fn release(
-    conn: &mut Conn,
-    engine: &Engine,
-    replica: Uuid,
-    keys: &[(usize, String)],
-) -> Result<(), Error> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let tables: Vec<&str> = keys.iter().map(|(i, _)| engine.table(*i)).collect();
-    let keys: Vec<&str> = keys.iter().map(|(_, k)| k.as_str()).collect();
-    sqlx::query(
-        "DELETE FROM sync.quarantine q USING unnest($2::text[], $3::text[]) AS h(t, k) \
-         WHERE q.replica_id = $1 AND q.relation = h.t AND q.row_key = h.k",
-    )
-    .bind(replica)
-    .bind(&tables)
-    .bind(&keys)
-    .execute(&mut *conn)
-    .await?;
     Ok(())
 }
 

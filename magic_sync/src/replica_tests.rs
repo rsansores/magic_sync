@@ -178,6 +178,37 @@ async fn a_table_this_build_does_not_mirror_is_rejected_row_by_row(pool: crate::
     );
 }
 
+/// A row this build refuses — a trigger, here, as a bug would — is the only
+/// one left out: the rows sent with it are taken.
+#[sqlx::test(migrations = false)]
+async fn a_row_a_trigger_refuses_is_the_only_one_rejected(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER a_bug BEFORE INSERT ON items WHEN NEW.name = 'poison' \
+         BEGIN SELECT RAISE(ABORT, 'this build cannot take it'); END",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let (good, bytes) = item("good");
+    apply(
+        &mut conn,
+        &codecs(),
+        &down("items", "e", 1, vec![(good, bytes), item("poison")]),
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM items")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(names, vec!["good".to_owned()]);
+    let reported = rejections(&mut conn, 10).await.unwrap();
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].reason.contains("cannot take it"));
+}
+
 async fn reported_up(conn: &mut Conn, rejected: &[envelope::Rejected]) {
     reported(conn, rejected).await.unwrap();
 }

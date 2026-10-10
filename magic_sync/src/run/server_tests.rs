@@ -273,9 +273,37 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
 
     BUGGY.set(false);
     let fixed = server().await.unwrap();
-    until(&[&fixed], || async { quarantined().await == 0 }).await;
+    // Sent and recorded, to both replicas.
+    let held = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sync.held")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    until(&[&fixed], || async { held().await == 4 }).await;
     BUGGY.set(true);
     assert_eq!(wire.items(a), ["fine", "poison"]);
+    // Out of the quarantine once each replica says it took it.
+    let (epoch, sent): (Uuid, Vec<(Uuid, i64)>) = (
+        sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        sqlx::query_as("SELECT replica_id, last_sequence FROM sync.replicas")
+            .fetch_all(&pool)
+            .await
+            .unwrap(),
+    );
+    for (replica, last) in sent {
+        let ack = crate::envelope::Up {
+            replica_id: replica.to_string(),
+            epoch: epoch.to_string(),
+            sequence: last as u64,
+            ..crate::envelope::Up::default()
+        };
+        fixed.receive(replica, &ack.encode_to_vec()).await.unwrap();
+    }
+    assert_eq!(quarantined().await, 0);
 }
 
 /// A relay whose lock's connection is gone cannot record what it sent: the
