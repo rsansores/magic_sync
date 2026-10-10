@@ -1550,3 +1550,127 @@ async fn a_change_owed_to_one_replica_outdates_no_other(pool: crate::DbPool) {
     assert_eq!(places[0].state, RowState::Holds);
     older.rollback().await.unwrap();
 }
+
+/// A change to a row the replica holds that is set aside (it does not
+/// encode) stays set aside however often the replica confirms what it holds:
+/// the version it confirms is the old one. Only the message that carries the
+/// change again, applied, lets it out.
+#[sqlx::test(migrations = false)]
+async fn a_change_set_aside_stays_set_aside_until_the_change_itself_is_applied(
+    pool: crate::DbPool,
+) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Fake::default();
+    let id = world.item("fine").await;
+    world.pass(&wire).await;
+    world.acknowledge(a, world.last_sent(a).await).await;
+
+    world
+        .exec(
+            "UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2",
+            id,
+            "poison",
+        )
+        .await;
+    world.pass(&wire).await;
+    let quarantined = "SELECT count(*) FROM sync.quarantine WHERE replica_id = $1";
+    let count = |replica: Uuid| {
+        let pool = world.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(quarantined)
+                .bind(replica)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count(a).await, 1);
+    world.acknowledge(a, world.last_sent(a).await).await;
+    assert_eq!(
+        count(a).await,
+        1,
+        "it confirmed the old version, not this one"
+    );
+    let overview = world.overview(Scope::Replicas(&[a])).await;
+    assert_eq!(overview.replicas[0].state, ReplicaState::AwaitingFix);
+
+    // The fix deployed: carried again, and applied.
+    BUGGY.set(false);
+    retry_quarantine(&mut world.pool.acquire().await.unwrap())
+        .await
+        .unwrap();
+    world.pass(&wire).await;
+    BUGGY.set(true);
+    assert_eq!(count(a).await, 1, "sent, not yet applied");
+    world.acknowledge(a, world.last_sent(a).await).await;
+    assert_eq!(count(a).await, 0);
+}
+
+/// A replica that is no longer live is no one's to wait for: its failures
+/// leave the health, which every read counts over live replicas only.
+#[sqlx::test(migrations = false)]
+async fn a_replica_retired_while_failing_leaves_the_health(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Fake::default();
+    wire.failing.lock().unwrap().insert(a, true);
+    world.item("one").await;
+    world.pass(&wire).await;
+    assert_eq!(world.overview(Scope::All).await.health.failing.total, 1);
+
+    sqlx::query("UPDATE fixture.t_replicas SET live = false WHERE id = $1")
+        .bind(a)
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let health = world.overview(Scope::All).await.health;
+    assert!(health.healthy, "{health:?}");
+}
+
+/// How long a replica has not answered runs from when it fell behind, or
+/// from its last confirmation that left it behind — not from the last thing
+/// it confirmed, days ago, before it was sent anything new.
+#[sqlx::test(migrations = false)]
+async fn waiting_runs_from_when_a_replica_fell_behind(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Fake::default();
+    world.item("one").await;
+    world.pass(&wire).await;
+    let first = world.last_sent(a).await;
+    let waiting = |replica: Uuid| {
+        let pool = world.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                "SELECT waiting_since FROM sync.replicas WHERE replica_id = $1",
+            )
+            .bind(replica)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert!(waiting(a).await.is_some(), "sent, not confirmed");
+    world.acknowledge(a, first).await;
+    assert!(waiting(a).await.is_none(), "caught up");
+
+    // Long quiet, then sent two messages; it confirms the first only.
+    sqlx::query("UPDATE sync.replicas SET applied_at = now() - interval '2 days'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.item("two").await;
+    world.pass(&wire).await;
+    let since = waiting(a).await.expect("behind again");
+    assert!(chrono::Utc::now() - since < chrono::Duration::minutes(1));
+    let overview = world.overview(Scope::Replicas(&[a])).await;
+    assert_eq!(overview.replicas[0].waiting_since, Some(since));
+    world.item("three").await;
+    world.pass(&wire).await;
+    world.acknowledge(a, world.last_sent(a).await - 1).await;
+    let moved = waiting(a).await.expect("still behind");
+    assert!(moved >= since, "its last confirmation restarts the wait");
+    world.acknowledge(a, world.last_sent(a).await).await;
+    assert!(waiting(a).await.is_none());
+}

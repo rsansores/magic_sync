@@ -65,10 +65,11 @@ const percent = (share: number) => `${Math.floor(share * 100)}%`
   <div class="msd">
     <p v-if="!summary || !banner" class="msd-muted">{{ t('loading') }}</p>
     <template v-else>
-      <section class="msd-banner" :data-mood="banner.mood" role="status">
+      <section class="msd-banner" :data-mood="banner.mood">
         <span class="msd-dot" aria-hidden="true" />
         <div>
-          <h2 class="msd-title">{{ banner.title }}</h2>
+          <!-- Announced when it changes; the lines under it tick every few seconds. -->
+          <h2 class="msd-title" role="status">{{ banner.title }}</h2>
           <p v-for="line in banner.lines" :key="line" class="msd-line">{{ line }}</p>
         </div>
       </section>
@@ -151,7 +152,13 @@ const percent = (share: number) => `${Math.floor(share * 100)}%`
             >
               {{ dash.stateLabel(state) }} {{ dash.count(summary.counts[state]) }}
             </button>
-            <input v-model="search" class="msd-input" type="search" :placeholder="t('search')" />
+            <input
+              v-model="search"
+              class="msd-input"
+              type="search"
+              :placeholder="t('search')"
+              :aria-label="t('search')"
+            />
           </div>
           <p v-if="shown.length === 0" class="msd-muted">{{ t('replica.none') }}</p>
           <ul class="msd-list">

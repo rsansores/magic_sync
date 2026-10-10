@@ -21,7 +21,7 @@ export interface SummaryOptions {
   label?: (table: string) => string | undefined
   /** Now, in milliseconds. */
   now: number
-  /** A replica that has not confirmed what it was sent for this long is not
+  /** A replica that has not moved on what it was sent for this long is not
    * answering (it is off, or out of reach). Default 15 minutes. */
   silentAfter?: number
   /** A change waiting this long to be sent means the engine is stuck.
@@ -119,8 +119,8 @@ function labelOf(options: Pick<SummaryOptions, 'label'>, table: string): string 
 
 function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
   const heardAt = at(r.applied_at)
-  const since = heardAt ?? at(r.sent_at)
-  const quiet = r.unconfirmed && since != null ? options.now - since : null
+  const waiting = at(r.waiting_since)
+  const quiet = waiting == null ? null : options.now - waiting
   const silentFor = quiet != null && quiet > (options.silentAfter ?? 15 * MINUTE) ? quiet : null
   const backlog = r.backlog && {
     unsent: r.backlog.tables.reduce((n, t) => n + t.unsent, 0),

@@ -115,6 +115,7 @@ CREATE TABLE sync.replicas (
     applied_epoch    UUID,
     applied_sequence BIGINT,
     applied_at       TIMESTAMPTZ,
+    waiting_since    TIMESTAMPTZ,
     backlog          JSONB,
     backlog_at       TIMESTAMPTZ
 );
@@ -122,6 +123,9 @@ CREATE TABLE sync.replicas (
 COMMENT ON TABLE sync.replicas IS
     'How sending to each replica is going: consecutive failures, when it is tried again, '
     'when it was last sent to, and the last message it acknowledged applying.';
+COMMENT ON COLUMN sync.replicas.waiting_since IS
+    'While it has messages it has not said it applied: since when it has not moved — the '
+    'first send it did not confirm, or the last confirmation that left it behind. NULL: caught up.';
 COMMENT ON COLUMN sync.replicas.backlog IS
     'What the replica last said it wrote and the server has not filed, per table '
     '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
@@ -138,12 +142,16 @@ CREATE TABLE sync.quarantine (
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempts   INTEGER     NOT NULL DEFAULT 1,
+    carried    BIGINT,
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
 COMMENT ON TABLE sync.quarantine IS
     'Rows a replica should hold and does not, for a reason a retry cannot change. Never '
     'repaired by hand: a deploy that fixes the cause lets the next retry through.';
+COMMENT ON COLUMN sync.quarantine.carried IS
+    'The message that carried the row again since it was set aside: once the replica says it '
+    'applied it, the row leaves the quarantine. NULL: not carried since.';
 
 -- Rows a replica uploaded that the server could not file, kept as they came:
 -- the replica may have let go of them since. Filed again on a timer and when
@@ -158,6 +166,8 @@ CREATE TABLE sync.inbox (
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempts   INTEGER     NOT NULL DEFAULT 1
 );
+
+CREATE INDEX inbox_replica ON sync.inbox (replica_id);
 
 COMMENT ON TABLE sync.inbox IS
     'Rows replicas uploaded that the server could not file for a reason a retry cannot '

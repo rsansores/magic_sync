@@ -584,3 +584,101 @@ async fn a_json_table_is_applied_like_any_other(pool: crate::DbPool) {
         .unwrap();
     assert_eq!(names(&mut conn).await, vec!["as json"]);
 }
+
+/// A replica does not confirm a message while refusals of it are still to
+/// report: the server would take the refused rows for applied.
+#[sqlx::test(migrations = false)]
+async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = codecs();
+    let lanes = [Lane {
+        name: "main",
+        tables: &[],
+    }];
+    let settings = Outbox {
+        rejections: 1,
+        ..Outbox::default()
+    };
+    let me = Uuid::now_v7();
+    let broken = |name: &str| {
+        let (id, bytes) = item(name);
+        (id, bytes[..3].to_vec())
+    };
+    apply(
+        &mut conn,
+        &codecs,
+        &down("items", "e", 7, vec![broken("one"), broken("two")]),
+    )
+    .await
+    .unwrap();
+
+    let first = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("a refusal to report");
+    assert_eq!((first.up.rejected.len(), first.up.sequence), (1, 0));
+    delivered(&mut conn, &first).await.unwrap();
+    let last = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("the other refusal, and the confirmation");
+    assert_eq!((last.up.rejected.len(), last.up.sequence), (1, 7));
+}
+
+/// A backlog that is not empty is said again now and then, unchanged, and
+/// at once to a server installed again: either may have lost it.
+#[sqlx::test(migrations = false)]
+async fn a_backlog_not_empty_is_said_again(pool: crate::DbPool) {
+    let mut conn = replica(&pool).await;
+    let codecs = codecs();
+    let lanes = [
+        Lane {
+            name: "main",
+            tables: &[],
+        },
+        Lane {
+            name: "fast",
+            tables: &["items"],
+        },
+    ];
+    let mut settings = Outbox::default();
+    let me = Uuid::now_v7();
+    sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', 'k')")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("it starts");
+    delivered(&mut conn, &main).await.unwrap();
+    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .is_none());
+
+    settings.backlog_every = std::time::Duration::ZERO;
+    let again = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("unchanged, said again");
+    assert!(again.up.backlog.is_some());
+    delivered(&mut conn, &again).await.unwrap();
+
+    settings.backlog_every = std::time::Duration::from_secs(3600);
+    apply(&mut conn, &codecs, &down("items", "first", 1, vec![]))
+        .await
+        .unwrap();
+    apply(
+        &mut conn,
+        &codecs,
+        &down("items", "installed again", 1, vec![]),
+    )
+    .await
+    .unwrap();
+    let told = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+        .await
+        .unwrap()
+        .expect("a new server hears it");
+    assert!(told.up.backlog.is_some());
+}

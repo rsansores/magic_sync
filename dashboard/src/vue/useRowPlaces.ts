@@ -44,5 +44,11 @@ export function useRowPlaces(options: RowPlacesOptions) {
       }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })),
   )
-  return { rows, nowhere: computed(() => t('row.nowhere')), t }
+  return {
+    rows,
+    /** The answer has not come yet: `places` is null. */
+    loading: computed(() => toValue(options.places) == null),
+    nowhere: computed(() => t('row.nowhere')),
+    t,
+  }
 }

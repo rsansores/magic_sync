@@ -353,8 +353,10 @@ should be. Per replica, one state:
 | `awaiting_fix` | something is set aside for it until a fix: a row in quarantine, a parked note, an upload in the inbox |
 
 It never counts the rows a replica should hold: it reads only what the engine
-records, so it costs the same for a fleet as for one replica, and it is exact
-all the same. A change a replica lacks is in one of three places — a note not
+records, so it costs little for a fleet — a few milliseconds for 200 replicas
+holding 3 million rows, while they are caught up; the rows still on their way
+are counted one by one, about a fifth of a second when every replica has all
+of them unconfirmed — and it is exact all the same. A change a replica lacks is in one of three places — a note not
 yet planned, a message it has not confirmed, or set aside — and each is
 recorded. Per table, the same figures over the scope's replicas say which
 tables are not where they should be yet.
@@ -415,7 +417,8 @@ They rest on:
   messages in order and does not deliver the next one until the previous one
   is acknowledged. With NATS JetStream, that is a durable pull consumer with
   `max_ack_pending = 1`. Without this, a failed message could be retried after
-  the ones behind it.
+  the ones behind it. The way up is the same, per lane: a replica's uploads
+  reach the server in the order it sent them.
 - **Transactions.** `prepare` and `file` run in a transaction (they use
   savepoints); `apply` runs in one so a message applies whole or not at all.
 - **A monotonic version column**, if tables have one: the server must stamp it

@@ -45,8 +45,9 @@ system with one answers for the caller instead: a customer's partition
 untouched, and the dashboard of the same version reads them.
 
 > **What happens:** the overview reads only what the engine records, so it
-> answers in a few milliseconds for hundreds of replicas, and the page can ask
-> every second or two. Progress counts what one replica should hold: ask it
+> answers in milliseconds for hundreds of replicas that are caught up — a
+> fifth of a second at worst, while a whole fleet has rows on their way — and
+> the page can ask every few seconds. Progress counts what one replica should hold: ask it
 > for the one being looked at, not for the fleet.
 
 ## The page
@@ -66,12 +67,15 @@ import 'magic_sync_dashboard/styles.css'
 const overview = ref<Overview | null>(null)
 const progress = ref<ReplicaProgress | null>(null)
 const selected = ref<string | null>(null)
-setInterval(async () => {
+// Ask again a moment after each answer, never two at a time.
+async function poll() {
   overview.value = await (await fetch('/api/sync/overview')).json()
   progress.value = selected.value
     ? await (await fetch(`/api/sync/progress/${selected.value}`)).json()
     : null
-}, 1000)
+  setTimeout(poll, 2000)
+}
+poll()
 </script>
 
 <template>

@@ -14,7 +14,7 @@ const props = defineProps<{
   messages?: Messages
 }>()
 
-const { rows, nowhere } = useRowPlaces({
+const { rows, loading, nowhere, t } = useRowPlaces({
   places: () => props.places,
   names: () => props.names,
   locale: () => props.locale,
@@ -24,7 +24,8 @@ const { rows, nowhere } = useRowPlaces({
 
 <template>
   <div class="msd">
-    <p v-if="rows.length === 0" class="msd-muted">{{ nowhere }}</p>
+    <p v-if="loading" class="msd-muted">{{ t('row.loading') }}</p>
+    <p v-else-if="rows.length === 0" class="msd-muted">{{ nowhere }}</p>
     <ul v-else class="msd-list">
       <li v-for="r in rows" :key="r.replica" class="msd-place">
         <span class="msd-name">{{ r.name }}</span>

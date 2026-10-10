@@ -236,9 +236,14 @@ A replica **may** say what it wrote and the server has not filed yet, in
 `Up.backlog`: per table, rows not sent yet (`unsent`) and rows sent and not
 yet `Filed` (`unfiled`). The server keeps the last one it was told, with the
 time, and shows the replica as catching up while it is not empty. Say it
-when it changes — at once when it empties — and not on every write; an `Up`
-without `backlog` leaves the last one standing. A replica that never says
-leaves the server with nothing to show, and nothing breaks.
+when it changes — at once when it empties — and not on every write; say it
+again now and then while it is not empty, and to a server whose epoch
+changed, either of which may have lost it. An `Up` without `backlog` leaves
+the last one standing. A replica that never says leaves the server with
+nothing to show, and nothing breaks.
+
+A replica's `Up`s on one lane reach the server in the order it sent them: the
+backlog an earlier one carried must not arrive after a later one's.
 
 One `Up` may carry several of these at once: rows, rejections, digests, the
 backlog, and the last applied message.

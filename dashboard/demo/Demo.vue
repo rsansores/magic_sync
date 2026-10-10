@@ -42,11 +42,12 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     retry_at: null,
     sent_at: ago(3 + i),
     applied_at: ago(3 + i),
+    waiting_since: null,
     backlog: null,
   }
   if (scenario === 'healthy') return base
-  if (i % 5 === 1) return { ...base, state: 'catching_up', unconfirmed: true, applied_at: ago(2) }
-  if (i === 4) return { ...base, state: 'catching_up', unconfirmed: true, applied_at: ago(190) }
+  if (i % 5 === 1) return { ...base, state: 'catching_up', unconfirmed: true, waiting_since: ago(1) }
+  if (i === 4) return { ...base, state: 'catching_up', unconfirmed: true, waiting_since: ago(190) }
   if (i === 7)
     return {
       ...base,

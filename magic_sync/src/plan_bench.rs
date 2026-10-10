@@ -1,7 +1,8 @@
 //! What the engine costs on the operations that move many rows at once, on the
-//! schema the engine's tests use. Ignored by default; `just bench-mirror` runs
-//! them and prints the timings. Each measures the database work of planning
-//! and recording — what the relay does besides encoding and publishing.
+//! schema the engine's tests use. Ignored by default; the command in
+//! CONTRIBUTING.md runs them and prints the timings. Most measure the database
+//! work of planning and recording — what the relay does besides encoding and
+//! publishing — and one what a dashboard's reads cost.
 
 use super::plan_tests::{tables, REPLICAS, SCHEMA};
 use super::*;
@@ -150,7 +151,7 @@ async fn assign(conn: &mut Conn, partition: Uuid, list: Uuid, replica: Uuid) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_list_of_20k_given_to_a_unit(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let list = list_of(&mut conn, partition, 20_000).await;
@@ -163,7 +164,7 @@ async fn bench_a_list_of_20k_given_to_a_unit(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_list_of_10k_swapped_for_one_of_8k(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let old = list_of(&mut conn, partition, 10_000).await;
@@ -184,7 +185,7 @@ async fn bench_a_list_of_10k_swapped_for_one_of_8k(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_10k_products_imported_for_100_units(pool: crate::DbPool) {
     let (mut conn, engine, partition, _) = fleet(&pool, 100).await;
     sqlx::query(
@@ -201,7 +202,7 @@ async fn bench_10k_products_imported_for_100_units(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let list = list_of(&mut conn, partition, 10_000).await;
@@ -225,7 +226,7 @@ async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 10).await;
     let list = Uuid::now_v7();
@@ -259,7 +260,7 @@ async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbP
 }
 
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
     let (mut conn, engine, partition, _) = fleet(&pool, 4000).await;
     sqlx::query(
@@ -278,7 +279,7 @@ async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
 /// What a dashboard costs over a partition of 200 replicas holding 3M rows
 /// between them: the overview, against counting what each should hold.
 #[sqlx::test(migrations = false)]
-#[ignore = "a benchmark: just bench-mirror"]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool) {
     use crate::status::Scope;
     let (mut conn, engine, partition, replicas) = fleet(&pool, 200).await;

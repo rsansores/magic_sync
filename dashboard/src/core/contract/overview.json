@@ -73,7 +73,8 @@
       "sent_at": "2026-01-01T00:00:00Z",
       "state": "synced",
       "unconfirmed": false,
-      "unfiled": 0
+      "unfiled": 0,
+      "waiting_since": null
     },
     {
       "applied_at": "2026-01-01T00:00:00Z",
@@ -89,7 +90,8 @@
       "sent_at": "2026-01-01T00:00:00Z",
       "state": "awaiting_fix",
       "unconfirmed": false,
-      "unfiled": 1
+      "unfiled": 1,
+      "waiting_since": null
     },
     {
       "applied_at": null,
@@ -114,7 +116,8 @@
       "sent_at": "2026-01-01T00:00:00Z",
       "state": "catching_up",
       "unconfirmed": true,
-      "unfiled": 0
+      "unfiled": 0,
+      "waiting_since": "2026-01-01T00:00:00Z"
     },
     {
       "applied_at": null,
@@ -130,7 +133,8 @@
       "sent_at": null,
       "state": "unreachable",
       "unconfirmed": false,
-      "unfiled": 0
+      "unfiled": 0,
+      "waiting_since": null
     }
   ],
   "tables": [

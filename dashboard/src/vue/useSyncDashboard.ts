@@ -5,7 +5,7 @@
 // It reads nothing itself: the host fetches the engine's answers (from its
 // own handlers, behind its own auth) and passes them in.
 
-import { computed, onScopeDispose, ref, toValue, type MaybeRefOrGetter } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, ref, toValue, type MaybeRefOrGetter } from 'vue'
 import { progressOf, summarize, type Problem, type ReplicaRow, type TableRow } from '../core/derive'
 import { count, since, until } from '../core/format'
 import type { Overview, ReplicaId, ReplicaProgress, ReplicaState } from '../core/types'
@@ -43,10 +43,13 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
     () => toValue(options.locale),
     () => toValue(options.messages),
   )
-  // Relative times move on by themselves.
+  // Relative times move on by themselves, for as long as whatever called
+  // this lives.
   const now = ref(Date.now())
-  const timer = setInterval(() => (now.value = Date.now()), 15_000)
-  onScopeDispose(() => clearInterval(timer))
+  if (getCurrentScope()) {
+    const timer = setInterval(() => (now.value = Date.now()), 15_000)
+    onScopeDispose(() => clearInterval(timer))
+  }
 
   const name = (replica: ReplicaId) => lookup(toValue(options.names), replica)
   const label = (table: string) => lookup(toValue(options.labels), table)

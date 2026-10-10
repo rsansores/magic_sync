@@ -59,7 +59,7 @@ describe('summarize', () => {
     expect([stuck.mood, stuck.stuck]).toEqual(['attention', true])
   })
 
-  it('says a replica is not answering once it has not confirmed for long', () => {
+  it('says a replica is not answering once it has not moved for long', () => {
     const silent = (now: number) =>
       summarize(overview, { ...options, now }).replicas.find((r) => r.name === 'Silent')!
     expect(silent(AT + 5 * MINUTE).silentFor).toBeNull()
@@ -67,6 +67,22 @@ describe('summarize', () => {
     expect(summarize(overview, { ...options, now: AT + 20 * MINUTE, silentAfter: 30 * MINUTE }).silent).toBe(
       0,
     )
+  })
+
+  it('does not call a replica silent for the days it had nothing to confirm', () => {
+    const DAY = 24 * 60 * MINUTE
+    const quiet = {
+      ...overview,
+      replicas: overview.replicas.map((r) =>
+        r.replica === id(5)
+          ? { ...r, applied_at: new Date(AT - 2 * DAY).toISOString(), waiting_since: '2026-01-01T00:00:00Z' }
+          : r,
+      ),
+    }
+    const silent = summarize(quiet, { ...options, now: AT + 5_000 }).replicas.find(
+      (r) => r.name === 'Silent',
+    )!
+    expect(silent.silentFor).toBeNull()
   })
 
   it('sums what a replica said it wrote and the server has not filed', () => {

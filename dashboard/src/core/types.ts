@@ -43,6 +43,10 @@ export interface ReplicaOverview {
   retry_at: Timestamp | null
   sent_at: Timestamp | null
   applied_at: Timestamp | null
+  /** While it has messages it has not said it applied: since when it has not
+   * moved — the first one it did not confirm, or its last confirmation that
+   * left it behind. */
+  waiting_since: Timestamp | null
   backlog: Backlog | null
 }
 

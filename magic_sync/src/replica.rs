@@ -296,12 +296,21 @@ async fn newer(conn: &mut Conn, epoch: &str, sequence: u64) -> Result<bool, Erro
         sqlx::query_as("SELECT epoch, sequence FROM sync_applied WHERE id = 1")
             .fetch_optional(&mut *conn)
             .await?;
-    if last.is_some_and(|(e, s)| e == epoch && sequence <= s) {
+    if last
+        .as_ref()
+        .is_some_and(|(e, s)| e == epoch && sequence <= *s)
+    {
         tracing::info!(
             sequence,
             "sync: a message at or below the last applied — nothing to do"
         );
         return Ok(false);
+    }
+    // A server installed again knows nothing it was told: say it again.
+    if last.is_some_and(|(e, _)| e != epoch) {
+        sqlx::query("DELETE FROM sync_backlog")
+            .execute(&mut *conn)
+            .await?;
     }
     sqlx::query(
         "INSERT INTO sync_applied (id, epoch, sequence) VALUES (1, $1, $2) \
@@ -711,9 +720,10 @@ pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
     .await?)
 }
 
-/// The backlog to tell the server, when it changed since it was last told:
+/// The backlog to tell the server: when it changed since it was last told —
 /// with a message going anyway, when it empties or starts, or when the last
-/// time is `backlog_every` ago.
+/// time is `backlog_every` ago — and, while it is not empty, every
+/// `backlog_every` even unchanged.
 async fn backlog_due(
     conn: &mut Conn,
     settings: &Outbox,
@@ -728,12 +738,16 @@ async fn backlog_due(
         Some((backlog, at)) => (Some(backlog.0), at),
         None => (None, 0),
     };
-    if before.as_ref() == Some(&now) {
-        return Ok(None);
-    }
-    let edge = now.is_empty() || before.as_ref().is_none_or(Vec::is_empty);
     let every = i64::try_from(settings.backlog_every.as_secs()).unwrap_or(i64::MAX);
-    let due = sending || edge || chrono::Utc::now().timestamp() - at >= every;
+    let stale = chrono::Utc::now().timestamp() - at >= every;
+    let due = if before.as_ref() == Some(&now) {
+        // Unchanged: said again now and then while not empty, should the
+        // server have lost it.
+        !now.is_empty() && stale
+    } else {
+        let edge = now.is_empty() || before.as_ref().is_none_or(Vec::is_empty);
+        sending || edge || stale
+    };
     Ok(due.then(|| envelope::Backlog {
         tables: now
             .into_iter()
@@ -792,7 +806,8 @@ pub struct Outbox {
     /// Rejections per message.
     pub rejections: i64,
     /// How often, at most, the replica tells the server its backlog while it
-    /// grows; it says at once when it empties, or starts.
+    /// grows — and how often it says it again, unchanged, while it is not
+    /// empty; it says at once when it empties, or starts.
     pub backlog_every: std::time::Duration,
 }
 
@@ -871,7 +886,13 @@ pub async fn outbox<P: Sync + 'static>(
         upload(conn, codecs, replica, &notes).await?
     };
     if lane == 0 {
-        up.rejected = rejections(conn, settings.rejections).await?;
+        // One over the cap says whether this message reports them all: the
+        // server must hear of a refusal before the message it refused is
+        // confirmed, or it would take the refused row for applied.
+        let mut rejected = rejections(conn, settings.rejections + 1).await?;
+        let all_reported = rejected.len() as i64 <= settings.rejections;
+        rejected.truncate(usize::try_from(settings.rejections).unwrap_or(usize::MAX));
+        up.rejected = rejected;
         if digests {
             up.digests = self::digests(conn, codecs, replica).await?.digests;
         }
@@ -879,7 +900,7 @@ pub async fn outbox<P: Sync + 'static>(
             sqlx::query_as("SELECT epoch, sequence, acknowledged FROM sync_applied WHERE id = 1")
                 .fetch_optional(&mut *conn)
                 .await?;
-        if let Some((epoch, sequence, acknowledged)) = applied {
+        if let (Some((epoch, sequence, acknowledged)), true) = (applied, all_reported) {
             // The last applied goes with digests always (they are compared
             // against it), and otherwise when the server has not heard of it.
             if sequence > acknowledged || !up.digests.is_empty() {

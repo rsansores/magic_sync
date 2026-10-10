@@ -375,6 +375,19 @@ impl<P: Sync + 'static> Relay<'_, P> {
         .bind(&sequences)
         .execute(&mut *conn)
         .await?;
+        // A row set aside, carried again: the message that carries it is the
+        // one whose application lets it out.
+        sqlx::query(
+            "UPDATE sync.quarantine q SET carried = u.s \
+               FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) AS u(r, t, k, s) \
+              WHERE q.replica_id = u.r AND q.relation = u.t AND q.row_key = u.k",
+        )
+        .bind(&replicas)
+        .bind(&tables)
+        .bind(&keys)
+        .bind(&sequences)
+        .execute(&mut *conn)
+        .await?;
         for (id, why) in &outcome.parked {
             sqlx::query(
                 "UPDATE sync.notes SET parked_at = now(), attempts = attempts + 1, last_error = $2 \
@@ -404,11 +417,12 @@ impl<P: Sync + 'static> Relay<'_, P> {
             .map(|(replica, sequence)| (replica, i64::try_from(sequence).unwrap_or(i64::MAX)))
             .unzip();
         sqlx::query(
-            "INSERT INTO sync.replicas AS r (replica_id, last_sent_at, last_sequence) \
-             SELECT r, now(), s FROM unnest($1::uuid[], $2::bigint[]) AS u(r, s) \
+            "INSERT INTO sync.replicas AS r (replica_id, last_sent_at, last_sequence, waiting_since) \
+             SELECT r, now(), s, now() FROM unnest($1::uuid[], $2::bigint[]) AS u(r, s) \
              ON CONFLICT (replica_id) DO UPDATE SET \
                failures = 0, retry_after = NULL, last_error = NULL, last_sent_at = now(), \
-               last_sequence = EXCLUDED.last_sequence",
+               last_sequence = EXCLUDED.last_sequence, \
+               waiting_since = coalesce(r.waiting_since, now())",
         )
         .bind(&sent_to)
         .bind(&last)
@@ -447,7 +461,7 @@ pub async fn rejected(
             "INSERT INTO sync.quarantine AS q (replica_id, relation, row_key, reason) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET \
-               reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1",
+               reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1, carried = NULL",
         )
         .bind(replica)
         .bind(&row.table)
@@ -484,7 +498,9 @@ pub async fn acknowledge(
          SELECT $1, $2, $3, now() FROM sync.epoch e WHERE e.epoch = $2 \
          ON CONFLICT (replica_id) DO UPDATE SET \
            applied_epoch = EXCLUDED.applied_epoch, applied_sequence = EXCLUDED.applied_sequence, \
-           applied_at = now() \
+           applied_at = now(), \
+           waiting_since = CASE WHEN EXCLUDED.applied_sequence >= coalesce(r.last_sequence, 0) \
+                                THEN NULL ELSE now() END \
          WHERE r.applied_epoch IS DISTINCT FROM EXCLUDED.applied_epoch \
             OR r.applied_sequence IS NULL OR r.applied_sequence < EXCLUDED.applied_sequence",
     )
@@ -493,14 +509,13 @@ pub async fn acknowledge(
     .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
     .execute(&mut *conn)
     .await?;
-    // A row set aside for it leaves the quarantine once it confirms holding
-    // it, not when it is sent again: it may refuse it again.
+    // A row set aside for it leaves the quarantine once it applied the
+    // message that carried it again — not when it is sent: it may refuse it
+    // again, and an older version it applied says nothing of this one.
     sqlx::query(
-        "DELETE FROM sync.quarantine q USING sync.held h, sync.replicas r \
-          WHERE q.replica_id = $1 AND h.replica_id = q.replica_id \
-            AND h.relation = q.relation AND h.row_key = q.row_key \
-            AND r.replica_id = q.replica_id AND r.applied_epoch = $2 \
-            AND h.sequence <= r.applied_sequence",
+        "DELETE FROM sync.quarantine q USING sync.replicas r \
+          WHERE q.replica_id = $1 AND r.replica_id = q.replica_id AND r.applied_epoch = $2 \
+            AND q.carried <= r.applied_sequence",
     )
     .bind(replica)
     .bind(epoch)
@@ -721,7 +736,7 @@ async fn quarantine(conn: &mut Conn, unsent: &[Unsent]) -> Result<(), Error> {
             "INSERT INTO sync.quarantine AS q (replica_id, relation, row_key, reason) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET \
-               reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1",
+               reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1, carried = NULL",
         )
         .bind(row.replica)
         .bind(row.table)

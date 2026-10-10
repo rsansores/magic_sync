@@ -130,6 +130,10 @@ pub struct ReplicaOverview {
     /// When it was last sent a message, and when it last said it applied one.
     pub sent_at: Option<DateTime<Utc>>,
     pub applied_at: Option<DateTime<Utc>>,
+    /// While it has messages it has not said it applied: since when it has
+    /// not moved — the first one it did not confirm, or its last confirmation
+    /// that left it behind. How long a replica has not answered.
+    pub waiting_since: Option<DateTime<Utc>>,
     /// What it last said it wrote and the server has not filed, per table:
     /// `None` until it says.
     pub backlog: Option<Backlog>,
@@ -593,23 +597,21 @@ impl Engine {
             .await?,
         };
         let ids = scoped.ids();
-        // Every replica's, when the scope is all of them: a row may wait for
-        // one that is no longer live.
-        let mine = "($1 OR replica_id = ANY($2))";
+        // Live replicas only, as every read: one that is no longer sent to
+        // is no one's to wait for.
+        let mine = "replica_id = ANY($1)";
         let quarantine = Listed {
             total: sqlx::query_scalar(&format!(
                 "SELECT count(*) FROM sync.quarantine WHERE {mine}"
             ))
-            .bind(scoped.all)
             .bind(&ids)
             .fetch_one(&mut *conn)
             .await?,
             first: sqlx::query_as(&format!(
                 "SELECT replica_id AS replica, relation AS table, row_key AS key, reason, \
                         first_at, last_at, attempts \
-                   FROM sync.quarantine WHERE {mine} ORDER BY first_at LIMIT $3"
+                   FROM sync.quarantine WHERE {mine} ORDER BY first_at LIMIT $2"
             ))
-            .bind(scoped.all)
             .bind(&ids)
             .bind(limit)
             .fetch_all(&mut *conn)
@@ -617,16 +619,14 @@ impl Engine {
         };
         let inbox = Listed {
             total: sqlx::query_scalar(&format!("SELECT count(*) FROM sync.inbox WHERE {mine}"))
-                .bind(scoped.all)
                 .bind(&ids)
                 .fetch_one(&mut *conn)
                 .await?,
             first: sqlx::query_as(&format!(
                 "SELECT id, replica_id AS replica, relation AS table, reason, \
                         first_at, last_at, attempts \
-                   FROM sync.inbox WHERE {mine} ORDER BY id LIMIT $3"
+                   FROM sync.inbox WHERE {mine} ORDER BY id LIMIT $2"
             ))
-            .bind(scoped.all)
             .bind(&ids)
             .bind(limit)
             .fetch_all(&mut *conn)
@@ -636,16 +636,14 @@ impl Engine {
             total: sqlx::query_scalar(&format!(
                 "SELECT count(*) FROM sync.replicas WHERE failures > 0 AND {mine}"
             ))
-            .bind(scoped.all)
             .bind(&ids)
             .fetch_one(&mut *conn)
             .await?,
             first: sqlx::query_as(&format!(
                 "SELECT replica_id AS replica, failures, last_error, retry_after AS retry_at \
                    FROM sync.replicas WHERE failures > 0 AND {mine} \
-                  ORDER BY failures DESC, replica_id LIMIT $3"
+                  ORDER BY failures DESC, replica_id LIMIT $2"
             ))
-            .bind(scoped.all)
             .bind(&ids)
             .bind(limit)
             .fetch_all(&mut *conn)
@@ -681,6 +679,7 @@ impl Engine {
             bool,
             Option<serde_json::Value>,
             Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
             i64,
             i64,
         );
@@ -689,12 +688,15 @@ impl Engine {
                     coalesce(r.last_sequence IS NOT NULL \
                              AND (r.applied_epoch IS DISTINCT FROM e.epoch \
                                   OR coalesce(r.applied_sequence, 0) < r.last_sequence), false), \
-                    r.backlog, r.backlog_at, \
-                    (SELECT count(*) FROM sync.quarantine q WHERE q.replica_id = s.id), \
-                    (SELECT count(*) FROM sync.inbox i WHERE i.replica_id = s.id) \
+                    r.backlog, r.backlog_at, r.waiting_since, \
+                    coalesce(q.n, 0), coalesce(i.n, 0) \
                FROM unnest($1::uuid[]) AS s(id) \
                LEFT JOIN sync.replicas r ON r.replica_id = s.id \
                LEFT JOIN sync.epoch e ON true \
+               LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.quarantine \
+                           WHERE replica_id = ANY($1) GROUP BY 1) q ON q.replica_id = s.id \
+               LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.inbox \
+                           WHERE replica_id = ANY($1) GROUP BY 1) i ON i.replica_id = s.id \
               ORDER BY s.id",
         )
         .bind(scoped.ids())
@@ -714,6 +716,7 @@ impl Engine {
                     unconfirmed,
                     backlog,
                     backlog_at,
+                    waiting_since,
                     quarantined,
                     unfiled,
                 )| {
@@ -728,9 +731,13 @@ impl Engine {
                             .sum()
                     };
                     let backlog = match (backlog, backlog_at) {
-                        (Some(tables), Some(at)) => serde_json::from_value(tables)
-                            .ok()
-                            .map(|tables| Backlog { tables, at }),
+                        (Some(tables), Some(at)) => match serde_json::from_value(tables) {
+                            Ok(tables) => Some(Backlog { tables, at }),
+                            Err(e) => {
+                                tracing::warn!(%replica, "sync: a backlog this build cannot read: {e}");
+                                None
+                            }
+                        },
                         _ => None,
                     };
                     let mut overview = ReplicaOverview {
@@ -747,6 +754,7 @@ impl Engine {
                         retry_at,
                         sent_at,
                         applied_at,
+                        waiting_since: waiting_since.filter(|_| unconfirmed),
                         backlog,
                     };
                     overview.settle();
