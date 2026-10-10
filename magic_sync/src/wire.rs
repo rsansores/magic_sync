@@ -42,36 +42,35 @@ impl<P: Sync + 'static> Codec<P> {
                 encode: Box::new(move |row: R| {
                     to(row)
                         .map(|m| m.encode_to_vec())
-                        .map_err(|e| mapping(R::TABLE, e))
+                        .map_err(|e| Error::Misuse(format!("`{}` does not encode: {e}", R::TABLE)))
                 }),
                 decode: Box::new(move |bytes: &[u8]| {
-                    let message = M::decode(bytes)
-                        .map_err(|e| Error::Misuse(format!("`{}` on the wire: {e}", R::TABLE)))?;
-                    from(message).map_err(|e| mapping(R::TABLE, e))
+                    let message = M::decode(bytes).map_err(|e| malformed(R::TABLE, e))?;
+                    from(message).map_err(|e| malformed(R::TABLE, e))
                 }),
                 place,
             }),
         }
     }
 
-    /// A table that travels as JSON: its row type's own serde shape, with no
-    /// message of its own to declare. For a replica in another language, a
-    /// row is a JSON object of its columns.
+    /// A table that travels as JSON, with no message of its own to declare:
+    /// a row is an object of its columns, keyed by their names, each value as
+    /// the field's serde writes it — but a 64-bit integer as its decimal text,
+    /// which a JSON number would round past 2^53 for a replica that reads
+    /// numbers as doubles. A field serde names otherwise than itself does not
+    /// encode.
     pub fn json<R>(place: Option<Place<R, P>>) -> Self
     where
         R: Row + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned,
     {
+        let table = Table::of::<R>();
+        let columns = table.columns.clone();
+        let columns_back = table.columns.clone();
         Self {
-            table: Table::of::<R>(),
+            table,
             ops: Box::new(Typed {
-                encode: Box::new(|row: R| {
-                    serde_json::to_vec(&row)
-                        .map_err(|e| Error::Misuse(format!("`{}` as JSON: {e}", R::TABLE)))
-                }),
-                decode: Box::new(|bytes: &[u8]| {
-                    serde_json::from_slice(bytes)
-                        .map_err(|e| Error::Misuse(format!("`{}` as JSON: {e}", R::TABLE)))
-                }),
+                encode: Box::new(move |row: R| json_encode(R::TABLE, &columns, &row)),
+                decode: Box::new(move |bytes: &[u8]| json_decode(R::TABLE, &columns_back, bytes)),
                 place,
             }),
         }
@@ -80,12 +79,14 @@ impl<P: Sync + 'static> Codec<P> {
     /// A key of this table from its parts' text, as its key columns type them.
     pub fn key(&self, parts: &[String]) -> Result<Key, Error> {
         if parts.len() != self.table.key.len() {
-            return Err(Error::Misuse(format!(
-                "`{}` is keyed by {:?}, not {} parts",
-                self.table.name,
-                self.table.key,
-                parts.len()
-            )));
+            return Err(Error::Malformed {
+                table: self.table.name.to_owned(),
+                reason: format!(
+                    "a key of {} parts, and the table is keyed by {:?}",
+                    parts.len(),
+                    self.table.key
+                ),
+            });
         }
         self.table
             .key
@@ -98,7 +99,10 @@ impl<P: Sync + 'static> Codec<P> {
                     .iter()
                     .find(|c| c.name == *name)
                     .expect("a key column is a column");
-                crate::row::KeyPart::parse(column, part)
+                KeyPart::parse(column, part).ok_or_else(|| Error::Malformed {
+                    table: self.table.name.to_owned(),
+                    reason: format!("`{part}` is not a value of the key column `{name}`"),
+                })
             })
             .collect()
     }
@@ -137,11 +141,13 @@ impl<P: Sync + 'static> Codec<P> {
     }
 
     /// A replica letting rows go: deleted, or retired where a row of its own
-    /// still points at them.
+    /// still points at them, or refused one by one ([`row::retire_by_keys`]).
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     pub fn retire<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, row::Retired> {
         self.ops.retire(conn, keys)
     }
 
+    /// Every key this side holds.
     pub fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
         self.ops.keys(conn)
     }
@@ -149,6 +155,16 @@ impl<P: Sync + 'static> Codec<P> {
     /// Every key this side holds that is not retired.
     pub fn live_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
         self.ops.live_keys(conn)
+    }
+
+    /// Whether the server sends this table's rows down.
+    pub fn sent_down(&self) -> bool {
+        matches!(self.table.mirror, Mirror::Catalog | Mirror::Both)
+    }
+
+    /// Whether a replica's writes to this table go up.
+    pub fn goes_up(&self) -> bool {
+        matches!(self.table.mirror, Mirror::Record | Mirror::Both)
     }
 
     /// Where the replica sits in this table's key: only a table keyed by it
@@ -218,8 +234,18 @@ type Placed<T> = Vec<(usize, T)>;
 #[derive(Debug, Default)]
 pub struct Taken {
     pub held: Vec<Key>,
-    /// The rows it could not take, by their place in the message, with why.
-    pub rejected: Placed<String>,
+    /// The rows it could not take.
+    pub rejected: Vec<Refused>,
+}
+
+/// A row of a message a side could not take.
+#[derive(Debug)]
+pub struct Refused {
+    /// Its place in the message's rows.
+    pub at: usize,
+    /// Its key, read off the row: `None` when the row does not decode.
+    pub key: Option<Key>,
+    pub reason: String,
 }
 
 /// Rows as [`Codec::load`] read them: encoded, and the ones that did not
@@ -240,6 +266,7 @@ trait Ops<P>: Send + Sync {
         sender: Uuid,
         known: &'a P,
     ) -> Fut<'a, Taken>;
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     fn retire<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, row::Retired>;
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     fn forget<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64>;
@@ -269,8 +296,71 @@ struct Typed<R, P> {
     place: Option<Place<R, P>>,
 }
 
-fn mapping(table: &str, e: magic_map::MappingError) -> Error {
-    Error::Misuse(format!("`{table}` on the wire: {e}"))
+fn malformed(table: &str, e: impl std::fmt::Display) -> Error {
+    Error::Malformed {
+        table: table.to_owned(),
+        reason: format!("a row that does not decode: {e}"),
+    }
+}
+
+/// A row as [`Codec::json`] writes it: its columns by name, a 64-bit integer
+/// as text.
+pub(crate) fn json_encode<R: serde::Serialize>(
+    table: &str,
+    columns: &[row::Column],
+    row: &R,
+) -> Result<Vec<u8>, Error> {
+    use serde_json::Value;
+    let misuse = |why: String| Error::Misuse(format!("`{table}` as JSON: {why}"));
+    let Value::Object(mut fields) = serde_json::to_value(row).map_err(|e| misuse(e.to_string()))?
+    else {
+        return Err(misuse("serde does not write the row as an object".into()));
+    };
+    let mut out = serde_json::Map::new();
+    for column in columns {
+        let value = fields.remove(column.field).ok_or_else(|| {
+            misuse(format!(
+                "serde does not write the field `{}` by its name",
+                column.field
+            ))
+        })?;
+        let value = match (column.wire, value) {
+            (row::Wire::Int64, Value::Number(n)) => Value::String(n.to_string()),
+            (_, value) => value,
+        };
+        out.insert(column.name.to_owned(), value);
+    }
+    serde_json::to_vec(&Value::Object(out)).map_err(|e| misuse(e.to_string()))
+}
+
+/// A row [`json_encode`] wrote, read back.
+fn json_decode<R: serde::de::DeserializeOwned>(
+    table: &str,
+    columns: &[row::Column],
+    bytes: &[u8],
+) -> Result<R, Error> {
+    use serde_json::Value;
+    let Value::Object(mut fields) =
+        serde_json::from_slice(bytes).map_err(|e| malformed(table, e))?
+    else {
+        return Err(malformed(table, "not a JSON object"));
+    };
+    let mut out = serde_json::Map::new();
+    for column in columns {
+        let value = fields.remove(column.name).unwrap_or(Value::Null);
+        let value = match (column.wire, value) {
+            (row::Wire::Int64, Value::String(text)) => Value::Number(
+                text.parse::<i64>()
+                    .map_err(|_| {
+                        malformed(table, format!("`{}` is not a 64-bit integer", column.name))
+                    })?
+                    .into(),
+            ),
+            (_, value) => value,
+        };
+        out.insert(column.field.to_owned(), value);
+    }
+    serde_json::from_value(Value::Object(out)).map_err(|e| malformed(table, e))
 }
 
 impl<R, P> Typed<R, P>
@@ -279,7 +369,7 @@ where
 {
     /// Every row that decodes, by its place in `rows`; one that does not is
     /// answered apart, so it cannot take the rest of its table down with it.
-    fn decode(&self, rows: Vec<Vec<u8>>) -> (Placed<R>, Placed<String>) {
+    fn decode(&self, rows: Vec<Vec<u8>>) -> (Placed<R>, Vec<Refused>) {
         let mut decoded = Vec::new();
         let mut failed = Vec::new();
         for (at, bytes) in rows.into_iter().enumerate() {
@@ -291,7 +381,11 @@ where
                         table = R::TABLE,
                         "a row that does not decode — skipped: {e}"
                     );
-                    failed.push((at, e.to_string()));
+                    failed.push(Refused {
+                        at,
+                        key: None,
+                        reason: e.to_string(),
+                    });
                 }
             }
         }
@@ -302,8 +396,8 @@ where
         match how {
             How::Down => row::overwrite_except(conn, rows, &Self::owned(true)).await,
             How::UpOwned => row::update_only(conn, rows, &Self::owned(true)).await,
-            How::UpNewest => row::upsert_keys(conn, rows).await,
-            How::UpFirst => row::insert_ignore_keys(conn, rows).await,
+            How::UpNewest => row::upsert(conn, rows).await,
+            How::UpFirst => row::insert_ignore(conn, rows).await,
         }
     }
 
@@ -316,7 +410,7 @@ where
         conn: &mut Conn,
         rows: Placed<R>,
         how: How,
-    ) -> Result<(Vec<Key>, Placed<String>), Error> {
+    ) -> Result<(Vec<Key>, Vec<Refused>), Error> {
         if rows.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -341,38 +435,27 @@ where
                         ?key,
                         "a row the database refuses — skipped: {e}"
                     );
-                    refused.push((at, e.to_string()));
+                    refused.push(Refused {
+                        at,
+                        key: Some(key),
+                        reason: e.to_string(),
+                    });
                 }
             }
         }
         Ok((written, refused))
     }
 
-    /// One write in a savepoint: a refusal — a constraint, a trigger, any
-    /// error retrying would meet again — comes back as the inner error with
-    /// the transaction still usable, for the rows to be tried one by one; a
-    /// transient failure is the outer one, and the whole write goes again.
+    /// One write in a savepoint ([`row::released`]): a refusal comes back as
+    /// the inner error, for the rows to be tried one by one.
     async fn attempt(
         conn: &mut Conn,
         rows: Vec<R>,
         how: How,
     ) -> Result<Result<Vec<Key>, Error>, Error> {
-        sqlx::query("SAVEPOINT wire_rows")
-            .execute(&mut *conn)
-            .await?;
+        row::savepoint(conn).await?;
         let result = Self::write(conn, rows, how).await;
-        if result.is_err() {
-            sqlx::query("ROLLBACK TO SAVEPOINT wire_rows")
-                .execute(&mut *conn)
-                .await?;
-        }
-        sqlx::query("RELEASE SAVEPOINT wire_rows")
-            .execute(&mut *conn)
-            .await?;
-        match result {
-            Err(e) if !e.is_transient() => Ok(Err(e)),
-            other => other.map(Ok),
-        }
+        row::released(conn, result).await
     }
 
     fn owned(replica: bool) -> Vec<&'static str> {
@@ -418,7 +501,7 @@ where
             // Held, whether written now or already newer here.
             let held: Vec<Key> = offered
                 .into_iter()
-                .filter(|(at, _)| !refused.iter().any(|(r, _)| r == at))
+                .filter(|(at, _)| !refused.iter().any(|r| r.at == *at))
                 .map(|(_, key)| key)
                 .collect();
             row::unretire_by_keys::<R>(conn, &held).await?;
@@ -461,6 +544,7 @@ where
         })
     }
 
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     fn retire<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, row::Retired> {
         Box::pin(row::retire_by_keys::<R>(conn, keys))
     }

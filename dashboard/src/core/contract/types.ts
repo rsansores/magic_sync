@@ -22,10 +22,10 @@ export type NoteKind = "row" | "members" | "assigned" | "resync";
 
 /**
  * How far this replica is from having sent the server what it wrote, per
- * table: rows noted and not sent yet, and rows sent the server has not said
- * it filed.
+ * table: rows noted and not sent yet, rows sent the server has not said it
+ * filed, and rows that cannot go as they are.
  */
-export type UpProgress = { table: string, unsent: number, unfiled: number, };
+export type UpProgress = { table: string, unsent: number, unfiled: number, set_aside: number, };
 
 /**
  * What a replica wrote and the server has not filed, as of when it said so.

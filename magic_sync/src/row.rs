@@ -24,11 +24,11 @@
 //! row, and names no column, so a column added to the struct is written and
 //! read without touching them:
 //!
-//! - [`upsert`] — a catalog whose rows carry the server's version
-//!   ([`Row::VERSION`]): every column, newest wins.
-//! - [`overwrite`] — a catalog whose rows carry no version: every column, the
-//!   incoming value wins.
-//! - [`insert_ignore`] — a record arriving on the server: first delivery wins.
+//! - [`upsert`] — every column, newest wins when the row has a version
+//!   ([`Row::VERSION`]).
+//! - [`overwrite_except`] / [`update_only`] — a table written on both sides,
+//!   each side's columns kept apart.
+//! - [`insert_ignore`] — history arriving: first delivery wins.
 //! - [`get`] / [`get_many`] — active rows by key, every column.
 //!
 //! None rewrites [`Row::CREATED`]: a row's creation is its first write.
@@ -127,7 +127,6 @@ pub trait Row:
     const TABLE: &'static str;
     /// The primary key, checked by the parity test: `id`, the parent's for a
     /// table that extends another one to one, or several for a link table.
-    /// [`get`] and [`get_many`] read by a single uuid key.
     const KEY: &'static [&'static str];
     /// The postgres schema; sqlite has none.
     const SCHEMA: &'static str;
@@ -193,17 +192,19 @@ impl KeyValue for i32 {
 
 impl KeyPart {
     /// Whether a key column is one of the integer kinds; any other is a UUID.
-    fn is_int(column: &Column) -> bool {
+    pub(crate) fn is_int(column: &Column) -> bool {
         matches!(column.wire, Wire::Int16 | Wire::Int32 | Wire::Int64)
     }
 
-    /// Reads a part back from its text form, as `column` types it.
-    pub fn parse(column: &Column, text: &str) -> Result<Self, Error> {
-        let bad = || Error::Misuse(format!("`{text}` is not a key of `{}`", column.name));
+    /// Reads a part back from its text form, as `column` types it: any form
+    /// a uuid or an integer is written in, which [`Display`](std::fmt::Display)
+    /// writes back in the one form keys are compared in. `None`: no value of
+    /// the column.
+    pub fn parse(column: &Column, text: &str) -> Option<Self> {
         if Self::is_int(column) {
-            text.parse().map(Self::Int).map_err(|_| bad())
+            text.parse().map(Self::Int).ok()
         } else {
-            Uuid::parse_str(text).map(Self::Uuid).map_err(|_| bad())
+            Uuid::parse_str(text).map(Self::Uuid).ok()
         }
     }
 
@@ -236,7 +237,8 @@ impl std::fmt::Display for KeyPart {
 /// A row's key, one part per `KEY` column.
 pub type Key = Vec<KeyPart>;
 
-/// A key as sync writes it: its parts joined by `|`.
+/// A key as sync writes it: its parts joined by `|`, each in its one form —
+/// a uuid lowercase and hyphenated, an integer decimal.
 pub fn key_text(key: &Key) -> String {
     key.iter()
         .map(ToString::to_string)
@@ -261,16 +263,8 @@ fn written_names<R: Columns>() -> Vec<&'static str> {
 
 /// Inserts `rows` — the last of any two with one key, since a statement may
 /// not touch a row twice — in statements that stay under the backend's bind
-/// limit, each ending in `conflict`.
-async fn write<R>(exec: &mut Conn, rows: Vec<R>, conflict: &str) -> Result<u64, Error>
-where
-    R: Row,
-{
-    Ok(write_keys(exec, rows, conflict).await?.len() as u64)
-}
-
-/// [`write`], answering the keys of the rows it wrote — inserted, or updated
-/// where the conflict clause let it.
+/// limit, each ending in `conflict`. Answers the keys of the rows it wrote:
+/// inserted, or updated where the conflict clause let it.
 async fn write_keys<R>(exec: &mut Conn, rows: Vec<R>, conflict: &str) -> Result<Vec<Key>, Error>
 where
     R: Row,
@@ -338,14 +332,8 @@ fn key_of_row(row: &<Db as sqlx::Database>::Row, kinds: &[Wire]) -> Result<Key, 
         .collect()
 }
 
-/// `ON CONFLICT (key) DO UPDATE SET` every written column but the key and
-/// [`Row::CREATED`].
-fn update_clause<R: Row>() -> String {
-    update_clause_where::<R>(|_| true)
-}
-
-/// [`update_clause`] narrowed to the columns `take` keeps; nothing to set is
-/// `DO NOTHING`.
+/// `ON CONFLICT (key) DO UPDATE SET` every written column `take` keeps but
+/// the key and [`Row::CREATED`]; nothing to set is `DO NOTHING`.
 fn update_clause_where<R: Row>(take: impl Fn(&str) -> bool) -> String {
     let set: Vec<String> = written_names::<R>()
         .into_iter()
@@ -362,84 +350,24 @@ fn update_clause_where<R: Row>(take: impl Fn(&str) -> bool) -> String {
     )
 }
 
-/// Every column of every row, the incoming value winning on a known key —
-/// unless the stored version is newer, so a late redelivery never rolls a
-/// catalog back. Only for rows whose version is the server's.
-pub async fn upsert<R>(exec: &mut Conn, rows: Vec<R>) -> Result<u64, Error>
-where
-    R: Row,
-{
-    let offered = rows.len();
-    let affected = write(exec, rows, &newest::<R>(update_clause::<R>())).await?;
-    if (affected as usize) < offered {
-        tracing::debug!(
-            table = R::TABLE,
-            skipped = offered - affected as usize,
-            "upsert kept newer stored rows"
-        );
-    }
-    Ok(affected)
-}
-
-/// Every column of every row, the incoming value winning on a known key. For
-/// a payload that carries no server version, where a version check would
-/// compare this backend's clock with itself.
-pub async fn overwrite<R>(exec: &mut Conn, rows: Vec<R>) -> Result<u64, Error>
-where
-    R: Row,
-{
-    write(exec, rows, &update_clause::<R>()).await
-}
-
-/// Every row whose key is new; a redelivered one is left as it was.
-pub async fn insert_ignore<R>(exec: &mut Conn, rows: Vec<R>) -> Result<u64, Error>
-where
-    R: Row,
-{
-    write(
-        exec,
-        rows,
-        &format!(" ON CONFLICT ({}) DO NOTHING", R::KEY.join(", ")),
-    )
-    .await
-}
-
-pub async fn get<R>(exec: &mut Conn, key: Uuid) -> Result<Option<R>, Error>
-where
-    R: Row,
-{
-    Ok(get_many::<R>(exec, &[key]).await?.pop())
-}
-
-/// Active rows by key: read from the table as its active rows are named —
-/// the relation the table is read through, where a retired row is not one.
-pub async fn get_many<R>(exec: &mut Conn, keys: &[Uuid]) -> Result<Vec<R>, Error>
-where
-    R: Row,
-{
-    let [key] = R::KEY else {
-        return Err(Error::Misuse(format!("{} has a composite key", R::TABLE)));
-    };
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
+/// Active rows by key, every column: on the server through the relation its
+/// [`Row::ACTIVE`] names, on a replica less the rows it retired.
+pub async fn get_many<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
-    let per_statement = crate::dialect::MAX_BINDS;
+    let relation = crate::dialect::active::<R>();
     let mut out = Vec::with_capacity(keys.len());
-    for chunk in keys.chunks(per_statement) {
-        let mut qb = sqlx::QueryBuilder::new(format!(
-            "SELECT {} FROM {} WHERE {key} IN (",
-            names.join(", "),
-            R::ACTIVE.unwrap_or(R::QUALIFIED),
-        ));
-        let mut sep = qb.separated(", ");
-        for key in chunk {
-            sep.push_bind(*key);
-        }
-        qb.push(")");
+    for chunk in keys.chunks(keys_per_statement::<R>()) {
+        let mut qb =
+            sqlx::QueryBuilder::new(format!("SELECT {} FROM {relation}", names.join(", ")));
+        key_filter::<R>(&mut qb, chunk);
         out.extend(qb.build_query_as::<R>().fetch_all(&mut *exec).await?);
     }
     Ok(out)
+}
+
+/// The active row of `key`, as [`get_many`] reads it.
+pub async fn get<R: Row>(exec: &mut Conn, key: &Key) -> Result<Option<R>, Error> {
+    Ok(get_many::<R>(exec, std::slice::from_ref(key)).await?.pop())
 }
 
 /// `WHERE (k1, k2) IN ((…), …)` for one chunk of keys.
@@ -489,55 +417,182 @@ pub async fn delete_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<u64
     Ok(affected)
 }
 
-/// What [`retire_by_keys`] did with each row it was asked to remove.
+/// What [`retire_by_keys`] did with the rows it was asked to let go of.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Retired {
     pub deleted: u64,
-    /// Kept, because something here still names them, and retired.
+    /// Kept, because a row here still points at them, and retired.
     pub kept: u64,
+    /// Still held as they were: the database refused to let them go (a
+    /// trigger), or a row here points at them and the table has no
+    /// [`Row::RETIRED`] column. With why.
+    pub refused: Vec<(Key, String)>,
 }
 
-/// Removes the rows of `keys` from this side: deleted, or — where a local row
-/// still points at one and the key refuses the delete — kept with its
-/// [`Row::RETIRED`] column set, still there for what names it.
+/// Lets go of the rows of `keys` on a replica, one by one as far as the
+/// database is concerned: a row nothing here points at is deleted; one a row
+/// of the replica's own still points at — through a foreign key that would
+/// refuse the delete, checked now whether it is deferred or not — is kept
+/// with its [`Row::RETIRED`] column set; and one the database refuses to let
+/// go is answered apart, so it cannot fail the rest. A transient failure is
+/// the error.
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
 pub async fn retire_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Retired, Error> {
+    let pointed: Vec<String> = crate::dialect::restricting(exec, R::TABLE, R::KEY)
+        .await?
+        .into_iter()
+        .map(|(child, from, to)| {
+            let on: Vec<String> = from
+                .iter()
+                .zip(&to)
+                .map(|(f, t)| format!("c.\"{f}\" = {}.\"{t}\"", R::QUALIFIED))
+                .collect();
+            format!(
+                "EXISTS (SELECT 1 FROM \"{child}\" c WHERE {})",
+                on.join(" AND ")
+            )
+        })
+        .collect();
+    let unpointed = if pointed.is_empty() {
+        String::new()
+    } else {
+        format!(" AND NOT ({})", pointed.join(" OR "))
+    };
     let mut retired = Retired::default();
     for chunk in keys.chunks(keys_per_statement::<R>()) {
-        match savepoint(exec, |qb| {
-            qb.push(format!("DELETE FROM {}", R::QUALIFIED));
-            key_filter::<R>(qb, chunk);
-        })
-        .await
-        {
-            Ok(n) => retired.deleted += n,
-            Err(e) if is_foreign_key_violation(&e) => {
-                for key in chunk {
-                    let one = std::slice::from_ref(key);
-                    match savepoint(exec, |qb| {
-                        qb.push(format!("DELETE FROM {}", R::QUALIFIED));
-                        key_filter::<R>(qb, one);
-                    })
-                    .await
-                    {
-                        Ok(n) => retired.deleted += n,
-                        Err(e) if is_foreign_key_violation(&e) && R::RETIRED.is_some() => {
-                            let retired_column = R::RETIRED.unwrap_or_default();
-                            let mut qb = sqlx::QueryBuilder::new(format!(
-                                "UPDATE {} SET {retired_column} = {}",
-                                R::QUALIFIED,
-                                crate::dialect::NOW
-                            ));
-                            key_filter::<R>(&mut qb, one);
-                            retired.kept += qb.build().execute(&mut *exec).await?.rows_affected();
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
+        let delete = |keys: &[Key]| {
+            let mut qb = sqlx::QueryBuilder::new(format!("DELETE FROM {}", R::QUALIFIED));
+            key_filter::<R>(&mut qb, keys);
+            qb.push(&unpointed);
+            qb
+        };
+        let refused = one_by_one(exec, chunk, delete, &mut retired.deleted).await?;
+        let left: Vec<Key> = chunk
+            .iter()
+            .filter(|key| !refused.iter().any(|(r, _)| r == *key))
+            .cloned()
+            .collect();
+        retired.refused.extend(refused);
+        let Some(column) = R::RETIRED else {
+            let held = key_select::<R>(exec, &left).await?;
+            retired.refused.extend(held.into_iter().map(|key| {
+                let why = format!(
+                    "a row here points at it, and `{}` has no retired column to keep it by",
+                    R::TABLE
+                );
+                (key, why)
+            }));
+            continue;
+        };
+        let retire = |keys: &[Key]| {
+            let mut qb = sqlx::QueryBuilder::new(format!(
+                "UPDATE {} SET {column} = {}",
+                R::QUALIFIED,
+                crate::dialect::NOW
+            ));
+            key_filter::<R>(&mut qb, keys);
+            qb.push(format!(" AND {column} IS NULL"));
+            qb
+        };
+        let refused = one_by_one(exec, &left, retire, &mut retired.kept).await?;
+        retired.refused.extend(refused);
     }
     Ok(retired)
+}
+
+/// Runs the statement `build` makes for `keys` in a savepoint, adding the
+/// rows it touched to `affected`; when the database refuses it, runs it key
+/// by key, and answers the keys refused, with why.
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+async fn one_by_one<'k>(
+    exec: &mut Conn,
+    keys: &'k [Key],
+    build: impl Fn(&'k [Key]) -> sqlx::QueryBuilder<'k, Db>,
+    affected: &mut u64,
+) -> Result<Vec<(Key, String)>, Error> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    savepoint(exec).await?;
+    let all = build(keys).build().execute(&mut *exec).await;
+    match released(exec, all.map_err(Error::from)).await? {
+        Ok(done) => {
+            *affected += done.rows_affected();
+            return Ok(Vec::new());
+        }
+        Err(e) => tracing::warn!("rows refused together, tried one by one: {e}"),
+    }
+    let mut refused = Vec::new();
+    for key in keys {
+        savepoint(exec).await?;
+        let one = build(std::slice::from_ref(key))
+            .build()
+            .execute(&mut *exec)
+            .await;
+        match released(exec, one.map_err(Error::from)).await? {
+            Ok(done) => *affected += done.rows_affected(),
+            Err(e) => refused.push((key.clone(), e.to_string())),
+        }
+    }
+    Ok(refused)
+}
+
+/// The keys of `keys` the table holds.
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+async fn key_select<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<Key>, Error> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kinds = key_kinds::<R>();
+    let mut qb = sqlx::QueryBuilder::new(format!(
+        "SELECT {} FROM {}",
+        R::KEY.join(", "),
+        R::QUALIFIED
+    ));
+    key_filter::<R>(&mut qb, keys);
+    let rows = qb.build().fetch_all(&mut *exec).await?;
+    rows.iter().map(|row| key_of_row(row, &kinds)).collect()
+}
+
+/// Opens a savepoint, for [`released`] to close.
+pub(crate) async fn savepoint(exec: &mut Conn) -> Result<(), Error> {
+    sqlx::query("SAVEPOINT sync_rows")
+        .execute(&mut *exec)
+        .await?;
+    Ok(())
+}
+
+/// Closes the savepoint [`savepoint`] opened around the work that answered
+/// `result`: a refusal — any error but a transient one, which retrying would
+/// meet again — comes back as the inner error, rolled back with the
+/// transaction still usable; a transient failure is the outer one. When the
+/// database already rolled the whole transaction back (a trigger's
+/// `RAISE(ROLLBACK)`, a full disk), the refusal is the outer error too: there
+/// is nothing left to go on with.
+pub(crate) async fn released<T>(
+    exec: &mut Conn,
+    result: Result<T, Error>,
+) -> Result<Result<T, Error>, Error> {
+    let refusal = match result {
+        Ok(value) => {
+            sqlx::query("RELEASE SAVEPOINT sync_rows")
+                .execute(&mut *exec)
+                .await?;
+            return Ok(Ok(value));
+        }
+        Err(e) if e.is_transient() => return Err(e),
+        Err(e) => e,
+    };
+    let rolled_back = sqlx::query("ROLLBACK TO SAVEPOINT sync_rows")
+        .execute(&mut *exec)
+        .await;
+    if rolled_back.is_err() {
+        return Err(refusal);
+    }
+    sqlx::query("RELEASE SAVEPOINT sync_rows")
+        .execute(&mut *exec)
+        .await?;
+    Ok(Err(refusal))
 }
 
 /// Clears the [`Row::RETIRED`] column of the rows of `keys`: the other side
@@ -556,68 +611,44 @@ pub async fn unretire_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<(
     Ok(())
 }
 
-/// Runs one statement inside a savepoint, so a refusal leaves the
-/// transaction usable.
-async fn savepoint(
-    exec: &mut Conn,
-    build: impl FnOnce(&mut sqlx::QueryBuilder<'_, Db>),
-) -> Result<u64, sqlx::Error> {
-    sqlx::query("SAVEPOINT row_retire")
-        .execute(&mut *exec)
-        .await?;
-    let mut qb = sqlx::QueryBuilder::new("");
-    build(&mut qb);
-    match qb.build().execute(&mut *exec).await {
-        Ok(done) => {
-            sqlx::query("RELEASE SAVEPOINT row_retire")
-                .execute(&mut *exec)
-                .await?;
-            Ok(done.rows_affected())
-        }
-        Err(e) => {
-            sqlx::query("ROLLBACK TO SAVEPOINT row_retire")
-                .execute(&mut *exec)
-                .await?;
-            sqlx::query("RELEASE SAVEPOINT row_retire")
-                .execute(&mut *exec)
-                .await?;
-            Err(e)
-        }
-    }
-}
-
-/// Whether a statement was refused because a key still points at the row.
-fn is_foreign_key_violation(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(db) if db.is_foreign_key_violation())
-}
-
 /// Every key the table holds that is not retired.
 pub async fn live_keys<R: Row>(exec: &mut Conn) -> Result<Vec<Key>, Error> {
-    let kinds = key_kinds::<R>();
     let live = R::RETIRED
         .map(|retired| format!(" WHERE {retired} IS NULL"))
         .unwrap_or_default();
-    let rows = sqlx::query(&format!(
-        "SELECT {} FROM {}{live}",
-        R::KEY.join(", "),
-        R::QUALIFIED
-    ))
-    .fetch_all(&mut *exec)
-    .await?;
-    rows.iter().map(|row| key_of_row(row, &kinds)).collect()
+    keys_where::<R>(exec, &live).await
 }
 
 /// Every key the table holds.
 pub async fn keys<R: Row>(exec: &mut Conn) -> Result<Vec<Key>, Error> {
+    keys_where::<R>(exec, "").await
+}
+
+/// The keys of the rows `filter` admits. A key stored in a form the engine
+/// does not read — a uuid as text, written by something other than the
+/// engine — is logged and left out: that row is not one the engine holds.
+async fn keys_where<R: Row>(exec: &mut Conn, filter: &str) -> Result<Vec<Key>, Error> {
     let kinds = key_kinds::<R>();
     let rows = sqlx::query(&format!(
-        "SELECT {} FROM {}",
+        "SELECT {} FROM {}{filter}",
         R::KEY.join(", "),
         R::QUALIFIED
     ))
     .fetch_all(&mut *exec)
     .await?;
-    rows.iter().map(|row| key_of_row(row, &kinds)).collect()
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            key_of_row(row, &kinds)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        table = R::TABLE,
+                        "a key stored in a form the engine does not read — left out: {e}"
+                    );
+                })
+                .ok()
+        })
+        .collect())
 }
 
 /// Every row, the incoming value winning on a known key for every column but
@@ -648,13 +679,16 @@ pub async fn update_only<R: Row>(
     .await
 }
 
-/// [`upsert`], answering the keys it wrote.
-pub async fn upsert_keys<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
-    write_keys(exec, rows, &newest::<R>(update_clause::<R>())).await
+/// Every column of every row, the incoming value winning on a known key —
+/// unless the stored version is newer, so a late redelivery never rolls the
+/// row back. Answers the keys it wrote.
+pub async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
+    write_keys(exec, rows, &newest::<R>(update_clause_where::<R>(|_| true))).await
 }
 
-/// [`insert_ignore`], answering the keys it inserted.
-pub async fn insert_ignore_keys<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
+/// Every row whose key is new; a redelivered one is left as it was. Answers
+/// the keys it inserted.
+pub async fn insert_ignore<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
     let conflict = format!(" ON CONFLICT ({}) DO NOTHING", R::KEY.join(", "));
     write_keys(exec, rows, &conflict).await
 }
@@ -668,10 +702,15 @@ pub fn version<R: Row>() -> Option<&'static str> {
 /// than the stored one, for a row that has one.
 fn newest<R: Row>(mut conflict: String) -> String {
     if let Some(version) = version::<R>().filter(|_| conflict.contains("DO UPDATE")) {
+        let kind = declared::<R>()
+            .iter()
+            .find(|c| c.name == version)
+            .map_or(Wire::String, |c| c.wire);
         conflict.push_str(" WHERE ");
         conflict.push_str(&crate::dialect::not_older(
             &format!("EXCLUDED.{version}"),
             &format!("{}.{version}", R::QUALIFIED),
+            kind,
         ));
     }
     conflict

@@ -1,65 +1,30 @@
 //! A replica as a host runs it: a message received is committed and the
 //! server hears of it without a line of loop in the test; what the uplink
-//! refuses goes again.
+//! refuses for a while goes again.
 
 use super::*;
-use crate::envelope::{self, Body, Down, Key as WireKey, Table, Up};
-use crate::testkit::{from_wire, to_wire, Item, ItemRow};
+use crate::conformance::{codecs, Uplinked};
+use crate::envelope::{self, Body, Down, Key as WireKey, Table};
+use crate::testkit::ItemRow;
 use prost::Message as _;
-use std::sync::{Arc, Mutex};
 
-const TABLE: &str = "CREATE TABLE items (
-    id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT)";
-
-/// What went up: who sent it, on which lane.
-type Sent = Vec<(Uuid, &'static str, Up)>;
-
-/// What went up, and whether the uplink is down.
-#[derive(Clone, Default)]
-struct Wire {
-    sent: Arc<Mutex<Sent>>,
-    down: Arc<Mutex<bool>>,
-}
-
-impl Uplink for Wire {
-    async fn send(&self, replica: Uuid, lane: &'static str, message: Vec<u8>) -> Result<(), Error> {
-        if *self.down.lock().unwrap() {
-            return Err(Error::Transport {
-                reason: "the network".into(),
-                transient: true,
-            });
-        }
-        let up = Up::decode(message.as_slice()).expect("an upload");
-        self.sent.lock().unwrap().push((replica, lane, up));
-        Ok(())
-    }
-}
-
-impl Wire {
-    fn acknowledged(&self) -> Vec<u64> {
-        self.sent
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, _, up)| up.sequence > 0)
-            .map(|(_, _, up)| up.sequence)
-            .collect()
-    }
-}
+const TABLES: &str = "
+CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT);
+CREATE TABLE shelves (aisle BLOB NOT NULL, slot INTEGER NOT NULL, label TEXT NOT NULL, revision INTEGER NOT NULL,
+    PRIMARY KEY (aisle, slot));
+CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL, cents INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE tasks (id BLOB PRIMARY KEY NOT NULL, title TEXT NOT NULL, done INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE readings (replica_id BLOB NOT NULL, id BLOB NOT NULL, value INTEGER NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (replica_id, id));
+CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL, what TEXT NOT NULL);
+";
 
 async fn pool(pool: SqlitePool) -> SqlitePool {
-    sqlx::raw_sql(crate::SQLITE_SCHEMA)
-        .execute(&pool)
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    replica::install(&mut pool.acquire().await.unwrap(), codecs())
         .await
         .unwrap();
-    sqlx::raw_sql(TABLE).execute(&pool).await.unwrap();
     pool
-}
-
-fn codecs() -> &'static [Codec<()>] {
-    Box::leak(Box::new([Codec::new::<Item, ItemRow>(
-        to_wire, from_wire, None,
-    )]))
 }
 
 fn rows(sequence: u64, name: &str) -> Vec<u8> {
@@ -79,7 +44,7 @@ fn rows(sequence: u64, name: &str) -> Vec<u8> {
             ..Table::default()
         }],
         sequence,
-        epoch: "e".to_owned(),
+        epoch: Uuid::nil().to_string(),
         ..Down::default()
     })
     .encoded()
@@ -110,12 +75,25 @@ async fn until<I: Identity, U: Uplink>(replica: &Replica<(), I, U>, done: impl F
     tokio::join!(run, check);
 }
 
+fn acknowledged(uplink: &Uplinked) -> Vec<u64> {
+    uplink
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, up)| up.sequence > 0)
+        .map(|(_, _, up)| up.sequence)
+        .collect()
+}
+
 #[sqlx::test(migrations = false)]
 async fn what_the_replica_applied_reaches_the_server_even_through_an_outage(pool_: SqlitePool) {
     let pool = pool(pool_).await;
     let me = Uuid::now_v7();
-    let wire = Wire::default();
-    let replica = Replica::new(pool.clone(), codecs(), me, wire.clone(), settings());
+    let uplink = Uplinked::default();
+    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings())
+        .await
+        .unwrap();
 
     let received = replica.receive(&rows(4, "four")).await.unwrap();
     assert!(matches!(received, Received::Applied(_)));
@@ -125,14 +103,14 @@ async fn what_the_replica_applied_reaches_the_server_even_through_an_outage(pool
         .unwrap();
     assert_eq!(names, ["four"], "committed before it returns");
 
-    *wire.down.lock().unwrap() = true;
+    *uplink.refusing.lock().unwrap() = Some(true);
     replica.receive(&rows(5, "five")).await.unwrap();
     let outage = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        *wire.down.lock().unwrap() = false;
+        *uplink.refusing.lock().unwrap() = None;
     };
-    let (_, ()) = tokio::join!(outage, until(&replica, || wire.acknowledged() == [5]));
-    assert!(wire
+    let (_, ()) = tokio::join!(outage, until(&replica, || acknowledged(&uplink) == [5]));
+    assert!(uplink
         .sent
         .lock()
         .unwrap()
@@ -150,9 +128,19 @@ async fn nothing_goes_up_until_the_replica_knows_who_it_is(pool_: SqlitePool) {
         }
     }
     let pool = pool(pool_).await;
-    let wire = Wire::default();
-    let replica = Replica::new(pool, codecs(), Nobody, wire.clone(), settings());
+    let uplink = Uplinked::default();
+    let replica = Replica::new(pool, codecs(), Nobody, uplink.clone(), settings())
+        .await
+        .unwrap();
     replica.receive(&rows(1, "one")).await.unwrap();
-    assert_eq!(replica.send_up(true).await.unwrap(), 0);
-    assert!(wire.sent.lock().unwrap().is_empty());
+    assert!(!replica.send_lane(0, true).await.unwrap());
+    assert!(uplink.sent.lock().unwrap().is_empty());
+}
+
+/// A replica refuses to start over a database it cannot run against.
+#[sqlx::test(migrations = false)]
+async fn a_replica_does_not_start_over_a_database_it_cannot_run_against(pool: SqlitePool) {
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    let refused = Replica::new(pool, codecs(), Uuid::nil(), Uplinked::default(), settings()).await;
+    assert!(refused.is_err());
 }

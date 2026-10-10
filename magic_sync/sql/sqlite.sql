@@ -1,4 +1,6 @@
--- The sync engine: a replica's side.
+-- The sync engine: a replica's side, version 1. The engine applies it in one
+-- transaction with the triggers its tables need (replica::install); a host
+-- with migrations runs it in one, with replica::triggers' script.
 
 -- The version of this schema: the engine refuses to run against another.
 CREATE TABLE sync_version (
@@ -7,22 +9,28 @@ CREATE TABLE sync_version (
 );
 INSERT INTO sync_version (id, version) VALUES (1, 1);
 
--- The snapshots the server has provisioned this replica with. Only the latest
--- is in progress; one that has ended, or that a newer one superseded, sweeps
--- nothing when its end arrives again.
+-- Present only while the engine applies what the server sent, inside that
+-- transaction: the triggers note no write it makes, and refuse none.
+CREATE TABLE sync_applying (
+    id INTEGER PRIMARY KEY CHECK (id = 1)
+);
+
+-- The snapshots the server provisioned this replica with, by the sequence of
+-- the message that began each: the one not ended is in progress, and a
+-- snapshot not seen before supersedes it. The latest few are kept, so a
+-- message of one that ended names nothing.
 CREATE TABLE sync_snapshots (
-    snapshot_id TEXT PRIMARY KEY NOT NULL,
-    started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ended_at    TEXT
+    snapshot_id TEXT    PRIMARY KEY NOT NULL,
+    began       INTEGER NOT NULL,
+    ended       INTEGER
 );
 
 -- The rows the snapshot in progress has named, per table: at its end every
--- row of those tables it did not name goes. Emptied when the snapshot ends.
+-- row of those tables it did not name goes. Emptied when a snapshot begins.
 CREATE TABLE sync_snapshot_keys (
-    snapshot_id TEXT NOT NULL,
-    table_name  TEXT NOT NULL,
-    row_key     TEXT NOT NULL,
-    PRIMARY KEY (snapshot_id, table_name, row_key)
+    table_name TEXT NOT NULL,
+    row_key    TEXT NOT NULL,
+    PRIMARY KEY (table_name, row_key)
 );
 
 -- The last message this replica applied, from which server: one at or below
@@ -33,43 +41,57 @@ CREATE TABLE sync_applied (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     epoch        TEXT    NOT NULL,
     sequence     INTEGER NOT NULL,
-    -- The last one the server has been told of.
+    -- The last one the server of this epoch has been told of.
     acknowledged INTEGER NOT NULL DEFAULT 0
 );
 
 -- What this replica last told the server it wrote and the server has not
--- filed ([{table, unsent, unfiled}]), and when (unix seconds): it says again
--- when that changes, at most so often while it grows.
+-- filed ([{table, unsent, unfiled, set_aside}]), and when (unix seconds): it
+-- says again when that changes, at most so often while it grows.
 CREATE TABLE sync_backlog (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     backlog     TEXT    NOT NULL,
     reported_at INTEGER NOT NULL
 );
 
--- Rows the server sent that this replica could not take, until it takes
--- them: the server is told once (reported_at), quarantines them, and sends
--- them again once a fix is deployed on either side.
+-- Rows the server sent that this replica could not take, or could not let
+-- go of, until it does: the server is told once (reported_at), quarantines
+-- them, and sends them again once a fix is deployed on either side. `sequence`
+-- is the message that refused it: a snapshot that ends clears what was
+-- refused before it began, which it sent again.
 CREATE TABLE sync_rejections (
-    table_name  TEXT NOT NULL,
-    row_key     TEXT NOT NULL,
-    reason      TEXT NOT NULL,
-    rejected_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    table_name  TEXT    NOT NULL,
+    row_key     TEXT    NOT NULL,
+    reason      TEXT    NOT NULL,
+    sequence    INTEGER NOT NULL,
+    rejected_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     reported_at TEXT,
     PRIMARY KEY (table_name, row_key)
 );
 
 -- What this replica wrote, noted in the writing transaction by a trigger on
 -- each table that goes up: the table and the row's key (its parts as text,
--- joined by |). An upload carries noted rows as they are by then, and is
--- numbered by the highest note it carries; a note leaves once the server says
--- it filed that upload.
+-- joined by |). An upload carries noted rows as they are by then, under a
+-- number of its own (`upload`), and a note leaves once the server says it
+-- filed that upload. A note that cannot go as it is waits, `set_aside` with
+-- why, until the replica runs again.
 CREATE TABLE sync_notes (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    relation TEXT    NOT NULL,
-    row_key  TEXT    NOT NULL,
-    noted_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    upload   INTEGER,
-    sent_at  TEXT
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    relation  TEXT    NOT NULL,
+    row_key   TEXT    NOT NULL,
+    noted_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    upload    INTEGER,
+    sent_at   TEXT,
+    set_aside TEXT
 );
 
 CREATE INDEX sync_notes_unsent ON sync_notes (id) WHERE upload IS NULL;
+CREATE INDEX sync_notes_upload ON sync_notes (upload) WHERE upload IS NOT NULL;
+
+-- The last upload number drawn: every send draws a fresh one, so the
+-- server's answer to an upload never names notes another one carried.
+CREATE TABLE sync_uploads (
+    id   INTEGER PRIMARY KEY CHECK (id = 1),
+    last INTEGER NOT NULL
+);
+INSERT INTO sync_uploads (id, last) VALUES (1, 0);

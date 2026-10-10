@@ -857,11 +857,11 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
         digests: tables
             .iter()
             .map(|(table, keys)| {
-                let mut keys: Vec<String> = keys.iter().map(Uuid::to_string).collect();
+                let keys: Vec<String> = keys.iter().map(Uuid::to_string).collect();
                 Digest {
                     table: (*table).to_owned(),
                     count: keys.len() as u64,
-                    fingerprint: fingerprint(&mut keys),
+                    fingerprint: fingerprint(keys.clone()),
                 }
             })
             .collect(),
@@ -1342,7 +1342,6 @@ impl World {
             .await
             .unwrap();
         let ack = envelope::Up {
-            replica_id: replica.to_string(),
             epoch: epoch.to_string(),
             sequence,
             ..envelope::Up::default()

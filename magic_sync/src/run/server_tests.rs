@@ -227,7 +227,6 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
     .await;
 
     let upload = Up {
-        replica_id: a.to_string(),
         tables: vec![WireTable {
             table: "readings".to_owned(),
             upserts: vec![ReadingRow {
@@ -349,7 +348,6 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
     );
     for (replica, last) in sent {
         let ack = crate::envelope::Up {
-            replica_id: replica.to_string(),
             epoch: epoch.to_string(),
             sequence: last as u64,
             ..crate::envelope::Up::default()
@@ -858,9 +856,9 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         table: pick(&mut walk, &tables),
                         unsent: [0, 5, u64::MAX][walk.below(3)],
                         unfiled: 1,
+                        set_aside: 0,
                     }],
                 }),
-                ..Up::default()
             };
             came += up
                 .tables

@@ -46,7 +46,6 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
     .await
     .unwrap();
     let ack = Up {
-        replica_id: a.to_string(),
         epoch: epoch.to_string(),
         sequence: last as u64,
         ..Up::default()
@@ -383,7 +382,6 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
     }
     let say = |tables: Vec<envelope::TableBacklog>| async {
         let up = envelope::Up {
-            replica_id: a.to_string(),
             backlog: Some(envelope::Backlog { tables }),
             ..envelope::Up::default()
         };
@@ -396,6 +394,7 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
         table: "sales".into(),
         unsent: 3,
         unfiled: 1,
+        set_aside: 0,
     }])
     .await;
     let writing = world.overview(Scope::Replicas(&[a])).await;
@@ -530,7 +529,6 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
     say(
         refusing,
         Up {
-            replica_id: refusing.to_string(),
             rejected: vec![Rejected {
                 table: "items".into(),
                 key: Some(WireKey {
@@ -550,12 +548,12 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
     say(
         silent,
         Up {
-            replica_id: silent.to_string(),
             backlog: Some(envelope::Backlog {
                 tables: vec![TableBacklog {
                     table: "receipts".into(),
                     unsent: 2,
                     unfiled: 1,
+                    set_aside: 0,
                 }],
             }),
             ..Up::default()

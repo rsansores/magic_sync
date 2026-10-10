@@ -92,6 +92,7 @@ impl Walk {
 }
 
 /// A record: written on a replica, filed on the server.
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 pub mod records {
     use super::*;
 

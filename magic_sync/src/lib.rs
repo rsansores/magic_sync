@@ -30,6 +30,8 @@ compile_error!(
      (one workspace, or one test crate) — build each side in a workspace of its own"
 );
 
+#[cfg(test)]
+mod conformance;
 pub mod dialect;
 pub mod envelope;
 mod error;

@@ -1,20 +1,21 @@
 // The sync engine's messages, for a replica written in any language.
 // PROTOCOL.md says what each one means and what a replica must do with it.
-// The engine's Rust types (src/envelope.rs) are these messages, tag for tag.
+// The engine's Rust types (src/envelope/sync.rs) are generated from this file,
+// and a test fails while they differ from what it generates.
 syntax = "proto3";
 
 package sync;
 
-// A row's key: its parts as text, in primary key order. A uuid part is
-// lowercase and hyphenated; an integer part is decimal.
+// A row's key: its parts as text, in primary key order — a uuid part
+// lowercase and hyphenated, an integer part decimal.
 message Key {
   repeated string parts = 1;
 }
 
 // Everything the server sends a replica: one message, whichever it is.
-// `protocol` is the version the server speaks; a replica that receives a
-// later one than its own does not act on it, and does not acknowledge it.
 message ToReplica {
+  // The version of the protocol the server speaks. A replica that receives a
+  // later one than its own does not act on it, and does not acknowledge it.
   uint32 protocol = 1;
   oneof body {
     Down down = 2;
@@ -23,47 +24,68 @@ message ToReplica {
   }
 }
 
-// One table's part of a message.
+// One table's part of a message: rows to hold, then rows to let go.
 message Table {
   string table = 1;
-  // Rows to hold, each encoded as the table's own row message.
+  // Rows to hold, each encoded as the table's own row.
   repeated bytes upserts = 2;
   // Rows to let go of.
   repeated Key deletes = 3;
-  // The key of each upsert, in the same order.
+  // The key of each upsert, in the same order, one per upsert: a side that
+  // cannot read a row can still say which one it was.
   repeated Key keys = 4;
 }
 
-// Server to replica: rows to hold and rows to let go.
+// Server to replica: rows to hold and rows to let go, in the order given —
+// parents' upserts first, children's deletes first — applied in one
+// transaction.
 message Down {
+  // Set while the replica is provisioned from scratch: it remembers every
+  // row the snapshot names, and lets go of the rest when the snapshot ends.
   string snapshot_id = 1;
   repeated Table tables = 2;
+  // Rises with every message the server sends, from 1 to 2^63 - 1: a replica
+  // applies nothing at or below the last it applied from the same epoch.
   uint64 sequence = 3;
+  // The server installation the sequence is from, a uuid.
   string epoch = 4;
 }
 
-// Server to replica: a snapshot is complete.
+// Server to replica: a snapshot is complete. Every row of `tables` the
+// replica holds and the snapshot did not name goes, children first: in
+// reverse of the order `tables` lists them.
 message EndSnapshot {
   string snapshot_id = 1;
   repeated string tables = 2;
+  // As Down's.
   uint64 sequence = 3;
+  // As Down's.
   string epoch = 4;
 }
 
-// Server to replica: these uploads are filed.
+// Server to replica: these uploads are filed, or kept to be filed once they
+// can be. The notes they carried are done.
 message Filed {
   repeated uint64 uploads = 1;
 }
 
 // Replica to server: rows it wrote, rows it could not take, what it holds,
-// and the last message it applied.
+// and the last message it applied. The transport says which replica sent it.
 message Up {
-  string replica_id = 1;
+  reserved 1;
+  reserved "replica_id";
   repeated Table tables = 2;
   repeated Rejected rejected = 3;
+  // What the replica holds of each table sent down, to compare with what the
+  // server records it holds.
   repeated Digest digests = 4;
+  // The last message the replica applied: its epoch and sequence. Set when
+  // the server has not heard of it, and always with digests, which are only
+  // comparable once the replica applied every message recorded for it.
   string epoch = 5;
   uint64 sequence = 6;
+  // The number of this upload, when it carries rows: a fresh one on every
+  // send, from 1 to 2^63 - 1. The server answers with Filed once it filed it.
   repeated uint64 uploads = 7;
   // The version of the protocol the replica speaks.
   uint32 protocol = 8;
@@ -77,22 +99,29 @@ message Backlog {
   repeated TableBacklog tables = 1;
 }
 
-// One table's part of a backlog: rows not sent yet, and rows sent the server
-// has not said it filed.
+// One table's part of a backlog.
 message TableBacklog {
   string table = 1;
+  // Rows not sent yet.
   uint64 unsent = 2;
+  // Rows sent the server has not said it filed.
   uint64 unfiled = 3;
+  // Rows that cannot go up as they are — larger than a message, refused by
+  // the transport, of a table or a key this build cannot read — kept until
+  // the replica runs again.
+  uint64 set_aside = 4;
 }
 
-// A row a replica could not take.
+// A row a replica could not take, or could not let go of, and why. The key
+// is required.
 message Rejected {
   string table = 1;
   Key key = 2;
   string reason = 3;
 }
 
-// What a replica holds of one table.
+// What a replica holds of one table: how many rows, and a fingerprint of
+// their keys. Rows it retired, or rejected, are left out.
 message Digest {
   string table = 1;
   uint64 count = 2;

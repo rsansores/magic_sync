@@ -394,7 +394,10 @@ pub(crate) fn parse_key(columns: &[Column], text: &str) -> Result<Key, Error> {
     columns
         .iter()
         .zip(parts)
-        .map(|(column, part)| KeyPart::parse(column, part))
+        .map(|(column, part)| {
+            KeyPart::parse(column, part)
+                .ok_or_else(|| Error::Misuse(format!("`{part}` is not a key of `{}`", column.name)))
+        })
         .collect()
 }
 

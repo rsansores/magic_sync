@@ -1,684 +1,1634 @@
-//! A replica against what can go wrong with what it is sent: a message from
-//! the past, a row it cannot read, a table it does not have. None of it stops
-//! the rest, and what it could not take is kept for the server to hear of.
+//! The replica conformance suite: a replica as a host runs it, driven by the
+//! bytes the server sends — snapshots whole, empty and superseded, messages
+//! redelivered or numbered as no server numbers them, bodies it does not
+//! know, deletes the database refuses, versions of every type in either
+//! order, every key shape, tables written on both sides, records — each
+//! checked by what the replica then holds, what it reports, and that nothing
+//! a message carries is ever an error. Then what goes up: numbered so that no
+//! answer forgets a write it did not carry, within the transport's bytes, on
+//! lanes that do not wait for one another.
 
 use super::*;
-use crate::envelope::{Key as WireKey, Table};
-use crate::testkit::{from_wire, to_wire, Item, ItemRow};
-use prost::Message as _;
+use crate::conformance::{codecs, json, Event, Price, Reading, Shelf, Task, Uplinked};
+use crate::envelope::{Backlog, Down, EndSnapshot, Filed, Key as WireKey, Table, ToReplica};
+use crate::run::replica::{Replica, Settings};
+use crate::testkit::ItemRow;
+use chrono::{TimeZone, Utc};
+use sqlx::SqlitePool;
 
-const TABLE: &str = "CREATE TABLE items (
-    id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT)";
+const TABLES: &str = "
+CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT);
+CREATE TABLE shelves (aisle BLOB NOT NULL, slot INTEGER NOT NULL, label TEXT NOT NULL, revision INTEGER NOT NULL,
+    PRIMARY KEY (aisle, slot));
+CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL, cents INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE tasks (id BLOB PRIMARY KEY NOT NULL, title TEXT NOT NULL, done INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE readings (replica_id BLOB NOT NULL, id BLOB NOT NULL, value INTEGER NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (replica_id, id));
+CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL, what TEXT NOT NULL);
+-- The replica's own rows, pointing at the server's: one key checked at once,
+-- one at commit.
+CREATE TABLE receipts (id INTEGER PRIMARY KEY, item_id BLOB NOT NULL REFERENCES items (id));
+CREATE TABLE quotes (id INTEGER PRIMARY KEY,
+    price_id BLOB NOT NULL REFERENCES prices (id) DEFERRABLE INITIALLY DEFERRED);
+";
 
-async fn replica(pool: &crate::DbPool) -> sqlx::pool::PoolConnection<crate::Db> {
-    let mut conn = pool.acquire().await.expect("a connection");
-    sqlx::raw_sql(crate::SQLITE_SCHEMA)
-        .execute(&mut *conn)
-        .await
-        .expect("the engine's tables");
-    sqlx::raw_sql(TABLE)
-        .execute(&mut *conn)
-        .await
-        .expect("items");
-    conn
+const EPOCH: &str = "0192f6a0-0000-7000-8000-000000000001";
+const OTHER_EPOCH: &str = "0192f6a0-0000-7000-8000-000000000002";
+
+struct World {
+    pool: SqlitePool,
+    me: Uuid,
+    uplink: Uplinked,
+    replica: Replica<(), Uuid, Uplinked>,
 }
 
-fn codecs() -> Vec<Codec<()>> {
-    vec![Codec::new::<Item, ItemRow>(to_wire, from_wire, None)]
+async fn world(pool: SqlitePool) -> World {
+    world_with(pool, Settings::default()).await
 }
 
-/// A row as the server sends it: its key, and its bytes.
-fn item(name: &str) -> (Uuid, Vec<u8>) {
-    let id = Uuid::now_v7();
+async fn world_with(pool: SqlitePool, settings: Settings) -> World {
+    sqlx::raw_sql(TABLES).execute(&pool).await.expect("tables");
+    install(&mut pool.acquire().await.unwrap(), codecs())
+        .await
+        .expect("installed");
+    let me = Uuid::now_v7();
+    let uplink = Uplinked::default();
+    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings)
+        .await
+        .expect("a replica");
+    World {
+        pool,
+        me,
+        uplink,
+        replica,
+    }
+}
+
+impl World {
+    /// `bytes` received as a host receives them: nothing a message carries
+    /// is an error.
+    async fn receive(&self, bytes: &[u8]) -> Received {
+        match self.replica.receive(bytes).await {
+            Ok(received) => received,
+            Err(e) => panic!("a message's data made an error, and would come again for ever: {e}"),
+        }
+    }
+
+    async fn texts(&self, sql: &str) -> Vec<String> {
+        sqlx::query_scalar(sql)
+            .fetch_all(&self.pool)
+            .await
+            .expect(sql)
+    }
+
+    async fn count(&self, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(&self.pool)
+            .await
+            .expect(sql)
+    }
+
+    async fn exec(&self, sql: &str) -> Result<(), sqlx::Error> {
+        sqlx::raw_sql(sql).execute(&self.pool).await.map(|_| ())
+    }
+
+    /// The item names held and not retired.
+    async fn items(&self) -> Vec<String> {
+        self.texts("SELECT name FROM items WHERE retired_at IS NULL ORDER BY name")
+            .await
+    }
+
+    /// The rows refused, as `table key`.
+    async fn rejected(&self) -> Vec<String> {
+        self.texts("SELECT table_name || ' ' || row_key FROM sync_rejections ORDER BY 1")
+            .await
+    }
+
+    /// One message up on `lane`, as the uplink took it.
+    async fn up(&self, lane: usize, digests: bool) -> Option<Up> {
+        self.replica.send_lane(lane, digests).await.expect("sent");
+        let mut taken = self.uplink.taken();
+        assert!(taken.len() <= 1);
+        taken.pop().map(|(_, up)| up)
+    }
+}
+
+fn key(parts: &[&str]) -> WireKey {
+    WireKey {
+        parts: parts.iter().map(|p| (*p).to_owned()).collect(),
+    }
+}
+
+fn item(id: Uuid, name: &str) -> (WireKey, Vec<u8>) {
     let row = ItemRow {
         id: id.to_string(),
         partition_id: Uuid::nil().to_string(),
         name: name.to_owned(),
     };
-    (id, row.encode_to_vec())
+    (key(&[&id.to_string()]), row.encode_to_vec())
 }
 
-fn down(table: &str, epoch: &str, sequence: u64, rows: Vec<(Uuid, Vec<u8>)>) -> Down {
-    let (keys, upserts): (Vec<WireKey>, Vec<Vec<u8>>) = rows
-        .into_iter()
-        .map(|(id, bytes)| {
-            (
-                WireKey {
-                    parts: vec![id.to_string()],
-                },
-                bytes,
-            )
-        })
-        .unzip();
-    Down {
-        snapshot_id: String::new(),
-        tables: vec![Table {
-            table: table.to_owned(),
-            upserts,
-            deletes: Vec::new(),
-            keys,
-        }],
+fn upserts(table: &str, rows: Vec<(WireKey, Vec<u8>)>) -> Table {
+    let (keys, upserts) = rows.into_iter().unzip();
+    Table {
+        table: table.to_owned(),
+        upserts,
+        deletes: Vec::new(),
+        keys,
+    }
+}
+
+fn deletes(table: &str, keys: Vec<WireKey>) -> Table {
+    Table {
+        table: table.to_owned(),
+        deletes: keys,
+        ..Table::default()
+    }
+}
+
+fn down(sequence: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
+    Body::Down(Down {
+        snapshot_id: snapshot.to_owned(),
+        tables,
         sequence,
-        epoch: epoch.to_owned(),
-    }
+        epoch: EPOCH.to_owned(),
+    })
+    .encoded()
 }
 
-async fn names(conn: &mut Conn) -> Vec<String> {
-    sqlx::query_scalar("SELECT name FROM items ORDER BY name")
-        .fetch_all(&mut *conn)
-        .await
-        .expect("names")
+fn end(sequence: u64, snapshot: &str, tables: &[&str]) -> Vec<u8> {
+    Body::EndSnapshot(EndSnapshot {
+        snapshot_id: snapshot.to_owned(),
+        tables: tables.iter().map(|t| (*t).to_owned()).collect(),
+        sequence,
+        epoch: EPOCH.to_owned(),
+    })
+    .encoded()
 }
 
+fn ids<const N: usize>() -> [Uuid; N] {
+    std::array::from_fn(|_| Uuid::now_v7())
+}
+
+fn at(seconds: i64) -> chrono::DateTime<Utc> {
+    Utc.timestamp_opt(1_800_000_000 + seconds, 0).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// What the server really sends.
+
+/// The server's own messages (`tests/golden`, captured from the postgres
+/// side's relay) leave the replica holding, step by step, what the server
+/// holds — its encodings, its numbering and its snapshots as they are.
 #[sqlx::test(migrations = false)]
-async fn a_message_at_or_below_the_last_applied_changes_nothing(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e1", 5, vec![item("five")]),
-    )
-    .await
-    .unwrap();
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e1", 4, vec![item("four")]),
-    )
-    .await
-    .unwrap();
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e1", 5, vec![item("five again")]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        names(&mut conn).await,
-        vec!["five"],
-        "the past changes nothing"
-    );
-
-    // A server installed again numbers from scratch, and is listened to.
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e2", 1, vec![item("one")]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(names(&mut conn).await, vec!["five", "one"]);
-}
-
-#[sqlx::test(migrations = false)]
-async fn a_row_the_replica_cannot_take_is_reported_until_it_takes_it(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let good = item("good");
-    let (broken, _) = item("broken");
-
-    let applied = apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e", 1, vec![good, (broken, vec![0xff, 0xff])]),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(applied[0].1.len(), 1, "the good row is held");
-    assert_eq!(names(&mut conn).await, vec!["good"]);
-    let reported = rejections(&mut conn, 10).await.unwrap();
-    assert_eq!(reported.len(), 1);
-    assert_eq!(reported[0].table, "items");
-    assert_eq!(
-        reported[0].key.as_ref().map(|k| k.parts.clone()),
-        Some(vec![broken.to_string()])
-    );
-
-    // Sent again as it should be, it is taken, and nothing is left to report.
-    let mut fixed = item("fixed");
-    fixed.1 = ItemRow {
-        id: broken.to_string(),
-        partition_id: Uuid::nil().to_string(),
-        name: "fixed".to_owned(),
+async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: SqlitePool) {
+    use crate::conformance::{golden, GOLDEN};
+    let w = world(pool).await;
+    let messages = golden(&std::fs::read_to_string(GOLDEN).expect("the golden messages"));
+    let mut steps: Vec<&str> = Vec::new();
+    for (step, _) in &messages {
+        if steps.last() != Some(&step.as_str()) {
+            steps.push(step);
+        }
     }
-    .encode_to_vec();
-    fixed.0 = broken;
-    apply(&mut conn, &codecs, &down("items", "e", 2, vec![fixed]))
+    let stray = || async {
+        // A row the server no longer has, held here: a snapshot sweeps it.
+        sqlx::raw_sql(&format!(
+            "INSERT INTO sync_applying VALUES (1); \
+             INSERT INTO items (id, partition_id, name) VALUES (x'{}', x'00', 'stray'); \
+             DELETE FROM sync_applying;",
+            Uuid::now_v7().simple()
+        ))
+        .execute(&w.pool)
         .await
         .unwrap();
-    assert!(rejections(&mut conn, 10).await.unwrap().is_empty());
-    assert_eq!(names(&mut conn).await, vec!["fixed", "good"]);
+    };
+    let state = || async {
+        let all = |sql: &'static str| w.texts(sql);
+        (
+            all("SELECT name FROM items ORDER BY name").await,
+            all("SELECT label || ' ' || revision FROM shelves ORDER BY slot").await,
+            all("SELECT CAST(cents AS TEXT) FROM prices").await,
+            all("SELECT title || ' ' || done FROM tasks").await,
+        )
+    };
+    let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    for step in steps {
+        if step.contains("snapshot") {
+            stray().await;
+        }
+        for (_, bytes) in messages.iter().filter(|(s, _)| s == step) {
+            let received = w.receive(bytes).await;
+            assert!(
+                matches!(received, Received::Applied(_) | Received::SnapshotEnded),
+                "{step}: {received:?}"
+            );
+        }
+        let expected = match step {
+            "rows" => (
+                owned(&["a", "b"]),
+                owned(&["top 1800000000000", "bottom 1800000000000"]),
+                owned(&["9007199254740993"]),
+                owned(&["count 0"]),
+            ),
+            "update" => (
+                owned(&["a2", "b"]),
+                owned(&["top2 1800000000001", "bottom 1800000000000"]),
+                owned(&["250"]),
+                owned(&["recount 1"]),
+            ),
+            "delete" | "snapshot" => (
+                owned(&["a2"]),
+                owned(&["top2 1800000000001"]),
+                owned(&["250"]),
+                owned(&["recount 1"]),
+            ),
+            "emptied" | "empty_snapshot" => (vec![], vec![], vec![], vec![]),
+            other => panic!("a step this suite does not know: {other}"),
+        };
+        assert_eq!(state().await, expected, "after {step}");
+        if step == "rows" {
+            // The replica's own column, kept through the server's edits.
+            w.exec("UPDATE tasks SET done = 1").await.unwrap();
+        }
+    }
+    assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
 }
 
+// ---------------------------------------------------------------------------
+// Snapshots.
+
 #[sqlx::test(migrations = false)]
-async fn a_table_this_build_does_not_mirror_is_rejected_row_by_row(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    apply(
-        &mut conn,
-        &codecs(),
-        &down("newer", "e", 1, vec![item("a"), item("b")]),
-    )
-    .await
-    .unwrap();
+async fn a_snapshot_keeps_what_it_names_and_lets_go_of_the_rest(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [old, a, b] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(old, "old")])]))
+        .await;
 
-    let reported = rejections(&mut conn, 10).await.unwrap();
-    assert_eq!(reported.len(), 2);
-    assert!(reported
-        .iter()
-        .all(|r| r.reason.contains("does not mirror")));
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(2, &s, vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    w.receive(&down(3, &s, vec![upserts("items", vec![item(b, "b")])]))
+        .await;
+    assert_eq!(
+        w.items().await,
+        ["a", "b", "old"],
+        "nothing goes before the end"
+    );
+    let ended = w.receive(&end(4, &s, &["items"])).await;
+    assert!(matches!(ended, Received::SnapshotEnded), "{ended:?}");
+    assert_eq!(w.items().await, ["a", "b"]);
+}
 
-    reported_up(&mut conn, &reported).await;
+/// A snapshot of nothing is only its end: every row of its tables goes.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_that_names_no_row_lets_go_of_every_row(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    w.receive(&end(2, &Uuid::now_v7().to_string(), &["items"]))
+        .await;
+    assert!(w.items().await.is_empty());
+}
+
+/// A table a snapshot covers and names no row of is emptied, while the
+/// tables it named rows of keep them.
+#[sqlx::test(migrations = false)]
+async fn a_table_a_snapshot_names_no_row_of_is_emptied(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, aisle] = ids();
+    let shelf = Shelf {
+        aisle,
+        slot: 1,
+        label: "top".into(),
+        revision: 1,
+    };
+    let shelf_key = key(&[&aisle.to_string(), "1"]);
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("shelves", vec![(shelf_key, json(&shelf))])],
+    ))
+    .await;
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(2, &s, vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    w.receive(&end(3, &s, &["items", "shelves"])).await;
+    assert_eq!(w.items().await, ["a"]);
+    assert_eq!(w.count("SELECT count(*) FROM shelves").await, 0);
+}
+
+/// A snapshot not seen before supersedes the one in progress, whatever
+/// their ids say: the sequence orders them. The end of the superseded one
+/// does nothing; the end of the newer sweeps what only the older named.
+#[sqlx::test(migrations = false)]
+async fn a_newer_snapshot_supersedes_the_one_in_progress_by_sequence(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    let newer_id = Uuid::now_v7().to_string();
+    let older_id = Uuid::now_v7().to_string();
+    // The later id begins first: an id's clock says nothing of the order.
+    w.receive(&down(
+        1,
+        &older_id,
+        vec![upserts("items", vec![item(a, "a")])],
+    ))
+    .await;
+    w.receive(&down(
+        2,
+        &newer_id,
+        vec![upserts("items", vec![item(b, "b")])],
+    ))
+    .await;
+    w.receive(&end(3, &older_id, &["items"])).await;
+    assert_eq!(
+        w.items().await,
+        ["a", "b"],
+        "the superseded end sweeps nothing"
+    );
+    w.receive(&end(4, &newer_id, &["items"])).await;
+    assert_eq!(w.items().await, ["b"]);
+}
+
+/// An end delivered again changes nothing, and a later message of a
+/// snapshot that ended names nothing.
+#[sqlx::test(migrations = false)]
+async fn an_end_delivered_again_changes_nothing(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(1, &s, vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    w.receive(&end(2, &s, &["items"])).await;
+    let again = w.receive(&end(2, &s, &["items"])).await;
+    assert!(matches!(again, Received::AlreadyApplied), "{again:?}");
+    w.receive(&down(3, &s, vec![upserts("items", vec![item(b, "b")])]))
+        .await;
+    let late = w.receive(&end(4, &s, &["items"])).await;
+    assert!(matches!(late, Received::SnapshotEnded));
+    assert_eq!(
+        w.items().await,
+        ["a", "b"],
+        "an ended snapshot sweeps nothing"
+    );
+}
+
+/// A server installed again knows nothing of the snapshot it was sending:
+/// the replica forgets it, and the end of it is the end of one never seen.
+#[sqlx::test(migrations = false)]
+async fn a_new_epoch_forgets_the_snapshot_in_progress(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(5, &s, vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    let other = |body: Body| {
+        let mut message = ToReplica {
+            protocol: envelope::PROTOCOL,
+            body: Some(body),
+        };
+        match &mut message.body {
+            Some(Body::Down(m)) => m.epoch = OTHER_EPOCH.to_owned(),
+            Some(Body::EndSnapshot(m)) => m.epoch = OTHER_EPOCH.to_owned(),
+            _ => {}
+        }
+        message.encode_to_vec()
+    };
+    let decoded = |bytes: Vec<u8>| ToReplica::decode(bytes.as_slice()).unwrap().body.unwrap();
+    w.receive(&other(decoded(down(
+        1,
+        "",
+        vec![upserts("items", vec![item(b, "b")])],
+    ))))
+    .await;
+    w.receive(&other(decoded(end(2, &s, &["items"])))).await;
+    assert!(w.items().await.is_empty(), "named nothing in this epoch");
+}
+
+// ---------------------------------------------------------------------------
+// Numbers, versions, bodies: what a replica does with every message.
+
+#[sqlx::test(migrations = false)]
+async fn a_message_at_or_below_the_last_applied_changes_nothing(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b, c] = ids();
+    w.receive(&down(5, "", vec![upserts("items", vec![item(a, "five")])]))
+        .await;
+    let past = w
+        .receive(&down(4, "", vec![upserts("items", vec![item(b, "four")])]))
+        .await;
+    assert!(matches!(past, Received::AlreadyApplied), "{past:?}");
+    w.receive(&down(5, "", vec![upserts("items", vec![item(c, "again")])]))
+        .await;
+    assert_eq!(w.items().await, ["five"]);
+}
+
+/// Numbers no server sends — 0, past 2^63 - 1 — and an epoch that is no
+/// uuid make the message malformed: acknowledged, and nothing applied.
+#[sqlx::test(migrations = false)]
+async fn a_message_numbered_as_no_server_numbers_one_is_malformed(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b, c] = ids();
+    for sequence in [0, u64::try_from(i64::MAX).unwrap() + 1, u64::MAX] {
+        let got = w
+            .receive(&down(
+                sequence,
+                "",
+                vec![upserts("items", vec![item(a, "a")])],
+            ))
+            .await;
+        assert!(matches!(got, Received::Malformed(_)), "{sequence}: {got:?}");
+    }
+    let no_epoch = Body::Down(Down {
+        tables: vec![upserts("items", vec![item(b, "b")])],
+        sequence: 1,
+        epoch: "e".into(),
+        ..Down::default()
+    })
+    .encoded();
+    assert!(matches!(w.receive(&no_epoch).await, Received::Malformed(_)));
+    assert!(w.items().await.is_empty());
+    assert_eq!(w.count("SELECT count(*) FROM sync_applied").await, 0);
+    // The largest number is one.
+    w.receive(&down(
+        u64::try_from(i64::MAX).unwrap(),
+        "",
+        vec![upserts("items", vec![item(c, "c")])],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["c"]);
+}
+
+/// A body this build does not know is malformed in its own protocol, and
+/// waits for an update in a later one; bytes that are no message at all are
+/// malformed.
+#[sqlx::test(migrations = false)]
+async fn a_body_this_build_does_not_know_waits_only_in_a_later_protocol(pool: SqlitePool) {
+    let w = world(pool).await;
+    // protocol = 1, then field 9 (a body a later build might send).
+    let unknown = |protocol: u8| vec![0x08, protocol, 0x4a, 0x02, 0x08, 0x01];
+    let ours = w.receive(&unknown(1)).await;
+    assert!(matches!(ours, Received::Malformed(_)), "{ours:?}");
+    let later = w.replica.receive(&unknown(2)).await;
     assert!(
-        rejections(&mut conn, 10).await.unwrap().is_empty(),
-        "forgotten once told"
+        matches!(later, Err(ref e @ Error::Protocol { theirs: 2, .. }) if e.is_transient()),
+        "{later:?}"
     );
+    assert!(matches!(
+        w.receive(&[0xff, 0xff, 0xff]).await,
+        Received::Malformed(_)
+    ));
 }
 
-/// A row this build refuses — a trigger, here, as a bug would — is the only
-/// one left out: the rows sent with it are taken.
+/// Whatever bytes arrive — a real message cut short, a byte flipped —
+/// receiving them is never an error, and leaves the replica able to go on.
 #[sqlx::test(migrations = false)]
-async fn a_row_a_trigger_refuses_is_the_only_one_rejected(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    sqlx::raw_sql(
-        "CREATE TRIGGER a_bug BEFORE INSERT ON items WHEN NEW.name = 'poison' \
-         BEGIN SELECT RAISE(ABORT, 'this build cannot take it'); END",
-    )
-    .execute(&mut *conn)
-    .await
-    .unwrap();
-    let (good, bytes) = item("good");
-    apply(
-        &mut conn,
-        &codecs(),
-        &down("items", "e", 1, vec![(good, bytes), item("poison")]),
-    )
-    .await
-    .unwrap();
+async fn no_bytes_make_receiving_an_error(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b, aisle] = ids();
+    let shelf = Shelf {
+        aisle,
+        slot: 3,
+        label: "x".into(),
+        revision: 2,
+    };
+    let message = down(
+        7,
+        &Uuid::now_v7().to_string(),
+        vec![
+            upserts("items", vec![item(a, "a")]),
+            upserts(
+                "shelves",
+                vec![(key(&[&aisle.to_string(), "3"]), json(&shelf))],
+            ),
+            deletes("items", vec![key(&[&b.to_string()])]),
+        ],
+    );
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |below: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % below as u64).unwrap()
+    };
+    for round in 0..300 {
+        let mut bytes = message.clone();
+        match round % 3 {
+            0 => bytes.truncate(next(bytes.len())),
+            1 => {
+                let at = next(bytes.len());
+                bytes[at] ^= 1 << next(8);
+            }
+            _ => {
+                let at = next(bytes.len());
+                bytes[at] = u8::try_from(next(256)).unwrap();
+            }
+        }
+        match w.replica.receive(&bytes).await {
+            Ok(_) | Err(Error::Protocol { .. }) => {}
+            Err(e) => panic!("round {round}: {e}"),
+        }
+    }
+    w.receive(&down(
+        u64::MAX >> 1,
+        "",
+        vec![upserts("items", vec![item(b, "after")])],
+    ))
+    .await;
+    assert!(w.items().await.contains(&"after".to_owned()));
+}
 
-    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM items")
-        .fetch_all(&mut *conn)
+/// The newest version wins whichever arrives first, for an integer version
+/// and for an instant — and an equal one is applied.
+#[sqlx::test(migrations = false)]
+async fn the_newest_version_wins_whatever_its_type_and_order(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [aisle, price] = ids();
+    let shelf = |revision: i64, label: &str| {
+        let row = Shelf {
+            aisle,
+            slot: 1,
+            label: label.into(),
+            revision,
+        };
+        upserts(
+            "shelves",
+            vec![(key(&[&aisle.to_string(), "1"]), json(&row))],
+        )
+    };
+    let price_at = |seconds: i64, cents: i64| {
+        let row = Price {
+            id: price,
+            cents,
+            updated_at: at(seconds),
+        };
+        upserts("prices", vec![(key(&[&price.to_string()]), json(&row))])
+    };
+    let mut sequence = 0;
+    let mut send = |table: Table| {
+        sequence += 1;
+        down(sequence, "", vec![table])
+    };
+    let label = "SELECT label FROM shelves";
+    let cents = "SELECT CAST(cents AS TEXT) FROM prices";
+
+    // Versions as a host keeps them: milliseconds since the epoch.
+    let ms = 1_800_000_000_000;
+    w.receive(&send(shelf(ms + 5, "five"))).await;
+    w.receive(&send(shelf(ms + 3, "three"))).await;
+    assert_eq!(w.texts(label).await, ["five"], "older: kept the newer");
+    w.receive(&send(shelf(ms + 10, "ten"))).await;
+    assert_eq!(w.texts(label).await, ["ten"], "newer: taken");
+    w.receive(&send(shelf(ms + 10, "ten again"))).await;
+    assert_eq!(w.texts(label).await, ["ten again"], "equal: taken");
+
+    w.receive(&send(price_at(60, 600))).await;
+    w.receive(&send(price_at(30, 300))).await;
+    assert_eq!(w.texts(cents).await, ["600"]);
+    w.receive(&send(price_at(61, 610))).await;
+    assert_eq!(w.texts(cents).await, ["610"]);
+    // Stored by another writer in another form, the instant still compares.
+    w.exec(&format!(
+        "UPDATE prices SET updated_at = '{}'",
+        at(120).format("%Y-%m-%d %H:%M:%S+00:00")
+    ))
+    .await
+    .unwrap_err();
+    sqlx::raw_sql("INSERT INTO sync_applying VALUES (1)")
+        .execute(&w.pool)
         .await
         .unwrap();
-    assert_eq!(names, vec!["good".to_owned()]);
-    let reported = rejections(&mut conn, 10).await.unwrap();
-    assert_eq!(reported.len(), 1, "{reported:?}");
-    assert!(reported[0].reason.contains("cannot take it"));
-}
-
-async fn reported_up(conn: &mut Conn, rejected: &[envelope::Rejected]) {
-    reported(conn, rejected).await.unwrap();
-}
-
-#[sqlx::test(migrations = false)]
-async fn digests_leave_out_what_was_retired_or_rejected(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let (kept, kept_bytes) = item("kept");
-    let (retired, retired_bytes) = item("retired");
-    let (broken, _) = item("broken");
-    apply(
-        &mut conn,
-        &codecs,
-        &down(
-            "items",
-            "e",
-            7,
-            vec![
-                (kept, kept_bytes),
-                (retired, retired_bytes),
-                (broken, vec![0xff]),
-            ],
-        ),
-    )
+    w.exec(&format!(
+        "UPDATE prices SET updated_at = '{}'",
+        at(120).format("%Y-%m-%d %H:%M:%S+00:00")
+    ))
     .await
     .unwrap();
-    sqlx::query("UPDATE items SET retired_at = 'now' WHERE name = 'retired'")
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+    w.exec("DELETE FROM sync_applying").await.unwrap();
+    w.receive(&send(price_at(90, 900))).await;
+    assert_eq!(w.texts(cents).await, ["610"]);
+}
 
-    let up = digests(&mut conn, &codecs, Uuid::nil()).await.unwrap();
-
-    assert_eq!((up.epoch.as_str(), up.sequence), ("e", 7));
-    assert_eq!(up.digests.len(), 1);
-    assert_eq!(up.digests[0].count, 1);
+/// Keys of every shape — two parts, an integer among them — are taken, let
+/// go of and swept by what they are, and written in one form wherever they
+/// are compared: a uuid that came uppercase or without hyphens included.
+#[sqlx::test(migrations = false)]
+async fn keys_of_every_shape_are_read_and_written_in_one_form(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [aisle, a] = ids();
+    let shelf = |slot: i64| {
+        let row = Shelf {
+            aisle,
+            slot,
+            label: format!("slot {slot}"),
+            revision: 1,
+        };
+        (key(&[&aisle.to_string(), &slot.to_string()]), json(&row))
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("shelves", vec![shelf(1), shelf(2), shelf(3)])],
+    ))
+    .await;
+    let shouted = aisle.simple().to_string().to_uppercase();
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes("shelves", vec![key(&[&shouted, "+2"])])],
+    ))
+    .await;
     assert_eq!(
-        up.digests[0].fingerprint,
-        envelope::fingerprint(&mut [kept.to_string()])
+        w.texts("SELECT label FROM shelves ORDER BY slot").await,
+        ["slot 1", "slot 3"]
+    );
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(3, &s, vec![upserts("shelves", vec![shelf(3)])]))
+        .await;
+    w.receive(&end(4, &s, &["shelves"])).await;
+    assert_eq!(w.texts("SELECT label FROM shelves").await, ["slot 3"]);
+    // A row that does not decode is reported by its key, in that one form.
+    let broken = upserts("items", vec![(key(&[&a.simple().to_string()]), vec![0xff])]);
+    w.receive(&down(5, "", vec![broken])).await;
+    assert_eq!(w.rejected().await, [format!("items {a}")]);
+    let up = w.up(0, true).await.expect("digests");
+    let shelves = up.digests.iter().find(|d| d.table == "shelves").unwrap();
+    assert_eq!(
+        shelves.fingerprint,
+        envelope::fingerprint([format!("{aisle}|3")])
     );
 }
 
+// ---------------------------------------------------------------------------
+// Rows the replica cannot take, or let go of.
+
 #[sqlx::test(migrations = false)]
-async fn what_the_replica_wrote_is_pending_until_the_server_filed_it(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let (one, one_bytes) = item("one");
-    let (two, two_bytes) = item("two");
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e", 1, vec![(one, one_bytes), (two, two_bytes)]),
+async fn a_row_the_replica_cannot_take_is_reported_until_it_takes_it(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [good, broken] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "items",
+            vec![
+                item(good, "good"),
+                (key(&[&broken.to_string()]), vec![0xff, 0xff]),
+            ],
+        )],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["good"]);
+    assert_eq!(w.rejected().await, [format!("items {broken}")]);
+    let up = w.up(0, false).await.expect("the refusal");
+    assert_eq!(up.rejected.len(), 1);
+    assert_eq!(up.rejected[0].key, Some(key(&[&broken.to_string()])));
+    assert_eq!(up.sequence, 1, "confirmed with its refusal");
+    assert!(w.up(0, false).await.is_none(), "said once");
+
+    w.receive(&down(
+        2,
+        "",
+        vec![upserts("items", vec![item(broken, "fixed")])],
+    ))
+    .await;
+    assert!(w.rejected().await.is_empty());
+    assert_eq!(w.items().await, ["fixed", "good"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_table_this_build_does_not_mirror_is_rejected_row_by_row(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("newer", vec![item(a, "a"), item(b, "b")])],
+    ))
+    .await;
+    assert_eq!(w.rejected().await.len(), 2);
+}
+
+/// A row a trigger refuses — as a bug in this build would — is the only one
+/// left out, and so is a delete it refuses: the rest of the message is
+/// taken.
+#[sqlx::test(migrations = false)]
+async fn what_a_trigger_refuses_is_the_only_thing_rejected(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [good, poison, kept, gone] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "items",
+            vec![item(kept, "kept"), item(gone, "gone")],
+        )],
+    ))
+    .await;
+    w.exec(
+        "CREATE TRIGGER a_bug BEFORE INSERT ON items WHEN NEW.name = 'poison' \
+         BEGIN SELECT RAISE(ABORT, 'this build cannot take it'); END; \
+         CREATE TRIGGER another BEFORE DELETE ON items WHEN OLD.name = 'kept' \
+         BEGIN SELECT RAISE(ABORT, 'this build cannot let it go'); END;",
     )
     .await
     .unwrap();
-    for id in [one, two] {
-        sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', $1)")
-            .bind(id.simple().to_string())
-            .execute(&mut *conn)
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            upserts("items", vec![item(good, "good"), item(poison, "poison")]),
+            deletes(
+                "items",
+                vec![key(&[&kept.to_string()]), key(&[&gone.to_string()])],
+            ),
+        ],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["good", "kept"]);
+    assert_eq!(
+        w.rejected().await,
+        [format!("items {kept}"), format!("items {poison}")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A row a row of the replica's own points at is retired where the table
+/// can retire it, and otherwise rejected — whether the key pointing at it is
+/// checked at once or at commit, the message commits.
+#[sqlx::test(migrations = false)]
+async fn a_row_still_pointed_at_is_retired_or_rejected_never_a_failed_message(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [item_id, price_id, free] = ids();
+    let price = Price {
+        id: price_id,
+        cents: 100,
+        updated_at: at(0),
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts("items", vec![item(item_id, "pointed"), item(free, "free")]),
+            upserts(
+                "prices",
+                vec![(key(&[&price_id.to_string()]), json(&price))],
+            ),
+        ],
+    ))
+    .await;
+    sqlx::query("INSERT INTO receipts (item_id) VALUES ($1)")
+        .bind(item_id)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO quotes (price_id) VALUES ($1)")
+        .bind(price_id)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            deletes("prices", vec![key(&[&price_id.to_string()])]),
+            deletes(
+                "items",
+                vec![key(&[&item_id.to_string()]), key(&[&free.to_string()])],
+            ),
+        ],
+    ))
+    .await;
+    assert!(w.items().await.is_empty());
+    assert_eq!(
+        w.texts("SELECT name FROM items WHERE retired_at IS NOT NULL")
+            .await,
+        ["pointed"],
+        "retired, still there for the receipt"
+    );
+    assert_eq!(w.count("SELECT count(*) FROM prices").await, 1);
+    assert_eq!(w.rejected().await, [format!("prices {price_id}")]);
+    // Sent again, the retired row is live again.
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("items", vec![item(item_id, "back")])],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["back"]);
+}
+
+/// Rejections from before a snapshot began are forgotten when it ends: it
+/// sent again everything the replica should hold.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_forgets_the_rejections_from_before_it(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [gone, still] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "items",
+            vec![
+                (key(&[&gone.to_string()]), vec![0xff]),
+                (key(&[&still.to_string()]), vec![0xff]),
+            ],
+        )],
+    ))
+    .await;
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(
+        2,
+        &s,
+        vec![upserts(
+            "items",
+            vec![(key(&[&still.to_string()]), vec![0xff])],
+        )],
+    ))
+    .await;
+    w.receive(&end(3, &s, &["items"])).await;
+    assert_eq!(w.rejected().await, [format!("items {still}")]);
+    // Let go of by the server, it is no longer one to report.
+    w.receive(&down(
+        4,
+        "",
+        vec![deletes("items", vec![key(&[&still.to_string()])])],
+    ))
+    .await;
+    assert!(w.rejected().await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Tables written on both sides, and records.
+
+/// A row of a two-way table begins on the server; the replica edits only
+/// its own columns, and only those edits go up — the engine's own writes
+/// note nothing.
+#[sqlx::test(migrations = false)]
+async fn a_two_way_row_keeps_the_replicas_columns_and_sends_only_its_edits(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [id, other] = ids();
+    let task = |title: &str, seconds: i64| {
+        let row = Task {
+            id,
+            title: title.into(),
+            done: false,
+            updated_at: at(seconds),
+        };
+        upserts("tasks", vec![(key(&[&id.to_string()]), json(&row))])
+    };
+    w.receive(&down(1, "", vec![task("write", 0)])).await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
+        0,
+        "no echo"
+    );
+    w.up(0, false).await;
+
+    sqlx::query("UPDATE tasks SET done = 1 WHERE id = $1")
+        .bind(id)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.receive(&down(2, "", vec![task("rewrite", 10)])).await;
+    assert_eq!(
+        w.texts("SELECT title || ' ' || done FROM tasks").await,
+        ["rewrite 1"]
+    );
+
+    let insert = sqlx::query(
+        "INSERT INTO tasks (id, title, done, updated_at) VALUES ($1, 'mine', 0, '2026-01-01')",
+    )
+    .bind(other)
+    .execute(&w.pool)
+    .await;
+    assert!(insert.is_err(), "a row of it begins on the server");
+
+    let up = w.up(0, false).await.expect("the edit");
+    assert_eq!(up.tables.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&up.tables[0].upserts[0]).unwrap();
+    assert_eq!(
+        (&sent["title"], &sent["done"]),
+        (&serde_json::json!("rewrite"), &serde_json::json!(true))
+    );
+    assert_eq!(up.tables[0].keys, [key(&[&id.to_string()])]);
+
+    w.receive(&down(
+        3,
+        "",
+        vec![deletes("tasks", vec![key(&[&id.to_string()])])],
+    ))
+    .await;
+    assert_eq!(w.count("SELECT count(*) FROM tasks").await, 0);
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes WHERE upload IS NULL")
+            .await,
+        0,
+        "letting go of the server's row notes nothing"
+    );
+}
+
+/// A record is the replica's: the server sends none of it and lets go of
+/// none of it. History is written once; state is edited, and a changed key
+/// goes up as the old one gone.
+#[sqlx::test(migrations = false)]
+async fn a_record_is_the_replicas_and_history_is_written_once(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [event, reading, moved] = ids();
+    let me = w.me;
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'opened')")
+        .bind(event)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, 1, 1)")
+        .bind(me)
+        .bind(reading)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let edit = sqlx::query("UPDATE events SET what = 'closed' WHERE id = $1")
+        .bind(event)
+        .execute(&w.pool)
+        .await;
+    assert!(edit.is_err(), "history is written once");
+
+    let theirs = Reading {
+        replica_id: me,
+        id: reading,
+        value: 99,
+        at: 99,
+    };
+    let reading_key = key(&[&me.to_string(), &reading.to_string()]);
+    let s = Uuid::now_v7().to_string();
+    w.receive(&down(
+        1,
+        &s,
+        vec![
+            upserts("readings", vec![(reading_key.clone(), json(&theirs))]),
+            deletes("events", vec![key(&[&event.to_string()])]),
+        ],
+    ))
+    .await;
+    w.receive(&end(2, &s, &["readings", "events"])).await;
+    assert_eq!(w.count("SELECT count(*) FROM events").await, 1);
+    assert_eq!(
+        w.texts("SELECT CAST(value AS TEXT) FROM readings").await,
+        ["1"]
+    );
+    assert_eq!(w.rejected().await, [format!("readings {me}|{reading}")]);
+
+    sqlx::query("UPDATE readings SET id = $2, value = 2, at = 2 WHERE id = $1")
+        .bind(reading)
+        .bind(moved)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let up = w.up(0, false).await.expect("the writes");
+    let tables: Vec<(&str, usize, usize)> = up
+        .tables
+        .iter()
+        .map(|t| (t.table.as_str(), t.upserts.len(), t.deletes.len()))
+        .collect();
+    assert_eq!(
+        tables,
+        [("readings", 1, 0), ("events", 1, 0), ("readings", 0, 1)],
+        "upserts parents first, then deletes children first"
+    );
+    let gone = up.tables.iter().find(|t| !t.deletes.is_empty()).unwrap();
+    assert_eq!(gone.deletes, [reading_key]);
+}
+
+/// A key stored in a form the engine does not read back is refused when it
+/// is written, rather than going up as a row that seems gone.
+#[sqlx::test(migrations = false)]
+async fn a_key_stored_in_a_form_the_engine_cannot_read_is_refused(pool: SqlitePool) {
+    let w = world(pool).await;
+    let as_text = sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7().to_string())
+        .execute(&w.pool)
+        .await;
+    assert!(as_text.is_err());
+    let as_blob = sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await;
+    assert!(as_blob.is_ok());
+    let theirs = w.exec("UPDATE items SET name = 'mine'").await;
+    assert!(theirs.is_ok(), "no row, nothing refused");
+    let [a] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    assert!(
+        w.exec("UPDATE items SET name = 'mine'").await.is_err(),
+        "the server's rows are the server's"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What goes up.
+
+#[sqlx::test(migrations = false)]
+async fn what_the_replica_wrote_is_pending_until_the_server_filed_it(pool: SqlitePool) {
+    let w = world(pool).await;
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+            .bind(Uuid::now_v7())
+            .execute(&w.pool)
             .await
             .unwrap();
     }
-    let progress = |unsent, unfiled| {
+    let pending = |unsent, unfiled| {
         vec![UpProgress {
-            table: "items".to_owned(),
+            table: "events".to_owned(),
             unsent,
             unfiled,
+            set_aside: 0,
         }]
     };
-    assert_eq!(super::progress(&mut conn).await.unwrap(), progress(2, 0));
-
-    let notes = unsent(&mut conn, 10, std::time::Duration::from_secs(3600))
-        .await
-        .unwrap();
-    let up = upload(&mut conn, &codecs, Uuid::nil(), &notes)
-        .await
-        .unwrap();
+    let mut conn = w.pool.acquire().await.unwrap();
+    assert_eq!(progress(&mut conn).await.unwrap(), pending(2, 0));
+    let up = w.up(0, false).await.expect("the rows");
     assert_eq!(up.tables[0].upserts.len(), 2);
-    assert_eq!(
-        up.uploads,
-        vec![notes[1].id as u64],
-        "numbered by its highest note"
-    );
-    sent(&mut conn, &notes, &up).await.unwrap();
-    assert_eq!(super::progress(&mut conn).await.unwrap(), progress(0, 2));
+    assert_eq!(progress(&mut conn).await.unwrap(), pending(0, 2));
     assert!(
-        unsent(&mut conn, 10, std::time::Duration::from_secs(3600))
+        w.up(0, false)
             .await
-            .unwrap()
-            .is_empty(),
+            .and_then(|up| up.tables.first().cloned())
+            .is_none(),
         "not sent again while the server may still answer"
     );
-
-    filed(
-        &mut conn,
-        &envelope::Filed {
-            uploads: up.uploads.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        super::progress(&mut conn).await.unwrap().is_empty(),
-        "nothing on its way"
-    );
+    let filed = w
+        .receive(
+            &Body::Filed(Filed {
+                uploads: up.uploads.clone(),
+            })
+            .encoded(),
+        )
+        .await;
+    assert!(matches!(filed, Received::Filed));
+    assert!(progress(&mut conn).await.unwrap().is_empty());
 }
 
-/// One message carries whichever thing the server sends; one of a later
-/// protocol is not acted on, so it can come again once this build is updated;
-/// bytes that are no message at all are dropped rather than stop the queue.
+/// Whatever the order uploads are sent, lost, sent again and answered in —
+/// late answers included — a write is forgotten only once the server filed
+/// an upload that carried it.
 #[sqlx::test(migrations = false)]
-async fn a_message_is_acted_on_only_in_a_protocol_this_build_speaks(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-
-    let applied = receive(
-        &mut conn,
-        &codecs,
-        &Body::Down(down("items", "e", 1, vec![item("one")])).encoded(),
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(applied, Received::Applied(ref t) if t[0].1.len() == 1),
-        "{applied:?}"
-    );
-
-    let later = ToReplica {
-        protocol: envelope::PROTOCOL + 1,
-        body: Some(Body::Down(down("items", "e", 2, vec![item("two")]))),
+async fn no_answer_forgets_a_write_it_did_not_carry(pool: SqlitePool) {
+    let settings = Outbox {
+        limits: Limits {
+            rows: 50,
+            bytes: 1 << 20,
+        },
+        resend_after: std::time::Duration::from_secs(3600),
+        ..Outbox::default()
     };
-    let refused = receive(&mut conn, &codecs, &later.encode_to_vec()).await;
-    assert!(
-        matches!(refused, Err(ref e @ Error::Protocol { .. }) if e.is_transient()),
-        "{refused:?}"
-    );
-    assert_eq!(names(&mut conn).await, vec!["one"]);
-
-    let garbage = receive(&mut conn, &codecs, &[0xff, 0xff, 0xff])
-        .await
-        .unwrap();
-    assert!(matches!(garbage, Received::Unreadable(_)), "{garbage:?}");
+    let lanes = Settings::default().lanes;
+    let w = world(pool).await;
+    for walk in 1..=5_u64 {
+        w.exec("DELETE FROM sync_notes").await.unwrap();
+        forgets_nothing_unfiled(&w, &lanes, &settings, walk).await;
+    }
 }
 
-/// One message up carries whatever the replica has to say on its lane: rows it
-/// wrote on theirs, and on the main lane what it could not take, what it
-/// applied and, when due, what it holds. Once the transport took it, none of
-/// it is said again.
+/// The schedule that once lost a write: the first upload is lost, the
+/// second carries only the newer write, both go again together, and the
+/// second's late answer arrives.
 #[sqlx::test(migrations = false)]
-async fn the_outbox_says_each_thing_once_on_its_lane(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let lanes = [
-        Lane {
-            name: "main",
-            tables: &[],
-        },
-        Lane {
-            name: "fast",
-            tables: &["items"],
-        },
-    ];
+async fn a_late_answer_forgets_only_what_its_upload_carried(pool: SqlitePool) {
+    let w = world(pool).await;
+    let lanes = Settings::default().lanes;
     let settings = Outbox::default();
-    let me = Uuid::now_v7();
-    let (written, bytes) = item("written");
-    let (_, broken) = item("broken");
-    apply(
-        &mut conn,
-        &codecs,
-        &down(
-            "items",
-            "e",
-            7,
-            vec![(written, bytes), (Uuid::now_v7(), broken[..3].to_vec())],
-        ),
-    )
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', $1)")
-        .bind(written.simple().to_string())
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-
-    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .expect("something to say");
-    assert_eq!(main.lane, "main");
-    assert!(main.up.tables.is_empty(), "the rows go on their own lane");
-    assert_eq!(main.up.rejected.len(), 1);
-    assert_eq!((main.up.epoch.as_str(), main.up.sequence), ("e", 7));
-    assert_eq!(main.up.protocol, envelope::PROTOCOL);
-    delivered(&mut conn, &main).await.unwrap();
-    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .is_none());
-
-    let fast = outbox(&mut conn, &codecs, me, &lanes, 1, &settings, false)
-        .await
-        .unwrap()
-        .expect("the row written");
-    assert_eq!(fast.up.tables[0].upserts.len(), 1);
-    assert_eq!(fast.up.sequence, 0, "the main lane says what was applied");
-    assert!(fast.up.rejected.is_empty());
-    delivered(&mut conn, &fast).await.unwrap();
-    assert!(outbox(&mut conn, &codecs, me, &lanes, 1, &settings, false)
-        .await
-        .unwrap()
-        .is_none());
-
-    let report = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, true)
-        .await
-        .unwrap()
-        .expect("the digests");
-    assert_eq!(report.up.digests.len(), 1);
-    assert_eq!(report.up.digests[0].count, 1);
-    assert_eq!(
-        report.up.sequence, 7,
-        "digests are compared at what was applied"
-    );
-}
-
-/// The replica tells the server what it wrote and the server has not filed:
-/// with the rows it sends, at once when that starts or empties, and while it
-/// grows, no more often than it was told to.
-#[sqlx::test(migrations = false)]
-async fn the_backlog_is_said_when_it_changes(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let lanes = [
-        Lane {
-            name: "main",
-            tables: &[],
-        },
-        Lane {
-            name: "fast",
-            tables: &["items"],
-        },
-    ];
-    let mut settings = Outbox::default();
-    let me = Uuid::now_v7();
-    let note = |key: Uuid| {
-        sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', $1)")
-            .bind(key.simple().to_string())
-    };
-    let said = |o: &Option<Outgoing>| {
-        o.as_ref().and_then(|o| o.up.backlog.clone()).map(|b| {
-            b.tables
-                .into_iter()
-                .map(|t| (t.table, t.unsent, t.unfiled))
-                .collect::<Vec<_>>()
-        })
-    };
-
-    note(Uuid::now_v7()).execute(&mut *conn).await.unwrap();
-    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap();
-    assert_eq!(said(&main), Some(vec![("items".into(), 1, 0)]), "it starts");
-    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
-
-    note(Uuid::now_v7()).execute(&mut *conn).await.unwrap();
-    assert!(
-        outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+    let write =
+        || sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')").bind(Uuid::now_v7());
+    let send = || async {
+        let mut tx = w.pool.begin().await.unwrap();
+        let outgoing = outbox(&mut tx, codecs(), &lanes, 0, &settings, false)
             .await
             .unwrap()
-            .is_none(),
-        "it grows, and was said a moment ago"
-    );
-    settings.backlog_every = std::time::Duration::ZERO;
-    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+            .unwrap();
+        delivered(&mut tx, &outgoing).await.unwrap();
+        tx.commit().await.unwrap();
+        outgoing
+    };
+    write().execute(&w.pool).await.unwrap();
+    let lost = send().await;
+    write().execute(&w.pool).await.unwrap();
+    let late = send().await;
+    assert_eq!((lost.rows(), late.rows()), (1, 1));
+    w.exec("UPDATE sync_notes SET sent_at = '2000-01-01T00:00:00.000Z'")
         .await
         .unwrap();
-    assert_eq!(said(&main), Some(vec![("items".into(), 2, 0)]), "when due");
-    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
-
-    let fast = outbox(&mut conn, &codecs, me, &lanes, 1, &settings, false)
-        .await
-        .unwrap()
-        .expect("the rows");
-    assert!(fast.up.backlog.is_none(), "the main lane says it");
-    delivered(&mut conn, &fast).await.unwrap();
-    filed(
-        &mut conn,
-        &envelope::Filed {
-            uploads: fast.up.uploads.clone(),
-        },
+    assert_eq!(send().await.rows(), 2, "both go again");
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: late.up.uploads.clone(),
+        })
+        .encoded(),
     )
-    .await
-    .unwrap();
-    settings.backlog_every = std::time::Duration::from_secs(3600);
-    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap();
-    assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
-    assert!(main.as_ref().unwrap().up.tables.is_empty());
-    delivered(&mut conn, main.as_ref().unwrap()).await.unwrap();
-    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .is_none());
+    .await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
+        2,
+        "the answer to the second upload names neither as they were sent again"
+    );
 }
 
-/// A replica database with nothing of the engine gets its tables and a
-/// trigger on every table that goes up, and every write to one is noted; a
-/// table that goes up with nothing noting it is refused.
-#[sqlx::test(migrations = false)]
-async fn install_notes_every_write_of_what_goes_up(pool: crate::DbPool) {
-    use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
-    let mut conn = pool.acquire().await.unwrap();
-    sqlx::raw_sql(
-        "CREATE TABLE readings (id BLOB PRIMARY KEY NOT NULL, replica_id BLOB NOT NULL, value TEXT NOT NULL)",
-    )
-    .execute(&mut *conn)
-    .await
-    .unwrap();
-    let codecs = vec![Codec::<()>::new::<Reading, ReadingRow>(
-        reading_to_wire,
-        reading_from_wire,
-        None,
-    )];
-    assert!(
-        check(&mut conn, &codecs).await.is_err(),
-        "nothing installed yet"
-    );
-
-    install(&mut conn, &codecs).await.unwrap();
-    install(&mut conn, &codecs).await.expect("idempotent");
-    let id = Uuid::now_v7();
-    for sql in [
-        "INSERT INTO readings VALUES ($1, $1, 'one')",
-        "UPDATE readings SET value = 'two' WHERE id = $1",
-        "DELETE FROM readings WHERE id = $1",
-    ] {
-        sqlx::query(sql).bind(id).execute(&mut *conn).await.unwrap();
+/// One seeded walk of [`no_answer_forgets_a_write_it_did_not_carry`].
+async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, walk: u64) {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15 ^ walk.wrapping_mul(0x2545_f491_4f6c_dd1d);
+    let mut next = |below: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % below as u64).unwrap()
+    };
+    // The sends the server got, each with its number and the notes it
+    // carried: an answer names the number.
+    let mut received: Vec<(u64, Vec<i64>)> = Vec::new();
+    let mut ever_filed: HashSet<i64> = HashSet::new();
+    let mut noted: HashSet<i64> = HashSet::new();
+    for _ in 0..150 {
+        match next(6) {
+            0 => {
+                sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+                    .bind(Uuid::now_v7())
+                    .execute(&w.pool)
+                    .await
+                    .unwrap();
+            }
+            1 | 2 => {
+                let mut tx = w.pool.begin().await.unwrap();
+                let outgoing = outbox(&mut tx, codecs(), lanes, 0, settings, false)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                let Some(outgoing) = outgoing else { continue };
+                let Some(&number) = outgoing.up.uploads.first() else {
+                    continue;
+                };
+                // Lost on the way, or taken by the server.
+                if next(2) == 0 {
+                    received.push((number, outgoing.notes.clone()));
+                }
+                let mut tx = w.pool.begin().await.unwrap();
+                delivered(&mut tx, &outgoing).await.unwrap();
+                tx.commit().await.unwrap();
+            }
+            3 | 4 => {
+                // Time passes: whatever was sent and not answered goes again.
+                w.exec("UPDATE sync_notes SET sent_at = '2000-01-01T00:00:00.000Z' WHERE sent_at IS NOT NULL")
+                    .await
+                    .unwrap();
+            }
+            5 if !received.is_empty() => {
+                // An answer, of any send the server got, in any order.
+                let (number, notes) = received.remove(next(received.len()));
+                ever_filed.extend(notes);
+                w.receive(
+                    &Body::Filed(Filed {
+                        uploads: vec![number],
+                    })
+                    .encoded(),
+                )
+                .await;
+            }
+            _ => {}
+        }
+        let now: HashSet<i64> = sqlx::query_scalar("SELECT id FROM sync_notes")
+            .fetch_all(&w.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        noted.extend(now.iter().copied());
+        for forgotten in noted.difference(&now) {
+            assert!(
+                ever_filed.contains(forgotten),
+                "walk {walk}: note {forgotten} forgotten, and no send that carried it was filed"
+            );
+        }
     }
-    let keys: Vec<String> =
-        sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = 'readings'")
-            .fetch_all(&mut *conn)
+    assert!(!ever_filed.is_empty(), "walk {walk} filed something");
+}
+
+/// A message up never outgrows the transport's bytes: what does not fit
+/// waits for the next, and a row no message can carry is set aside — and
+/// counted — rather than offered for ever.
+#[sqlx::test(migrations = false)]
+async fn a_message_up_fits_the_transport_and_a_row_too_large_is_set_aside(pool: SqlitePool) {
+    let limits = Limits {
+        rows: 100,
+        bytes: envelope::ENVELOPE_ROOM + 600,
+    };
+    let settings = Settings {
+        outbox: Outbox {
+            limits,
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    for what in [
+        "a".repeat(200),
+        "b".repeat(200),
+        "c".repeat(200),
+        "d".repeat(2000),
+    ] {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+            .bind(Uuid::now_v7())
+            .bind(what)
+            .execute(&w.pool)
             .await
             .unwrap();
-    assert_eq!(keys, vec![id.simple().to_string(); 3]);
-    assert!(
-        codecs[0].key(&[keys[0].clone()]).is_ok(),
-        "a key the codec reads"
-    );
-
-    sqlx::raw_sql("DROP TRIGGER sync_note_readings_insert; DROP TRIGGER sync_note_readings_update; DROP TRIGGER sync_note_readings_delete")
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-    let refused = check(&mut conn, &codecs).await.unwrap_err();
-    assert!(refused.to_string().contains("readings"), "{refused}");
+    }
+    let mut rows = 0;
+    while let Some(up) = w.up(0, false).await {
+        assert!(
+            up.encoded_len() <= limits.bytes,
+            "{} bytes",
+            up.encoded_len()
+        );
+        rows += up.tables.iter().map(|t| t.upserts.len()).sum::<usize>();
+        if up.tables.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(rows, 3);
+    let mut conn = w.pool.acquire().await.unwrap();
+    let progress = progress(&mut conn).await.unwrap();
+    assert_eq!((progress[0].set_aside, progress[0].unfiled), (1, 3));
 }
 
-/// A table that travels as JSON is applied like any other.
+/// A message the uplink refuses for good does not come back for ever: its
+/// rows are set aside, the rest of what the replica has to say goes, and
+/// the rows are offered again when the replica runs again.
 #[sqlx::test(migrations = false)]
-async fn a_json_table_is_applied_like_any_other(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = vec![Codec::<()>::json::<Item>(None)];
-    let id = Uuid::now_v7();
-    let row = serde_json::to_vec(&Item {
-        id,
-        partition_id: Uuid::nil(),
-        name: "as json".to_owned(),
-    })
-    .unwrap();
-    apply(&mut conn, &codecs, &down("items", "e", 1, vec![(id, row)]))
+async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool: SqlitePool) {
+    let w = world(pool.clone()).await;
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
         .await
         .unwrap();
-    assert_eq!(names(&mut conn).await, vec!["as json"]);
+    *w.uplink.refusing.lock().unwrap() = Some(false);
+    assert!(w.replica.send_lane(0, false).await.unwrap(), "set aside");
+    *w.uplink.refusing.lock().unwrap() = None;
+    let up = w.up(0, false).await.expect("the backlog");
+    assert!(up.tables.is_empty());
+    assert_eq!(up.backlog.unwrap().tables[0].set_aside, 1);
+
+    let again = Replica::new(pool, codecs(), w.me, w.uplink.clone(), Settings::default())
+        .await
+        .unwrap();
+    again.send_lane(0, false).await.unwrap();
+    let (_, up) = w.uplink.taken().pop().unwrap();
+    assert_eq!(up.tables[0].upserts.len(), 1, "offered again");
+}
+
+/// Each lane keeps its own pace: one the uplink fails on does not hold back
+/// another.
+#[sqlx::test(migrations = false)]
+async fn a_lane_that_fails_holds_back_no_other(pool: SqlitePool) {
+    let settings = Settings {
+        lanes: vec![
+            Lane {
+                name: "main",
+                tables: &[],
+            },
+            Lane {
+                name: "fast",
+                tables: &["readings"],
+            },
+        ],
+        idle: std::time::Duration::from_millis(10),
+        backoff: (
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(20),
+        ),
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    *w.uplink.refusing.lock().unwrap() = Some(true);
+    w.uplink.refused_lanes.lock().unwrap().push("main");
+    sqlx::query("INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, 1, 1)")
+        .bind(w.me)
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let [a] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let run = w.replica.run(async move {
+        let _ = stopped.wait_for(|s| *s).await;
+    });
+    let watch = async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let sent = w.uplink.sent.lock().unwrap().clone();
+            if sent
+                .iter()
+                .any(|(_, lane, up)| *lane == "fast" && !up.tables.is_empty())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fast lane waited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stop.send(true).unwrap();
+    };
+    tokio::join!(run, watch);
+}
+
+/// What the replica tells the server it applied is of one epoch: a message
+/// of a new one applied while the old one's confirmation was on its way is
+/// confirmed in turn.
+#[sqlx::test(migrations = false)]
+async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    w.receive(&down(7, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    let lanes = Settings::default().lanes;
+    let mut tx = w.pool.begin().await.unwrap();
+    let outgoing = outbox(&mut tx, codecs(), &lanes, 0, &Outbox::default(), false)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(outgoing.up.sequence, 7);
+    let mut message =
+        ToReplica::decode(down(1, "", vec![upserts("items", vec![item(b, "b")])]).as_slice())
+            .unwrap();
+    if let Some(Body::Down(down)) = &mut message.body {
+        down.epoch = OTHER_EPOCH.to_owned();
+    }
+    w.receive(&message.encode_to_vec()).await;
+    let mut tx = w.pool.begin().await.unwrap();
+    delivered(&mut tx, &outgoing).await.unwrap();
+    tx.commit().await.unwrap();
+    let up = w.up(0, false).await.expect("the new epoch's confirmation");
+    assert_eq!((up.epoch.as_str(), up.sequence), (OTHER_EPOCH, 1));
 }
 
 /// A replica does not confirm a message while refusals of it are still to
 /// report: the server would take the refused rows for applied.
 #[sqlx::test(migrations = false)]
-async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let lanes = [Lane {
-        name: "main",
-        tables: &[],
-    }];
-    let settings = Outbox {
-        rejections: 1,
-        ..Outbox::default()
+async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool) {
+    let settings = Settings {
+        outbox: Outbox {
+            rejections: 1,
+            ..Outbox::default()
+        },
+        ..Settings::default()
     };
-    let me = Uuid::now_v7();
-    let broken = |name: &str| {
-        let (id, bytes) = item(name);
-        (id, bytes[..3].to_vec())
-    };
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "e", 7, vec![broken("one"), broken("two")]),
-    )
-    .await
-    .unwrap();
-
-    let first = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .expect("a refusal to report");
-    assert_eq!((first.up.rejected.len(), first.up.sequence), (1, 0));
-    delivered(&mut conn, &first).await.unwrap();
-    let last = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .expect("the other refusal, and the confirmation");
-    assert_eq!((last.up.rejected.len(), last.up.sequence), (1, 7));
+    let w = world_with(pool, settings).await;
+    let [a, b] = ids();
+    let broken = |id: Uuid| (key(&[&id.to_string()]), vec![0xff]);
+    w.receive(&down(
+        7,
+        "",
+        vec![upserts("items", vec![broken(a), broken(b)])],
+    ))
+    .await;
+    let first = w.up(0, false).await.unwrap();
+    assert_eq!((first.rejected.len(), first.sequence), (1, 0));
+    let last = w.up(0, false).await.unwrap();
+    assert_eq!((last.rejected.len(), last.sequence), (1, 7));
 }
 
-/// A backlog that is not empty is said again now and then, unchanged, and
-/// at once to a server installed again: either may have lost it.
+/// The replica tells the server what it wrote and the server has not filed:
+/// with the rows it sends, at once when that starts or empties, again to a
+/// server installed again, and while it grows no more often than told.
 #[sqlx::test(migrations = false)]
-async fn a_backlog_not_empty_is_said_again(pool: crate::DbPool) {
-    let mut conn = replica(&pool).await;
-    let codecs = codecs();
-    let lanes = [
+async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
+    let w = world(pool).await;
+    let lanes = vec![
         Lane {
             name: "main",
             tables: &[],
         },
         Lane {
             name: "fast",
-            tables: &["items"],
+            tables: &["events"],
         },
     ];
     let mut settings = Outbox::default();
-    let me = Uuid::now_v7();
-    sqlx::query("INSERT INTO sync_notes (relation, row_key) VALUES ('items', 'k')")
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-    let main = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .expect("it starts");
-    delivered(&mut conn, &main).await.unwrap();
-    assert!(outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .is_none());
+    let write =
+        || sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')").bind(Uuid::now_v7());
+    let said = |o: &Option<Outgoing>| {
+        o.as_ref()
+            .and_then(|o| o.up.backlog.clone())
+            .map(|b: Backlog| {
+                b.tables
+                    .into_iter()
+                    .map(|t| (t.table, t.unsent, t.unfiled))
+                    .collect::<Vec<_>>()
+            })
+    };
+    let turn = |lane: usize, settings: Outbox| {
+        let pool = w.pool.clone();
+        let lanes = lanes.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let outgoing = outbox(&mut tx, codecs(), &lanes, lane, &settings, false)
+                .await
+                .unwrap();
+            if let Some(o) = &outgoing {
+                delivered(&mut tx, o).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+            outgoing
+        }
+    };
 
+    write().execute(&w.pool).await.unwrap();
+    let main = turn(0, settings.clone()).await;
+    assert_eq!(
+        said(&main),
+        Some(vec![("events".into(), 1, 0)]),
+        "it starts"
+    );
+    write().execute(&w.pool).await.unwrap();
+    assert!(
+        turn(0, settings.clone()).await.is_none(),
+        "it grows, said a moment ago"
+    );
     settings.backlog_every = std::time::Duration::ZERO;
-    let again = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
-        .await
-        .unwrap()
-        .expect("unchanged, said again");
-    assert!(again.up.backlog.is_some());
-    delivered(&mut conn, &again).await.unwrap();
+    let main = turn(0, settings.clone()).await;
+    assert_eq!(said(&main), Some(vec![("events".into(), 2, 0)]), "when due");
+    let again = turn(0, settings.clone()).await;
+    assert!(again.is_some(), "unchanged, said again when due");
 
+    let fast = turn(1, settings.clone()).await.expect("the rows");
+    assert!(fast.up.backlog.is_none(), "the main lane says it");
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: fast.up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
     settings.backlog_every = std::time::Duration::from_secs(3600);
-    apply(&mut conn, &codecs, &down("items", "first", 1, vec![]))
+    let main = turn(0, settings.clone()).await;
+    assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
+    assert!(turn(0, settings.clone()).await.is_none());
+
+    write().execute(&w.pool).await.unwrap();
+    turn(0, settings.clone()).await.expect("it starts again");
+    let [a] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    let mut message = ToReplica::decode(down(1, "", vec![]).as_slice()).unwrap();
+    if let Some(Body::Down(down)) = &mut message.body {
+        down.epoch = OTHER_EPOCH.to_owned();
+    }
+    w.receive(&message.encode_to_vec()).await;
+    let told = turn(0, settings.clone())
+        .await
+        .expect("a new server hears it");
+    assert!(told.up.backlog.is_some());
+}
+
+/// A clock set back makes nothing wait for it to come round again: an upload
+/// sent "in the future" goes again.
+#[sqlx::test(migrations = false)]
+async fn a_clock_set_back_holds_back_nothing(pool: SqlitePool) {
+    let w = world(pool).await;
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
         .await
         .unwrap();
-    apply(
-        &mut conn,
-        &codecs,
-        &down("items", "installed again", 1, vec![]),
+    w.up(0, false).await.expect("sent");
+    w.exec(
+        "UPDATE sync_notes SET sent_at = '2999-01-01T00:00:00.000Z'; \
+            UPDATE sync_backlog SET reported_at = 32503680000",
     )
     .await
     .unwrap();
-    let told = outbox(&mut conn, &codecs, me, &lanes, 0, &settings, false)
+    let up = w.up(0, false).await.expect("sent again");
+    assert_eq!(up.tables[0].upserts.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The database the engine runs against.
+
+/// The engine's triggers are checked as they are, not by name: one that
+/// differs, one missing, and one left from a table that no longer travels
+/// are each refused; installing puts them right, in one transaction.
+#[sqlx::test(migrations = false)]
+async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
+    let w = world(pool).await;
+    let mut conn = w.pool.acquire().await.unwrap();
+    check(&mut conn, codecs()).await.expect("as installed");
+    let script = triggers(codecs());
+    assert!(script.contains("sync_note_readings_update"));
+
+    let cases = [
+        "DROP TRIGGER sync_note_readings_update; CREATE TRIGGER sync_note_readings_update \
+         AFTER UPDATE ON readings BEGIN INSERT INTO sync_notes (relation, row_key) VALUES ('readings', NEW.id); END",
+        "DROP TRIGGER sync_note_events_delete",
+        "CREATE TRIGGER sync_note_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
+        "CREATE TRIGGER by_hand AFTER INSERT ON receipts BEGIN \
+         INSERT INTO sync_notes (relation, row_key) VALUES ('receipts', NEW.id); END",
+    ];
+    for case in cases {
+        sqlx::raw_sql(case).execute(&mut *conn).await.unwrap();
+        let refused = check(&mut conn, codecs()).await;
+        assert!(refused.is_err(), "{case}");
+        if case.contains("by_hand") {
+            sqlx::raw_sql("DROP TRIGGER by_hand")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        install(&mut conn, codecs()).await.expect("put right");
+    }
+    sqlx::raw_sql("PRAGMA synchronous = OFF")
+        .execute(&mut *conn)
         .await
-        .unwrap()
-        .expect("a new server hears it");
-    assert!(told.up.backlog.is_some());
+        .unwrap();
+    assert!(
+        check(&mut conn, codecs()).await.is_err(),
+        "commits not durable"
+    );
+}
+
+/// An install that fails leaves nothing behind: the engine's tables and
+/// triggers go in together, or not at all.
+#[sqlx::test(migrations = false)]
+async fn an_install_that_fails_leaves_nothing_half_done(pool: SqlitePool) {
+    let mut conn = pool.acquire().await.unwrap();
+    // `tasks` is missing: its triggers cannot be created.
+    sqlx::raw_sql(&TABLES.replace("CREATE TABLE tasks", "CREATE TABLE not_tasks"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    assert!(install(&mut conn, codecs()).await.is_err());
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name LIKE 'sync%'")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Lanes a replica cannot send up with are refused before it runs.
+#[test]
+fn lanes_that_would_strand_a_write_are_refused() {
+    let lane = |name, tables| Lane { name, tables };
+    let refused: [&[Lane]; 5] = [
+        &[],
+        &[lane("a", &[]), lane("b", &[])],
+        &[lane("a", &["events"]), lane("b", &["events"])],
+        &[lane("a", &["items"])],
+        &[lane("a", &["events"])],
+    ];
+    for lanes in refused {
+        assert!(
+            check_settings(codecs(), lanes, &Outbox::default()).is_err(),
+            "{lanes:?}"
+        );
+    }
+    let fine = [lane("main", &[]), lane("fast", &["readings"])];
+    check_settings(codecs(), &fine, &Outbox::default()).unwrap();
+    let tiny = Outbox {
+        limits: Limits {
+            rows: 10,
+            bytes: 10,
+        },
+        ..Outbox::default()
+    };
+    assert!(check_settings(codecs(), &fine, &tiny).is_err());
+}
+
+/// A table that travels as JSON keeps a 64-bit integer exact for a replica
+/// that reads numbers as doubles, and names columns as the table does.
+#[test]
+fn a_json_row_carries_its_columns_by_name_and_big_integers_as_text() {
+    let shelf = Shelf {
+        aisle: Uuid::nil(),
+        slot: i64::MAX,
+        label: "x".into(),
+        revision: (1 << 53) + 1,
+    };
+    let row: serde_json::Value = serde_json::from_slice(&json(&shelf)).unwrap();
+    assert_eq!(row["slot"], serde_json::json!(i64::MAX.to_string()));
+    assert_eq!(row["revision"], serde_json::json!("9007199254740993"));
+    let event: serde_json::Value = serde_json::from_slice(&json(&Event {
+        id: Uuid::nil(),
+        what: "w".into(),
+    }))
+    .unwrap();
+    assert_eq!(event, serde_json::json!({"id": Uuid::nil(), "what": "w"}));
 }

@@ -36,4 +36,6 @@ uuid = { version = "1", features = ["serde", "v7"] }
 features = ["postgres"]
 
 [dev-dependencies]
+prost-build = "0.14"
+protox = "0.9"
 ts-rs = { version = "12", features = ["chrono-impl", "uuid-impl", "serde-compat", "no-serde-warnings"] }

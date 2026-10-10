@@ -12,26 +12,16 @@ pub const PROTOCOL: u32 = 1;
 /// byte limit less this can never travel, and is set aside instead.
 pub const ENVELOPE_ROOM: usize = 4096;
 
-/// Everything the server sends a replica, as one message.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct ToReplica {
-    /// [`PROTOCOL`], as the server speaks it.
-    #[prost(uint32, tag = "1")]
-    pub protocol: u32,
-    #[prost(oneof = "Body", tags = "2, 3, 4")]
-    pub body: Option<Body>,
-}
+// Generated from proto/sync.proto: the messages are the file's, field for
+// field, and `the_messages_are_generated_from_sync_proto` fails while they
+// differ from what it generates.
+#[rustfmt::skip]
+mod sync;
 
-/// What a [`ToReplica`] carries.
-#[derive(Clone, PartialEq, prost::Oneof)]
-pub enum Body {
-    #[prost(message, tag = "2")]
-    Down(Down),
-    #[prost(message, tag = "3")]
-    EndSnapshot(EndSnapshot),
-    #[prost(message, tag = "4")]
-    Filed(Filed),
-}
+pub use sync::to_replica::Body;
+pub use sync::{
+    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, TableBacklog, ToReplica, Up,
+};
 
 impl Body {
     /// As the bytes a transport carries.
@@ -45,164 +35,19 @@ impl Body {
     }
 }
 
-/// A row's key, its parts as text in key order.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, prost::Message)]
-pub struct Key {
-    #[prost(string, repeated, tag = "1")]
-    pub parts: Vec<String>,
-}
-
-/// One table's part of a message: rows to hold, then rows to let go.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Table {
-    #[prost(string, tag = "1")]
-    pub table: String,
-    #[prost(bytes = "vec", repeated, tag = "2")]
-    pub upserts: Vec<Vec<u8>>,
-    #[prost(message, repeated, tag = "3")]
-    pub deletes: Vec<Key>,
-    /// The key of each upsert, in the same order: a replica that cannot read
-    /// a row can still say which one it was.
-    #[prost(message, repeated, tag = "4")]
-    pub keys: Vec<Key>,
-}
-
-/// Server to replica: rows to hold and rows to let go, in the order given —
-/// parents' upserts first, children's deletes first — applied in one
-/// transaction. `snapshot_id` is set while the replica is provisioned from
-/// scratch: it remembers every row the snapshot names.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Down {
-    #[prost(string, tag = "1")]
-    pub snapshot_id: String,
-    #[prost(message, repeated, tag = "2")]
-    pub tables: Vec<Table>,
-    /// Rises with every message the engine sends, whichever relay sends it:
-    /// a replica applies nothing at or below the last it applied, so neither
-    /// a redelivery nor a relay that lost its lock can set it back.
-    #[prost(uint64, tag = "3")]
-    pub sequence: u64,
-    /// The server installation the sequence is from.
-    #[prost(string, tag = "4")]
-    pub epoch: String,
-}
-
-/// Server to replica: a snapshot is complete. Every row of `tables` the
-/// replica holds and the snapshot did not name goes.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct EndSnapshot {
-    #[prost(string, tag = "1")]
-    pub snapshot_id: String,
-    #[prost(string, repeated, tag = "2")]
-    pub tables: Vec<String>,
-    /// As [`Down::sequence`].
-    #[prost(uint64, tag = "3")]
-    pub sequence: u64,
-    /// As [`Down::epoch`].
-    #[prost(string, tag = "4")]
-    pub epoch: String,
-}
-
-/// Replica to server: rows the replica wrote, the keys of its own rows it let
-/// go of, and the rows the server sent that it could not take. The server
-/// files them under the replica the message came from, whatever they say.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Up {
-    #[prost(string, tag = "1")]
-    pub replica_id: String,
-    #[prost(message, repeated, tag = "2")]
-    pub tables: Vec<Table>,
-    #[prost(message, repeated, tag = "3")]
-    pub rejected: Vec<Rejected>,
-    /// What the replica holds of each table sent down, to compare with what
-    /// the server records it holds.
-    #[prost(message, repeated, tag = "4")]
-    pub digests: Vec<Digest>,
-    /// The last message the replica applied when it took the digests: they
-    /// are only comparable once it has applied every message recorded for it.
-    #[prost(string, tag = "5")]
-    pub epoch: String,
-    #[prost(uint64, tag = "6")]
-    pub sequence: u64,
-    /// The uploads this message carries rows of, each numbered by the
-    /// highest note it carries: the server answers with [`Filed`] once it has
-    /// filed them.
-    #[prost(uint64, repeated, tag = "7")]
-    pub uploads: Vec<u64>,
-    /// [`PROTOCOL`], as the replica speaks it.
-    #[prost(uint32, tag = "8")]
-    pub protocol: u32,
-    /// What the replica wrote and the server has not filed, when it says:
-    /// on the first lane, when it changed. `None`: it did not say this time.
-    #[prost(message, optional, tag = "9")]
-    pub backlog: Option<Backlog>,
-}
-
-/// What a replica wrote that the server has not filed yet, per table.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Backlog {
-    #[prost(message, repeated, tag = "1")]
-    pub tables: Vec<TableBacklog>,
-}
-
-/// One table's part of a [`Backlog`].
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct TableBacklog {
-    #[prost(string, tag = "1")]
-    pub table: String,
-    /// Rows not sent yet.
-    #[prost(uint64, tag = "2")]
-    pub unsent: u64,
-    /// Rows sent the server has not said it filed.
-    #[prost(uint64, tag = "3")]
-    pub unfiled: u64,
-}
-
-/// Server to replica: these uploads are filed (or kept, if a row could not
-/// be): the notes they carried are done.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Filed {
-    #[prost(uint64, repeated, tag = "1")]
-    pub uploads: Vec<u64>,
-}
-
-/// What a replica holds of one table: how many rows, and a fingerprint of
-/// their keys ([`fingerprint`]). Rows it retired, or could not take, are left
-/// out — the server leaves out the same.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Digest {
-    #[prost(string, tag = "1")]
-    pub table: String,
-    #[prost(uint64, tag = "2")]
-    pub count: u64,
-    #[prost(uint64, tag = "3")]
-    pub fingerprint: u64,
-}
-
 /// A fingerprint of a set of keys, as text: the same on every side and every
 /// build (FNV-1a over the keys sorted, each ended by a newline).
-pub fn fingerprint(keys: &mut [String]) -> u64 {
+pub fn fingerprint(keys: impl IntoIterator<Item = String>) -> u64 {
+    let mut keys: Vec<String> = keys.into_iter().collect();
     keys.sort_unstable();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for key in keys.iter() {
+    for key in &keys {
         for byte in key.bytes().chain(std::iter::once(b'\n')) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash
-}
-
-/// A row a replica could not take, and why. The server stops counting it as
-/// held and quarantines it, so a retry after the cause is fixed sends it.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct Rejected {
-    #[prost(string, tag = "1")]
-    pub table: String,
-    #[prost(message, optional, tag = "2")]
-    pub key: Option<Key>,
-    #[prost(string, tag = "3")]
-    pub reason: String,
 }
 
 /// How large a message the transport takes.
@@ -220,46 +65,59 @@ impl Limits {
 }
 
 /// One replica's rows as messages within `limits`, in their order: a new
-/// message begins when the current one is full. A row larger than the byte
-/// limit goes alone. Each row keeps its key beside it, and both count.
+/// message begins when the current one is full. A row larger than a message
+/// can carry goes alone. Each row keeps its key beside it, and every byte the
+/// rows add to a message counts — their framing and their tables' included —
+/// so a message never outgrows the limit by more than [`ENVELOPE_ROOM`] holds.
 pub fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
-    let mut messages: Vec<Vec<Table>> = vec![Vec::new()];
+    use prost::Message as _;
+    let budget = limits.largest_row();
+    let mut messages: Vec<Vec<Table>> = Vec::new();
     let (mut count, mut bytes) = (0usize, 0usize);
-    let mut slot = |messages: &mut Vec<Vec<Table>>, weight: usize, table: &str| -> usize {
-        if count > 0 && (count >= limits.rows || bytes + weight > limits.bytes) {
-            messages.push(Vec::new());
-            count = 0;
-            bytes = 0;
-        }
-        count += 1;
-        bytes += weight;
-        let current = messages.last_mut().expect("never empty");
-        if current.last().is_none_or(|t| t.table != table) {
-            current.push(Table {
-                table: table.to_owned(),
-                ..Table::default()
-            });
-        }
-        messages.len() - 1
-    };
     for table in tables {
+        let opening = opened(&table.table);
         let mut keys = table.keys.into_iter();
-        for row in table.upserts {
-            let key = keys.next();
-            let weight = row.len() + key.as_ref().map_or(0, key_weight);
-            let at = slot(&mut messages, weight, &table.table);
-            let current = messages[at].last_mut().expect("a slot");
-            current.upserts.push(row);
-            current.keys.extend(key);
-        }
-        for key in table.deletes {
-            let at = slot(&mut messages, key_weight(&key), &table.table);
-            messages[at].last_mut().expect("a slot").deletes.push(key);
+        let upserts = table
+            .upserts
+            .into_iter()
+            .map(|row| (Some(row), keys.next()));
+        let deletes = table.deletes.into_iter().map(|key| (None, Some(key)));
+        for (row, key) in upserts.chain(deletes) {
+            let weight = row.as_ref().map_or(0, |row| framed(row.len()))
+                + key.as_ref().map_or(0, |key| framed(key.encoded_len()));
+            let open = messages
+                .last()
+                .and_then(|m| m.last())
+                .is_some_and(|t| t.table == table.table);
+            let added = weight + if open { 0 } else { opening };
+            if messages.is_empty()
+                || (count > 0 && (count >= limits.rows || bytes + added > budget))
+            {
+                messages.push(Vec::new());
+                (count, bytes) = (0, 0);
+            }
+            let current = messages.last_mut().expect("one begun");
+            if current.last().is_none_or(|t| t.table != table.table) {
+                current.push(Table {
+                    table: table.table.clone(),
+                    ..Table::default()
+                });
+                bytes += opening;
+            }
+            count += 1;
+            bytes += weight;
+            let part = current.last_mut().expect("its table");
+            match row {
+                Some(row) => {
+                    part.upserts.push(row);
+                    part.keys.extend(key);
+                }
+                None => part.deletes.extend(key),
+            }
         }
     }
     messages
         .into_iter()
-        .filter(|tables| !tables.is_empty())
         .map(|tables| Down {
             snapshot_id: snapshot.to_owned(),
             tables,
@@ -269,9 +127,16 @@ pub fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
         .collect()
 }
 
-/// What a key adds to a message, about.
-fn key_weight(key: &Key) -> usize {
-    key.parts.iter().map(|p| p.len() + 2).sum::<usize>() + 2
+/// What `len` bytes weigh as one field of a message: its tag, its length,
+/// and themselves.
+pub fn framed(len: usize) -> usize {
+    1 + prost::length_delimiter_len(len) + len
+}
+
+/// What a table's part weighs in a message before it holds anything: its
+/// name, and its own tag and length (at most five bytes of length).
+pub fn opened(table: &str) -> usize {
+    framed(table.len()) + 6
 }
 
 #[cfg(test)]
@@ -293,8 +158,11 @@ mod tests {
 
     #[test]
     fn a_message_ends_at_either_limit_and_keeps_the_order() {
-        // Each row weighs its bytes and five for its key.
-        let limits = Limits { rows: 3, bytes: 21 };
+        // A row of four bytes weighs 6 and its key 5; `parents` opens with 15.
+        let limits = Limits {
+            rows: 3,
+            bytes: ENVELOPE_ROOM + 15 + 2 * 11,
+        };
         let packed = pack(
             vec![rows("parents", &[4, 4]), rows("children", &[4, 1, 1, 1])],
             "",
@@ -313,8 +181,8 @@ mod tests {
             shape,
             vec![
                 vec![("parents".to_owned(), 2)],
-                vec![("children".to_owned(), 3)],
-                vec![("children".to_owned(), 1)],
+                vec![("children".to_owned(), 2)],
+                vec![("children".to_owned(), 2)],
             ]
         );
     }
@@ -326,7 +194,7 @@ mod tests {
             "",
             Limits {
                 rows: 2,
-                bytes: 100,
+                bytes: ENVELOPE_ROOM + 100,
             },
         );
         let keys: Vec<Vec<String>> = packed
@@ -349,171 +217,114 @@ mod tests {
             "",
             Limits {
                 rows: 10,
-                bytes: 10,
+                bytes: ENVELOPE_ROOM + 30,
             },
         );
         let sizes: Vec<usize> = packed.iter().map(|m| m.tables[0].upserts.len()).collect();
         assert_eq!(sizes, vec![1, 1, 1]);
     }
 
-    /// The field numbers a message's bytes carry.
-    fn on_the_wire(mut bytes: &[u8]) -> std::collections::BTreeSet<u64> {
-        fn varint(bytes: &mut &[u8]) -> u64 {
-            let (mut value, mut shift) = (0u64, 0);
-            loop {
-                let byte = bytes[0];
-                *bytes = &bytes[1..];
-                value |= u64::from(byte & 0x7f) << shift;
-                if byte & 0x80 == 0 {
-                    return value;
-                }
-                shift += 7;
-            }
-        }
-        let mut tags = std::collections::BTreeSet::new();
-        while !bytes.is_empty() {
-            let key = varint(&mut bytes);
-            tags.insert(key >> 3);
-            match key & 7 {
-                0 => {
-                    varint(&mut bytes);
-                }
-                2 => {
-                    let len = varint(&mut bytes) as usize;
-                    bytes = &bytes[len..];
-                }
-                other => panic!("wire type {other}"),
-            }
-        }
-        tags
-    }
-
-    /// The field numbers `sync.proto` declares for `message`.
-    fn declared(message: &str) -> std::collections::BTreeSet<u64> {
-        let proto = include_str!("../proto/sync.proto");
-        let start = proto
-            .find(&format!("message {message} {{"))
-            .unwrap_or_else(|| panic!("{message} is not in sync.proto"));
-        let body = &proto[start..start + proto[start..].find('}').expect("a closing brace")];
-        body.lines()
-            .filter_map(|line| line.split('=').nth(1))
-            .filter_map(|tag| tag.trim().trim_end_matches(';').parse().ok())
-            .collect()
-    }
-
-    /// A replica in another language is generated from `proto/sync.proto`:
-    /// every field of every message here is there, under the same number.
+    /// Whatever the rows, keys and tables, every message as the transport
+    /// carries it — numbered, with its snapshot and epoch — fits the limit,
+    /// unless it is one row that alone does not.
     #[test]
-    fn the_messages_are_the_ones_sync_proto_declares() {
-        use prost::Message as _;
-        let key = Key {
-            parts: vec!["k".into()],
+    fn every_message_packed_fits_the_limit_framing_and_all() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % below as u64).expect("small")
         };
-        let table = Table {
-            table: "t".into(),
-            upserts: vec![vec![1]],
-            deletes: vec![key.clone()],
-            keys: vec![key.clone()],
-        };
-        let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("Key", key.encode_to_vec()),
-            ("Table", table.encode_to_vec()),
-            (
-                "Down",
-                Down {
-                    snapshot_id: "s".into(),
-                    tables: vec![table.clone()],
-                    sequence: 1,
-                    epoch: "e".into(),
-                }
-                .encode_to_vec(),
-            ),
-            (
-                "EndSnapshot",
-                EndSnapshot {
-                    snapshot_id: "s".into(),
-                    tables: vec!["t".into()],
-                    sequence: 1,
-                    epoch: "e".into(),
-                }
-                .encode_to_vec(),
-            ),
-            ("Filed", Filed { uploads: vec![1] }.encode_to_vec()),
-            (
-                "Up",
-                Up {
-                    replica_id: "r".into(),
-                    tables: vec![table.clone()],
-                    rejected: vec![Rejected::default()],
-                    digests: vec![Digest::default()],
-                    epoch: "e".into(),
-                    sequence: 1,
-                    uploads: vec![1],
-                    protocol: PROTOCOL,
-                    backlog: Some(Backlog::default()),
-                }
-                .encode_to_vec(),
-            ),
-            (
-                "Rejected",
-                Rejected {
-                    table: "t".into(),
-                    key: Some(key.clone()),
-                    reason: "r".into(),
-                }
-                .encode_to_vec(),
-            ),
-            (
-                "Backlog",
-                Backlog {
-                    tables: vec![TableBacklog::default()],
-                }
-                .encode_to_vec(),
-            ),
-            (
-                "TableBacklog",
-                TableBacklog {
-                    table: "t".into(),
-                    unsent: 1,
-                    unfiled: 1,
-                }
-                .encode_to_vec(),
-            ),
-            (
-                "Digest",
-                Digest {
-                    table: "t".into(),
-                    count: 1,
-                    fingerprint: 1,
-                }
-                .encode_to_vec(),
-            ),
-        ];
-        for (message, bytes) in cases {
-            assert_eq!(on_the_wire(&bytes), declared(message), "{message}");
+        for _ in 0..200 {
+            let limits = Limits {
+                rows: 1 + next(50),
+                bytes: ENVELOPE_ROOM + 1 + next(3000),
+            };
+            let tables: Vec<Table> = (0..1 + next(6))
+                .map(|t| {
+                    let n = next(40);
+                    let key = |at: usize| Key {
+                        parts: vec![uuid::Uuid::now_v7().to_string(), at.to_string()],
+                    };
+                    Table {
+                        table: format!("table_{t}_{}", "x".repeat(next(30))),
+                        upserts: (0..n).map(|_| vec![7; next(400)]).collect(),
+                        keys: (0..n).map(key).collect(),
+                        deletes: (0..next(20)).map(key).collect(),
+                    }
+                })
+                .collect();
+            let offered: usize = tables
+                .iter()
+                .map(|t| t.upserts.len() + t.deletes.len())
+                .sum();
+            let packed = pack(tables, &uuid::Uuid::now_v7().to_string(), limits);
+            let mut carried = 0;
+            for mut down in packed {
+                down.sequence = u64::MAX;
+                down.epoch = uuid::Uuid::now_v7().to_string();
+                let rows: usize = down
+                    .tables
+                    .iter()
+                    .map(|t| t.upserts.len() + t.deletes.len())
+                    .sum();
+                carried += rows;
+                assert!(rows <= limits.rows);
+                let len = Body::Down(down).encoded().len();
+                assert!(
+                    len <= limits.bytes || rows == 1,
+                    "{len} bytes over a limit of {}",
+                    limits.bytes
+                );
+            }
+            assert_eq!(carried, offered, "every row, once");
         }
-        // One body at a time: the oneof's fields over all three.
-        let bodies = [
-            Body::Down(Down::default()),
-            Body::EndSnapshot(EndSnapshot::default()),
-            Body::Filed(Filed::default()),
-        ];
-        let tags: std::collections::BTreeSet<u64> = bodies
+    }
+
+    /// The messages are generated from `proto/sync.proto`, the file a replica
+    /// in another language generates its own from: regenerated here, they are
+    /// the ones checked in. `MAGIC_SYNC_BLESS=1` writes them anew.
+    #[test]
+    fn the_messages_are_generated_from_sync_proto() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let files = protox::compile(["sync.proto"], [format!("{root}/proto")])
+            .expect("sync.proto compiles");
+        let requests = files
+            .file
             .into_iter()
-            .flat_map(|body| on_the_wire(&body.encoded()))
+            .map(|file| {
+                (
+                    prost_build::Module::from_protobuf_package_name(file.package()),
+                    file,
+                )
+            })
             .collect();
-        assert_eq!(tags, declared("ToReplica"), "ToReplica");
+        let generated = prost_build::Config::new()
+            .generate(requests)
+            .expect("prost generates the messages")
+            .into_values()
+            .next()
+            .expect("one package");
+        let path = format!("{root}/src/envelope/sync.rs");
+        if std::env::var_os("MAGIC_SYNC_BLESS").is_some() {
+            std::fs::write(&path, &generated).expect("write the messages");
+        }
+        let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            checked_in == generated,
+            "src/envelope/sync.rs is not what proto/sync.proto generates: \
+             run this test with MAGIC_SYNC_BLESS=1 and commit the result"
+        );
     }
 
     #[test]
     fn a_fingerprint_is_of_the_set_not_its_order() {
-        let mut one = vec!["b".to_owned(), "a".to_owned()];
-        let mut other = vec!["a".to_owned(), "b".to_owned()];
-        let mut fewer = vec!["a".to_owned()];
-        assert_eq!(fingerprint(&mut one), fingerprint(&mut other));
-        assert_ne!(fingerprint(&mut one), fingerprint(&mut fewer));
+        let set = |keys: &[&str]| fingerprint(keys.iter().map(|k| (*k).to_owned()));
+        assert_eq!(set(&["b", "a"]), set(&["a", "b"]));
+        assert_ne!(set(&["b", "a"]), set(&["a"]));
         // Pinned: a replica and a server of different builds must agree.
-        assert_eq!(fingerprint(&mut []), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fingerprint(&mut ["a".to_owned()]), 0x089b_dc07_b544_e7b2);
+        assert_eq!(set(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(set(&["a"]), 0x089b_dc07_b544_e7b2);
     }
 }

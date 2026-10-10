@@ -88,21 +88,33 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
 }
 
 impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
-    pub fn new(
+    /// A replica over a database the engine can run against
+    /// ([`replica::check`]), with settings it can send up with
+    /// ([`replica::check_settings`]). What an earlier run set aside, because
+    /// it could not go up as it was, is offered again: this build may send it.
+    pub async fn new(
         pool: SqlitePool,
         codecs: &'static [Codec<P>],
         identity: I,
         uplink: U,
         settings: Settings,
-    ) -> Self {
-        Replica {
+    ) -> Result<Self, Error> {
+        replica::check_settings(codecs, &settings.lanes, &settings.outbox)?;
+        let mut conn = pool.acquire().await?;
+        replica::check(&mut conn, codecs).await?;
+        let offered = replica::retry_set_aside(&mut conn).await?;
+        if offered > 0 {
+            tracing::info!(offered, "sync: writes set aside go up again");
+        }
+        drop(conn);
+        Ok(Replica {
             pool,
             codecs,
             identity,
             uplink,
             settings,
             wake: Notify::new(),
-        }
+        })
     }
 
     /// A message from the server, acted on and committed. Acknowledge it to
@@ -110,10 +122,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// again (the replica's storage failed, or it speaks a later protocol than
     /// this build).
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let received = replica::receive(&mut tx, self.codecs, bytes).await?;
         tx.commit().await?;
-        if matches!(received, Received::Applied(_)) {
+        if matches!(received, Received::Applied(_) | Received::SnapshotEnded) {
             // The server counts nothing as held until it hears of it.
             self.wake.notify_one();
         }
@@ -126,71 +138,103 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         self.wake.notify_one();
     }
 
-    /// Sends up what the replica has to say, until `shutdown` resolves.
+    /// Sends up what the replica has to say, until `shutdown` resolves. Each
+    /// lane keeps its own pace: one that fails waits out its own backoff
+    /// while the others go on; one with more to say goes again at once.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
         let (min, max) = self.settings.backoff;
-        let mut backoff = min;
-        let mut digests_at = Instant::now() + self.settings.digests_first;
+        let lanes = self.settings.lanes.len();
+        let start = Instant::now();
+        let mut due = vec![start; lanes];
+        let mut backoff = vec![min; lanes];
+        let mut digests_at = start + self.settings.digests_first;
         loop {
-            let digests = Instant::now() >= digests_at;
-            let wait = match self.send_up(digests).await {
-                Ok(sent) => {
-                    backoff = min;
-                    if digests {
-                        digests_at = Instant::now() + self.settings.digests_every;
-                    }
-                    if sent > 0 {
-                        continue;
-                    }
-                    self.settings.idle
+            for lane in 0..lanes {
+                let now = Instant::now();
+                if due[lane] > now {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "sync: what this replica has to say did not go up, and goes again: {e}"
-                    );
-                    let wait = backoff;
-                    backoff = (backoff * 2).min(max);
-                    wait
-                }
-            };
+                let digests = lane == 0 && now >= digests_at;
+                due[lane] = match self.send_lane(lane, digests).await {
+                    Ok(went) => {
+                        backoff[lane] = min;
+                        if digests {
+                            digests_at = now + self.settings.digests_every;
+                        }
+                        if went {
+                            now
+                        } else {
+                            now + self.settings.idle
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            lane = self.settings.lanes[lane].name,
+                            "sync: what this replica has to say did not go up, and goes again: {e}"
+                        );
+                        let wait = backoff[lane];
+                        backoff[lane] = (wait * 2).min(max);
+                        now + wait
+                    }
+                };
+            }
+            let next = due.iter().min().copied().unwrap_or(start);
             tokio::select! {
+                biased;
                 () = &mut shutdown => return,
-                () = self.wake.notified() => {}
-                () = tokio::time::sleep(wait) => {}
+                () = self.wake.notified() => {
+                    let now = Instant::now();
+                    for (due, backoff) in due.iter_mut().zip(&backoff) {
+                        if *backoff == min {
+                            *due = now;
+                        }
+                    }
+                }
+                () = tokio::time::sleep_until(next) => {}
             }
         }
     }
 
-    /// One turn of the upward loop: a message per lane with something to say.
-    /// Answers how many of the replica's writes went.
-    pub async fn send_up(&self, digests: bool) -> Result<usize, Error> {
+    /// One message on `lane`, when it has something to say: read and
+    /// numbered in one transaction, handed to the uplink with none open,
+    /// recorded in another. Answers whether one went. A message the uplink
+    /// refuses for good has its rows set aside rather than offered for ever.
+    pub async fn send_lane(&self, lane: usize, digests: bool) -> Result<bool, Error> {
         let mut conn = self.pool.acquire().await?;
         let Some(id) = self.identity.id(&mut conn).await? else {
-            return Ok(0);
+            return Ok(false);
         };
-        let mut sent = 0;
-        for lane in 0..self.settings.lanes.len() {
-            let Some(outgoing) = replica::outbox(
-                &mut conn,
-                self.codecs,
-                id,
-                &self.settings.lanes,
-                lane,
-                &self.settings.outbox,
-                digests,
-            )
-            .await?
-            else {
-                continue;
-            };
-            self.uplink
-                .send(id, outgoing.lane, outgoing.bytes())
-                .await?;
-            replica::delivered(&mut conn, &outgoing).await?;
-            sent += outgoing.rows();
+        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        let outgoing = replica::outbox(
+            &mut tx,
+            self.codecs,
+            &self.settings.lanes,
+            lane,
+            &self.settings.outbox,
+            digests,
+        )
+        .await?;
+        tx.commit().await?;
+        let Some(outgoing) = outgoing else {
+            return Ok(false);
+        };
+        let sent = self.uplink.send(id, outgoing.lane, outgoing.bytes()).await;
+        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        match sent {
+            Ok(()) => replica::delivered(&mut tx, &outgoing).await?,
+            Err(e) if !e.is_transient() && outgoing.rows() > 0 => {
+                tracing::error!(
+                    lane = outgoing.lane,
+                    rows = outgoing.rows(),
+                    "sync: the uplink refuses a message for good — its rows set aside: {e}"
+                );
+                replica::set_aside(&mut tx, &outgoing, &e.to_string()).await?;
+            }
+            Err(e) => return Err(e),
         }
-        Ok(sent)
+        tx.commit().await?;
+        Ok(true)
     }
 }
 

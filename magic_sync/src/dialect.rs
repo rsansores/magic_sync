@@ -3,6 +3,7 @@
 //! Generic code over [`Row`](crate::row::Row) never carries a backend `cfg`:
 //! where postgres and sqlite differ, the difference is an item here.
 
+use crate::row::{Row, Wire};
 use crate::{DbPool, Error};
 
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
@@ -14,9 +15,16 @@ mod imp {
     /// This instant, as the backend writes a timestamp.
     pub const NOW: &str = "now()";
 
-    /// Microsecond precision, as `timestamptz` stores it.
-    pub fn not_older(incoming: &str, stored: &str) -> String {
+    /// Every version type compares natively here: a `timestamptz` to the
+    /// microsecond.
+    pub fn not_older(incoming: &str, stored: &str, _kind: Wire) -> String {
         format!("{incoming} >= {stored}")
+    }
+
+    /// The relation a row's active rows are read from: the view its `ACTIVE`
+    /// names, or the table.
+    pub fn active<R: Row>() -> String {
+        R::ACTIVE.unwrap_or(R::QUALIFIED).to_owned()
     }
 
     /// Binds one statement may carry.
@@ -73,12 +81,68 @@ mod imp {
     /// This instant, as the backend writes a timestamp.
     pub const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
-    // Timestamps are text here, and not every writer formats them alike, so
-    // compare them normalised — to the millisecond, `%f`'s precision.
-    pub fn not_older(incoming: &str, stored: &str) -> String {
-        format!(
-            "strftime('%Y-%m-%dT%H:%M:%fZ', {incoming}) >= strftime('%Y-%m-%dT%H:%M:%fZ', {stored})"
+    /// Numbers compare natively. Anything else is text here, and a timestamp
+    /// is text not every writer formats alike, so text compares normalised as
+    /// an instant (to the millisecond, `%f`'s precision) — and as itself when
+    /// it is no instant, rather than as a NULL no comparison passes.
+    pub fn not_older(incoming: &str, stored: &str, kind: Wire) -> String {
+        match kind {
+            Wire::String | Wire::Json => {
+                let instant =
+                    |v: &str| format!("coalesce(strftime('%Y-%m-%dT%H:%M:%fZ', {v}), {v})");
+                format!("{} >= {}", instant(incoming), instant(stored))
+            }
+            Wire::Int16 | Wire::Int32 | Wire::Int64 | Wire::Bool | Wire::Float | Wire::Double => {
+                format!("{incoming} >= {stored}")
+            }
+        }
+    }
+
+    /// The relation a row's active rows are read from: on a replica, its rows
+    /// less the ones it retired.
+    pub fn active<R: Row>() -> String {
+        match R::RETIRED {
+            Some(retired) => format!("(SELECT * FROM {} WHERE {retired} IS NULL)", R::QUALIFIED),
+            None => R::QUALIFIED.to_owned(),
+        }
+    }
+
+    /// The foreign keys that refuse to let a row of `table` go while a row
+    /// points at it — `NO ACTION` or `RESTRICT` on delete, deferred or not —
+    /// as `(child, its columns, the parent's columns)`. A key naming no
+    /// parent columns names the parent's primary key, `key`.
+    pub async fn restricting(
+        conn: &mut crate::row::Conn,
+        table: &str,
+        key: &[&str],
+    ) -> Result<Vec<(String, Vec<String>, Vec<String>)>, Error> {
+        let rows: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT m.name, f.id, f."from", f."to"
+                 FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) f
+                WHERE m.type = 'table' AND f."table" = ?1 COLLATE NOCASE
+                  AND upper(f.on_delete) IN ('NO ACTION', 'RESTRICT')
+                ORDER BY m.name, f.id, f.seq"#,
         )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut out: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+        let mut last = None;
+        for (child, id, from, to) in rows {
+            if last.as_ref() != Some(&(child.clone(), id)) {
+                out.push((child.clone(), Vec::new(), Vec::new()));
+                last = Some((child, id));
+            }
+            let (_, from_columns, to_columns) = out.last_mut().expect("just pushed");
+            from_columns.push(from);
+            to_columns.extend(to);
+        }
+        for (_, from, to) in &mut out {
+            if to.len() != from.len() {
+                *to = key.iter().map(|k| (*k).to_owned()).collect();
+            }
+        }
+        Ok(out)
     }
 
     /// Binds one statement may carry (`SQLITE_MAX_VARIABLE_NUMBER`).

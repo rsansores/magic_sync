@@ -141,7 +141,7 @@ async fn file_parts<P: Sync + 'static>(
                         taken
                             .rejected
                             .iter()
-                            .filter_map(|(at, why)| Unfiled::row(table, *at, why)),
+                            .filter_map(|r| Unfiled::row(table, r.at, &r.reason)),
                     );
                 }
                 Err(e) if e.is_transient() => return Err(e),
@@ -423,7 +423,7 @@ async fn compare<P: Sync + 'static>(
     }
     let mut differ = Vec::new();
     for digest in &upload.digests {
-        let mut keys: Vec<String> = sqlx::query_scalar(
+        let keys: Vec<String> = sqlx::query_scalar(
             "SELECT h.row_key FROM sync.held h WHERE h.replica_id = $1 AND h.relation = $2 \
                AND NOT EXISTS (SELECT 1 FROM sync.quarantine q \
                                 WHERE q.replica_id = h.replica_id AND q.relation = h.relation \
@@ -434,7 +434,7 @@ async fn compare<P: Sync + 'static>(
         .fetch_all(&mut *conn)
         .await?;
         let count = keys.len() as u64;
-        if count != digest.count || envelope::fingerprint(&mut keys) != digest.fingerprint {
+        if count != digest.count || envelope::fingerprint(keys) != digest.fingerprint {
             tracing::error!(
                 %replica,
                 table = digest.table,
@@ -473,6 +473,7 @@ async fn backlog(conn: &mut Conn, replica: Uuid, told: &envelope::Backlog) -> Re
                 table: stored(&t.table),
                 unsent: i64::try_from(t.unsent).ok()?,
                 unfiled: i64::try_from(t.unfiled).ok()?,
+                set_aside: i64::try_from(t.set_aside).ok()?,
             })
         })
         .collect();
