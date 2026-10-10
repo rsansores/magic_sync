@@ -12,6 +12,7 @@
 - [A replica](guide/replica.md)
 - [Provisioning a replica](guide/provisioning.md)
 - [Progress and health](guide/progress.md)
+- [The dashboard](guide/dashboard.md)
 - [Recipes](guide/recipes.md)
 
 # Under the hood

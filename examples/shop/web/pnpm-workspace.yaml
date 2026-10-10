@@ -1,0 +1,2 @@
+# Don't re-run `pnpm install` before every `pnpm run`.
+verifyDepsBeforeRun: false

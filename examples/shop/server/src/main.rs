@@ -12,6 +12,7 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use magic_sync::relay::Transport;
 use magic_sync::run::server::{Anyone, Settings};
+use magic_sync::status::{Overview, ReplicaProgress, RowPlace, Scope};
 use magic_sync::{Error, Server};
 use serde::{Deserialize, Serialize};
 use shop_rows::{codecs, Product, Receipt, REGISTERS};
@@ -19,6 +20,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 const SCHEMA: &str = "
@@ -107,15 +109,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queues,
     };
     let router = Router::new()
-        .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/api/state", get(state))
+        .route("/api/sync/overview", get(overview))
+        .route("/api/sync/progress/{register}", get(progress))
+        .route("/api/sync/rows/{table}/{key}", get(row))
         .route("/api/products", post(add_product))
         .route("/api/products/{id}", put(edit_product).delete(delete_product))
         .route("/api/registers", post(register))
         .route("/sync/{register}/next", get(next))
         .route("/sync/{register}/ack", post(ack))
         .route("/sync/{register}/up", post(up))
-        .with_state(app);
+        .with_state(app)
+        // The page: the Vue app in ../web, built.
+        .fallback_service(ServeDir::new(PAGE).fallback(get(unbuilt)));
     // `--bind 0.0.0.0:8080` to reach it from another machine: it has no login.
     let args: Vec<String> = std::env::args().collect();
     let bind = args
@@ -129,21 +135,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Where the page is built to.
+const PAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/dist");
+
+async fn unbuilt() -> Html<&'static str> {
+    Html(
+        "<p>The page is not built yet: in <code>examples/shop/web</code>, run \
+         <code>pnpm install && pnpm build</code>, then reload.</p>",
+    )
+}
+
 fn fail(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::FromRow)]
 struct RegisterState {
     id: Uuid,
     name: String,
     url: String,
-    /// Products it confirmed it holds, of the ones it should.
-    holds: i64,
-    should: i64,
-    in_flight: i64,
-    /// Messages waiting in its queue.
-    queued: usize,
 }
 
 #[derive(Serialize)]
@@ -162,42 +172,62 @@ async fn state(State(app): State<App>) -> Result<Json<ShopState>, (StatusCode, S
         .fetch_all(&app.pool)
         .await
         .map_err(fail)?;
-    let known: Vec<(Uuid, String, String)> =
-        sqlx::query_as("SELECT id, name, url FROM shop.registers ORDER BY name")
-            .fetch_all(&app.pool)
-            .await
-            .map_err(fail)?;
-    let mut tx = app.server.begin().await.map_err(fail)?;
-    let progress = app
-        .server
-        .engine()
-        .progress(&mut tx, magic_sync::status::Scope::All)
+    let registers = sqlx::query_as("SELECT id, name, url FROM shop.registers ORDER BY name")
+        .fetch_all(&app.pool)
         .await
         .map_err(fail)?;
-    let queues = app.queues.0.lock().unwrap().clone();
-    let registers = known
-        .into_iter()
-        .map(|(id, name, url)| {
-            let products = progress
-                .iter()
-                .find(|p| p.replica == id)
-                .and_then(|p| p.tables.iter().find(|t| t.table == "products"));
-            RegisterState {
-                id,
-                name,
-                url,
-                holds: products.map_or(0, |t| t.up_to_date()),
-                should: products.map_or(0, |t| t.should),
-                in_flight: products.map_or(0, |t| t.in_flight),
-                queued: queues.get(&id).map_or(0, VecDeque::len),
-            }
-        })
-        .collect();
     Ok(Json(ShopState {
         products,
         receipts,
         registers,
     }))
+}
+
+// What the dashboard reads: the engine's answers, as they are. A shop with a
+// login would ask them over the registers the caller may see
+// (`Scope::Replicas`); this one has none, so every register.
+
+async fn overview(State(app): State<App>) -> Result<Json<Overview>, (StatusCode, String)> {
+    let mut tx = app.server.begin().await.map_err(fail)?;
+    let overview = app
+        .server
+        .engine()
+        .overview(&mut tx, Scope::All, 20)
+        .await
+        .map_err(fail)?;
+    Ok(Json(overview))
+}
+
+async fn progress(
+    State(app): State<App>,
+    Path(register): Path<Uuid>,
+) -> Result<Json<ReplicaProgress>, (StatusCode, String)> {
+    let mut tx = app.server.begin().await.map_err(fail)?;
+    let progress = app
+        .server
+        .engine()
+        .progress(&mut tx, Scope::Replicas(&[register]))
+        .await
+        .map_err(fail)?;
+    progress
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("no register {register}")))
+}
+
+async fn row(
+    State(app): State<App>,
+    Path((table, key)): Path<(String, String)>,
+) -> Result<Json<Vec<RowPlace>>, (StatusCode, String)> {
+    let mut tx = app.server.begin().await.map_err(fail)?;
+    let places = app
+        .server
+        .engine()
+        .row_progress(&mut tx, Scope::All, &table, &key)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(places))
 }
 
 #[derive(Deserialize)]
