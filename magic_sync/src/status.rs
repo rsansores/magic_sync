@@ -62,6 +62,13 @@ impl TableProgress {
 
 /// Where one row stands on one replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RowPlace {
+    pub replica: Uuid,
+    pub state: RowState,
+}
+
+/// What one row is to one replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowState {
     /// It holds the row as it is.
@@ -79,7 +86,7 @@ pub enum RowState {
 }
 
 /// Where a replica stands, in one word: the first of these that applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaState {
     /// Something is set aside for it until a fix is deployed: a row it is
@@ -156,6 +163,8 @@ impl ReplicaOverview {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TableOverview {
     pub table: String,
+    /// Every figure below is zero.
+    pub synced: bool,
     /// Changes to its rows not yet planned.
     pub pending: i64,
     /// Changes to its rows the planner set aside until a fix.
@@ -177,6 +186,9 @@ pub struct TableOverview {
 /// hand. Lists are cut at the limit the read was given; `total` is uncut.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Health {
+    /// Nothing waits for a fix and every replica can be reached. A backlog is
+    /// not unhealthy; one that stops draining is, and the host says when.
+    pub healthy: bool,
     /// Changes noted and not yet planned, and when the oldest was noted.
     pub pending: i64,
     pub oldest: Option<DateTime<Utc>>,
@@ -184,17 +196,6 @@ pub struct Health {
     pub quarantine: Listed<Quarantined>,
     pub inbox: Listed<Unfiled>,
     pub failing: Listed<Failing>,
-}
-
-impl Health {
-    /// Nothing waits for a fix and every replica can be reached. A backlog is
-    /// not unhealthy; one that stops draining is, and the host says when.
-    pub fn healthy(&self) -> bool {
-        self.parked.total == 0
-            && self.quarantine.total == 0
-            && self.inbox.total == 0
-            && self.failing.total == 0
-    }
 }
 
 /// The first entries of a list, and how many there are.
@@ -417,7 +418,7 @@ impl Engine {
         scope: Scope<'_>,
         table: &str,
         key: &str,
-    ) -> Result<Vec<(Uuid, RowState)>, Error> {
+    ) -> Result<Vec<RowPlace>, Error> {
         let scoped: BTreeSet<Uuid> = self.scoped(conn, scope).await?.ids().into_iter().collect();
         let i = self
             .index(table)
@@ -472,6 +473,7 @@ impl Engine {
         Ok(out
             .into_iter()
             .filter(|(replica, _)| scoped.contains(replica))
+            .map(|(replica, state)| RowPlace { replica, state })
             .collect())
     }
 
@@ -647,6 +649,10 @@ impl Engine {
             .await?,
         };
         Ok(Health {
+            healthy: parked.total == 0
+                && quarantine.total == 0
+                && inbox.total == 0
+                && failing.total == 0,
             pending,
             oldest,
             parked,
@@ -834,6 +840,13 @@ impl Engine {
             if let Some(entry) = out.get_mut(&table) {
                 entry.replicas = replicas.len() as i64;
             }
+        }
+        for entry in out.values_mut() {
+            entry.synced = entry.pending == 0
+                && entry.parked == 0
+                && entry.in_flight == 0
+                && entry.quarantined == 0
+                && entry.unfiled == 0;
         }
         // Parents first, as the engine sends them; tables only an upload
         // names after.

@@ -19,7 +19,7 @@ use magic_sync::status::{ReplicaState, Scope};
 
 let mut tx = server.begin().await?;
 let overview = server.engine().overview(&mut tx, Scope::Partition(customer), 20).await?;
-if overview.health.healthy() {
+if overview.health.healthy {
     // the green banner: nothing waits for a fix, every replica can be reached
 }
 for r in &overview.replicas {
@@ -31,8 +31,8 @@ for r in &overview.replicas {
     }
 }
 for t in &overview.tables {
-    // t.pending, t.in_flight, t.quarantined, t.unfiled: all zero
-    // means every replica of the scope holds this table as it should
+    // t.synced: every replica of the scope holds it as it should; else
+    // t.pending, t.in_flight, t.quarantined, t.unfiled say what it waits on
 }
 ```
 
@@ -73,10 +73,10 @@ for register in server.engine().progress(&mut tx, Scope::Replicas(&[register])).
 Where is one row?
 
 ```rust
-for (register, state) in server.engine()
+for place in server.engine()
     .row_progress(&mut tx, Scope::All, "products", &id.to_string()).await?
 {
-    // RowState::Holds, Outdated, OnItsWay, Missing, Leaving, Quarantined
+    // place.replica, place.state: RowState::Holds, Outdated, OnItsWay, Missing, Leaving, Quarantined
 }
 ```
 

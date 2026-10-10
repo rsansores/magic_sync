@@ -922,20 +922,19 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
         .row_progress(&mut conn, Scope::All, "items", &one.to_string())
         .await
         .unwrap();
+    let places = |found: Vec<crate::status::RowPlace>| -> BTreeMap<Uuid, RowState> {
+        found.into_iter().map(|p| (p.replica, p.state)).collect()
+    };
     assert_eq!(
-        one_where,
-        vec![(a, RowState::Outdated), (b, RowState::OnItsWay)]
-            .into_iter()
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .collect::<Vec<_>>()
+        places(one_where),
+        BTreeMap::from([(a, RowState::Outdated), (b, RowState::OnItsWay)])
     );
     let two_where = world
         .engine
         .row_progress(&mut conn, Scope::All, "items", &two.to_string())
         .await
         .unwrap();
-    assert!(two_where.contains(&(a, RowState::Leaving)), "{two_where:?}");
+    assert_eq!(places(two_where).get(&a), Some(&RowState::Leaving));
 }
 
 impl World {
@@ -1146,16 +1145,12 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
         world.acknowledge(replica, last).await;
     }
     let overview = world.overview(Scope::All).await;
-    assert!(overview.health.healthy(), "{:?}", overview.health);
+    assert!(overview.health.healthy, "{:?}", overview.health);
     for replica in &overview.replicas {
         assert_eq!(replica.state, ReplicaState::Synced, "{replica:?}");
     }
     assert!(
-        overview.tables.iter().all(|t| *t
-            == crate::status::TableOverview {
-                table: t.table.clone(),
-                ..Default::default()
-            }),
+        overview.tables.iter().all(|t| t.synced),
         "{:?}",
         overview.tables
     );
@@ -1173,7 +1168,7 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
     world.item("two").await;
 
     let noted = world.overview(Scope::All).await;
-    assert!(noted.health.healthy());
+    assert!(noted.health.healthy);
     assert_eq!(noted.health.pending, 2);
     assert!(noted.health.oldest.is_some());
     for replica in &noted.replicas {
@@ -1296,7 +1291,7 @@ async fn a_partition_sees_only_its_own(pool: crate::DbPool) {
     let ours = world.overview(Scope::Partition(world.partition)).await;
     let ids: Vec<Uuid> = ours.replicas.iter().map(|r| r.replica).collect();
     assert_eq!(ids, BTreeSet::from([a, b]).into_iter().collect::<Vec<_>>());
-    assert!(ours.health.healthy(), "{:?}", ours.health);
+    assert!(ours.health.healthy, "{:?}", ours.health);
     assert_eq!(ours.tables[0].quarantined, 0);
 
     let all = world.overview(Scope::All).await;
@@ -1308,4 +1303,177 @@ async fn a_partition_sees_only_its_own(pool: crate::DbPool) {
 
     let listed = world.overview(Scope::Replicas(&[a, asleep])).await;
     assert_eq!(listed.replicas.len(), 1, "a list is narrowed to the live");
+}
+
+/// The JSON a dashboard reads is the one `dashboard/src/core/contract/`
+/// holds: every state a replica can be in and every kind of problem, ids
+/// and times made stable. The dashboard's tests read the same files, so a
+/// change on either side shows on the other. `UPDATE_CONTRACT=1` writes them.
+#[sqlx::test(migrations = false)]
+async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Rejected, Table as WireTable, TableBacklog, Up};
+    let world = world(pool).await;
+    let [synced, refusing] = world.replicas;
+    let (silent, away) = (Uuid::now_v7(), Uuid::now_v7());
+    for replica in [silent, away] {
+        sqlx::query("INSERT INTO fixture.t_replicas VALUES ($1, $2, true)")
+            .bind(replica)
+            .bind(world.partition)
+            .execute(&world.pool)
+            .await
+            .unwrap();
+    }
+    let wire = Fake::default();
+    wire.failing.lock().unwrap().insert(away, true);
+    let one = world.item("one").await;
+    let two = world.item("two").await;
+    sqlx::query(
+        "INSERT INTO sync.notes (kind, relation, row_key, partition_id, scope) \
+         VALUES ('row', 'items', 'not-a-key', $1, $2)",
+    )
+    .bind(world.partition)
+    .bind(refusing)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    world.pass(&wire).await;
+    let last: i64 = sqlx::query_scalar("SELECT max(last_sequence) FROM sync.replicas")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    world.acknowledge(synced, last as u64).await;
+    world.acknowledge(refusing, last as u64).await;
+    let say = |from: Uuid, up: Up| {
+        let pool = world.pool.clone();
+        let codecs = &world.codecs;
+        async move {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::replica::file(&mut conn, codecs, &up, from, &())
+                .await
+                .unwrap();
+        }
+    };
+    say(
+        refusing,
+        Up {
+            replica_id: refusing.to_string(),
+            rejected: vec![Rejected {
+                table: "items".into(),
+                key: Some(WireKey {
+                    parts: vec![two.to_string()],
+                }),
+                reason: "a check this build has".into(),
+            }],
+            tables: vec![WireTable {
+                table: "from_a_newer_build".into(),
+                upserts: vec![vec![1, 2, 3]],
+                ..WireTable::default()
+            }],
+            ..Up::default()
+        },
+    )
+    .await;
+    say(
+        silent,
+        Up {
+            replica_id: silent.to_string(),
+            backlog: Some(envelope::Backlog {
+                tables: vec![TableBacklog {
+                    table: "receipts".into(),
+                    unsent: 2,
+                    unfiled: 1,
+                }],
+            }),
+            ..Up::default()
+        },
+    )
+    .await;
+
+    let mut conn = world.pool.acquire().await.unwrap();
+    let overview = world
+        .engine
+        .overview(&mut conn, Scope::All, 10)
+        .await
+        .unwrap();
+    let states: BTreeSet<ReplicaState> = overview.replicas.iter().map(|r| r.state).collect();
+    assert_eq!(states.len(), 4, "every state: {:?}", overview.replicas);
+    let progress = world
+        .engine
+        .progress(&mut conn, Scope::Replicas(&[synced, silent]))
+        .await
+        .unwrap();
+    let row = world
+        .engine
+        .row_progress(&mut conn, Scope::All, "items", &one.to_string())
+        .await
+        .unwrap();
+
+    let mut stable = Stable::default();
+    for (file, value) in [
+        ("overview.json", serde_json::to_value(&overview).unwrap()),
+        ("progress.json", serde_json::to_value(&progress).unwrap()),
+        ("row.json", serde_json::to_value(&row).unwrap()),
+    ] {
+        let text = serde_json::to_string_pretty(&stable.of(value)).unwrap() + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../dashboard/src/core/contract")
+            .join(file);
+        if std::env::var_os("UPDATE_CONTRACT").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        }
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            written, text,
+            "{file} is not what the engine answers: UPDATE_CONTRACT=1 rewrites it"
+        );
+    }
+}
+
+/// Ids and times made stable: each id the same placeholder wherever it
+/// appears, in the order it first does, and every time the same moment.
+#[derive(Default)]
+struct Stable {
+    ids: BTreeMap<String, String>,
+}
+
+impl Stable {
+    fn of(&mut self, value: serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match value {
+            Value::String(s) => Value::String(self.text(&s)),
+            Value::Array(items) => Value::Array(items.into_iter().map(|v| self.of(v)).collect()),
+            Value::Object(fields) => {
+                Value::Object(fields.into_iter().map(|(k, v)| (k, self.of(v))).collect())
+            }
+            other => other,
+        }
+    }
+
+    fn text(&mut self, s: &str) -> String {
+        if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+            return "2026-01-01T00:00:00Z".to_owned();
+        }
+        let mut out = s.to_owned();
+        let mut at = 0;
+        while let Some(found) = out.get(at..).and_then(|rest| {
+            rest.char_indices()
+                .find(|(i, _)| {
+                    rest.get(*i..*i + 36)
+                        .is_some_and(|c| Uuid::parse_str(c).is_ok())
+                })
+                .map(|(i, _)| at + i)
+        }) {
+            let id = out[found..found + 36].to_owned();
+            let next = self.ids.len() + 1;
+            let stable = self
+                .ids
+                .entry(id.clone())
+                .or_insert_with(|| format!("00000000-0000-7000-8000-{next:012}"))
+                .clone();
+            out.replace_range(found..found + 36, &stable);
+            at = found + 36;
+        }
+        out
+    }
 }

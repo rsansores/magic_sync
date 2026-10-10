@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+*.tsbuildinfo
+# Copied from the repository root when packed.
+LICENSE-MIT
+LICENSE-APACHE
