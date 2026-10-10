@@ -205,35 +205,6 @@ pub struct Rejected {
     pub reason: String,
 }
 
-impl Up {
-    /// Several uploads as one per replica, each table's rows together.
-    pub fn by_replica(uploads: Vec<Up>) -> Vec<Up> {
-        let mut merged: Vec<Up> = Vec::new();
-        for upload in uploads {
-            let Some(into) = merged
-                .iter_mut()
-                .find(|m| m.replica_id == upload.replica_id)
-            else {
-                merged.push(upload);
-                continue;
-            };
-            into.rejected.extend(upload.rejected);
-            into.uploads.extend(upload.uploads);
-            for table in upload.tables {
-                match into.tables.iter_mut().find(|t| t.table == table.table) {
-                    Some(same) => {
-                        same.upserts.extend(table.upserts);
-                        same.deletes.extend(table.deletes);
-                        same.keys.extend(table.keys);
-                    }
-                    None => into.tables.push(table),
-                }
-            }
-        }
-        merged
-    }
-}
-
 /// How large a message the transport takes.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -544,24 +515,5 @@ mod tests {
         // Pinned: a replica and a server of different builds must agree.
         assert_eq!(fingerprint(&mut []), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fingerprint(&mut ["a".to_owned()]), 0x089b_dc07_b544_e7b2);
-    }
-
-    #[test]
-    fn uploads_merge_per_replica_and_table() {
-        let up = |replica: &str, table: &str| Up {
-            replica_id: replica.to_owned(),
-            tables: vec![rows(table, &[1])],
-            rejected: vec![Rejected {
-                table: table.to_owned(),
-                key: None,
-                reason: "why".to_owned(),
-            }],
-            ..Up::default()
-        };
-        let merged = Up::by_replica(vec![up("a", "x"), up("b", "x"), up("a", "x"), up("a", "y")]);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].tables.len(), 2);
-        assert_eq!(merged[0].tables[0].upserts.len(), 2);
-        assert_eq!(merged[0].rejected.len(), 3);
     }
 }
