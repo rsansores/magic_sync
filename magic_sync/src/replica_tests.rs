@@ -1482,6 +1482,14 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
     let main = turn(0, settings.clone()).await;
     assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
     assert!(turn(0, settings.clone()).await.is_none());
+    let zero = Outbox {
+        backlog_every: std::time::Duration::ZERO,
+        ..settings.clone()
+    };
+    assert!(
+        turn(0, zero).await.is_none(),
+        "empty, said: not said again however due"
+    );
 
     write().execute(&w.pool).await.unwrap();
     turn(0, settings.clone()).await.expect("it starts again");
@@ -1518,6 +1526,181 @@ async fn a_clock_set_back_holds_back_nothing(pool: SqlitePool) {
     .unwrap();
     let up = w.up(0, false).await.expect("sent again");
     assert_eq!(up.tables[0].upserts.len(), 1);
+    // A backlog told "in the future", unchanged and not empty: said again.
+    w.exec("UPDATE sync_backlog SET reported_at = 32503680000")
+        .await
+        .unwrap();
+    let up = w.up(0, false).await.expect("the backlog again");
+    assert!(up.tables.is_empty() && up.backlog.is_some(), "{up:?}");
+}
+
+/// A row the replica deleted goes up as its key only for a table keyed by
+/// its replica: history it let go of is not the server's to delete, and its
+/// note is done.
+#[sqlx::test(migrations = false)]
+async fn only_a_table_keyed_by_its_replica_sends_its_deletes(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [event, reading] = ids();
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(event)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, 1, 1)")
+        .bind(w.me)
+        .bind(reading)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.exec("DELETE FROM events; DELETE FROM readings")
+        .await
+        .unwrap();
+    let up = w.up(0, false).await.expect("the deletes");
+    let sent: Vec<(&str, usize, usize)> = up
+        .tables
+        .iter()
+        .map(|t| (t.table.as_str(), t.upserts.len(), t.deletes.len()))
+        .collect();
+    assert_eq!(sent, [("readings", 0, 1)]);
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes WHERE relation = 'events'")
+            .await,
+        0,
+        "done here"
+    );
+}
+
+/// Whatever rows, rejections and digests there are, every message up fits
+/// the transport's bytes — framing, the backlog and the confirmation
+/// included — and every row goes, once.
+#[sqlx::test(migrations = false)]
+async fn every_message_up_fits_whatever_it_carries(pool: SqlitePool) {
+    let limits = Limits {
+        rows: 500,
+        bytes: envelope::ENVELOPE_ROOM + 700,
+    };
+    let settings = Settings {
+        outbox: Outbox {
+            limits,
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    let mut seed: u64 = 0x5851_f42d_4c95_7f2d;
+    let mut next = |below: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % below as u64).unwrap()
+    };
+    // Rejections whose reasons are long: they share the room with the rows.
+    let broken: Vec<(WireKey, Vec<u8>)> = (0..40)
+        .map(|_| (key(&[&Uuid::now_v7().to_string()]), vec![0xff]))
+        .collect();
+    w.receive(&down(1, "", vec![upserts("items", broken)]))
+        .await;
+    w.exec(&format!(
+        "UPDATE sync_rejections SET reason = '{}'",
+        "r".repeat(150)
+    ))
+    .await
+    .unwrap();
+    let mut written = 0;
+    for _ in 0..60 {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+            .bind(Uuid::now_v7())
+            .bind("w".repeat(1 + next(500)))
+            .execute(&w.pool)
+            .await
+            .unwrap();
+        written += 1;
+    }
+    let (mut rows, mut rejected) = (0, 0);
+    for round in 0..200 {
+        let Some(up) = w.up(0, round % 3 == 0).await else {
+            break;
+        };
+        assert!(
+            up.encoded_len() <= limits.bytes,
+            "{} bytes, over {}",
+            up.encoded_len(),
+            limits.bytes
+        );
+        rows += up.tables.iter().map(|t| t.upserts.len()).sum::<usize>();
+        rejected += up.rejected.len();
+    }
+    assert_eq!((rows, rejected), (written, 40));
+}
+
+/// The tables the suite runs on are their rows, column for column.
+#[sqlx::test(migrations = false)]
+async fn the_suites_tables_are_their_rows(pool: SqlitePool) {
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    crate::row::assert_parity::<crate::testkit::Item>(&pool).await;
+    crate::row::assert_parity::<Shelf>(&pool).await;
+    crate::row::assert_parity::<Price>(&pool).await;
+    crate::row::assert_parity::<Task>(&pool).await;
+    crate::row::assert_parity::<Reading>(&pool).await;
+    crate::row::assert_parity::<Event>(&pool).await;
+}
+
+/// Rows by key are the active ones: on a replica, less the retired.
+#[sqlx::test(migrations = false)]
+async fn rows_by_key_are_the_ones_not_retired(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [kept, retired, aisle] = ids();
+    let shelf = Shelf {
+        aisle,
+        slot: 4,
+        label: "four".into(),
+        revision: 1,
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts("items", vec![item(kept, "kept"), item(retired, "retired")]),
+            upserts(
+                "shelves",
+                vec![(key(&[&aisle.to_string(), "4"]), json(&shelf))],
+            ),
+        ],
+    ))
+    .await;
+    sqlx::query("INSERT INTO receipts (item_id) VALUES ($1)")
+        .bind(retired)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes("items", vec![key(&[&retired.to_string()])])],
+    ))
+    .await;
+    let mut conn = w.pool.acquire().await.unwrap();
+    let both = [
+        vec![crate::row::KeyPart::Uuid(kept)],
+        vec![crate::row::KeyPart::Uuid(retired)],
+    ];
+    let items = crate::row::get_many::<crate::testkit::Item>(&mut conn, &both)
+        .await
+        .unwrap();
+    assert_eq!(
+        items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        ["kept"]
+    );
+    let got = crate::row::get::<Shelf>(
+        &mut conn,
+        &vec![
+            crate::row::KeyPart::Uuid(aisle),
+            crate::row::KeyPart::Int(4),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, Some(shelf));
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,7 +1774,7 @@ fn lanes_that_would_strand_a_write_are_refused() {
         &[],
         &[lane("a", &[]), lane("b", &[])],
         &[lane("a", &["events"]), lane("b", &["events"])],
-        &[lane("a", &["items"])],
+        &[lane("main", &[]), lane("a", &["items"])],
         &[lane("a", &["events"])],
     ];
     for lanes in refused {
