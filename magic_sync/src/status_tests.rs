@@ -856,12 +856,7 @@ async fn a_row_reaching_a_replica_through_two_groups_counts_once(pool: crate::Db
              list_id UUID NOT NULL REFERENCES fixture.lists (id),
              replica_id UUID NOT NULL REFERENCES fixture.t_replicas (id),
              partition_id UUID NOT NULL, PRIMARY KEY (list_id, replica_id));
-         CREATE VIEW customers AS SELECT * FROM fixture.customers;
-         CREATE VIEW list_members AS SELECT * FROM fixture.list_members;
-         CREATE VIEW replica_lists AS SELECT * FROM fixture.replica_lists;
-         SELECT sync.mirror_table('fixture', 'customers', '{}', 'partition_id');
-         SELECT sync.mirror_group('fixture', 'list_members', 'list_id', 'members', 'partition_id');
-         SELECT sync.mirror_group('fixture', 'replica_lists', 'replica_id', 'assigned', 'partition_id');",
+         CREATE VIEW customers AS SELECT * FROM fixture.customers;",
     )
     .execute(&world.pool)
     .await
@@ -886,9 +881,11 @@ async fn a_row_reaching_a_replica_through_two_groups_counts_once(pool: crate::Db
         .unwrap();
     }
     let tables = [Table::of::<Item>(), Table::of::<Customer>()];
-    let engine = Engine::new(&mut conn, &[&tables[0], &tables[1]], REPLICAS)
+    let mut tx = conn.begin().await.unwrap();
+    let engine = Engine::install(&mut tx, &[&tables[0], &tables[1]], REPLICAS)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
 
     let progress = engine
         .progress(&mut conn, Scope::Replicas(&[a]))

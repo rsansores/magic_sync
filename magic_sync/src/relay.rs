@@ -1,7 +1,9 @@
 //! One pass of the server's relay, in three steps a host runs in order:
 //!
 //! 1. [`Relay::prepare`] reads the pending notes and plans them, in a
-//!    transaction of its own, closed before anything is sent.
+//!    `REPEATABLE READ` transaction of its own, closed before anything is
+//!    sent — after [`Engine::observe`] has looked at the replicas, in one of
+//!    the host's lock.
 //! 2. [`Relay::publish`] sends each replica what it is owed, with no
 //!    transaction open.
 //! 3. [`Relay::record`] records what each replica now holds and marks the

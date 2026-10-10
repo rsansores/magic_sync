@@ -65,6 +65,10 @@ pub struct Walk(pub u64);
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 impl Walk {
     pub fn next(&mut self) -> u64 {
+        // Xorshift stays at zero from zero: that seed walks from another.
+        if self.0 == 0 {
+            self.0 = 0x9E37_79B9_7F4A_7C15;
+        }
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -75,8 +79,15 @@ impl Walk {
         (self.next() % n as u64) as usize
     }
 
-    pub fn pick(&mut self, from: &[Uuid]) -> Option<Uuid> {
+    pub fn pick<T: Copy>(&mut self, from: &[T]) -> Option<T> {
         (!from.is_empty()).then(|| from[self.below(from.len())])
+    }
+
+    /// A uuid the seed decides, so a replay writes the same rows.
+    pub fn uuid(&mut self) -> Uuid {
+        let (high, low) = (self.next(), self.next());
+        uuid::Builder::from_random_bytes(((u128::from(high) << 64) | u128::from(low)).to_be_bytes())
+            .into_uuid()
     }
 }
 

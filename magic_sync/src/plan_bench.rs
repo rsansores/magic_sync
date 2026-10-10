@@ -4,8 +4,9 @@
 //! work of planning and recording — what the relay does besides encoding and
 //! publishing — and one what a dashboard's reads cost.
 
-use super::plan_tests::{tables, REPLICAS, SCHEMA};
+use super::plan_tests::{codecs, REPLICAS, SCHEMA};
 use super::*;
+use sqlx::Connection as _;
 use std::time::{Duration, Instant};
 
 /// Notes the relay drains per plan (`BATCH` in the server's relay).
@@ -44,7 +45,11 @@ async fn drain(conn: &mut Conn, engine: &Engine) -> Drained {
         record: Duration::ZERO,
     };
     loop {
-        let noted = pending(conn, BATCH).await.expect("pending");
+        let mut tx = conn
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .expect("a transaction");
+        let noted = pending(&mut tx, BATCH).await.expect("pending");
         if noted.is_empty() {
             return out;
         }
@@ -52,7 +57,8 @@ async fn drain(conn: &mut Conn, engine: &Engine) -> Drained {
             noted.into_iter().map(|n| (n.id, n.change)).unzip();
         out.notes += ids.len();
         let started = Instant::now();
-        let delta = engine.plan(conn, &changes).await.expect("plan");
+        let delta = engine.plan(&mut tx, &changes).await.expect("plan");
+        tx.commit().await.expect("commit");
         out.plan += started.elapsed();
         let count = |m: &BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>| -> usize {
             m.values().flat_map(|t| t.values()).map(BTreeSet::len).sum()
@@ -96,11 +102,13 @@ async fn fleet(
         .expect("a replica");
         replicas.push(id);
     }
-    let tables = tables();
-    let refs: Vec<&Table> = tables.iter().collect();
-    let engine = Engine::new(&mut conn, &refs, REPLICAS)
+    let codecs = codecs();
+    let refs: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = conn.begin().await.expect("a transaction");
+    let engine = Engine::install(&mut tx, &refs, REPLICAS)
         .await
         .expect("engine");
+    tx.commit().await.expect("installed");
     (conn, engine, partition, replicas)
 }
 

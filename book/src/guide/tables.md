@@ -60,27 +60,35 @@ are two ways to get them there.
 
 > **You write**, if you have no migrations of your own — the example's way —
 > nothing: build the server with `Server::install` instead of `Server::new`
-> ([next chapters](server.md)). It creates the `sync` schema the first time,
-> and the trigger of every table that lacks one, every time it starts.
+> ([next chapters](server.md)). Every time it starts, in one transaction and
+> one process at a time, it brings the `sync` schema to the version this build
+> needs and writes every trigger that is missing or not as the engine needs it.
 
 Run it before anything writes a mirrored table: a write before its trigger
 exists is never noted.
 
 > **You write**, if you do have migrations, the engine's schema in one of them
-> — it is [`magic_sync::POSTGRES_SCHEMA`], one SQL script — and each table's
-> trigger in the migration that creates the table, as you would its indexes:
+> — it is [`magic_sync::POSTGRES_SCHEMA`], one SQL script — and the triggers in
+> the migration that creates the tables, as you would their indexes. You do not
+> write them by hand: `Engine::triggers` prints them, from the same
+> declarations the server starts from, one `CREATE TRIGGER` per line:
 
 ```sql
 -- after CREATE TABLE shop.products …
-SELECT sync.mirror_table('shop', 'products', '{}', '');
+CREATE TRIGGER sync_note_row AFTER INSERT OR UPDATE OR DELETE ON "shop"."products" FOR EACH ROW EXECUTE FUNCTION sync.note_row('products', '', '1', 'id', '0');
+CREATE TRIGGER sync_refuse_truncate BEFORE TRUNCATE ON "shop"."products" FOR EACH STATEMENT EXECUTE FUNCTION sync.refuse_truncate();
 ```
 
-The arguments are the schema, the table, the columns replicas own (in a table
-written on both sides; see [Recipes](recipes.md)), and the partition column
-(see [The server](server.md); `''` for none).
+The arguments say how the table is noted: its name, its partition column
+(see [The server](server.md); `''` for none), its key's columns in the order
+the row declares them, the columns that point at other mirrored tables (kept
+of the row as it was, so a parent it no longer points at can be let go), and
+the columns replicas own (in a table written on both sides; see
+[Recipes](recipes.md)). Print them again when a declaration changes.
 
-> **What happens:** forget one, and the server refuses to start, naming the
-> table. Declare a trigger for a table no row declares, and it refuses too: its
+> **What happens:** forget one, write one with other arguments, or disable it,
+> and the server refuses to start, naming the table and printing the trigger
+> it needs. Leave a trigger on a table no row declares, and it refuses too: its
 > changes would be noted and never sent.
 
 ## On a register

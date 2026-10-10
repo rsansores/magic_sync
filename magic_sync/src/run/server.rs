@@ -141,7 +141,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         settings: Settings,
     ) -> Result<Self, Error> {
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
-        let mut tx = begin(&pool, settings.role.as_deref()).await?;
+        let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::new(&mut tx, &tables, replicas).await?;
         tx.rollback().await?;
         Ok(Self::with(
@@ -162,7 +162,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         settings: Settings,
     ) -> Result<Self, Error> {
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
-        let mut tx = pool.begin().await?;
+        let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::install(&mut tx, &tables, replicas).await?;
         tx.commit().await?;
         Ok(Self::with(
@@ -195,7 +195,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
 
     /// A transaction of the engine's own, for the host to ask it things in.
     pub async fn begin(&self) -> Result<Transaction<'static, Postgres>, Error> {
-        begin(&self.pool, self.settings.role.as_deref()).await
+        begin(&self.pool, "BEGIN", self.settings.role.as_deref()).await
     }
 
     /// Runs the relay until `shutdown` resolves: stands by while another
@@ -301,8 +301,17 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
             timeout: self.settings.send_timeout,
             backoff: self.settings.replica_backoff,
         };
+        let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
+        self.engine.observe(&mut tx).await?;
+        tx.commit().await?;
         let prepared = {
-            let mut tx = self.begin().await?;
+            // One snapshot for the notes, the plan and the rows it loads.
+            let mut tx = begin(
+                &self.pool,
+                "BEGIN ISOLATION LEVEL REPEATABLE READ",
+                self.settings.role.as_deref(),
+            )
+            .await?;
             let prepared = relay.prepare(&mut tx).await?;
             tx.rollback().await?;
             prepared
@@ -544,9 +553,13 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     }
 }
 
-/// A transaction that assumes `role`, when there is one.
-async fn begin(pool: &PgPool, role: Option<&str>) -> Result<Transaction<'static, Postgres>, Error> {
-    let mut tx = pool.begin().await?;
+/// A transaction begun with `statement`, that assumes `role` when there is one.
+async fn begin(
+    pool: &PgPool,
+    statement: &'static str,
+    role: Option<&str>,
+) -> Result<Transaction<'static, Postgres>, Error> {
+    let mut tx = pool.begin_with(statement).await?;
     assume(&mut tx, role).await?;
     Ok(tx)
 }

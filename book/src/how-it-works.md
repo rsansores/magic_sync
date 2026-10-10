@@ -131,7 +131,8 @@ until every replica that should hold it holds the new name.
    └─ trigger: INSERT INTO sync.notes        (same transaction: atomic)
 
  relay pass
-   1. prepare  (a read transaction)
+   0. observe  (what became of the replicas: live, moved, gone)
+   1. prepare  (one REPEATABLE READ transaction: one snapshot)
         read pending notes ──▶ plan ──▶ load and encode rows
    2. publish  (no transaction open)
         per replica: pack into messages ──▶ number them ──▶ transport.send
@@ -144,20 +145,36 @@ until every replica that should hold it holds the new name.
 
 ### 4.1 Noting
 
-`sync.mirror_table('schema', 'table', ignore, 'partition_column')` installs
-triggers on a table. Every insert, delete, and update that changes something
-writes a row to `sync.notes`: the table, the row's key, the row as it was
-before (which says what it pointed at), and the id of the transaction. Because
+Every mirrored table has the engine's triggers, as `Engine::triggers` writes
+them ([The tables](guide/tables.md)). Every insert, delete, and update that
+changes a column the replicas do not own writes a row to `sync.notes`: the
+table as the engine knows it (a partitioned table by its own name, not its
+partition's), the row's key in the order the row declares it, the columns it
+pointed at other mirrored rows with before the change, and the id of the
+transaction. A key that changed notes the old key too, in the partition it
+was in. Because
 the note is written by a trigger in the same transaction, **no write path can
 forget to note**, and a rolled-back change leaves no note. `TRUNCATE` is
 refused on a mirrored table, because it would remove rows without a note.
 
-Group tables get `sync.mirror_group`: a member joining or leaving a group, or a
-group given to or taken from a replica, is noted the same way.
+Group tables get a trigger too: a member joining or leaving a group, or a
+group given to or taken from a replica, is noted the same way. The server
+refuses to start while a trigger is missing, disabled, or not as it would
+write it.
 
 ### 4.2 Planning
 
-The relay reads up to a batch of pending notes, oldest first. It reads every
+Before each pass the relay compares the replicas (`Replicas::relation` and
+`live`) with what it saw last (`sync.replicas.live`, `partition_id`): a
+replica that became live, or moved to another partition, is provisioned again
+from scratch; one that stopped being live, or is gone, is forgotten — nothing
+recorded as held by it, nothing sent it.
+
+The relay reads up to a batch of pending notes, oldest first, in a
+`REPEATABLE READ` transaction: the notes, the plan and the rows it loads are
+one snapshot, so a row is never sent as it is after a write the plan did not
+see — a parent it now points at left behind. A note this build cannot read (a
+later build's) is skipped by the query, and holds back nothing. It reads every
 note that is not done, instead of "every note after the last one I read",
 because PostgreSQL assigns ids before commit: a transaction that started first
 can commit last with a lower id. A cursor would skip it; a "not done" query
@@ -172,7 +189,9 @@ For the notes it read, the planner computes, per replica:
    the replica lacks.
 3. **Release**: a row taken back, or one a changed row no longer points at,
    releases what it pointed at, and a parent goes only once nothing the
-   replica keeps points at it.
+   replica keeps points at it. One kept for what points at it — a `Referenced`
+   row, or any row held only because a child needs it — is sent again when it
+   changed.
 4. **Followers**: rows that `Follow` a parent go wherever the parent goes.
 
 These steps feed each other, so they repeat until nothing changes. The result
@@ -190,8 +209,13 @@ earlier) is never missed.
 ### 4.3 Loading
 
 Every row the delta sends is read once and encoded once by its codec, however
-many replicas get it. A row that is gone by now (deleted since the plan read
-it) is taken back instead of sent.
+many replicas get it, in the plan's snapshot. A row that cannot go — it does
+not encode, or no message could carry it — is planned around: the plan runs
+again with it blocked, so it is not sent, what points at it is not sent
+either, and a replica holding an older version of it has that version taken
+back with whatever points at it there. A replica never keeps a version the
+planner can no longer reason about; each of those rows is quarantined and
+comes back once a fix lets it through.
 
 ### 4.4 Publishing
 
@@ -317,7 +341,7 @@ fixed:
 | What fails | What the engine does | How it heals |
 |---|---|---|
 | Planning, on one note | halves the batch until the failing note is alone, parks it (`parked_at`), and plans the rest | parked notes are unparked when the relay starts (usually after a deploy) and on a timer |
-| Encoding a row, on the server | leaves the row out of what is sent and recorded, and **quarantines** it for every replica that was owed it. A replica keeps whatever copy it has | quarantined rows are noted again, for their replica alone, when the relay starts and on a timer; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
+| Encoding a row, on the server | leaves the row out of what is sent and recorded, with every row that points at it there, and **quarantines** them for every replica that was owed them. A replica holding an older copy has it taken back, with what points at it | quarantined rows are noted again, for their replica alone, when the relay starts and on a timer; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
 | The transport, for one replica — unreachable, refusing a message for good, or not answering within `send_timeout` | that replica waits out a backoff (`sync.replicas`, the refusal in `last_error`) and is sent nothing more that pass; everything it is owed — rows, deletes, a snapshot — is noted again **for it alone**, as of the transactions that first noted it; owed more than a pass plans, it is provisioned again instead; every other replica carries on | sent when its backoff ends |
 | A row larger than any message may be | left out at loading and **quarantined**, as one that does not encode | as above, once a fix makes it smaller or the limit larger |
 | A replica, taking a row | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`) and reports it in an `Up`; the server stops counting it as held and quarantines it | a fix deployed on either side lets the retry through |

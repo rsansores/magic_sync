@@ -10,7 +10,12 @@ The first release: the engine extracted from the system it was built in.
   message of your own).
 - `Server` and `Replica` runners, built on public step functions.
 - `Server::install`, `replica::install` and `replica::check` for the engine's
-  schema and triggers; a schema version both sides check.
+  schema and triggers; a schema version both sides check. On the server the
+  schema is installed or upgraded in one transaction, one process at a time,
+  and `Engine::triggers` prints the triggers a host's migrations write; the
+  server refuses to start while one is missing, disabled or different.
+- Replicas are provisioned when they become live or move partition, and
+  forgotten when they stop being live; no host call needed.
 - The replica protocol (`PROTOCOL.md`, `proto/sync.proto`), version 1.
 - The shop example: a head office and its registers, each with a page.
 - `status`: what the engine answers about itself, for a dashboard — the

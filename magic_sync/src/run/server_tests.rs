@@ -15,7 +15,6 @@ CREATE TABLE fixture.t_replicas (id UUID PRIMARY KEY, partition_id UUID NOT NULL
 CREATE TABLE fixture.items (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL, retired_at TIMESTAMPTZ);
 CREATE VIEW items AS SELECT * FROM fixture.items WHERE retired_at IS NULL;
-SELECT sync.mirror_table('fixture', 'items', '{}', 'partition_id');
 CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL);
 CREATE TABLE fixture.logs (replica_id UUID NOT NULL, id UUID NOT NULL, value TEXT NOT NULL,
     PRIMARY KEY (replica_id, id));
@@ -154,6 +153,10 @@ async fn world(pool: &PgPool) -> (Uuid, [Uuid; 2]) {
             .await
             .unwrap();
     }
+    let tables: Vec<&Table> = codecs().iter().map(|c| &c.table).collect();
+    let mut tx = conn.begin().await.unwrap();
+    Engine::install(&mut tx, &tables, REPLICAS).await.unwrap();
+    tx.commit().await.unwrap();
     (partition, replicas)
 }
 
@@ -400,8 +403,8 @@ async fn a_relay_that_lost_its_lock_records_nothing(pool: PgPool) {
     assert!(count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL").await > 0);
     assert_eq!(
         server.pass_now().await.unwrap(),
-        Some(1),
-        "the next relay does it"
+        Some(3),
+        "the next relay does it, and provisions the two replicas it sees for the first time"
     );
 }
 

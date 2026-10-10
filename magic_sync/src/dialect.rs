@@ -22,9 +22,6 @@ mod imp {
     /// Binds one statement may carry.
     pub const MAX_BINDS: usize = 65_535;
 
-    /// How a test table declares a uuid column.
-    pub const UUID_TYPE: &str = "UUID";
-
     /// `(column, nullable, generated)` for every column of `schema.table`.
     /// Read from `pg_attribute`, which answers whatever the role may see.
     pub async fn columns(
@@ -86,9 +83,6 @@ mod imp {
 
     /// Binds one statement may carry (`SQLITE_MAX_VARIABLE_NUMBER`).
     pub const MAX_BINDS: usize = 32_766;
-
-    /// How a test table declares a uuid column.
-    pub const UUID_TYPE: &str = "BLOB";
 
     /// `(column, nullable, generated)` for every column of `table`. A primary
     /// key is NOT NULL only when declared so: sqlite lets a non-INTEGER one

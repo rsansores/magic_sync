@@ -64,8 +64,9 @@ pub use sqlx as __sqlx;
 /// run against a database that installed another.
 pub const SCHEMA_VERSION: i32 = 1;
 
-/// The server's schema, as one SQL script: a host runs it in a migration
-/// before any table calls `sync.mirror_table`.
+/// The server's schema at [`SCHEMA_VERSION`], as one SQL script: a host with
+/// migrations runs it in one, before the migration that writes the triggers
+/// [`plan::Engine::triggers`] prints.
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 pub const POSTGRES_SCHEMA: &str = include_str!("../sql/postgres.sql");
 

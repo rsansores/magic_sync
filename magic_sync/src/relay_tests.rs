@@ -8,6 +8,7 @@ use crate::row::Table;
 use crate::status::{ReplicaState, RowState, Scope};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use prost::Message as _;
+use sqlx::Connection as _;
 use std::sync::Mutex;
 
 const SCHEMA: &str = "
@@ -16,8 +17,10 @@ CREATE TABLE fixture.t_replicas (id UUID PRIMARY KEY, partition_id UUID NOT NULL
 CREATE TABLE fixture.items (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL, retired_at TIMESTAMPTZ);
 CREATE VIEW items AS SELECT * FROM fixture.items WHERE retired_at IS NULL;
-SELECT sync.mirror_table('fixture', 'items', '{}', 'partition_id');
 ";
+
+/// How a pass reads: the notes, the plan and its rows in one snapshot.
+const SNAPSHOT: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
 
 const REPLICAS: Replicas = Replicas {
     relation: "fixture.t_replicas",
@@ -121,9 +124,11 @@ async fn world(pool: crate::DbPool) -> World {
             .expect("a replica");
     }
     let table = Table::of::<Item>();
-    let engine = Engine::new(&mut conn, &[&table], REPLICAS)
+    let mut tx = conn.begin().await.expect("a transaction");
+    let engine = Engine::install(&mut tx, &[&table], REPLICAS)
         .await
         .expect("the engine");
+    tx.commit().await.expect("installed");
     World {
         pool,
         engine,
@@ -161,7 +166,7 @@ impl World {
     }
 
     async fn pass_relay<T: Transport>(&self, relay: &Relay<'_, ()>, transport: &T) -> Outcome {
-        let mut tx = self.pool.begin().await.expect("a transaction");
+        let mut tx = self.pool.begin_with(SNAPSHOT).await.expect("a transaction");
         let prepared = relay.prepare(&mut tx).await.expect("prepared");
         tx.rollback().await.expect("rollback");
         let Some(prepared) = prepared else {
@@ -283,7 +288,7 @@ async fn a_row_larger_than_any_message_waits_in_quarantine(pool: crate::DbPool) 
         ..world.relay()
     };
 
-    let mut tx = world.pool.begin().await.unwrap();
+    let mut tx = world.pool.begin_with(SNAPSHOT).await.unwrap();
     let prepared = relay.prepare(&mut tx).await.unwrap().expect("a pass");
     tx.rollback().await.unwrap();
     let sent = relay.publish(&wire, prepared).await;
@@ -547,7 +552,7 @@ async fn a_send_that_never_answers_holds_back_no_other_replica(pool: crate::DbPo
         timeout: std::time::Duration::from_millis(50),
         ..world.relay()
     };
-    let mut tx = world.pool.begin().await.unwrap();
+    let mut tx = world.pool.begin_with(SNAPSHOT).await.unwrap();
     let prepared = relay.prepare(&mut tx).await.unwrap().expect("a pass");
     tx.rollback().await.unwrap();
     let sent = relay.publish(&stuck, prepared).await;
@@ -1287,7 +1292,7 @@ async fn a_pass_that_sent_but_never_recorded_is_sent_again(pool: crate::DbPool) 
     world.item("once").await;
 
     let relay = world.relay();
-    let mut tx = world.pool.begin().await.unwrap();
+    let mut tx = world.pool.begin_with(SNAPSHOT).await.unwrap();
     let prepared = relay.prepare(&mut tx).await.unwrap().expect("a pass");
     tx.rollback().await.unwrap();
     let first = relay.publish(&wire, prepared).await;
@@ -1449,21 +1454,20 @@ fn tag_from_wire(row: ItemRow) -> Result<Tag, magic_map::MappingError> {
 async fn a_row_set_aside_and_owed_to_no_one_leaves_while_its_namesake_stays(pool: crate::DbPool) {
     let world = world(pool).await;
     sqlx::raw_sql(
-        "CREATE TABLE fixture.tags (id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL);
-         SELECT sync.mirror_table('fixture', 'tags', '{}', 'partition_id');",
+        "CREATE TABLE fixture.tags (id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL);",
     )
     .execute(&world.pool)
     .await
     .unwrap();
-    let mut conn = world.pool.acquire().await.unwrap();
-    let engine = Engine::new(
-        &mut conn,
+    let mut tx = world.pool.begin().await.unwrap();
+    let engine = Engine::install(
+        &mut tx,
         &[&Table::of::<Item>(), &Table::of::<Tag>()],
         REPLICAS,
     )
     .await
     .unwrap();
-    drop(conn);
+    tx.commit().await.unwrap();
     let codecs = vec![
         Codec::<()>::new::<Item, ItemRow>(to_wire, from_wire, None),
         Codec::<()>::new::<Tag, ItemRow>(tag_to_wire, tag_from_wire, None),

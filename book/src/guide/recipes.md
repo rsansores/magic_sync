@@ -45,12 +45,16 @@ pub struct Customer { /* … */ }
 
 Taking a list away from a register is deleting one row; the engine works out
 which customers to take back, and keeps those another list still gives it.
-With migrations of your own, each group table gets its trigger:
+With migrations of your own, each group table gets its trigger, which
+`Engine::triggers` prints with the others:
 
 ```sql
-SELECT sync.mirror_group('shop', 'list_members',   'list_id',     'members',  '');
-SELECT sync.mirror_group('shop', 'register_lists', 'register_id', 'assigned', '');
+CREATE TRIGGER sync_note_group AFTER INSERT OR UPDATE OR DELETE ON "shop"."list_members" FOR EACH ROW EXECUTE FUNCTION sync.note_group('list_members', 'list_id', 'members', '');
+CREATE TRIGGER sync_note_group AFTER INSERT OR UPDATE OR DELETE ON "shop"."register_lists" FOR EACH ROW EXECUTE FUNCTION sync.note_group('register_lists', 'register_id', 'assigned', '');
 ```
+
+The members table points at the grouped table by its key — one column or
+several — and both group tables point at the table of groups.
 
 ## A table both sides write
 
@@ -100,5 +104,4 @@ pub const REGISTERS: Replicas = Replicas {
 ```
 
 Every table that goes down carries `company_id`; a `broadcast` product reaches
-only its company's registers. With migrations, pass the column to
-`sync.mirror_table('shop', 'products', '{}', 'company_id')`.
+only its company's registers. The triggers `Engine::triggers` prints note it.
