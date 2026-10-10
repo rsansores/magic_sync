@@ -211,10 +211,6 @@ mod server {
     CREATE TABLE fixture.prices (id UUID PRIMARY KEY, cents BIGINT NOT NULL, updated_at TIMESTAMPTZ NOT NULL);
     CREATE TABLE fixture.tasks (id UUID PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL);
-    SELECT sync.mirror_table('fixture', 'items');
-    SELECT sync.mirror_table('fixture', 'shelves');
-    SELECT sync.mirror_table('fixture', 'prices');
-    SELECT sync.mirror_table('fixture', 'tasks', '{done}');
     ";
 
     /// Each step's statements, run before its pass.
@@ -300,8 +296,10 @@ mod server {
             live: "live",
             partition: None,
         };
-        let engine = Engine::new(&mut conn, &tables, replicas).await.unwrap();
         drop(conn);
+        let mut tx = pool.begin().await.unwrap();
+        let engine = Engine::install(&mut tx, &tables, replicas).await.unwrap();
+        tx.commit().await.unwrap();
         let relay = Relay {
             engine: &engine,
             codecs: codecs(),
@@ -322,7 +320,10 @@ mod server {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
             loop {
                 let kept = Kept::default();
-                let mut tx = pool.begin().await.unwrap();
+                let mut tx = pool
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    .await
+                    .unwrap();
                 let prepared = relay.prepare(&mut tx).await.unwrap();
                 tx.commit().await.unwrap();
                 let Some(prepared) = prepared else { break };
