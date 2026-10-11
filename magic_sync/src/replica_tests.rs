@@ -2132,6 +2132,50 @@ async fn a_message_up_the_main_lane_fills_the_transport_too(pool: SqlitePool) {
     }
 }
 
+/// Deletes fill a message up too, to the byte, and never outgrow it.
+#[sqlx::test(migrations = false)]
+async fn deletes_up_fill_the_transport_to_the_byte(pool: SqlitePool) {
+    let limits = Limits::new(500, 5000).unwrap();
+    let settings = Settings {
+        outbox: Outbox {
+            limits,
+            ..Outbox::default()
+        },
+        lanes: vec![Lane::new("main", &[]), Lane::new("state", &["readings"])],
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    for n in 0..200 {
+        sqlx::query("INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, 1, $3)")
+            .bind(w.me)
+            .bind(Uuid::now_v7())
+            .bind(n)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    w.exec("DELETE FROM sync_notes; DELETE FROM readings")
+        .await
+        .unwrap();
+    let mut ups = Vec::new();
+    while let Some(up) = w.up(1, false).await {
+        ups.push(up);
+    }
+    let deleted: usize = ups.iter().map(|up| up.tables[0].deletes.len()).sum();
+    assert_eq!(deleted, 200);
+    for up in ups.iter().take(ups.len() - 1) {
+        let used = up.encoded_len();
+        assert!(used <= limits.bytes(), "{used} bytes");
+        let room = limits.bytes() + number_field(up) - used - framed(9);
+        let part = up.tables[0].encoded_len();
+        let next = framed(up.tables[0].deletes[0].encoded_len());
+        assert!(
+            room < framed(part + next) - framed(part),
+            "{room} bytes of room left"
+        );
+    }
+}
+
 /// The edges, to the byte, on a lane with nothing but rows: a row that
 /// fills a message alone goes, one a byte larger is set aside; a second row
 /// that fills what the first left goes with it, one a byte larger waits.

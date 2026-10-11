@@ -1986,15 +1986,14 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
             .execute(&mut *conn)
             .await?;
     }
-    if outgoing.up.sequence > 0 {
-        sqlx::query(
-            "UPDATE sync_applied SET acknowledged = max(acknowledged, $2) WHERE id = 1 AND epoch = $1",
-        )
-        .bind(&outgoing.up.epoch)
-        .bind(i64::try_from(outgoing.up.sequence).unwrap_or(i64::MAX))
-        .execute(&mut *conn)
-        .await?;
-    }
+    // A message that says nothing of it names no epoch, and changes nothing.
+    sqlx::query(
+        "UPDATE sync_applied SET acknowledged = max(acknowledged, $2) WHERE id = 1 AND epoch = $1",
+    )
+    .bind(&outgoing.up.epoch)
+    .bind(i64::try_from(outgoing.up.sequence).unwrap_or(i64::MAX))
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
