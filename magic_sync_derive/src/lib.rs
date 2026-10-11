@@ -11,6 +11,8 @@
 //! [magic_sync]: https://docs.rs/magic_sync
 //! [`magic_sync::Row`]: https://docs.rs/magic_sync/latest/magic_sync/derive.Row.html
 
+#![warn(missing_docs)]
+
 use proc_macro::TokenStream as Tokens;
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
@@ -627,15 +629,6 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             );
         });
     }
-    let leaves_out = |lit: &LitStr, name: &str| {
-        match column(name) {
-        Some(_) => Err(syn::Error::new_spanned(
-            lit,
-            format!("`{name}` is a field of the row: a column the row leaves out is not one of its fields"),
-        )),
-        None => Ok(()),
-    }
-    };
     let retired = match &args.retired {
         Some(lit) => Some(identifier(&lit.value(), lit.span())?),
         None => None,
@@ -644,7 +637,12 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         Some(lit) => {
             let names = names(lit)?;
             for name in &names {
-                leaves_out(lit, name)?;
+                if column(name).is_some() {
+                    return Err(syn::Error::new_spanned(
+                        lit,
+                        format!("`{name}` is a field of the row: a column the row leaves out is not one of its fields"),
+                    ));
+                }
                 if retired.as_ref() == Some(name) {
                     return Err(syn::Error::new_spanned(
                         lit,
