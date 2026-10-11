@@ -926,3 +926,54 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         );
     }
 }
+
+/// A host spawns what the server runs, and answers from handlers whose
+/// futures must be `Send`: every future a host gets from the server is.
+#[sqlx::test(migrations = false)]
+async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
+    fn spawnable<T: Send>(_: T) {}
+    world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the server");
+    spawnable(server.run(std::future::pending()));
+    spawnable(server.receive(Uuid::nil(), &[]));
+    spawnable(server.pass_now());
+    spawnable(server.begin());
+    spawnable(Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone(pool.clone()),
+        settings(),
+    ));
+    spawnable(Server::install(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone(pool.clone()),
+        settings(),
+    ));
+    let mut conn = pool.acquire().await.unwrap();
+    spawnable(crate::plan::note_resync(&mut conn, None, Uuid::nil()));
+
+    spawnable(Engine::triggers(&mut conn, &codecs(), REPLICAS));
+    spawnable(crate::row::upsert::<Item>(&mut conn, Vec::new()));
+    spawnable(crate::row::get::<Item>(&mut conn, &Vec::new()));
+    let engine = server.engine();
+    let scope = crate::status::Scope::All;
+    spawnable(engine.overview(&mut conn, scope, 1));
+    spawnable(engine.listing(&mut conn, scope, None, 0, 1));
+    spawnable(engine.health(&mut conn, scope, 1));
+    spawnable(engine.progress(&mut conn, scope));
+    spawnable(engine.row_progress(&mut conn, scope, "items", ""));
+}

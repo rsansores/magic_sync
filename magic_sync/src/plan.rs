@@ -570,7 +570,9 @@ async fn migrate(conn: &mut Conn) -> Result<(), Error> {
         )));
     }
     for script in &MIGRATIONS[from..] {
-        sqlx::raw_sql(script).execute(&mut *conn).await?;
+        // Not `raw_sql`: its future is not `Send` for every lifetime a
+        // host's spawn asks of it.
+        sqlx::Executor::execute(&mut *conn, *script).await?;
     }
     Ok(())
 }
@@ -656,13 +658,12 @@ impl Engine {
         let engine = Self::read(conn, tables, replicas).await?;
         let live = live_triggers(conn).await?;
         for stray in engine.strays(&live) {
-            sqlx::raw_sql(&format!(
+            let drop = format!(
                 "DROP TRIGGER {} ON {}",
                 ident(&stray.name),
                 stray.on().sql()
-            ))
-            .execute(&mut *conn)
-            .await?;
+            );
+            sqlx::Executor::execute(&mut *conn, drop.as_str()).await?;
         }
         let mut first_noted = false;
         for expected in engine.triggers_needed() {
@@ -673,13 +674,8 @@ impl Engine {
                 continue;
             }
             if existing.is_some() {
-                sqlx::raw_sql(&format!(
-                    "DROP TRIGGER {} ON {}",
-                    expected.name,
-                    expected.on.sql()
-                ))
-                .execute(&mut *conn)
-                .await?;
+                let drop = format!("DROP TRIGGER {} ON {}", expected.name, expected.on.sql());
+                sqlx::Executor::execute(&mut *conn, drop.as_str()).await?;
             } else if expected.function == "note_row" {
                 let has_rows: bool = sqlx::query_scalar(&format!(
                     "SELECT EXISTS (SELECT 1 FROM {})",
@@ -689,7 +685,7 @@ impl Engine {
                 .await?;
                 first_noted |= has_rows;
             }
-            sqlx::raw_sql(&expected.ddl()).execute(&mut *conn).await?;
+            sqlx::Executor::execute(&mut *conn, expected.ddl().as_str()).await?;
         }
         if first_noted {
             // Rows written before their table was noted reached no replica:
