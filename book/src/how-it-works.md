@@ -350,7 +350,10 @@ meant for another replica, or for this one before it was restored, names
 nothing of its. An upload the server does not answer
 goes again after a while. An upload stays within the transport's size; a row
 that can never fit, or that the transport refuses for good, is set aside and
-counted in the backlog until the replica runs again. So the replica always
+counted in the backlog until the replica runs again — found by sending half of
+what was refused, and half again, and blamed only when the transport took some
+other message meanwhile; a transport that refuses everything sets nothing aside
+and is asked again after a backoff. So the replica always
 knows what it wrote that has not reached the server yet.
 
 The same `Up` carries everything else a replica has to tell the server: the

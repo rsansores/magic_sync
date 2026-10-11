@@ -50,7 +50,8 @@ pub(crate) fn keys_of<P: Sync + 'static>(
 /// The engine's steps, in order, each as released and never edited: the
 /// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
 #[cfg(feature = "sqlite")]
-const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [include_str!("../sql/sqlite/1.sql")];
+const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] =
+    [include_str!("../sql/sqlite/1.sql")];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
 /// script that also records the version it brings them to — `None` for a
@@ -1591,6 +1592,16 @@ impl Outgoing {
     }
 }
 
+/// Which of its rows and rejections a message carries when the transport
+/// refused a larger one for good: `take` of them at most, after the first
+/// `skip` that would otherwise go.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Window {
+    pub(crate) take: usize,
+    pub(crate) skip: usize,
+}
+
 /// What this replica has to tell the server on `lane` of `lanes`, as one
 /// message within the outbox's limits: `None` when it has nothing. Rows it
 /// wrote (as they are now), on every lane; on the first lane — the main one
@@ -1600,9 +1611,10 @@ impl Outgoing {
 /// `BEGIN IMMEDIATE`, and commit before the message goes: it reads all of
 /// that as of one moment, and draws the upload's number. Hand the message
 /// to the transport, then to [`delivered`] — or, when the transport refuses
-/// it for good, ask again with a `cap` on the rows and rejections it
+/// it for good, ask again with a `window` on the rows and rejections it
 /// carries, halving it until the one it refuses is alone: then to
-/// [`refused`]. The digests go only with the last message applied they were
+/// [`refused`] — or, to see whether the transport takes any other, with the
+/// window moved past it. The digests go only with the last message applied they were
 /// read with, which goes only once every refusal of it is told, and only
 /// when they fit; otherwise they wait.
 ///
@@ -1622,7 +1634,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     lane: usize,
     settings: &Outbox,
     digests: Option<Held>,
-    cap: Option<usize>,
+    window: Option<Window>,
 ) -> Result<Option<Outgoing>, Error> {
     let Some(this) = lanes.get(lane) else {
         return Err(Error::Misuse(format!("no lane {lane} of {}", lanes.len())));
@@ -1641,8 +1653,9 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     let mut untold_gap = false;
     // Whether the last applied is news to the server.
     let mut news = false;
-    // Rows and rejections it may carry, at most.
-    let mut items = cap.unwrap_or(usize::MAX);
+    // Rows and rejections it may carry, at most, after those it passes over.
+    let mut items = window.map_or(usize::MAX, |w| w.take);
+    let mut skip = window.map_or(0, |w| w.skip);
     if main {
         let tables: usize = progress(conn)
             .await?
@@ -1664,8 +1677,11 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         // server must hear of a refusal before the message it refused is
         // confirmed, or it would take the refused row for applied.
         let most = settings.rejections.get().min(items);
-        let pending = unreported(conn, most + 1).await?;
-        let mut all_reported = pending.len() <= most;
+        let mut pending = unreported(conn, skip.saturating_add(most).saturating_add(1)).await?;
+        let passed = skip.min(pending.len());
+        pending.drain(..passed);
+        skip -= passed;
+        let mut all_reported = passed == 0 && pending.len() <= most;
         for (row, sequence) in pending.into_iter().take(most) {
             let weight = framed(row.encoded_len());
             if up.encoded_len() + reserved + weight > limit {
@@ -1715,7 +1731,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     };
     let largest = limit.saturating_sub(bare.encoded_len() + reserved);
     let budget = limit.saturating_sub(up.encoded_len() + reserved);
-    let notes = unsent(conn, lanes, this, settings, items).await?;
+    let notes = unsent(conn, lanes, this, settings, items, skip).await?;
     let gathered = gather(conn, codecs, notes, largest, budget).await?;
     up.tables = gathered.tables;
     if !gathered.carried.is_empty() {
@@ -1776,6 +1792,7 @@ async fn unsent(
     lane: &Lane,
     settings: &Outbox,
     most: usize,
+    skip: usize,
 ) -> Result<Vec<Note>, Error> {
     let quoted = |tables: &mut dyn Iterator<Item = &&str>| {
         tables.map(|t| literal(t)).collect::<Vec<_>>().join(", ")
@@ -1797,10 +1814,11 @@ async fn unsent(
             AND (sent_at IS NULL OR writes > sent \
                  OR sent_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{:.3} seconds') \
                  OR sent_at > {now}) {filter} \
-          ORDER BY id LIMIT $1",
+          ORDER BY id LIMIT $1 OFFSET $2",
         settings.resend_after.as_secs_f64()
     ))
     .bind(i64::try_from(settings.limits.rows.min(most)).unwrap_or(i64::MAX))
+    .bind(i64::try_from(skip).unwrap_or(i64::MAX))
     .fetch_all(&mut *conn)
     .await?)
 }

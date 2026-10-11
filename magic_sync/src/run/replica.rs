@@ -53,7 +53,11 @@ pub trait Uplink: Send + Sync + 'static {
     /// has the replica send half of what it carried, and half again, until
     /// what the transport refuses is alone: that row is set aside, counted
     /// in the backlog, until the replica runs again with a build that may
-    /// send it. Anything else goes again after a backoff.
+    /// send it — but only once the transport has taken some other message of
+    /// the lane meanwhile, since one that takes none refuses for a reason
+    /// that is not the row's, and then nothing is set aside: the replica
+    /// logs an error and goes again after a backoff, as it does for anything
+    /// else.
     fn send(
         &self,
         replica: Uuid,
@@ -147,6 +151,13 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     /// Per lane, how many rows and rejections a message carries at most
     /// while the uplink refuses one for good: 0 for no cap.
     caps: Vec<AtomicUsize>,
+    /// Per lane, whether the transport took a message while it was being
+    /// asked for less than the replica had to say: proof that a row it then
+    /// refuses alone is the one at fault, and not the transport.
+    witnessed: Vec<AtomicBool>,
+    /// Per lane, how many rows and rejections the next message passes over
+    /// while it looks for one the transport takes: 0 when it is not looking.
+    skips: Vec<AtomicUsize>,
 }
 
 impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
@@ -197,6 +208,12 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             identity,
             uplink,
             caps: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
+            witnessed: settings
+                .lanes
+                .iter()
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            skips: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
             wake: settings.lanes.iter().map(|_| Notify::new()).collect(),
             running: AtomicBool::new(false),
             settings,
@@ -338,12 +355,17 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// numbered in one transaction, handed to the uplink with none open,
     /// recorded in another. A message the uplink refuses for good is asked
     /// again with half its rows and rejections, until the one it refuses is
-    /// alone: that one is set aside, never the ones beside it.
+    /// alone: that one is set aside, never the ones beside it — provided the
+    /// transport took another message of the lane meanwhile. One that took
+    /// none refuses for a reason that is not the row's (a credential, a host
+    /// that answers every message so): nothing is set aside, the alarm is
+    /// raised, and the lane goes again after its backoff.
     pub(crate) async fn send_lane(&self, lane: usize, digests: bool) -> Result<Went, Error> {
         let Some(id) = self.identity.id(&mut *self.pool.acquire().await?).await? else {
             return Ok(Went::default());
         };
         let cap = self.caps[lane].load(Ordering::Relaxed);
+        let skip = self.skips[lane].load(Ordering::Relaxed);
         // Read apart from the write lock: digests read every row it holds.
         let held = if digests {
             let mut tx = self.pool.begin().await?;
@@ -361,11 +383,24 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             lane,
             &self.settings.outbox,
             held,
-            (cap > 0).then_some(cap),
+            (cap > 0).then_some(replica::Window { take: cap, skip }),
         )
         .await?;
         tx.commit().await?;
-        let Some(outgoing) = outgoing else {
+        let Some(outgoing) = outgoing.filter(|o| skip == 0 || o.items() > 0) else {
+            if skip > 0 {
+                self.skips[lane].store(0, Ordering::Relaxed);
+                self.caps[lane].store(0, Ordering::Relaxed);
+                tracing::error!(
+                    lane = self.settings.lanes[lane].name,
+                    "sync: the uplink refuses what this lane sends for good, and has no other \
+                     row to try it with — nothing is set aside, and it goes again"
+                );
+                return Err(Error::Transport {
+                    reason: "the uplink refuses the only messages this lane has".to_owned(),
+                    transient: true,
+                });
+            }
             return Ok(Went::default());
         };
         let timeout = self.settings.send_timeout;
@@ -380,16 +415,20 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 transient: true,
             })
         });
-        let went = Went {
+        let mut went = Went {
             message: true,
-            digests: !outgoing.up.digests.is_empty(),
+            digests: false,
         };
         let items = outgoing.items();
+        let witnessed = &self.witnessed[lane];
         match sent {
             Ok(()) => {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 replica::delivered(&mut tx, &outgoing).await?;
                 tx.commit().await?;
+                went.digests = !outgoing.up.digests.is_empty();
+                witnessed.store(cap > 0, Ordering::Relaxed);
+                self.skips[lane].store(0, Ordering::Relaxed);
                 self.caps[lane].store(0, Ordering::Relaxed);
             }
             Err(e) if !e.is_transient() && items > 1 => {
@@ -400,7 +439,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 );
                 self.caps[lane].store(items / 2, Ordering::Relaxed);
             }
-            Err(e) if !e.is_transient() && items == 1 => {
+            Err(e) if !e.is_transient() && items == 1 && witnessed.load(Ordering::Relaxed) => {
                 tracing::error!(
                     lane = outgoing.lane,
                     "sync: the uplink refuses a row or a rejection for good — set aside: {e}"
@@ -408,9 +447,30 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 replica::refused(&mut tx, &outgoing, &e.to_string()).await?;
                 tx.commit().await?;
+                witnessed.store(false, Ordering::Relaxed);
+                self.skips[lane].store(0, Ordering::Relaxed);
                 self.caps[lane].store(0, Ordering::Relaxed);
             }
-            Err(e) => return Err(e),
+            Err(e) if !e.is_transient() && items == 1 => {
+                tracing::warn!(
+                    lane = outgoing.lane,
+                    "sync: the uplink refuses a row for good, and has taken nothing else of this \
+                     lane meanwhile — another goes, to see whether it is the row: {e}"
+                );
+                self.skips[lane].store(if skip == 0 { 1 } else { skip * 2 }, Ordering::Relaxed);
+                self.caps[lane].store(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if !e.is_transient() {
+                    tracing::error!(
+                        lane = outgoing.lane,
+                        items,
+                        "sync: the uplink refuses for good a message that carries no row — \
+                         nothing to set aside, and it goes again: {e}"
+                    );
+                }
+                return Err(e);
+            }
         }
         Ok(went)
     }

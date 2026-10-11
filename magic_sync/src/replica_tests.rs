@@ -2331,15 +2331,22 @@ async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool:
         .execute(&w.pool)
         .await
         .unwrap();
-    *w.uplink.refusing.lock().unwrap() = Some(false);
-    assert!(
-        w.replica.send_lane(0, false).await.unwrap().message,
-        "set aside"
-    );
-    *w.uplink.refusing.lock().unwrap() = None;
-    let up = w.up(0, false).await.expect("the backlog");
-    assert!(up.tables.is_empty());
-    assert_eq!(up.backlog.unwrap().tables[0].set_aside, 1);
+    events(&w, &["bad"]).await;
+    *w.uplink.cannot_take.lock().unwrap() = Some(|up: &Up| {
+        up.tables
+            .iter()
+            .flat_map(|t| &t.upserts)
+            .any(|row| String::from_utf8_lossy(row).contains("\"what\":\"bad\""))
+    });
+    for _ in 0..8 {
+        w.replica.send_lane(0, false).await.unwrap();
+    }
+    *w.uplink.cannot_take.lock().unwrap() = None;
+    w.uplink.taken();
+    let mut conn = w.pool.acquire().await.unwrap();
+    let progress = progress(&mut conn).await.unwrap();
+    assert_eq!((progress[0].set_aside, progress[0].unfiled), (1, 1));
+    drop(conn);
 
     let again = Replica::new(
         w.pool.clone(),
@@ -2416,6 +2423,138 @@ async fn what_the_uplink_refuses_for_good_is_found_and_only_it_set_aside(pool: S
             .await,
         0
     );
+}
+
+async fn events(w: &World, names: &[&str]) {
+    for what in names {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+            .bind(Uuid::now_v7())
+            .bind(what)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+}
+
+/// A transport that refuses every message for good — a revoked credential, a
+/// host that answers 403 — says nothing of any one row: nothing is set aside
+/// on its word, whatever the number of rows, and it goes on being asked.
+async fn nothing_is_blamed_when_everything_is_refused(pool: SqlitePool, names: &[&str]) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, names).await;
+    *w.uplink.refusing.lock().unwrap() = Some(false);
+    let mut alarms = 0;
+    for _ in 0..20 {
+        alarms += usize::from(w.replica.send_lane(0, false).await.is_err());
+    }
+    assert!(alarms > 0, "{names:?}: the lane backs off");
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes WHERE set_aside IS NOT NULL")
+            .await,
+        0,
+        "{names:?}"
+    );
+    *w.uplink.refusing.lock().unwrap() = None;
+    let mut sent = 0;
+    for _ in 0..10 {
+        let _ = w.replica.send_lane(0, false).await;
+        sent += w
+            .uplink
+            .taken()
+            .iter()
+            .flat_map(|(_, up)| &up.tables)
+            .map(|t| t.upserts.len())
+            .sum::<usize>();
+    }
+    assert_eq!(
+        sent,
+        names.len(),
+        "all of it goes once the transport takes it"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_uplink_that_refuses_everything_for_good_blames_no_lone_row(pool: SqlitePool) {
+    nothing_is_blamed_when_everything_is_refused(pool, &["only"]).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_uplink_that_refuses_everything_for_good_blames_none_of_many_rows(pool: SqlitePool) {
+    nothing_is_blamed_when_everything_is_refused(pool, &["a", "b", "c", "d", "e"]).await;
+}
+
+/// The row at the head of the queue that the transport refuses is found
+/// all the same: with nothing yet taken to prove the transport works, the
+/// ones behind it are tried, and then it is the one set aside.
+#[sqlx::test(migrations = false)]
+async fn a_refused_row_at_the_head_of_the_queue_is_set_aside_once_the_others_go(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["bad", "b", "c", "d", "e"]).await;
+    *w.uplink.cannot_take.lock().unwrap() = Some(|up: &Up| {
+        up.tables
+            .iter()
+            .flat_map(|t| &t.upserts)
+            .any(|row| String::from_utf8_lossy(row).contains("\"what\":\"bad\""))
+    });
+    for _ in 0..12 {
+        let _ = w.replica.send_lane(0, false).await;
+    }
+    let sent: usize = w
+        .uplink
+        .taken()
+        .iter()
+        .flat_map(|(_, up)| &up.tables)
+        .map(|t| t.upserts.len())
+        .sum();
+    assert_eq!(sent, 4);
+    assert_eq!(
+        w.texts("SELECT set_aside FROM sync_notes WHERE set_aside IS NOT NULL")
+            .await
+            .len(),
+        1
+    );
+}
+
+/// A message with nothing of the replica's writes in it — the confirmation of
+/// what it applied — that the transport refuses for good has no row to
+/// blame: it is the alarm and the backoff, not a silent loop.
+#[sqlx::test(migrations = false)]
+async fn a_message_with_no_rows_the_uplink_refuses_for_good_blames_nothing(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [id] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(id, "a")])]))
+        .await;
+    *w.uplink.refusing.lock().unwrap() = Some(false);
+    for _ in 0..3 {
+        assert!(w.replica.send_lane(0, false).await.is_err());
+    }
+    *w.uplink.refusing.lock().unwrap() = None;
+    let up = w.up(0, false).await.expect("the confirmation still goes");
+    assert_eq!(up.sequence, BASE + 1);
+}
+
+/// The digests are due again an hour after they went, not after a message
+/// that carried them and was refused.
+#[sqlx::test(migrations = false)]
+async fn digests_in_a_message_the_uplink_refuses_are_not_counted_as_sent(pool: SqlitePool) {
+    let w = world(pool).await;
+    events(&w, &["a", "bad", "c"]).await;
+    *w.uplink.cannot_take.lock().unwrap() = Some(|up: &Up| {
+        up.tables
+            .iter()
+            .flat_map(|t| &t.upserts)
+            .any(|row| String::from_utf8_lossy(row).contains("\"what\":\"bad\""))
+    });
+    let went = w.replica.send_lane(0, true).await.unwrap();
+    assert!(went.message);
+    assert!(!went.digests, "refused with the rows");
+    let mut digests = false;
+    for _ in 0..8 {
+        digests |= w.replica.send_lane(0, true).await.unwrap().digests;
+    }
+    assert!(digests, "they go with the message that is taken");
 }
 
 /// A row this build cannot encode is set aside, with why, and counted: the
@@ -3062,15 +3201,24 @@ async fn the_triggers_script_runs_again_over_what_it_wrote(pool: SqlitePool) {
     let script = triggers(&codecs());
     let before = live_triggers(&mut conn).await;
 
-    sqlx::raw_sql(&script).execute(&mut *conn).await.expect("a second run");
-    sqlx::raw_sql(&script).execute(&mut *conn).await.expect("a third run");
+    sqlx::raw_sql(&script)
+        .execute(&mut *conn)
+        .await
+        .expect("a second run");
+    sqlx::raw_sql(&script)
+        .execute(&mut *conn)
+        .await
+        .expect("a third run");
     assert_eq!(live_triggers(&mut conn).await, before);
 
     sqlx::raw_sql("ALTER TABLE readings ADD COLUMN later TEXT")
         .execute(&mut *conn)
         .await
         .unwrap();
-    sqlx::raw_sql(&script).execute(&mut *conn).await.expect("after a column is added");
+    sqlx::raw_sql(&script)
+        .execute(&mut *conn)
+        .await
+        .expect("after a column is added");
     assert_eq!(live_triggers(&mut conn).await, before);
 }
 
