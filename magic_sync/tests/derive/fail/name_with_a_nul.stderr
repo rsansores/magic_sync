@@ -1,0 +1,5 @@
+error: a name cannot hold a NUL character
+ --> tests/derive/fail/name_with_a_nul.rs:2:15
+  |
+2 | #[row(table = "th\0ings", mirror = "catalog")]
+  |               ^^^^^^^^^^

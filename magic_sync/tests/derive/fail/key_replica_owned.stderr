@@ -1,0 +1,5 @@
+error: a key column is the row's identity: it is not generated, owned by a replica, a version or a creation time
+ --> tests/derive/fail/key_replica_owned.rs:4:11
+  |
+4 |     #[row(replica_owned)]
+  |           ^^^^^^^^^^^^^

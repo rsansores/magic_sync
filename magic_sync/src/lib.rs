@@ -110,10 +110,10 @@ pub use row::{Columns, Row};
 /// | `table` | the table's name (required) |
 /// | `schema` | its PostgreSQL schema; `public` when left out |
 /// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server), `both` (each side its own columns) or `server` (it never travels) — required |
-/// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names), `follows(col)` (wherever the row `col` points at goes) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
-/// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]) |
-/// | `active` | for `catalog` and `both`, the relation the rows replicas hold are read through on the server — `view` or `schema.view`, a view that leaves out the rows no replica should hold |
-/// | `retired` | for `catalog` and `both`, the column a replica sets on a row it lets go of but must keep, because a row of its own points at it |
+/// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names: a uuid, or an `Option` of one), `follows(col)` (wherever the row `col` points at goes: one column, the whole of a foreign key into a mirrored table) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
+/// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]), and a field of the row itself — not of a part flattened in |
+/// | `active` | for `catalog` and `both`, the relation the rows replicas hold are read through on the server — `view` or `schema.view` (a name has no dot), a view that leaves out the rows no replica should hold |
+/// | `retired` | for `catalog` and `both`, the column a replica sets on a row it lets go of but must keep, because a row of its own points at it. It is left out of the row as a rule; a row that has it as a field too gets it back as the server sends it, which is live |
 /// | `origin` | for `record` and `both`, the uuid key column naming the replica a row belongs to: a replica deletes only its own rows |
 /// | `unmirrored` | columns one side's table has that the row leaves out: `unmirrored = "archived_at, notes"` |
 /// | `crate` | the path to this crate, when a host reaches it through another: `crate = "platform::sync"` |
@@ -129,10 +129,12 @@ pub use row::{Columns, Row};
 ///
 /// Fields follow `sqlx::FromRow`: `#[sqlx(rename = "…")]` names the column,
 /// `#[sqlx(try_from = "…")]` is the type the column decodes into,
-/// `#[sqlx(skip)]` is no column, and `#[sqlx(flatten)]` brings in the columns
+/// `#[sqlx(skip)]` is no column (and takes no `rename`), and `#[sqlx(flatten)]` brings in the columns
 /// of a part that derives [`Columns`](macro@Columns). `#[sqlx(json)]` and a
 /// struct-level `#[sqlx(rename_all)]` are refused rather than
-/// half-understood. A nullable column is a field written as `Option<…>`.
+/// half-understood. A nullable column is a field written as `Option<…>`, spelled
+/// so (`Option<T>` or `std::option::Option<T>`): the
+/// engine refuses the table of a field typed through an alias.
 ///
 /// Every name is the database's own, as written — the engine quotes each —
 /// and at most the 63 bytes PostgreSQL keeps of one. Whatever the derive
@@ -208,6 +210,9 @@ type DbPool = sqlx::PgPool;
 pub mod __private {
     pub use crate::row::{Column, Columns, Route, Row};
     pub use sqlx;
+
+    /// Keeps [`Columns`] and [`Row`] to what the derives write.
+    pub trait Sealed {}
 
     /// This side's database.
     #[cfg(feature = "postgres")]

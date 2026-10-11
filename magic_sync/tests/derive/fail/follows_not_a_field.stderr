@@ -1,0 +1,5 @@
+error: sync = "follows(parent)": `parent` is not a field of the row
+ --> tests/derive/fail/follows_not_a_field.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "follows(parent)")]
+  |                                                    ^^^^^^^^^^^^^^^^^

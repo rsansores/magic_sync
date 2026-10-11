@@ -91,8 +91,14 @@ pub struct Column {
 /// [`#[derive(Columns)]`](crate::Columns) writes for a part a row flattens in
 /// (`#[sqlx(flatten)]`), and [`#[derive(Row)]`](crate::Row) for the row.
 ///
-/// Its items are the derive's; implement it only through the derive.
-pub trait Columns {
+/// Its items are the derive's; it is sealed, and implemented only through the
+/// derive:
+///
+/// ```compile_fail,E0277
+/// struct Mine;
+/// impl magic_sync::Columns for Mine {}
+/// ```
+pub trait Columns: crate::__private::Sealed {
     /// The column marked `version`, here or in a part flattened in.
     #[doc(hidden)]
     const VERSION: Option<&'static str>;
@@ -897,6 +903,29 @@ impl Table {
             .collect()
     }
 
+    /// Where the row contradicts itself in a way only the types of its
+    /// flattened parts show, which the derive cannot read: a column twice,
+    /// or one the row leaves `unmirrored` that is also a field.
+    fn contradictions(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, column) in self.columns.iter().enumerate() {
+            if self.columns[..i].iter().any(|c| c.name == column.name) {
+                out.push(format!(
+                    "the column `{}` is a field of the row twice, once in a part flattened in",
+                    column.name
+                ));
+            }
+        }
+        for name in self.unmirrored {
+            if self.columns.iter().any(|c| c.name == *name) {
+                out.push(format!(
+                    "`{name}` is a field of the row, in a part flattened in, and is also `unmirrored`"
+                ));
+            }
+        }
+        out
+    }
+
     /// How the table differs from its row on this database: each column the
     /// table has and the row does not, or the other way round, one nullable
     /// on one side only, generated on one side only, or of a type its field
@@ -904,8 +933,8 @@ impl Table {
     /// the row leaves out — its retired column, its unmirrored ones — are
     /// not compared. Empty when they agree.
     pub(crate) async fn differences(&self, conn: &mut Conn) -> Result<Vec<String>, Error> {
+        let mut out = self.contradictions();
         let actual = crate::dialect::columns(conn, self.schema, self.name).await?;
-        let mut out = Vec::new();
         if actual.is_empty() {
             out.push(format!("the table is not on {}", crate::dialect::NAME));
             return Ok(out);
@@ -1020,6 +1049,65 @@ mod tests {
         note: Option<Cents>,
         #[row(version)]
         at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Columns)]
+    struct Label {
+        label: String,
+    }
+
+    /// Two parts that bring in the same column, and one that brings in a
+    /// column the row says it leaves out: nothing the derive can see.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(table = "tangled", mirror = "catalog", unmirrored = "label")]
+    struct Tangled {
+        id: Uuid,
+        #[sqlx(flatten)]
+        first: Label,
+        #[sqlx(flatten)]
+        second: Label,
+    }
+
+    #[test]
+    fn a_row_whose_flattened_parts_contradict_it_says_so() {
+        assert_eq!(
+            Table::of::<Tangled>().contradictions(),
+            [
+                "the column `label` is a field of the row twice, once in a part flattened in",
+                "`label` is a field of the row, in a part flattened in, and is also `unmirrored`",
+            ]
+        );
+        assert!(Table::of::<Order>().contradictions().is_empty());
+    }
+
+    /// Nullable is read off the standard `Option`, by any of its paths.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(table = "paths", mirror = "catalog")]
+    struct Paths {
+        id: Uuid,
+        bare: Option<String>,
+        by_std: std::option::Option<String>,
+        by_core: ::core::option::Option<String>,
+        plain: String,
+    }
+
+    #[test]
+    fn an_option_is_nullable_by_whichever_path_it_is_written() {
+        let nullable: Vec<_> = Table::of::<Paths>()
+            .columns
+            .iter()
+            .map(|c| (c.name, c.nullable))
+            .collect();
+        assert_eq!(
+            nullable,
+            [
+                ("id", false),
+                ("bare", true),
+                ("by_std", true),
+                ("by_core", true),
+                ("plain", false)
+            ]
+        );
     }
 
     #[test]

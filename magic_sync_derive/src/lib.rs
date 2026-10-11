@@ -20,7 +20,10 @@ use syn::meta::ParseNestedMeta;
 use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Ident, LitStr, Type};
 
-/// Written by `magic_sync_derive`.
+/// Implements `magic_sync::Row` for a struct that is one table, column for
+/// column. Use it as `magic_sync::Row`: the attributes it reads (`#[row(…)]`
+/// on the struct and its fields, and the `#[sqlx(…)]` keys that name a
+/// column) are documented there.
 #[proc_macro_derive(Row, attributes(row))]
 pub fn derive_row(input: Tokens) -> Tokens {
     let input = parse_macro_input!(input as DeriveInput);
@@ -29,7 +32,9 @@ pub fn derive_row(input: Tokens) -> Tokens {
         .into()
 }
 
-/// Written by `magic_sync_derive`.
+/// Implements `magic_sync::Columns` for a part of a row, which the row brings
+/// in with `#[sqlx(flatten)]`. Use it as `magic_sync::Columns`: its fields take
+/// the same `#[row(…)]` flags as a row's, and the struct only `crate`.
 #[proc_macro_derive(Columns, attributes(row))]
 pub fn derive_columns(input: Tokens) -> Tokens {
     let input = parse_macro_input!(input as DeriveInput);
@@ -155,11 +160,39 @@ fn krate(args: &Args) -> syn::Result<syn::Path> {
     }
 }
 
-/// Read off the type as written: an alias to `Option` reads as NOT NULL,
-/// which the engine's check of the table against its row then refuses.
-fn is_option(ty: &Type) -> bool {
-    matches!(ty, Type::Path(p) if p.qself.is_none()
-        && p.path.segments.last().is_some_and(|s| s.ident == "Option"))
+/// What `ty` holds, when it is written as the standard `Option<T>`: bare,
+/// or by its path in `std` or `core`. Read off the type as written: an alias
+/// to `Option` reads as NOT NULL, which the engine's check of the table
+/// against its row then refuses.
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else { return None };
+    if path.qself.is_some() {
+        return None;
+    }
+    let names: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    let std_path = matches!(
+        names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["Option"] | ["std" | "core", "option", "Option"]
+    );
+    if !std_path {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &path.path.segments.last()?.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(inner) if args.args.len() == 1 => Some(inner),
+        _ => None,
+    }
 }
 
 /// The `#[sqlx(…)]` keys on a field that name or shape its column.
@@ -192,6 +225,19 @@ fn sqlx_field(field: &Field) -> syn::Result<SqlxField> {
             }
             Ok(())
         })?;
+    }
+    if out.skip || out.flatten {
+        let stray = out
+            .rename
+            .as_ref()
+            .map(Spanned::span)
+            .or_else(|| out.try_from.as_ref().map(Spanned::span));
+        if let Some(at) = stray {
+            return Err(syn::Error::new(
+                at,
+                "a skipped or flattened field names no column: nothing reads its `rename` or `try_from`",
+            ));
+        }
     }
     Ok(out)
 }
@@ -366,7 +412,7 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
                 ),
             ));
         }
-        let nullable = is_option(ty);
+        let nullable = option_inner(ty).is_some();
         if let Some(version) = flags.version.filter(|_| nullable) {
             return Err(syn::Error::new(
                 version,
@@ -458,6 +504,8 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
             let _ = <#ident as #private::Columns>::VERSION;
             let _ = <#ident as #private::Columns>::CREATED;
         };
+
+        impl #private::Sealed for #ident {}
 
         impl #private::Columns for #ident {
             const VERSION: ::core::option::Option<&'static ::core::primitive::str> = #version;
@@ -577,7 +625,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             ));
         }
     }
-    let route = route(args.sync.as_ref(), mirror, &direct, &private)?;
+    let (route, mut checks) = route(args.sync.as_ref(), mirror, &direct, &krate)?;
     only_sent_down(args.active.as_ref(), mirror, "an `active` relation")?;
     only_sent_down(args.retired.as_ref(), mirror, "a `retired` column")?;
 
@@ -605,7 +653,6 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         key_columns.push(column);
     }
 
-    let mut checks = Vec::new();
     if let Some(lit) = &args.origin {
         let origin = identifier(&lit.value(), lit.span())?;
         if !matches!(mirror, Mirror::Record | Mirror::Both) {
@@ -657,10 +704,13 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
     let active = match &args.active {
         Some(lit) => {
             let text = lit.value();
-            let parts = match text.split_once('.') {
-                Some((schema, name)) => vec![schema, name],
-                None => vec![text.as_str()],
-            };
+            let parts: Vec<&str> = text.split('.').collect();
+            if parts.len() > 2 {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("active = \"{text}\": expected `view` or `schema.view`"),
+                ));
+            }
             let quoted: Vec<String> = parts
                 .into_iter()
                 .map(|p| identifier(p, lit.span()).map(|p| quoted(&p)))
@@ -715,16 +765,17 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
     })
 }
 
-/// `sync = "…"`: how a table's rows find the replicas that hold them. The
-/// columns it names are the row's own.
+/// `sync = "…"`: how a table's rows find the replicas that hold them, and
+/// the checks of the types of the columns it names, which are the row's own.
 fn route(
     sync: Option<&LitStr>,
     mirror: Mirror,
     direct: &[Direct],
-    private: &TokenStream,
-) -> syn::Result<TokenStream> {
+    krate: &syn::Path,
+) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
+    let private = quote!(#krate::__private);
     let Some(lit) = sync else {
-        return Ok(quote!(#private::Route::Referenced));
+        return Ok((quote!(#private::Route::Referenced), Vec::new()));
     };
     if !mirror.sent_down() {
         return Err(syn::Error::new_spanned(
@@ -743,26 +794,46 @@ fn route(
         }
         None => (text.trim(), None),
     };
-    let column = |inner: Option<&str>| -> syn::Result<String> {
+    let column = |inner: Option<&str>| -> syn::Result<&Direct> {
         let arg = inner.map(str::trim).unwrap_or_default();
         if arg.is_empty() || arg.contains(',') || arg.contains('=') {
             return Err(bad("expected one column name"));
         }
         let name = identifier(arg, lit.span())?;
-        if !direct.iter().any(|d| d.name == name) {
-            return Err(bad(&format!("`{name}` is not a field of the row")));
+        direct
+            .iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| bad(&format!("`{name}` is not a field of the row")))
+    };
+    // The column holds a uuid or an integer, or is nullable.
+    let of_a_key = |column: &Direct| {
+        let ty = option_inner(&column.ty).unwrap_or(&column.ty);
+        quote_spanned! {lit.span()=>
+            const _: #krate::row::KeyKind = <#ty as #krate::row::KeyValue>::KIND;
         }
-        Ok(name)
     };
     Ok(match name {
-        "broadcast" if inner.is_none() => quote!(#private::Route::Broadcast),
+        "broadcast" if inner.is_none() => (quote!(#private::Route::Broadcast), Vec::new()),
         "assigned" => {
             let column = column(inner)?;
-            quote!(#private::Route::Assigned(#column))
+            let name = &column.name;
+            let ty = option_inner(&column.ty).unwrap_or(&column.ty);
+            let refusal = format!("sync = \"{text}\": the replica a row is sent to is a uuid");
+            let check = quote_spanned! {lit.span()=>
+                const _: () = ::core::assert!(
+                    ::core::matches!(<#ty as #krate::row::KeyValue>::KIND, #krate::row::KeyKind::Uuid),
+                    #refusal,
+                );
+            };
+            (quote!(#private::Route::Assigned(#name)), vec![check])
         }
         "follows" => {
             let column = column(inner)?;
-            quote!(#private::Route::Follows(#column))
+            let name = &column.name;
+            (
+                quote!(#private::Route::Follows(#name)),
+                vec![of_a_key(column)],
+            )
         }
         "grouped" => {
             let mut members = None;
@@ -783,10 +854,13 @@ fn route(
             let (Some(members), Some(assigned)) = (members, assigned) else {
                 return Err(bad("expected `members = …, assigned = …`"));
             };
-            quote!(#private::Route::Grouped {
-                members: #members,
-                assigned: #assigned,
-            })
+            (
+                quote!(#private::Route::Grouped {
+                    members: #members,
+                    assigned: #assigned,
+                }),
+                Vec::new(),
+            )
         }
         _ => {
             return Err(bad(

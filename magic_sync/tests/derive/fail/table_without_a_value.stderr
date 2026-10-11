@@ -1,0 +1,5 @@
+error: `table` takes a value: `table = "…"`
+ --> tests/derive/fail/table_without_a_value.rs:2:7
+  |
+2 | #[row(table, mirror = "catalog")]
+  |       ^^^^^

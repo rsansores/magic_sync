@@ -1,0 +1,5 @@
+error: `gone` is the retired column already
+ --> tests/derive/fail/unmirrored_is_retired.rs:2:76
+  |
+2 | #[row(table = "things", mirror = "catalog", retired = "gone", unmirrored = "gone")]
+  |                                                                            ^^^^^^

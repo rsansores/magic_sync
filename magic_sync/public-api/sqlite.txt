@@ -210,7 +210,7 @@ impl core::marker::Unpin for magic_sync::row::VersionKind
 impl core::marker::UnsafeUnpin for magic_sync::row::VersionKind
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::row::VersionKind
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::VersionKind
-pub trait magic_sync::row::Columns
+pub trait magic_sync::row::Columns: crate::__private::Sealed
 pub trait magic_sync::row::KeyValue
 pub const magic_sync::row::KeyValue::KIND: magic_sync::row::KeyKind
 pub fn magic_sync::row::KeyValue::key_part(&self) -> magic_sync::row::KeyPart
@@ -388,7 +388,7 @@ impl<P, I, U> !core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::repl
 impl<P, I, U> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Replica<P, I, U>
 pub const magic_sync::SCHEMA_VERSION: i32
 pub const magic_sync::SQLITE_SCHEMA: &str
-pub trait magic_sync::Columns
+pub trait magic_sync::Columns: crate::__private::Sealed
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
 pub const magic_sync::Row::KEY: &'static [&'static str]
 pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror

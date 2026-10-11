@@ -1,0 +1,5 @@
+error: a skipped or flattened field names no column: nothing reads its `rename` or `try_from`
+ --> tests/derive/fail/rename_on_a_skipped_field.rs:5:27
+  |
+5 |     #[sqlx(skip, rename = "cached")]
+  |                           ^^^^^^^^

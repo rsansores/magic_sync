@@ -146,7 +146,7 @@ impl core::marker::Unpin for magic_sync::row::VersionKind
 impl core::marker::UnsafeUnpin for magic_sync::row::VersionKind
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::row::VersionKind
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::VersionKind
-pub trait magic_sync::row::Columns
+pub trait magic_sync::row::Columns: crate::__private::Sealed
 pub trait magic_sync::row::KeyValue
 pub const magic_sync::row::KeyValue::KIND: magic_sync::row::KeyKind
 pub fn magic_sync::row::KeyValue::key_part(&self) -> magic_sync::row::KeyPart
@@ -305,15 +305,6 @@ impl core::marker::Copy for magic_sync::status::NoteKind
 impl core::marker::StructuralPartialEq for magic_sync::status::NoteKind
 impl serde_core::ser::Serialize for magic_sync::status::NoteKind
 pub fn magic_sync::status::NoteKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl sqlx_core::types::Type<sqlx_postgres::database::Postgres> for magic_sync::status::NoteKind
-pub fn magic_sync::status::NoteKind::type_info() -> sqlx_postgres::type_info::PgTypeInfo
-impl sqlx_postgres::types::array::PgHasArrayType for magic_sync::status::NoteKind
-pub fn magic_sync::status::NoteKind::array_type_info() -> sqlx_postgres::type_info::PgTypeInfo
-impl<'q, DB: sqlx_core::database::Database> sqlx_core::encode::Encode<'q, DB> for magic_sync::status::NoteKind where &'q str: sqlx_core::encode::Encode<'q, DB>
-pub fn magic_sync::status::NoteKind::encode_by_ref(&self, &mut <DB as sqlx_core::database::Database>::ArgumentBuffer) -> core::result::Result<sqlx_core::encode::IsNull, sqlx_core::error::BoxDynError>
-pub fn magic_sync::status::NoteKind::size_hint(&self) -> usize
-impl<'r> sqlx_core::decode::Decode<'r, sqlx_postgres::database::Postgres> for magic_sync::status::NoteKind
-pub fn magic_sync::status::NoteKind::decode(sqlx_postgres::value::PgValueRef<'r>) -> core::result::Result<Self, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync + 'static)>>
 impl core::marker::Freeze for magic_sync::status::NoteKind
 impl core::marker::Send for magic_sync::status::NoteKind
 impl core::marker::Sync for magic_sync::status::NoteKind
@@ -424,8 +415,6 @@ impl core::fmt::Debug for magic_sync::status::Failing
 pub fn magic_sync::status::Failing::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl serde_core::ser::Serialize for magic_sync::status::Failing
 pub fn magic_sync::status::Failing::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'a, R: sqlx_core::row::Row> sqlx_core::from_row::FromRow<'a, R> for magic_sync::status::Failing where &'a str: sqlx_core::column::ColumnIndex<R>, uuid::Uuid: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, i32: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, core::option::Option<alloc::string::String>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>
-pub fn magic_sync::status::Failing::from_row(&'a R) -> sqlx_core::error::Result<Self>
 impl core::marker::Freeze for magic_sync::status::Failing
 impl core::marker::Send for magic_sync::status::Failing
 impl core::marker::Sync for magic_sync::status::Failing
@@ -528,8 +517,6 @@ impl core::fmt::Debug for magic_sync::status::Parked
 pub fn magic_sync::status::Parked::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl serde_core::ser::Serialize for magic_sync::status::Parked
 pub fn magic_sync::status::Parked::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'a, R: sqlx_core::row::Row> sqlx_core::from_row::FromRow<'a, R> for magic_sync::status::Parked where &'a str: sqlx_core::column::ColumnIndex<R>, i64: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, magic_sync::status::NoteKind: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, core::option::Option<alloc::string::String>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, core::option::Option<uuid::Uuid>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, i32: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>
-pub fn magic_sync::status::Parked::from_row(&'a R) -> sqlx_core::error::Result<Self>
 impl core::marker::Freeze for magic_sync::status::Parked
 impl core::marker::Send for magic_sync::status::Parked
 impl core::marker::Sync for magic_sync::status::Parked
@@ -567,8 +554,6 @@ impl core::fmt::Debug for magic_sync::status::Quarantined
 pub fn magic_sync::status::Quarantined::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl serde_core::ser::Serialize for magic_sync::status::Quarantined
 pub fn magic_sync::status::Quarantined::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'a, R: sqlx_core::row::Row> sqlx_core::from_row::FromRow<'a, R> for magic_sync::status::Quarantined where &'a str: sqlx_core::column::ColumnIndex<R>, uuid::Uuid: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, alloc::string::String: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, chrono::datetime::DateTime<chrono::offset::utc::Utc>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, i32: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>
-pub fn magic_sync::status::Quarantined::from_row(&'a R) -> sqlx_core::error::Result<Self>
 impl core::marker::Freeze for magic_sync::status::Quarantined
 impl core::marker::Send for magic_sync::status::Quarantined
 impl core::marker::Sync for magic_sync::status::Quarantined
@@ -754,8 +739,6 @@ impl core::fmt::Debug for magic_sync::status::Unfiled
 pub fn magic_sync::status::Unfiled::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl serde_core::ser::Serialize for magic_sync::status::Unfiled
 pub fn magic_sync::status::Unfiled::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'a, R: sqlx_core::row::Row> sqlx_core::from_row::FromRow<'a, R> for magic_sync::status::Unfiled where &'a str: sqlx_core::column::ColumnIndex<R>, i64: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, uuid::Uuid: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, alloc::string::String: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, chrono::datetime::DateTime<chrono::offset::utc::Utc>: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, i32: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>
-pub fn magic_sync::status::Unfiled::from_row(&'a R) -> sqlx_core::error::Result<Self>
 impl core::marker::Freeze for magic_sync::status::Unfiled
 impl core::marker::Send for magic_sync::status::Unfiled
 impl core::marker::Sync for magic_sync::status::Unfiled
@@ -869,7 +852,7 @@ impl<S, T> !core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::server:
 impl<S, T> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Server<S, T>
 pub const magic_sync::POSTGRES_SCHEMA: &str
 pub const magic_sync::SCHEMA_VERSION: i32
-pub trait magic_sync::Columns
+pub trait magic_sync::Columns: crate::__private::Sealed
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
 pub const magic_sync::Row::KEY: &'static [&'static str]
 pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror

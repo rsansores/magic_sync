@@ -1,0 +1,5 @@
+error: a skipped or flattened field names no column: nothing reads its `rename` or `try_from`
+  --> tests/derive/fail/rename_on_a_flattened_field.rs:10:30
+   |
+10 |     #[sqlx(flatten, rename = "part")]
+   |                              ^^^^^^

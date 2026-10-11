@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: sync = "assigned(store)": the replica a row is sent to is a uuid
+ --> tests/derive/fail/assigned_not_a_uuid.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "assigned(store)")]
+  |                                                    ^^^^^^^^^^^^^^^^^ evaluation of `_` failed here
