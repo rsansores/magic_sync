@@ -235,6 +235,8 @@ pub magic_sync::run::server::Settings::batch: core::num::nonzero::NonZeroU32
 pub magic_sync::run::server::Settings::idle: core::time::Duration
 pub magic_sync::run::server::Settings::limits: magic_sync::envelope::Limits
 pub magic_sync::run::server::Settings::lock_key: i64
+pub magic_sync::run::server::Settings::outbox_bytes: core::num::nonzero::NonZeroU64
+pub magic_sync::run::server::Settings::outbox_messages: core::num::nonzero::NonZeroU32
 pub magic_sync::run::server::Settings::prune_after: core::time::Duration
 pub magic_sync::run::server::Settings::replica_backoff: magic_sync::run::Backoff
 pub magic_sync::run::server::Settings::retry_every: core::time::Duration

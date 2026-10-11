@@ -318,20 +318,30 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
     };
 
     let before = server().await.unwrap();
-    until(&[&before], || async { quarantined().await == 2 }).await;
+    until(&[&before], || async {
+        quarantined().await == 2 && wire.items(a) == ["fine"]
+    })
+    .await;
     assert_eq!(wire.items(a), ["fine"]);
     drop(before);
 
     BUGGY.set(false);
     let fixed = server().await.unwrap();
-    // Sent and recorded, to both replicas.
-    let held = || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sync.held")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+    // Recorded and sent, to both replicas.
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
     };
-    until(&[&fixed], || async { held().await == 4 }).await;
+    until(&[&fixed], || async {
+        count("SELECT count(*) FROM sync.held").await == 4
+            && count("SELECT count(*) FROM sync.outbox").await == 0
+    })
+    .await;
     BUGGY.set(true);
     assert_eq!(wire.items(a), ["fine", "poison"]);
     // Out of the quarantine once each replica says it took it.
@@ -340,7 +350,7 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
             .fetch_one(&pool)
             .await
             .unwrap(),
-        sqlx::query_as("SELECT replica_id, last_sequence FROM sync.replicas")
+        sqlx::query_as("SELECT replica_id, last_sequence FROM sync.chains")
             .fetch_all(&pool)
             .await
             .unwrap(),
@@ -400,8 +410,9 @@ async fn a_relay_that_lost_its_lock_records_nothing(pool: PgPool) {
     assert!(count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL").await > 0);
     assert_eq!(
         server.pass_now().await.unwrap(),
-        Some(3),
-        "the next relay does it, and provisions the two replicas it sees for the first time"
+        Some(7),
+        "the next relay plans the three notes, provisioning the two replicas it sees for the \
+         first time, and sends each its snapshot's two messages"
     );
 }
 
@@ -744,7 +755,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         .fetch_one(&pool)
         .await
         .unwrap();
-    let last: i64 = sqlx::query_scalar("SELECT max(last_sequence) FROM sync.replicas")
+    let last: i64 = sqlx::query_scalar("SELECT max(last_sequence) FROM sync.chains")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -917,8 +928,9 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         assert_eq!(
             count(
                 &pool,
-                "SELECT count(*) FROM sync.replicas WHERE applied_sequence > last_sequence \
-                    OR (applied_sequence IS NOT NULL AND last_sequence IS NULL)"
+                "SELECT count(*) FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
+                  WHERE r.applied_sequence > c.last_sequence \
+                     OR (r.applied_sequence IS NOT NULL AND c.last_sequence IS NULL)"
             )
             .await,
             0,

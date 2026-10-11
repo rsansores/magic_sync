@@ -103,19 +103,89 @@ impl Limits {
     }
 }
 
-/// One replica's rows as messages within `limits`, in their order: a new
-/// message begins when the current one is full. A row larger than a message
-/// can carry goes alone. Each row keeps its key beside it, and every byte the
-/// rows add to a message counts — their framing and their tables' included —
-/// so a message never outgrows the limit by more than [`ENVELOPE_ROOM`] holds.
+/// One replica's rows made into messages within `limits`, a row at a time,
+/// in the order given: a new message begins when the current one is full,
+/// and a row larger than a message can carry goes alone. Each row keeps its
+/// key beside it, and every byte the rows add to a message counts — their
+/// framing and their tables' included — so a message never outgrows the
+/// limit by more than [`ENVELOPE_ROOM`] holds. It holds one message at most:
+/// what a replica is sent is never in memory whole.
 #[cfg(feature = "postgres")]
+pub(crate) struct Packer {
+    limits: Limits,
+    snapshot: String,
+    tables: Vec<Table>,
+    count: usize,
+    bytes: usize,
+}
+
+#[cfg(feature = "postgres")]
+impl Packer {
+    /// Messages of the snapshot `snapshot` (empty: of none).
+    pub(crate) fn new(snapshot: &str, limits: Limits) -> Self {
+        Packer {
+            limits,
+            snapshot: snapshot.to_owned(),
+            tables: Vec::new(),
+            count: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Adds a row of `table` — `Some` bytes to hold, `None` to let go of —
+    /// and answers the message it completed, when there was no room left
+    /// for it in the current one.
+    pub(crate) fn push(&mut self, table: &str, row: Option<Vec<u8>>, key: Key) -> Option<Down> {
+        use prost::Message as _;
+        let weight = row.as_ref().map_or(0, |row| framed(row.len())) + framed(key.encoded_len());
+        let open = self.tables.last().is_some_and(|t| t.table == table);
+        let opening = opened(table);
+        let added = weight + if open { 0 } else { opening };
+        let full = self.count > 0
+            && (self.count >= self.limits.rows || self.bytes + added > self.limits.largest_row());
+        let done = full.then(|| self.finish()).flatten();
+        if self.tables.last().is_none_or(|t| t.table != table) {
+            self.tables.push(Table {
+                table: table.to_owned(),
+                ..Table::default()
+            });
+            self.bytes += opening;
+        }
+        self.count += 1;
+        self.bytes += weight;
+        let part = self.tables.last_mut().expect("its table");
+        match row {
+            Some(row) => {
+                part.upserts.push(row);
+                part.keys.push(key);
+            }
+            None => part.deletes.push(key),
+        }
+        done
+    }
+
+    /// The message begun and not yet answered, if any.
+    pub(crate) fn finish(&mut self) -> Option<Down> {
+        if self.tables.is_empty() {
+            return None;
+        }
+        (self.count, self.bytes) = (0, 0);
+        Some(Down {
+            snapshot_id: self.snapshot.clone(),
+            tables: std::mem::take(&mut self.tables),
+            sequence: 0,
+            epoch: String::new(),
+        })
+    }
+}
+
+/// One replica's rows as messages within `limits`, in their order, as a
+/// [`Packer`] makes them.
+#[cfg(all(test, feature = "postgres"))]
 pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
-    use prost::Message as _;
-    let budget = limits.largest_row();
-    let mut messages: Vec<Vec<Table>> = Vec::new();
-    let (mut count, mut bytes) = (0usize, 0usize);
+    let mut packer = Packer::new(snapshot, limits);
+    let mut out = Vec::new();
     for table in tables {
-        let opening = opened(&table.table);
         let mut keys = table.keys.into_iter();
         let upserts = table
             .upserts
@@ -123,48 +193,11 @@ pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Do
             .map(|row| (Some(row), keys.next()));
         let deletes = table.deletes.into_iter().map(|key| (None, Some(key)));
         for (row, key) in upserts.chain(deletes) {
-            let weight = row.as_ref().map_or(0, |row| framed(row.len()))
-                + key.as_ref().map_or(0, |key| framed(key.encoded_len()));
-            let open = messages
-                .last()
-                .and_then(|m| m.last())
-                .is_some_and(|t| t.table == table.table);
-            let added = weight + if open { 0 } else { opening };
-            if messages.is_empty()
-                || (count > 0 && (count >= limits.rows || bytes + added > budget))
-            {
-                messages.push(Vec::new());
-                (count, bytes) = (0, 0);
-            }
-            let current = messages.last_mut().expect("one begun");
-            if current.last().is_none_or(|t| t.table != table.table) {
-                current.push(Table {
-                    table: table.table.clone(),
-                    ..Table::default()
-                });
-                bytes += opening;
-            }
-            count += 1;
-            bytes += weight;
-            let part = current.last_mut().expect("its table");
-            match row {
-                Some(row) => {
-                    part.upserts.push(row);
-                    part.keys.extend(key);
-                }
-                None => part.deletes.extend(key),
-            }
+            out.extend(packer.push(&table.table, row, key.unwrap_or_default()));
         }
     }
-    messages
-        .into_iter()
-        .map(|tables| Down {
-            snapshot_id: snapshot.to_owned(),
-            tables,
-            sequence: 0,
-            epoch: String::new(),
-        })
-        .collect()
+    out.extend(packer.finish());
+    out
 }
 
 /// What `len` bytes weigh as one field of a message: its tag, its length,

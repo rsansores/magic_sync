@@ -66,6 +66,7 @@ export function describeReplica(r: ReplicaRow, speech: Speech): string[] {
   if (r.unfiled > 0) out.push(t('replica.unfiled', { n: r.unfiled }))
   if (r.parked > 0) out.push(t('replica.parked', { n: r.parked }))
   if (r.silentFor != null) out.push(t('replica.silent', { since: ago(speech.now - r.silentFor, speech) }))
+  else if (r.owed > 0) out.push(t('replica.owed', { n: r.owed }))
   else if (r.pending > 0) out.push(t('replica.pending', { n: r.pending }))
   else if (r.unconfirmed) out.push(t('replica.applying'))
   if (r.backlog) out.push(t('replica.backlog', { n: r.backlog.unsent + r.backlog.unfiled }))

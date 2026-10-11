@@ -155,8 +155,8 @@ pub enum RowState {
 pub enum ReplicaState {
     /// Something of its own is set aside until a fix is deployed: a row it
     /// is owed and cannot be sent or could not take, a row it sent that
-    /// could not be filed, or a change owed to it alone the planner could
-    /// not plan.
+    /// could not be filed, or a change of it alone the planner could not
+    /// plan.
     AwaitingFix,
     /// Sends to it fail; it is tried again at `retry_at`.
     Unreachable,
@@ -208,7 +208,8 @@ pub struct ReplicaOverview {
     pub state: ReplicaState,
     /// Changes noted and not yet planned that may concern it.
     pub pending: i64,
-    /// Of those, the ones owed to it alone after a send to it failed.
+    /// Messages written for it that the transport has not taken yet: what
+    /// waits for it, in order, while it cannot be reached.
     pub owed: i64,
     /// Changes the planner set aside that may concern it.
     pub parked: i64,
@@ -220,7 +221,8 @@ pub struct ReplicaOverview {
     pub unfiled: i64,
     /// Sends to it that failed in a row.
     pub failures: i32,
-    /// The last failed send's error.
+    /// The last failed send's error — or, failing none, why what waited for
+    /// it was last dropped and it was provisioned again.
     pub last_error: Option<String>,
     /// When it is tried again, while it waits out a failure.
     pub retry_at: Option<DateTime<Utc>>,
@@ -288,8 +290,7 @@ pub struct Health {
     pub healthy: bool,
     /// Changes noted and not yet planned.
     pub pending: i64,
-    /// When the oldest change the planner is due to get to was noted: one
-    /// owed to a replica out of reach waits for it, and is not counted here.
+    /// When the oldest change not yet planned was noted.
     pub oldest: Option<DateTime<Utc>>,
     /// Changes the planner set aside until a fix.
     pub parked: Listed<Parked>,
@@ -365,7 +366,7 @@ pub struct Parked {
     pub table: Option<String>,
     /// The row's key, for a row.
     pub key: Option<String>,
-    /// The replica it is about, or owed to alone.
+    /// The replica it is about.
     pub replica: Option<Uuid>,
     /// How many times it was planned and failed.
     pub attempts: i32,
@@ -544,10 +545,9 @@ const CONFIRMED: &str =
     "coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = e.epoch, false)";
 
 /// The pending notes a scope sees: `$1` every one, else those of the
-/// partitions `$2` (or of none), owed to and about the replicas `$3` (or any).
+/// partitions `$2` (or of none), about the replicas `$3` (or any).
 const NOTES_IN_SCOPE: &str = "n.done_at IS NULL AND ($1 OR ( \
        (n.partition_id IS NULL OR n.partition_id = ANY($2)) \
-   AND (n.scope IS NULL OR n.scope = ANY($3)) \
    AND (n.replica_id IS NULL OR n.replica_id = ANY($3))))";
 
 /// The live replicas a scope names, with their partitions.
@@ -570,12 +570,8 @@ impl Scoped {
 struct NoteGroup {
     table: Option<String>,
     partition: Option<Uuid>,
-    scope: Option<Uuid>,
     replica: Option<Uuid>,
     parked: bool,
-    /// Owed to, or about, a replica sends to are failing: it waits for that
-    /// replica, not for the planner.
-    deferred: bool,
     count: i64,
     oldest: DateTime<Utc>,
 }
@@ -584,16 +580,14 @@ struct NoteGroup {
 #[derive(Clone, Copy, Default)]
 struct NoteCount {
     pending: i64,
-    owed: i64,
     parked: i64,
-    /// Parked, and owed to or about this replica alone.
+    /// Parked, and about this replica alone.
     own_parked: i64,
 }
 
 impl std::ops::AddAssign for NoteCount {
     fn add_assign(&mut self, other: Self) {
         self.pending += other.pending;
-        self.owed += other.owed;
         self.parked += other.parked;
         self.own_parked += other.own_parked;
     }
@@ -621,19 +615,17 @@ impl Folded {
                 parked,
                 ..NoteCount::default()
             };
-            match (note.scope, note.replica) {
-                (Some(scope), Some(replica)) if scope != replica => {}
-                (Some(replica), _) | (None, Some(replica)) => {
+            match note.replica {
+                Some(replica) => {
                     let partition = partition_of.get(&replica).copied().flatten();
                     if note.partition.is_none_or(|p| Some(p) == partition) {
                         *folded.replicas.entry(replica).or_default() += NoteCount {
-                            owed: if note.scope.is_some() { pending } else { 0 },
                             own_parked: parked,
                             ..shared
                         };
                     }
                 }
-                (None, None) => match note.partition {
+                None => match note.partition {
                     Some(p) => *folded.partitions.entry(p).or_default() += shared,
                     None => folded.everyone += shared,
                 },
@@ -669,6 +661,7 @@ struct Recorded {
     waiting_since: Option<DateTime<Utc>>,
     quarantined: i64,
     unfiled: i64,
+    owed: i64,
 }
 
 /// Every replica of a scope, worst first, with how many are in each state.
@@ -764,16 +757,14 @@ impl Engine {
             });
             let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
                 "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
-                 p AS (SELECT DISTINCT ON (n.row_key, n.scope) n.row_key, n.scope, n.xid FROM sync.notes n \
+                 p AS (SELECT n.row_key, max(n.xid) AS xid FROM sync.notes n \
                         WHERE n.done_at IS NULL AND n.kind = 'row' AND n.relation = $1 \
-                        ORDER BY n.row_key, n.scope, n.xid DESC), \
+                        GROUP BY n.row_key), \
                  h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
-                              coalesce(everyone.xid >= h.horizon, false) \
-                                OR coalesce(mine.xid >= h.horizon, false) AS outdated \
+                              coalesce(p.xid >= h.horizon, false) AS outdated \
                          FROM sync.held h CROSS JOIN sync.epoch e \
                          LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-                         LEFT JOIN p everyone ON everyone.row_key = h.row_key AND everyone.scope IS NULL \
-                         LEFT JOIN p mine ON mine.row_key = h.row_key AND mine.scope = h.replica_id \
+                         LEFT JOIN p ON p.row_key = h.row_key \
                         WHERE h.relation = $1 AND h.replica_id = ANY($2)) \
                  SELECT coalesce(w.replica_id, h.replica_id), \
                         count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
@@ -854,8 +845,7 @@ impl Engine {
         let held: Vec<(Uuid, bool, bool)> = sqlx::query_as(&format!(
             "SELECT h.replica_id, {CONFIRMED}, \
                     EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
-                             AND n.relation = h.relation AND n.row_key = h.row_key AND n.xid >= h.horizon \
-                             AND (n.scope IS NULL OR n.scope = h.replica_id)) \
+                             AND n.relation = h.relation AND n.row_key = h.row_key AND n.xid >= h.horizon) \
                FROM sync.held h CROSS JOIN sync.epoch e \
                LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
               WHERE h.relation = $1 AND h.row_key = $2 AND h.replica_id = ANY($3)"
@@ -1037,14 +1027,10 @@ impl Engine {
     /// The pending notes the scope sees, counted by what they may concern.
     async fn notes(&self, conn: &mut Conn, scoped: &Scoped) -> Result<Vec<NoteGroup>, Error> {
         Ok(sqlx::query_as(&format!(
-            "SELECT n.relation AS table, n.partition_id AS partition, n.scope, \
+            "SELECT n.relation AS table, n.partition_id AS partition, \
                     n.replica_id AS replica, n.parked_at IS NOT NULL AS parked, \
-                    f.replica_id IS NOT NULL AS deferred, \
                     count(*) AS count, min(n.noted_at) AS oldest \
-               FROM sync.notes n \
-               LEFT JOIN sync.replicas f \
-                 ON f.replica_id = coalesce(n.scope, n.replica_id) AND f.failures > 0 \
-              WHERE {NOTES_IN_SCOPE} GROUP BY 1, 2, 3, 4, 5, 6"
+               FROM sync.notes n WHERE {NOTES_IN_SCOPE} GROUP BY 1, 2, 3, 4"
         ))
         .bind(scoped.all)
         .bind(&scoped.partitions)
@@ -1063,7 +1049,7 @@ impl Engine {
         let limit = i64::from(limit);
         let waiting = notes.iter().filter(|n| !n.parked);
         let pending = waiting.clone().map(|n| n.count).sum();
-        let oldest = waiting.filter(|n| !n.deferred).map(|n| n.oldest).min();
+        let oldest = waiting.map(|n| n.oldest).min();
         let parked = Listed {
             total: notes.iter().filter(|n| n.parked).map(|n| n.count).sum(),
             first: sqlx::query(&format!(
@@ -1156,21 +1142,26 @@ impl Engine {
         notes: &[NoteGroup],
     ) -> Result<Fleet, Error> {
         let recorded: Vec<Recorded> = sqlx::query_as(
-            "SELECT s.id AS replica, r.failures, r.last_error, r.retry_after AS retry_at, \
+            "SELECT s.id AS replica, r.failures, coalesce(r.last_error, c.dropped) AS last_error, \
+                    r.retry_after AS retry_at, \
                     r.last_sent_at AS sent_at, r.applied_at, \
-                    coalesce(r.last_sequence IS NOT NULL \
+                    coalesce(c.last_sequence IS NOT NULL \
                              AND (r.applied_epoch IS DISTINCT FROM e.epoch \
-                                  OR coalesce(r.applied_sequence, 0) < r.last_sequence), false) \
+                                  OR coalesce(r.applied_sequence, 0) < c.last_sequence), false) \
                       AS unconfirmed, \
                     r.backlog, r.backlog_at, r.waiting_since, \
-                    coalesce(q.n, 0) AS quarantined, coalesce(i.n, 0) AS unfiled \
+                    coalesce(q.n, 0) AS quarantined, coalesce(i.n, 0) AS unfiled, \
+                    coalesce(o.n, 0) AS owed \
                FROM unnest($1::uuid[]) AS s(id) \
                LEFT JOIN sync.replicas r ON r.replica_id = s.id \
+               LEFT JOIN sync.chains c ON c.replica_id = s.id \
                LEFT JOIN sync.epoch e ON true \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.quarantine \
                            WHERE replica_id = ANY($1) GROUP BY 1) q ON q.replica_id = s.id \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.inbox \
-                           WHERE replica_id = ANY($1) GROUP BY 1) i ON i.replica_id = s.id",
+                           WHERE replica_id = ANY($1) GROUP BY 1) i ON i.replica_id = s.id \
+               LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.outbox \
+                           WHERE replica_id = ANY($1) GROUP BY 1) o ON o.replica_id = s.id",
         )
         .bind(scoped.ids())
         .fetch_all(&mut *conn)
@@ -1202,7 +1193,7 @@ impl Engine {
                     replica: r.replica,
                     state,
                     pending: notes.pending,
-                    owed: notes.owed,
+                    owed: r.owed,
                     parked: notes.parked,
                     unconfirmed: r.unconfirmed,
                     quarantined: r.quarantined,
@@ -1391,27 +1382,20 @@ pub(crate) mod tests {
         );
     }
 
-    fn note(
-        partition: Option<Uuid>,
-        scope: Option<Uuid>,
-        replica: Option<Uuid>,
-        parked: bool,
-    ) -> NoteGroup {
+    fn note(partition: Option<Uuid>, replica: Option<Uuid>, parked: bool) -> NoteGroup {
         NoteGroup {
             table: None,
             partition,
-            scope,
             replica,
             parked,
-            deferred: false,
             count: 1,
             oldest: Utc::now(),
         }
     }
 
     /// The fold gives each replica what the scan over every note did: a note
-    /// concerns a replica when its partition, its scope and the replica it is
-    /// about each match or are absent.
+    /// concerns a replica when its partition and the replica it is about each
+    /// match or are absent.
     #[test]
     fn folding_the_notes_counts_what_may_concern_each_replica() {
         let (p, q) = (Uuid::now_v7(), Uuid::now_v7());
@@ -1419,11 +1403,9 @@ pub(crate) mod tests {
         let partition_of = HashMap::from([(a, Some(p)), (b, Some(p)), (c, Some(q))]);
         let mut notes = Vec::new();
         for partition in [None, Some(p), Some(q)] {
-            for scope in [None, Some(a), Some(c)] {
-                for replica in [None, Some(a), Some(b)] {
-                    for parked in [false, true] {
-                        notes.push(note(partition, scope, replica, parked));
-                    }
+            for replica in [None, Some(a), Some(b), Some(c)] {
+                for parked in [false, true] {
+                    notes.push(note(partition, replica, parked));
                 }
             }
         }
@@ -1431,7 +1413,6 @@ pub(crate) mod tests {
         for (&replica, &partition) in &partition_of {
             let concerns = |n: &&NoteGroup| {
                 n.partition.is_none_or(|x| Some(x) == partition)
-                    && n.scope.is_none_or(|s| s == replica)
                     && n.replica.is_none_or(|r| r == replica)
             };
             let sum = |f: &dyn Fn(&NoteGroup) -> bool| -> i64 {
@@ -1446,13 +1427,8 @@ pub(crate) mod tests {
             assert_eq!(counted.pending, sum(&|n| !n.parked), "{replica}");
             assert_eq!(counted.parked, sum(&|n| n.parked), "{replica}");
             assert_eq!(
-                counted.owed,
-                sum(&|n| !n.parked && n.scope == Some(replica)),
-                "{replica}"
-            );
-            assert_eq!(
                 counted.own_parked,
-                sum(&|n| n.parked && (n.scope.is_some() || n.replica.is_some())),
+                sum(&|n| n.parked && n.replica.is_some()),
                 "{replica}"
             );
         }

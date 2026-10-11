@@ -27,7 +27,6 @@ CREATE TABLE sync.notes (
     replica_id   UUID,
     partition_id UUID,
     previous     JSONB,
-    scope        UUID,
     xid          XID8        NOT NULL DEFAULT pg_current_xact_id(),
     noted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     done_at      TIMESTAMPTZ,
@@ -43,6 +42,8 @@ CREATE INDEX notes_undone ON sync.notes (id) WHERE done_at IS NULL;
 CREATE INDEX notes_pending ON sync.notes (id) WHERE done_at IS NULL AND parked_at IS NULL;
 -- The prune: what is done, oldest first.
 CREATE INDEX notes_done ON sync.notes (done_at) WHERE done_at IS NOT NULL;
+-- A replica's provisioning is noted once, however many reasons ask for it.
+CREATE INDEX notes_resync ON sync.notes (replica_id) WHERE kind = 'resync' AND done_at IS NULL;
 
 COMMENT ON TABLE sync.notes IS
     'Every change to a mirrored table or a group table, and every replica to provision '
@@ -60,11 +61,9 @@ COMMENT ON COLUMN sync.notes.previous IS
 COMMENT ON COLUMN sync.notes.xid IS
     'The transaction that noted it. A replica sent a row from a snapshot whose horizon is past '
     'it already holds this change.';
-COMMENT ON COLUMN sync.notes.scope IS
-    'The one replica the note is still owed to, after a send to it failed: what it asks is '
-    'planned for that replica alone. NULL: every replica.';
 COMMENT ON COLUMN sync.notes.done_at IS
-    'When the relay sent what the note asked for and recorded it. NULL: pending.';
+    'When the relay recorded what the note asked for and wrote its messages to the outbox. '
+    'NULL: pending.';
 COMMENT ON COLUMN sync.notes.parked_at IS
     'When the planner set the note aside because planning it fails for a reason a retry '
     'cannot change (a bug, data no declaration allows). Parked notes are tried again when '
@@ -80,15 +79,16 @@ CREATE TABLE sync.held (
     row_key      TEXT        NOT NULL,
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     horizon      XID8        NOT NULL,
-    sequence     BIGINT,
+    sequence     BIGINT      NOT NULL,
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
 CREATE INDEX held_row ON sync.held (relation, row_key);
 
 COMMENT ON TABLE sync.held IS
-    'Every mirrored row each replica holds, as the engine sent it. What a replica should '
-    'hold, less what it holds, is sent; what it holds and should no longer is taken back.';
+    'Every mirrored row each replica holds, as the engine sent it — recorded with the message '
+    'that carries it before that message goes. What a replica should hold, less what it holds, '
+    'is sent; what it holds and should no longer is taken back.';
 COMMENT ON COLUMN sync.held.sent_at IS
     'When the version the replica holds was sent.';
 COMMENT ON COLUMN sync.held.sequence IS
@@ -112,8 +112,48 @@ CREATE TABLE sync.epoch (
 );
 INSERT INTO sync.epoch DEFAULT VALUES;
 
--- A replica the relay could not send to: it is left out of passes until
--- retry_after, while every other replica carries on.
+-- The messages each replica is owed, written in the transaction that
+-- records what they carry, and sent after it commits, in order: a message
+-- leaves once the transport took it. A replica the transport cannot reach
+-- keeps its own here, while every other is sent to.
+CREATE TABLE sync.outbox (
+    replica_id UUID        NOT NULL,
+    sequence   BIGINT      NOT NULL,
+    message    BYTEA       NOT NULL,
+    snapshot   BOOLEAN     NOT NULL,
+    written_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (replica_id, sequence)
+);
+
+COMMENT ON TABLE sync.outbox IS
+    'Messages written for a replica and not yet taken by the transport, as the bytes it '
+    'carries. Sent in sequence order once the pass that wrote them commits, by whichever '
+    'process runs the relay: a crash or a lost lock loses none of them.';
+COMMENT ON COLUMN sync.outbox.snapshot IS
+    'Part of a snapshot: what the replica should hold, whole. A snapshot written for a replica '
+    'replaces its outbox, so these lead it; what follows them counts against its bound.';
+
+-- The messages written for each replica, as the relay alone writes them: a
+-- pass records in one REPEATABLE READ snapshot, and nothing else updates
+-- these rows under it.
+CREATE TABLE sync.chains (
+    replica_id        UUID        PRIMARY KEY,
+    last_sequence     BIGINT,
+    snapshot_sequence BIGINT,
+    dropped           TEXT,
+    dropped_at        TIMESTAMPTZ
+);
+
+COMMENT ON COLUMN sync.chains.last_sequence IS
+    'The last message written to its outbox in this epoch. NULL: none since it was last '
+    'provisioned or the epoch began.';
+COMMENT ON COLUMN sync.chains.snapshot_sequence IS
+    'The first message of the last snapshot written to its outbox, in this epoch.';
+COMMENT ON COLUMN sync.chains.dropped IS
+    'Why its outbox was last dropped and it provisioned again, an alarm: it outgrew its bound, '
+    'or the transport refused its next message for good again and again.';
+
+-- How sending to each replica is going, and what the engine last saw of it.
 CREATE TABLE sync.replicas (
     replica_id   UUID        PRIMARY KEY,
     live         BOOLEAN     NOT NULL DEFAULT false,
@@ -122,7 +162,7 @@ CREATE TABLE sync.replicas (
     retry_after  TIMESTAMPTZ,
     last_error       TEXT,
     last_sent_at     TIMESTAMPTZ,
-    last_sequence    BIGINT,
+    refusals         INTEGER     NOT NULL DEFAULT 0,
     applied_epoch    UUID,
     applied_sequence BIGINT,
     applied_at       TIMESTAMPTZ,
@@ -146,7 +186,11 @@ COMMENT ON COLUMN sync.replicas.backlog IS
     '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
 COMMENT ON COLUMN sync.replicas.last_error IS
     'Why the last send to it failed — the network, or a message the transport refuses for '
-    'good — while failures counts on. NULL once a send gets through.';
+    'good — while failures counts on, or why it was provisioned again. NULL once a send gets '
+    'through.';
+COMMENT ON COLUMN sync.replicas.refusals IS
+    'Times in a row the transport refused its next message for good: past a few it is '
+    'provisioned again, and that is an alarm.';
 COMMENT ON COLUMN sync.replicas.drifted_at IS
     'When its digests last differed from what the server records and it was provisioned '
     'again for it. Digests that differ again within a day are a bug no provisioning cures: '

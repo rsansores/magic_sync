@@ -77,9 +77,9 @@ impl Unfiled {
     }
 }
 
-/// Where the sender stands with the server, read once and locked for the
-/// filing: a relay recording a pass for it waits, so what it was sent cannot
-/// move while its acknowledgement and its digests are read against it.
+/// Where the sender stands with the server, read once, its row locked for
+/// the filing: two filings of one replica run one after the other. What it
+/// was sent is what the relay committed; a pass in flight has sent nothing.
 struct Standing {
     epoch: Uuid,
     /// The last message sent to it; `None` while nothing was.
@@ -202,7 +202,8 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
         .fetch_one(&mut *conn)
         .await?;
     let row: Option<(Option<i64>, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT last_sequence, drifted_at FROM sync.replicas WHERE replica_id = $1 FOR UPDATE",
+        "SELECT c.last_sequence, r.drifted_at FROM sync.replicas r \
+           LEFT JOIN sync.chains c USING (replica_id) WHERE r.replica_id = $1 FOR UPDATE OF r",
     )
     .bind(sender)
     .fetch_optional(&mut *conn)
@@ -366,13 +367,14 @@ async fn acknowledge(
     }
     sqlx::query(
         "UPDATE sync.replicas SET applied_epoch = $2, applied_sequence = $3, applied_at = now(), \
-           waiting_since = CASE WHEN $3 >= last_sequence THEN NULL ELSE now() END \
+           waiting_since = CASE WHEN $3 >= $4 THEN NULL ELSE now() END \
          WHERE replica_id = $1 AND (applied_epoch IS DISTINCT FROM $2 \
                                     OR applied_sequence IS NULL OR applied_sequence < $3)",
     )
     .bind(replica)
     .bind(epoch)
     .bind(sequence)
+    .bind(standing.last)
     .execute(&mut *conn)
     .await?;
     // A row set aside for it leaves the quarantine once it applied the

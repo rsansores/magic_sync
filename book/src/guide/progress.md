@@ -49,8 +49,8 @@ the server's, and how long ago one was is measured from it, never from the
 reader's clock.
 
 A replica is waiting for a fix (`AwaitingFix`) only for what is its own: a
-row set aside for it, an upload of its that waits in the inbox, a change owed
-to it alone that the planner set aside. A change the planner set aside that
+row set aside for it, an upload of its that waits in the inbox, a change of it
+alone (its provisioning, say) that the planner set aside. A change the planner set aside that
 may concern every replica is one problem, listed once in the health; each
 replica it may concern is catching up on it.
 
@@ -60,8 +60,9 @@ uploads in the inbox and why, replicas a send keeps failing to. Each means one
 of two things — *wait* (the network) or *deploy a fix* (a bug) — and none of
 them ever means *go fix the data by hand*. `healthy` is whether nothing waits
 for a fix: a replica out of reach is the network's to settle, listed in
-`failing` but not unhealthy, and the changes owed to it alone are not counted
-in `oldest`, the age of the oldest change the planner is due to get to.
+`failing` but not unhealthy; what waits for it waits in its outbox (`owed`
+on its overview), not on the planner, so `oldest`, the age of the oldest
+change not yet planned, does not grow while it is away.
 `engine().health(&mut conn, scope, limit)` answers it alone; the server's
 runner logs it every few minutes.
 

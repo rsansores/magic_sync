@@ -3,6 +3,7 @@
 //! cause is gone.
 
 use super::*;
+use crate::model::{Model, Rules, Wire};
 use crate::plan::Replicas;
 use crate::row::Table;
 use crate::status::{ReplicaState, RowState, Scope};
@@ -20,7 +21,8 @@ CREATE TABLE fixture.items (
 CREATE VIEW items AS SELECT * FROM fixture.items WHERE retired_at IS NULL;
 ";
 
-/// How a pass reads: the notes, the plan and its rows in one snapshot.
+/// How a pass records: the notes, the plan, its rows and what it writes in
+/// one snapshot.
 const SNAPSHOT: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
 
 const REPLICAS: Replicas = Replicas {
@@ -154,30 +156,52 @@ impl World {
                 std::time::Duration::from_secs(2),
                 std::time::Duration::from_secs(900),
             ),
+            bound: Bound {
+                messages: 1_000,
+                bytes: 1 << 30,
+            },
         }
     }
 
     /// One pass, as a host runs it.
-    async fn pass(&self, transport: &Fake) -> Outcome {
-        self.pass_with(transport).await
-    }
-
-    async fn pass_with<T: Transport>(&self, transport: &T) -> Outcome {
+    async fn pass<T: Transport>(&self, transport: &T) -> Passed {
         self.pass_relay(&self.relay(), transport).await
     }
 
-    async fn pass_relay<T: Transport>(&self, relay: &Relay<'_, ()>, transport: &T) -> Outcome {
+    async fn pass_relay<T: Transport>(&self, relay: &Relay<'_, ()>, transport: &T) -> Passed {
+        let recorded = self.record(relay).await;
+        let published = self.publish(relay, transport).await;
+        Passed {
+            recorded,
+            failing: published.failing,
+            sent: published.sent,
+        }
+    }
+
+    /// The first half of a pass: planned and recorded, nothing sent.
+    async fn record(&self, relay: &Relay<'_, ()>) -> Outcome {
         let mut tx = self.pool.begin_with(SNAPSHOT).await.expect("a transaction");
-        let prepared = relay.prepare(&mut tx).await.expect("prepared");
-        tx.rollback().await.expect("rollback");
-        let Some(prepared) = prepared else {
-            return Outcome::default();
-        };
-        let sent = relay.publish(transport, prepared).await;
-        let mut tx = self.pool.begin().await.expect("a transaction");
-        let outcome = relay.record(&mut tx, sent).await.expect("recorded");
+        let outcome = relay.record(&mut tx).await.expect("recorded");
         tx.commit().await.expect("commit");
         outcome
+    }
+
+    /// The second half: every outbox sent.
+    async fn publish<T: Transport>(&self, relay: &Relay<'_, ()>, transport: &T) -> Published {
+        let mut conn = self.pool.acquire().await.expect("a connection");
+        relay
+            .publish(&mut conn, transport)
+            .await
+            .expect("published")
+    }
+
+    /// Messages waiting in `replica`'s outbox.
+    async fn outbox(&self, replica: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM sync.outbox WHERE replica_id = $1")
+            .bind(replica)
+            .fetch_one(&self.pool)
+            .await
+            .expect("outbox")
     }
 
     async fn item(&self, name: &str) -> Uuid {
@@ -215,6 +239,30 @@ impl World {
             .await
             .expect("held")
     }
+}
+
+/// What a pass did: recorded, and sent.
+#[derive(Debug)]
+struct Passed {
+    recorded: Outcome,
+    failing: Vec<(Uuid, String)>,
+    sent: usize,
+}
+
+impl std::ops::Deref for Passed {
+    type Target = Outcome;
+    fn deref(&self) -> &Outcome {
+        &self.recorded
+    }
+}
+
+/// The names of the items a modelled replica holds.
+fn items_of(model: &Model) -> BTreeSet<String> {
+    model
+        .rows
+        .values()
+        .map(|bytes| ItemRow::decode(bytes.as_slice()).expect("an item").name)
+        .collect()
 }
 
 fn names(names: &[&str]) -> BTreeSet<String> {
@@ -255,7 +303,8 @@ async fn a_row_that_does_not_encode_waits_in_quarantine_and_holds_back_nothing(
         retry_quarantine(&mut world.pool.acquire().await.unwrap())
             .await
             .unwrap(),
-        2
+        1,
+        "one note for the row, whoever it is owed to"
     );
     world.pass(&wire).await;
 
@@ -289,13 +338,7 @@ async fn a_row_larger_than_any_message_waits_in_quarantine(pool: crate::DbPool) 
         ..world.relay()
     };
 
-    let mut tx = world.pool.begin_with(SNAPSHOT).await.unwrap();
-    let prepared = relay.prepare(&mut tx).await.unwrap().expect("a pass");
-    tx.rollback().await.unwrap();
-    let sent = relay.publish(&wire, prepared).await;
-    let mut tx = world.pool.begin().await.unwrap();
-    let outcome = relay.record(&mut tx, sent).await.unwrap();
-    tx.commit().await.unwrap();
+    let outcome = world.pass_relay(&relay, &wire).await;
 
     let delivered = wire.delivered();
     assert_eq!(delivered[&a], names(&["small"]));
@@ -345,6 +388,10 @@ async fn a_note_the_planner_fails_on_is_parked_alone(pool: crate::DbPool) {
     assert_eq!(outcome.parked.len(), 1);
 }
 
+/// A replica the transport cannot reach keeps what it is owed in its outbox,
+/// in order, recorded as on its way to it, while every other replica is sent
+/// to; once it can be reached it is sent the outbox, and nothing is planned
+/// twice.
 #[sqlx::test(migrations = false)]
 async fn a_replica_the_transport_cannot_reach_waits_while_the_others_carry_on(pool: crate::DbPool) {
     let world = world(pool).await;
@@ -359,12 +406,18 @@ async fn a_replica_the_transport_cannot_reach_waits_while_the_others_carry_on(po
     let delivered = wire.delivered();
     assert_eq!(delivered[&b], names(&["one"]));
     assert!(!delivered.contains_key(&a));
-    assert_eq!((world.held(a).await, world.held(b).await), (0, 1));
-    let owed = "SELECT count(*) FROM sync.notes WHERE done_at IS NULL AND scope IS NOT NULL";
     assert_eq!(
-        world.count(owed).await,
-        1,
-        "noted again for the replica alone"
+        (world.held(a).await, world.held(b).await),
+        (1, 1),
+        "recorded before it went, as on its way"
+    );
+    assert_eq!(world.outbox(a).await, 1, "kept for it");
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
+            .await,
+        0,
+        "nothing is planned again"
     );
 
     let overview = world
@@ -378,34 +431,52 @@ async fn a_replica_the_transport_cannot_reach_waits_while_the_others_carry_on(po
         .unwrap();
     let status = &overview.replicas.first[0];
     assert_eq!(
-        (status.owed, status.failures, status.state),
-        (1, 1, ReplicaState::Unreachable)
+        (
+            status.owed,
+            status.failures,
+            status.state,
+            status.unconfirmed
+        ),
+        (1, 1, ReplicaState::Unreachable, true)
     );
     assert!(
         status.retry_at.is_some_and(|at| at > chrono::Utc::now()),
         "{status:?}"
     );
 
-    // While it waits, the others go on getting changes, and it is owed them.
+    // While it waits, the others go on getting changes, and its own queue
+    // up behind what it was owed first.
     world.item("two").await;
     world.pass(&wire).await;
     assert_eq!(wire.delivered()[&b], names(&["two"]));
-    assert_eq!(world.count(owed).await, 2);
+    assert_eq!(world.outbox(a).await, 2);
 
-    // Back, and its wait over: it gets what it is owed, and only it does.
+    // Back, and its wait over: it gets its outbox in order, and only it does.
     wire.failing.lock().unwrap().clear();
     sqlx::query("UPDATE sync.replicas SET retry_after = now()")
         .execute(&world.pool)
         .await
         .unwrap();
-    world.pass(&wire).await;
-    let delivered = wire.delivered();
-    assert_eq!(delivered[&a], names(&["one", "two"]));
-    assert!(
-        !delivered.contains_key(&b),
-        "already holds them: {delivered:?}"
-    );
-    assert_eq!(world.count(owed).await, 0);
+    let outcome = world.pass(&wire).await;
+    assert_eq!(outcome.sent, 2);
+    let sent: Vec<(Uuid, String)> = wire
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(r, m)| match m {
+            Body::Down(d) => Some((
+                *r,
+                ItemRow::decode(d.tables[0].upserts[0].as_slice())
+                    .unwrap()
+                    .name,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, [(a, "one".to_owned()), (a, "two".to_owned())]);
+    wire.delivered();
+    assert_eq!(world.outbox(a).await, 0);
     assert_eq!(world.held(a).await, 2);
     let failures: i32 =
         sqlx::query_scalar("SELECT failures FROM sync.replicas WHERE replica_id = $1")
@@ -457,13 +528,7 @@ async fn a_message_the_transport_refuses_for_good_leaves_its_replica_owed_everyt
             .unwrap();
     assert_eq!(failures, 1);
     assert!(why.contains("for good"), "{why}");
-    assert!(
-        world
-            .count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL AND scope IS NOT NULL")
-            .await
-            > 0,
-        "owed to it alone"
-    );
+    assert!(world.outbox(a).await > 0, "kept for it");
 
     wire.failing.lock().unwrap().clear();
     sqlx::query("UPDATE sync.replicas SET retry_after = now()")
@@ -479,51 +544,76 @@ async fn a_message_the_transport_refuses_for_good_leaves_its_replica_owed_everyt
         .filter(|(r, _)| *r == a)
         .map(|(_, m)| m)
         .collect();
-    let mut model = Modelled::default();
-    model.items.insert(gone, "gone".to_owned());
+    let mut model = Model::default();
+    model.rows.insert(
+        ("items".to_owned(), gone.to_string()),
+        ItemRow {
+            name: "gone".to_owned(),
+            ..ItemRow::default()
+        }
+        .encode_to_vec(),
+    );
     for message in sent {
-        model.apply(message);
+        model.receive(
+            &envelope::ToReplica {
+                protocol: envelope::PROTOCOL,
+                body: Some(message),
+            }
+            .encode_to_vec(),
+            &Rules::ANY,
+        );
     }
     assert_eq!(
-        model.items.values().cloned().collect::<BTreeSet<_>>(),
+        items_of(&model),
         names(&["big"]),
         "the delete and the snapshot arrived too"
     );
 }
 
-/// A replica a send fails to gets nothing more in that pass: a later group's
-/// message must not reach it before what an earlier one owed it.
+/// A send that fails stops its replica's outbox there: nothing after it goes
+/// before it does, and once it can be reached the rest goes in order.
 #[sqlx::test(migrations = false)]
-async fn a_replica_a_send_fails_to_is_sent_nothing_more_that_pass(pool: crate::DbPool) {
+async fn a_send_that_fails_holds_back_what_follows_it(pool: crate::DbPool) {
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
-    let first = world.item("first").await;
-    world.pass(&wire).await;
-    wire.delivered();
-    // Owed to a alone, planned in a group of its own after the global one.
-    sqlx::query(
-        "INSERT INTO sync.notes (kind, relation, row_key, scope) VALUES ('row', 'items', $1, $2)",
-    )
-    .bind(first.to_string())
-    .bind(a)
-    .execute(&world.pool)
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM sync.held WHERE replica_id = $1")
-        .bind(a)
-        .execute(&world.pool)
-        .await
-        .unwrap();
+    let relay = Relay {
+        limits: Limits {
+            rows: 1,
+            bytes: 1 << 20,
+        },
+        ..world.relay()
+    };
+    world.item("first").await;
     world.item("second").await;
     wire.fail_next.lock().unwrap().insert(a, 1);
 
-    let outcome = world.pass(&wire).await;
+    let outcome = world.pass_relay(&relay, &wire).await;
 
     assert_eq!(outcome.failing.len(), 1);
     let delivered = wire.delivered();
     assert!(!delivered.contains_key(&a), "{delivered:?}");
-    assert_eq!(delivered[&b], names(&["second"]));
+    assert_eq!(delivered[&b], names(&["first", "second"]));
+    assert_eq!(world.outbox(a).await, 2);
+
+    sqlx::query("UPDATE sync.replicas SET retry_after = now()")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass_relay(&relay, &wire).await;
+    let numbers: Vec<u64> = wire
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(r, _)| *r == a)
+        .filter_map(|(_, m)| match m {
+            Body::Down(d) => Some(d.sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers.len(), 2);
+    assert!(numbers[0] < numbers[1], "in order: {numbers:?}");
 }
 
 /// A send that never answers holds back no other replica: it times out, and
@@ -553,13 +643,7 @@ async fn a_send_that_never_answers_holds_back_no_other_replica(pool: crate::DbPo
         timeout: std::time::Duration::from_millis(50),
         ..world.relay()
     };
-    let mut tx = world.pool.begin_with(SNAPSHOT).await.unwrap();
-    let prepared = relay.prepare(&mut tx).await.unwrap().expect("a pass");
-    tx.rollback().await.unwrap();
-    let sent = relay.publish(&stuck, prepared).await;
-    let mut tx = world.pool.begin().await.unwrap();
-    let outcome = relay.record(&mut tx, sent).await.unwrap();
-    tx.commit().await.unwrap();
+    let outcome = world.pass_relay(&relay, &stuck).await;
 
     assert_eq!(outcome.failing.len(), 1);
     assert_eq!(outcome.failing[0].0, a);
@@ -639,59 +723,59 @@ async fn every_message_has_a_number_of_its_own_rising_as_they_go(pool: crate::Db
     }
 }
 
-/// A replica owed more, alone, than a pass plans is provisioned again
-/// instead: what it is owed stays bounded however long it waits, and what it
-/// gets once back is everything it should hold.
+/// A replica away long enough that its outbox outgrows its bound has its
+/// outbox dropped and is provisioned again — an alarm, in its last error —
+/// rather than owed every change; an outbox that begins with a snapshot is
+/// not dropped for its size. Once back it holds everything it should.
 #[sqlx::test(migrations = false)]
 async fn a_replica_away_long_is_owed_one_provisioning_not_every_change(pool: crate::DbPool) {
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
     let relay = Relay {
-        batch: 4,
+        bound: Bound {
+            messages: 4,
+            bytes: 1 << 30,
+        },
         ..world.relay()
     };
     wire.failing.lock().unwrap().insert(a, true);
+    let mut collapsed = 0;
     for n in 0..30 {
         world.item(&format!("n{n}")).await;
-        world.pass_relay(&relay, &wire).await;
-        sqlx::query("UPDATE sync.replicas SET retry_after = now() + interval '1 hour' WHERE replica_id = $1")
+        collapsed += world.pass_relay(&relay, &wire).await.collapsed.len();
+        assert!(
+            world.outbox(a).await <= 7,
+            "its outbox stays bounded: a snapshot, and what follows it within the bound"
+        );
+    }
+    assert!(collapsed >= 1, "provisioned again for its outbox");
+    let why: String =
+        sqlx::query_scalar("SELECT last_error FROM sync.replicas WHERE replica_id = $1")
             .bind(a)
-            .execute(&world.pool)
+            .fetch_one(&world.pool)
             .await
             .unwrap();
-        let owed = world
-            .count(&format!(
-                "SELECT count(*) FROM sync.notes WHERE done_at IS NULL AND scope = '{a}' AND kind <> 'resync'"
-            ))
-            .await;
-        assert!(owed <= 4, "owed {owed} notes alone");
-    }
-    assert_eq!(
-        world
-            .count(&format!(
-                "SELECT count(*) FROM sync.notes WHERE done_at IS NULL AND kind = 'resync' AND replica_id = '{a}'"
-            ))
-            .await,
-        1
-    );
+    assert!(!why.is_empty());
     assert_eq!(world.held(b).await, 30);
+    assert_eq!(world.outbox(b).await, 0);
 
     wire.failing.lock().unwrap().clear();
     sqlx::query("UPDATE sync.replicas SET retry_after = now()")
         .execute(&world.pool)
         .await
         .unwrap();
-    for _ in 0..10 {
-        if world.pass_relay(&relay, &wire).await.done == 0 {
-            break;
-        }
-    }
-    let mut model = Modelled::default();
+    world.pass_relay(&relay, &wire).await;
+    let mut model = Model::default();
     for (_, message) in wire.sent.lock().unwrap().drain(..).filter(|(r, _)| *r == a) {
-        model.apply(message);
+        let bytes = envelope::ToReplica {
+            protocol: envelope::PROTOCOL,
+            body: Some(message),
+        }
+        .encode_to_vec();
+        model.receive(&bytes, &Rules::ANY);
     }
-    assert_eq!(model.items.len(), 30);
+    assert_eq!(model.rows.len(), 30);
     assert_eq!(world.held(a).await, 30);
 }
 
@@ -999,261 +1083,6 @@ async fn an_uploaded_row_the_server_cannot_file_waits_in_the_inbox_until_a_fix(
     assert_eq!(left, ("from_a_newer_build\u{FFFD}".to_owned(), 3));
 }
 
-/// A replica as the transport reaches it: the items it holds, by id, the
-/// last message it applied — it takes a message only above that — and the
-/// snapshot in progress, with the rows it named.
-#[derive(Default, Debug)]
-struct Modelled {
-    items: BTreeMap<Uuid, String>,
-    last: u64,
-    snapshot: Option<(String, BTreeSet<Uuid>)>,
-}
-
-impl Modelled {
-    /// Applies a message as a real replica does: only above the last one; a
-    /// snapshot's rows remembered, and what it did not name swept at its end.
-    fn apply(&mut self, message: Body) {
-        let sequence = match &message {
-            Body::Down(down) => down.sequence,
-            Body::EndSnapshot(end) => end.sequence,
-            Body::Filed(_) => return,
-        };
-        if sequence <= self.last {
-            return;
-        }
-        self.last = sequence;
-        match message {
-            Body::Down(down) => {
-                let snapshot = (!down.snapshot_id.is_empty()).then(|| {
-                    if self
-                        .snapshot
-                        .as_ref()
-                        .is_none_or(|(id, _)| *id != down.snapshot_id)
-                    {
-                        self.snapshot = Some((down.snapshot_id.clone(), BTreeSet::new()));
-                    }
-                });
-                for table in down.tables {
-                    for bytes in table.upserts {
-                        let row = ItemRow::decode(bytes.as_slice()).expect("an item");
-                        let id: Uuid = row.id.parse().unwrap();
-                        if let (Some(()), Some((_, named))) = (snapshot, self.snapshot.as_mut()) {
-                            named.insert(id);
-                        }
-                        self.items.insert(id, row.name);
-                    }
-                    for key in table.deletes {
-                        self.items.remove(&key.parts[0].parse().unwrap());
-                    }
-                }
-            }
-            Body::EndSnapshot(end) => {
-                let named = match self.snapshot.take() {
-                    Some((id, named)) if id == end.snapshot_id => named,
-                    _ => BTreeSet::new(),
-                };
-                self.items.retain(|id, _| named.contains(id));
-            }
-            Body::Filed(_) => {}
-        }
-    }
-}
-
-/// A transport that fails at random — partway through a replica's messages
-/// as often as not, now as a network does, now refusing a message for good —
-/// and replicas that apply what reaches them, as a real one does.
-struct Chaos {
-    walk: Mutex<crate::testkit::Walk>,
-    /// Out of 100: how often a send fails, while the network is bad.
-    failure_rate: Mutex<u64>,
-    replicas: Mutex<BTreeMap<Uuid, Modelled>>,
-}
-
-impl Transport for Chaos {
-    fn send(
-        &self,
-        replica: Uuid,
-        message: Vec<u8>,
-        _id: &str,
-    ) -> impl Future<Output = Result<(), Error>> + Send {
-        let message = body(&message);
-        let mut walk = self.walk.lock().unwrap();
-        let fails = walk.below(100) < *self.failure_rate.lock().unwrap() as usize;
-        let refused = walk.below(3) == 0;
-        drop(walk);
-        let result = if fails {
-            Err(Error::Transport {
-                reason: if refused {
-                    "refused\0 for good"
-                } else {
-                    "the network"
-                }
-                .into(),
-                transient: !refused,
-            })
-        } else {
-            self.replicas
-                .lock()
-                .unwrap()
-                .entry(replica)
-                .or_default()
-                .apply(message);
-            Ok(())
-        };
-        async move { result }
-    }
-}
-
-/// Whatever fails along the way, once the network is back and the fix is
-/// deployed, every replica holds exactly what it should — with nobody
-/// touching the data.
-#[sqlx::test(migrations = false)]
-async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(pool: crate::DbPool) {
-    let world = world(pool).await;
-    // The replicas live through every storm, as real ones do.
-    let chaos = Chaos {
-        walk: Mutex::new(crate::testkit::Walk(0)),
-        failure_rate: Mutex::new(0),
-        replicas: Mutex::new(BTreeMap::new()),
-    };
-    // Small messages, so a replica's rows span several and a failure can cut
-    // them partway; a small batch, so a replica left out long is owed one
-    // provisioning rather than every change.
-    let relay = Relay {
-        limits: Limits {
-            rows: 3,
-            bytes: 1 << 20,
-        },
-        batch: 8,
-        ..world.relay()
-    };
-    for seed in [
-        0x9E37_79B9_7F4A_7C15_u64,
-        0xD1B5_4A32_D192_ED03,
-        0x2545_F491_4F6C_DD1D,
-    ] {
-        *chaos.walk.lock().unwrap() = crate::testkit::Walk(seed);
-        *chaos.failure_rate.lock().unwrap() = 30;
-        let mut walk = crate::testkit::Walk(seed ^ 0xFFFF);
-        let mut names = 0;
-        let (mut failed_sends, mut refusals) = (0, 0);
-        for step in 0..150 {
-            let items: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM fixture.items ORDER BY id")
-                .fetch_all(&world.pool)
-                .await
-                .unwrap();
-            let pick = (!items.is_empty()).then(|| items[walk.below(items.len())]);
-            names += 1;
-            let name = if walk.below(10) == 0 {
-                "poison".to_owned()
-            } else {
-                format!("n{names}")
-            };
-            match (walk.below(5), pick) {
-                (0 | 1, _) | (_, None) => {
-                    world.item(&name).await;
-                }
-                (2, Some(id)) => {
-                    world.exec("UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2", id, &name).await;
-                }
-                (3, Some(id)) => {
-                    world.exec("UPDATE fixture.items SET retired_at = CASE WHEN retired_at IS NULL THEN now() END WHERE id = $1 AND partition_id = $2 AND $3 <> ''", id, &name).await;
-                }
-                (_, Some(id)) => {
-                    world.exec("DELETE FROM fixture.items WHERE id = $1 AND partition_id = $2 AND $3 <> ''", id, &name).await;
-                }
-            }
-            if walk.below(15) == 0 {
-                // Provisioned again mid-storm: a snapshot that may itself
-                // be cut short.
-                let replica = world.replicas[walk.below(2)];
-                sqlx::query("INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', $1)")
-                    .bind(replica)
-                    .execute(&world.pool)
-                    .await
-                    .unwrap();
-            }
-            if walk.below(3) == 0 {
-                let failing = world.pass_relay(&relay, &chaos).await.failing;
-                failed_sends += failing.len();
-                refusals += failing
-                    .iter()
-                    .filter(|(_, why)| why.contains("for good"))
-                    .count();
-            }
-            if step % 40 == 0 {
-                // Some replicas' waits run out early, mid-storm.
-                sqlx::query("UPDATE sync.replicas SET retry_after = now()")
-                    .execute(&world.pool)
-                    .await
-                    .unwrap();
-            }
-        }
-
-        // The storm was one: sends failed, and rows waited in quarantine.
-        assert!(failed_sends > 0, "seed {seed:#x}: no send failed");
-        assert!(refusals > 0, "seed {seed:#x}: no send refused for good");
-        assert!(
-            world.count("SELECT count(*) FROM sync.quarantine").await > 0,
-            "seed {seed:#x}: nothing was quarantined"
-        );
-
-        // The network comes back and the encoding bug is fixed: the relay
-        // starts again, as after a deploy, and drains.
-        *chaos.failure_rate.lock().unwrap() = 0;
-        BUGGY.set(false);
-        let mut conn = world.pool.acquire().await.unwrap();
-        unpark(&mut conn).await.unwrap();
-        retry_quarantine(&mut conn).await.unwrap();
-        sqlx::query("UPDATE sync.replicas SET retry_after = now()")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        drop(conn);
-        for _ in 0..500 {
-            if world.pass_relay(&relay, &chaos).await.done == 0 {
-                break;
-            }
-        }
-        BUGGY.set(true);
-
-        let should: BTreeMap<Uuid, String> =
-            sqlx::query_as("SELECT id, name FROM fixture.items WHERE retired_at IS NULL")
-                .fetch_all(&world.pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .collect();
-        for replica in world.replicas {
-            let holds = chaos
-                .replicas
-                .lock()
-                .unwrap()
-                .get(&replica)
-                .map(|m| m.items.clone())
-                .unwrap_or_default();
-            assert_eq!(
-                holds, should,
-                "seed {seed:#x}: {replica} holds other than it should"
-            );
-            let last = chaos
-                .replicas
-                .lock()
-                .unwrap()
-                .get(&replica)
-                .map_or(0, |m| m.last);
-            world.acknowledge(replica, last).await;
-        }
-        assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
-        assert_eq!(
-            world
-                .count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
-                .await,
-            0
-        );
-    }
-}
-
 /// A transaction that began before a pass read and commits after it: what
 /// it changed still reaches every replica, though the pass recorded a later
 /// send of the same row.
@@ -1283,57 +1112,151 @@ async fn a_change_committed_after_the_pass_read_past_it_still_arrives(pool: crat
     }
 }
 
-/// A relay that sent and died before it recorded: the next pass sends the
-/// same again, and records it once.
+/// A relay that recorded a pass and died before it sent it: whoever runs the
+/// relay next sends what it recorded, once, under the same ids — and plans
+/// nothing again.
 #[sqlx::test(migrations = false)]
-async fn a_pass_that_sent_but_never_recorded_is_sent_again(pool: crate::DbPool) {
+async fn a_pass_recorded_and_never_sent_is_sent_by_the_next_relay(pool: crate::DbPool) {
     let world = world(pool).await;
-    let [a, _] = world.replicas;
-    let wire = Fake::default();
+    let [a, b] = world.replicas;
+    let wire = Wire::new(1);
     world.item("once").await;
 
     let relay = world.relay();
+    world.record(&relay).await;
+    assert!(wire.empty(), "nothing went before the record committed");
+    assert_eq!(world.held(a).await, 1, "recorded before it goes");
+
+    // Another process takes the lock: it publishes the outbox first.
+    let next = world.relay();
+    let outcome = world.pass_relay(&next, &wire).await;
+    assert_eq!(outcome.done, 0, "nothing planned again");
+    assert_eq!(outcome.sent, 2);
+    for replica in [a, b] {
+        let ids = wire.ids(replica);
+        assert_eq!(ids.len(), 1, "sent once");
+        let mut model = Model::default();
+        model.receive(&wire.next(replica).unwrap(), &Rules::ANY);
+        assert_eq!(items_of(&model), names(&["once"]));
+    }
+    assert_eq!(world.outbox(a).await + world.outbox(b).await, 0);
+}
+
+/// A relay that loses its lock while it records commits nothing: nothing
+/// was sent, nothing is recorded, the notes are pending, and the next relay
+/// sends it all.
+#[sqlx::test(migrations = false)]
+async fn a_relay_that_loses_its_lock_mid_pass_sends_and_records_nothing(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(2);
+    world.item("kept").await;
+    let relay = world.relay();
     let mut tx = world.pool.begin_with(SNAPSHOT).await.unwrap();
-    let prepared = relay.prepare(&mut tx).await.unwrap().expect("a pass");
-    tx.rollback().await.unwrap();
-    let first = relay.publish(&wire, prepared).await;
-    drop(first);
-    assert_eq!(world.held(a).await, 0, "nothing recorded");
-
-    world.pass(&wire).await;
-
-    let downs: Vec<u64> = wire
-        .sent
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(r, _)| *r == a)
-        .filter_map(|(_, m)| match m {
-            Body::Down(d) => Some(d.sequence),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(downs.len(), 2, "sent twice");
-    assert!(downs[1] > downs[0], "the second numbered above the first");
-    assert_eq!(world.held(a).await, 1);
+    relay.record(&mut tx).await.unwrap();
+    // The lock's connection is gone: its transaction never commits.
+    drop(tx);
+    world.publish(&relay, &wire).await;
+    assert!(wire.empty());
+    assert_eq!(world.held(a).await, 0);
     assert_eq!(
         world
             .count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
             .await,
-        0
+        1
     );
+
+    world.pass_relay(&relay, &wire).await;
+    let mut model = Model::default();
+    model.receive(&wire.next(a).unwrap(), &Rules::ANY);
+    assert_eq!(items_of(&model), names(&["kept"]));
+    assert_eq!(world.held(a).await, 1);
+}
+
+/// A replica sent part of what it was owed before its transport failed,
+/// then a row it took leaves its scope: it is told to let the row go, and
+/// ends holding exactly what it should — the part that went was recorded,
+/// the part that did not waits, in order.
+#[sqlx::test(migrations = false)]
+async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::DbPool) {
+    struct Partial {
+        wire: Wire,
+        /// Sends to the first replica that go before the transport fails.
+        left: Mutex<usize>,
+        replica: Uuid,
+    }
+    impl Transport for Partial {
+        async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+            if replica == self.replica {
+                let mut left = self.left.lock().unwrap();
+                if *left == 0 {
+                    return Err(Error::Transport {
+                        reason: "cut".into(),
+                        transient: true,
+                    });
+                }
+                *left -= 1;
+            }
+            self.wire.send(replica, message, id).await
+        }
+    }
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let relay = Relay {
+        limits: Limits {
+            rows: 1,
+            bytes: 1 << 20,
+        },
+        ..world.relay()
+    };
+    let wire = Partial {
+        wire: Wire::new(3),
+        left: Mutex::new(1),
+        replica: a,
+    };
+    let first = world.item("first").await;
+    world.item("second").await;
+    world.pass_relay(&relay, &wire).await;
+    assert_eq!(wire.wire.ids(a).len(), 1, "one of two went");
+
+    // The row that went leaves every replica.
+    world
+        .exec(
+            "DELETE FROM fixture.items WHERE id = $1 AND partition_id = $2 AND $3 <> ''",
+            first,
+            "x",
+        )
+        .await;
+    *wire.left.lock().unwrap() = usize::MAX;
+    sqlx::query("UPDATE sync.replicas SET retry_after = now()")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass_relay(&relay, &wire).await;
+
+    let mut model = Model::default();
+    while let Some(bytes) = wire.wire.next(a) {
+        model.receive(&bytes, &Rules::ANY);
+        wire.wire.acknowledge(a);
+    }
+    assert_eq!(items_of(&model), names(&["second"]), "nothing left behind");
+    let held: Vec<String> =
+        sqlx::query_scalar("SELECT row_key FROM sync.held WHERE replica_id = $1")
+            .bind(a)
+            .fetch_all(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(held.len(), 1, "recorded as it holds: {held:?}");
 }
 
 impl World {
     /// The last message sent to `replica`.
     async fn last_sent(&self, replica: Uuid) -> u64 {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT last_sequence FROM sync.replicas WHERE replica_id = $1",
-        )
-        .bind(replica)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap() as u64
+        sqlx::query_scalar::<_, i64>("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
+            .bind(replica)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap() as u64
     }
 
     /// `replica` says it applied every message up to `sequence`.

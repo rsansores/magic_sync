@@ -29,7 +29,6 @@
 //! replica again on demand.
 
 use crate::dialect::{ident, literal};
-use crate::envelope;
 use crate::row::{key_text, Column, Key, KeyPart, Mirror, Route, Table};
 use crate::wire::Codec;
 use crate::Error;
@@ -150,9 +149,8 @@ pub(crate) struct Delta {
     changes: Vec<Change>,
     /// Rows that cannot go to a replica, and why: never sent it, and taken
     /// back where it holds them, with whatever points at them.
-    blocked: BTreeMap<(Uuid, usize, String), String>,
-    /// [`Delta::keep_only`] and [`Delta::forget`], kept to apply again.
-    only: Option<Uuid>,
+    pub(crate) blocked: BTreeMap<(Uuid, usize, String), String>,
+    /// Replicas not live: sent nothing.
     left_out: BTreeSet<Uuid>,
 }
 
@@ -225,23 +223,16 @@ impl Delta {
             .is_some_and(|k| k.contains(key))
     }
 
-    /// Only what `replica` is owed: what a note planned for that replica alone
-    /// asks.
-    pub(crate) fn keep_only(&mut self, replica: Uuid) {
-        self.only = Some(replica);
-        self.restrict();
-    }
-
-    /// Everything `replica` is owed, left out: it was not sent, so it is not
-    /// recorded.
-    pub(crate) fn forget(&mut self, replica: Uuid) {
+    /// Everything `replica` is owed, left out: it is not live, so it is sent
+    /// nothing.
+    fn forget(&mut self, replica: Uuid) {
         self.left_out.insert(replica);
         self.restrict();
     }
 
     fn restrict(&mut self) {
-        let (only, left_out) = (self.only, self.left_out.clone());
-        let keep = |r: &Uuid| only.is_none_or(|o| o == *r) && !left_out.contains(r);
+        let left_out = self.left_out.clone();
+        let keep = |r: &Uuid| !left_out.contains(r);
         self.upserts.retain(|r, _| keep(r));
         self.deletes.retain(|r, _| keep(r));
         self.snapshots.retain(keep);
@@ -252,19 +243,6 @@ impl Delta {
             }
             rows.retain(|_, tables| !tables.is_empty());
         }
-    }
-
-    /// Every row this delta sends `replica`, as its table and key.
-    pub(crate) fn upserted(&self, replica: Uuid) -> Vec<(usize, String)> {
-        self.upserts
-            .get(&replica)
-            .into_iter()
-            .flat_map(|tables| {
-                tables
-                    .iter()
-                    .flat_map(|(i, keys)| keys.iter().map(move |k| (*i, k.clone())))
-            })
-            .collect()
     }
 
     /// What is held, less what the snapshot replicas held: they start from
@@ -279,13 +257,11 @@ impl Delta {
     }
 }
 
-/// A pending note: what changed, and the one replica it is still owed to
-/// when a send to that replica failed.
+/// A pending note: what changed.
 #[derive(Clone, Debug)]
 pub(crate) struct Note {
     pub(crate) id: i64,
     pub(crate) change: Change,
-    pub(crate) scope: Option<Uuid>,
 }
 
 /// What changed, as the outbox noted it.
@@ -312,14 +288,12 @@ pub(crate) enum Change {
     Resync { replica: Uuid },
 }
 
-/// Every row a plan sends, encoded once: by table index and key text.
+/// Rows of one table, encoded: by key text, and the ones that cannot go,
+/// with why.
 #[derive(Default)]
-pub(crate) struct Loaded {
-    rows: HashMap<(usize, String), Vec<u8>>,
-    /// Rows that could not go, per replica they were to go to — that do not
-    /// encode, or point at a row that could not go where the replica lacks
-    /// it: left out of the delta, neither sent nor recorded as held.
-    pub(crate) failed: Vec<Unsent>,
+pub(crate) struct Encoded {
+    pub(crate) rows: BTreeMap<String, Vec<u8>>,
+    pub(crate) failed: BTreeMap<String, String>,
 }
 
 /// A row the engine could not send a replica, and why.
@@ -339,8 +313,9 @@ type ForeignKey = (Relation, Relation, Vec<String>, Vec<String>);
 /// schema and name.
 type CatalogForeignKey = (String, String, String, String, Vec<String>, Vec<String>);
 
-/// Rows `record` writes per statement.
-const RECORD_CHUNK: usize = 50_000;
+/// Rows a pass loads, encodes and records at a time: what it holds in
+/// memory however much it sends.
+pub(crate) const RECORD_CHUNK: usize = 2_000;
 
 /// The transaction-scoped advisory lock installs take, so two processes
 /// installing at once run one after the other ("SYNCINST").
@@ -1054,6 +1029,11 @@ impl Engine {
         self.plans[index].table
     }
 
+    /// `key` of table `i` in the one form keys are compared in.
+    pub(crate) fn canonical(&self, i: usize, key: &str) -> Result<String, Error> {
+        Ok(key_text(&parse_key(&self.plans[i].key, key)?))
+    }
+
     /// The live replicas, as a subquery `s(id, partition)`.
     pub(crate) fn replicas_sql(&self) -> String {
         let partition = self
@@ -1070,7 +1050,8 @@ impl Engine {
     /// in the caller's transaction: a replica that became live, or moved to
     /// another partition, is noted for provisioning from scratch; one that is
     /// no longer live, or gone, is forgotten — nothing is recorded as held by
-    /// it, and nothing is sent it until it is live again. The relay runs it
+    /// it, what waited in its outbox is dropped, and nothing is sent it until
+    /// it is live again. The relay runs it
     /// before every pass.
     pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
         sqlx::query(&format!(
@@ -1084,6 +1065,8 @@ impl Engine {
              provisioned AS (INSERT INTO sync.notes (kind, replica_id, partition_id) \
                              SELECT 'resync', a.id, a.partition FROM arrived a WHERE {}), \
              forgotten AS (DELETE FROM sync.held h USING gone g WHERE h.replica_id = g.replica_id), \
+             dropped AS (DELETE FROM sync.outbox o USING gone g WHERE o.replica_id = g.replica_id), \
+             unchained AS (DELETE FROM sync.chains c USING gone g WHERE c.replica_id = g.replica_id), \
              came AS (INSERT INTO sync.replicas AS r (replica_id, live, partition_id) \
                       SELECT id, true, partition FROM arrived \
                       ON CONFLICT (replica_id) DO UPDATE SET live = true, partition_id = EXCLUDED.partition_id) \
@@ -1305,8 +1288,7 @@ impl Engine {
     }
 
     /// [`Engine::plan`] of `delta`'s changes, around the rows it says cannot
-    /// go: the plan of every replica not narrowed away by
-    /// [`Delta::keep_only`] and [`Delta::forget`].
+    /// go.
     async fn plan_around(&self, conn: &mut Conn, mut delta: Delta) -> Result<Delta, Error> {
         let horizon: i64 =
             sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
@@ -2044,98 +2026,86 @@ impl Engine {
         Ok(())
     }
 
-    /// Loads and encodes every row the delta sends, once however many
-    /// replicas it goes to, in the plan's transaction. A row that does not
-    /// encode, or is larger than `largest_row` bytes, which no message could
-    /// carry, cannot go: the delta is planned again around it, and it is
-    /// answered in [`Loaded::failed`] for each replica it was to go to — with
-    /// every row that points at it there, which the replica could not apply.
-    /// A replica holding an older version of one has it taken back, with
-    /// what points at it, rather than keep a version the engine no longer
-    /// knows the contents of; each comes back once a fix lets it through.
-    pub(crate) async fn load<P: std::marker::Sync + 'static>(
+    /// The rows of `keys` of table `i`, encoded in the plan's snapshot, by
+    /// key text: the ones that cannot go — that do not encode, are larger
+    /// than `largest_row` bytes, which no message could carry, or are not in
+    /// the snapshot the plan read — answered apart, with why.
+    pub(crate) async fn encode<P: std::marker::Sync + 'static>(
         &self,
         conn: &mut Conn,
         codecs: &[Codec<P>],
-        delta: &mut Delta,
+        i: usize,
+        keys: &[String],
         largest_row: usize,
-    ) -> Result<Loaded, Error> {
-        let mut loaded = Loaded::default();
-        let mut refused: BTreeMap<(usize, String), String> = BTreeMap::new();
-        loop {
-            let mut wanted: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
-            for tables in delta.upserts.values() {
-                for (i, keys) in tables {
-                    wanted.entry(*i).or_default().extend(
-                        keys.iter()
-                            .filter(|k| !loaded.rows.contains_key(&(*i, (*k).clone())))
-                            .cloned(),
-                    );
-                }
+    ) -> Result<Encoded, Error> {
+        let plan = &self.plans[i];
+        let codec = codecs
+            .iter()
+            .find(|c| c.table.name == plan.table)
+            .ok_or_else(|| {
+                Error::Misuse(format!("no codec for mirrored table `{}`", plan.table))
+            })?;
+        let parsed: Vec<Key> = keys
+            .iter()
+            .map(|k| parse_key(&plan.key, k))
+            .collect::<Result<_, _>>()?;
+        let loaded = codec.load(conn, &parsed).await?;
+        let mut out = Encoded::default();
+        for (key, bytes) in loaded.rows {
+            let key = key_text(&key);
+            if bytes.len() > largest_row {
+                let why = format!(
+                    "a row of {} bytes, larger than any message may be ({largest_row})",
+                    bytes.len()
+                );
+                out.failed.insert(key, why);
+            } else {
+                out.rows.insert(key, bytes);
             }
-            for (i, keys) in wanted {
-                if keys.is_empty() {
-                    continue;
-                }
-                let plan = &self.plans[i];
-                let codec = codecs
-                    .iter()
-                    .find(|c| c.table.name == plan.table)
-                    .ok_or_else(|| {
-                        Error::Misuse(format!("no codec for mirrored table `{}`", plan.table))
-                    })?;
-                let parsed: Vec<Key> = keys
-                    .iter()
-                    .map(|k| parse_key(&plan.key, k))
-                    .collect::<Result<_, _>>()?;
-                let encoded = codec.load(conn, &parsed).await?;
-                for (key, bytes) in encoded.rows {
-                    if bytes.len() > largest_row {
-                        let reason = format!(
-                            "a row of {} bytes, larger than any message may be ({largest_row})",
-                            bytes.len()
-                        );
-                        refused.insert((i, key_text(&key)), reason);
-                        continue;
-                    }
-                    loaded.rows.insert((i, key_text(&key)), bytes);
-                }
-                for (key, e) in encoded.failed {
-                    refused.insert((i, key_text(&key)), e.to_string());
-                }
-                // The plan read it in this snapshot: a row not there is a
-                // bug, set aside like one.
-                for key in keys {
-                    if !loaded.rows.contains_key(&(i, key.clone())) {
-                        refused
-                            .entry((i, key))
-                            .or_insert_with(|| "the plan's snapshot has no such row".to_owned());
-                    }
-                }
-            }
-            let mut blocked = delta.blocked.clone();
-            for (replica, tables) in &delta.upserts {
-                for (i, keys) in tables {
-                    for key in keys {
-                        if let Some(reason) = refused.get(&(*i, key.clone())) {
-                            blocked.insert((*replica, *i, key.clone()), reason.clone());
-                        }
-                    }
-                }
-            }
-            if blocked.len() == delta.blocked.len() {
-                break;
-            }
-            let again = Delta {
-                changes: delta.changes.clone(),
-                blocked,
-                only: delta.only,
-                left_out: delta.left_out.clone(),
-                ..Delta::default()
-            };
-            *delta = self.plan_around(conn, again).await?;
         }
-        loaded.failed = delta
+        for (key, e) in loaded.failed {
+            out.failed.insert(key_text(&key), e.to_string());
+        }
+        // The plan read it in this snapshot: a row not there is a bug, set
+        // aside like one.
+        for key in keys {
+            if !out.rows.contains_key(key) {
+                out.failed
+                    .entry(key.clone())
+                    .or_insert_with(|| "the plan's snapshot has no such row".to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// `delta` planned again, in the same snapshot, around rows that cannot
+    /// go to a replica as well as the ones it already went around: each is
+    /// never sent there, a replica holding an older version of one has it
+    /// taken back, and so does every row that points at one there — a
+    /// replica never keeps content the engine no longer knows the contents
+    /// of. Each comes back once a fix lets it through.
+    pub(crate) async fn replan(
+        &self,
+        conn: &mut Conn,
+        delta: Delta,
+        blocked: BTreeMap<(Uuid, usize, String), String>,
+    ) -> Result<Delta, Error> {
+        let mut all = delta.blocked;
+        for (row, why) in blocked {
+            all.entry(row).or_insert(why);
+        }
+        let again = Delta {
+            changes: delta.changes,
+            blocked: all,
+            left_out: delta.left_out,
+            ..Delta::default()
+        };
+        self.plan_around(conn, again).await
+    }
+
+    /// The rows the delta could not send, each per replica it was to go to.
+    pub(crate) fn unsent(&self, delta: &Delta) -> Vec<Unsent> {
+        delta
             .blocked
             .iter()
             .map(|((replica, i, key), reason)| Unsent {
@@ -2144,120 +2114,7 @@ impl Engine {
                 key: key.clone(),
                 reason: reason.clone(),
             })
-            .collect();
-        Ok(loaded)
-    }
-
-    /// One replica's rows from what [`Engine::load`] read: its upserts
-    /// parents first, then its deletes children first.
-    pub(crate) fn rows(
-        &self,
-        delta: &Delta,
-        loaded: &Loaded,
-        replica: Uuid,
-    ) -> Vec<envelope::Table> {
-        let mut out = Vec::new();
-        if let Some(tables) = delta.upserts.get(&replica) {
-            for &i in &self.order {
-                let Some(keys) = tables.get(&i) else { continue };
-                let sent: Vec<(&String, &Vec<u8>)> = keys
-                    .iter()
-                    .filter_map(|k| loaded.rows.get(&(i, k.clone())).map(|bytes| (k, bytes)))
-                    .collect();
-                out.push(envelope::Table {
-                    table: self.plans[i].table.to_owned(),
-                    upserts: sent.iter().map(|(_, bytes)| (*bytes).clone()).collect(),
-                    deletes: Vec::new(),
-                    keys: sent
-                        .iter()
-                        .map(|(k, _)| envelope::Key {
-                            parts: k.split('|').map(str::to_owned).collect(),
-                        })
-                        .collect(),
-                });
-            }
-        }
-        if let Some(tables) = delta.deletes.get(&replica) {
-            for &i in self.order.iter().rev() {
-                let Some(keys) = tables.get(&i) else { continue };
-                out.push(envelope::Table {
-                    table: self.plans[i].table.to_owned(),
-                    upserts: Vec::new(),
-                    keys: Vec::new(),
-                    deletes: keys
-                        .iter()
-                        .map(|k| envelope::Key {
-                            parts: k.split('|').map(str::to_owned).collect(),
-                        })
-                        .collect(),
-                });
-            }
-        }
-        out
-    }
-
-    /// Records what the replicas hold once their messages are out: what was
-    /// sent, less what was taken back. A snapshot replaces everything its
-    /// replica held.
-    pub(crate) async fn record(&self, conn: &mut Conn, delta: &Delta) -> Result<(), Error> {
-        let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
-        if !snapshots.is_empty() {
-            sqlx::query("DELETE FROM sync.held WHERE replica_id = ANY($1)")
-                .bind(&snapshots)
-                .execute(&mut *conn)
-                .await?;
-        }
-        let (mut e, mut t, mut k) = (Vec::new(), Vec::new(), Vec::new());
-        for (replica, tables) in &delta.upserts {
-            for (i, keys) in tables {
-                for key in keys {
-                    e.push(*replica);
-                    t.push(self.plans[*i].table);
-                    k.push(key.as_str());
-                }
-            }
-        }
-        for start in (0..e.len()).step_by(RECORD_CHUNK) {
-            let range = start..(start + RECORD_CHUNK).min(e.len());
-            sqlx::query(
-                "INSERT INTO sync.held (replica_id, relation, row_key, horizon) \
-                 SELECT e, t, k, $4::text::xid8 \
-                   FROM unnest($1::uuid[], $2::text[], $3::text[]) AS u(e, t, k) \
-                 ON CONFLICT (replica_id, relation, row_key) \
-                 DO UPDATE SET sent_at = now(), horizon = EXCLUDED.horizon",
-            )
-            .bind(&e[range.clone()])
-            .bind(&t[range.clone()])
-            .bind(&k[range])
-            .bind(delta.horizon.to_string())
-            .execute(&mut *conn)
-            .await?;
-        }
-
-        let (mut e, mut t, mut k) = (Vec::new(), Vec::new(), Vec::new());
-        for (replica, tables) in &delta.deletes {
-            for (i, keys) in tables {
-                for key in keys {
-                    e.push(*replica);
-                    t.push(self.plans[*i].table);
-                    k.push(key.as_str());
-                }
-            }
-        }
-        for start in (0..e.len()).step_by(RECORD_CHUNK) {
-            let range = start..(start + RECORD_CHUNK).min(e.len());
-            sqlx::query(
-                "DELETE FROM sync.held h \
-                  USING unnest($1::uuid[], $2::text[], $3::text[]) AS d(e, t, k) \
-                  WHERE h.replica_id = d.e AND h.relation = d.t AND h.row_key = d.k",
-            )
-            .bind(&e[range.clone()])
-            .bind(&t[range.clone()])
-            .bind(&k[range])
-            .execute(&mut *conn)
-            .await?;
-        }
-        Ok(())
+            .collect()
     }
 
     /// The tables every snapshot names, parents first.
@@ -2286,7 +2143,6 @@ struct Noted {
     row_key: Option<String>,
     replica_id: Option<Uuid>,
     previous: Option<serde_json::Value>,
-    scope: Option<Uuid>,
     xid: i64,
 }
 
@@ -2324,8 +2180,8 @@ const READABLE: &str = "((kind = 'row' AND relation IS NOT NULL AND row_key IS N
      OR (kind = 'assigned' AND relation IS NOT NULL AND replica_id IS NOT NULL) \
      OR (kind = 'resync' AND replica_id IS NOT NULL))";
 
-/// The pending notes, oldest first: not parked, not owed to a replica that is
-/// waiting out a failure, and of a kind this build reads. `conn` is in the
+/// The pending notes, oldest first: not parked, and of a kind this build
+/// reads. `conn` is in the
 /// `REPEATABLE READ` transaction the notes are planned and loaded in, so the
 /// rows they are planned against do not move under the plan.
 pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Error> {
@@ -2339,11 +2195,8 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
         )));
     }
     let rows: Vec<Noted> = sqlx::query_as(&format!(
-        "SELECT id, kind, relation, row_key, replica_id, previous, scope, xid::text::bigint AS xid \
-           FROM sync.notes n \
-          WHERE done_at IS NULL AND parked_at IS NULL AND {READABLE} \
-            AND NOT EXISTS (SELECT 1 FROM sync.replicas r \
-                             WHERE r.replica_id = n.scope AND r.retry_after > now()) \
+        "SELECT id, kind, relation, row_key, replica_id, previous, xid::text::bigint AS xid \
+           FROM sync.notes WHERE done_at IS NULL AND parked_at IS NULL AND {READABLE} \
           ORDER BY id LIMIT $1"
     ))
     .bind(limit)
@@ -2352,8 +2205,8 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
     Ok(rows
         .into_iter()
         .filter_map(|noted| {
-            let (id, scope) = (noted.id, noted.scope);
-            noted.change().map(|change| Note { id, change, scope })
+            let id = noted.id;
+            noted.change().map(|change| Note { id, change })
         })
         .collect())
 }
@@ -2361,7 +2214,8 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
 /// No provisioning of the replica `$1` is pending: one is noted once, however
 /// many reasons ask for it. It is planned with the changes of its pass, so the
 /// snapshot carries them rather than a second message.
-const RESYNC_PENDING: &str = "NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
+pub(crate) const RESYNC_PENDING: &str =
+    "NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
                               AND p.replica_id = $1 AND p.done_at IS NULL)";
 
 /// Queues `replica`'s provisioning from scratch, in the caller's transaction,

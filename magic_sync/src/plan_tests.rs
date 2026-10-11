@@ -13,6 +13,7 @@
 //! independently of the engine.
 
 use super::*;
+use crate::model::{Faults, Model, Row, Rules, Wire};
 use crate::testkit::Walk;
 use chrono::{DateTime, Utc};
 use sqlx::Connection as _;
@@ -323,9 +324,6 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
     ("t_task_lines", &["size_code"], "t_sizes"),
 ];
 
-/// A replica as the engine told it: each row it holds, as it was sent.
-type Held = BTreeMap<(String, String), serde_json::Value>;
-
 /// A key's text from the columns of a row as JSON; `None` when one is NULL.
 fn key_of(row: &serde_json::Value, columns: &[&str]) -> Option<String> {
     let parts: Option<Vec<String>> = columns
@@ -347,15 +345,53 @@ enum Step {
     Cured,
 }
 
+/// The rows a row of `table` points at, read off it as JSON.
+fn parents(table: &str, bytes: &[u8]) -> Vec<Row> {
+    let row: serde_json::Value = serde_json::from_slice(bytes).expect("a row as JSON");
+    REFERENCES
+        .iter()
+        .filter(|(child, _, _)| *child == table)
+        .filter_map(|(_, columns, parent)| key_of(&row, columns).map(|k| ((*parent).to_owned(), k)))
+        .collect()
+}
+
+/// The replicas of the walk: their foreign keys, and nothing they refuse.
+const RULES: Rules = Rules {
+    refuses: |_, _| false,
+    parents,
+};
+
+/// The server's relay over the walk's tables, as a host's runs it.
+fn relay<'a>(engine: &'a Engine, codecs: &'a [Codec<()>]) -> crate::relay::Relay<'a, ()> {
+    crate::relay::Relay {
+        engine,
+        codecs,
+        limits: crate::envelope::Limits {
+            rows: 7,
+            bytes: 1 << 20,
+        },
+        batch: 100,
+        timeout: std::time::Duration::from_secs(5),
+        backoff: crate::run::Backoff::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        ),
+        bound: crate::relay::Bound {
+            messages: 50,
+            bytes: 1 << 30,
+        },
+    }
+}
+
+/// The server, its relay, and its replicas as the protocol says they behave,
+/// on a transport that keeps each one's messages in order.
 struct World {
-    pool: crate::DbPool,
     conn: sqlx::pool::PoolConnection<crate::Db>,
     engine: Engine,
     codecs: Vec<Codec<()>>,
     partitions: Vec<Uuid>,
-    held: BTreeMap<Uuid, Held>,
-    /// Rows the engine could not send a replica, until the fix.
-    quarantined: BTreeSet<(Uuid, String, String)>,
+    wire: Wire,
+    replicas: BTreeMap<Uuid, Model>,
     history: Vec<String>,
 }
 
@@ -392,149 +428,150 @@ async fn world(pool: crate::DbPool) -> World {
         .expect("engine");
     tx.commit().await.expect("installed");
     World {
-        pool,
         conn,
         engine,
         codecs,
         partitions,
-        held: BTreeMap::new(),
-        quarantined: BTreeSet::new(),
+        wire: Wire::new(0x5EED),
+        replicas: BTreeMap::new(),
         history: Vec::new(),
     }
 }
 
 impl World {
-    /// Drains the outbox as the relay does, a batch at a time — what became of
-    /// the replicas looked at first — into the
-    /// modelled replicas; when `walk` is given, another connection writes
-    /// between the plan and the load of some batches. Answers the deltas.
-    async fn sync(&mut self, mut walk: Option<&mut Walk>) -> Vec<Delta> {
-        let mut deltas = Vec::new();
-        loop {
-            let mut tx = self.conn.begin().await.expect("a transaction");
-            self.engine.observe(&mut tx).await.expect("observed");
+    /// One round of the system: the relay's pass — observed, recorded,
+    /// published — then each replica takes what reached it and says what it
+    /// applied and refused. With `storm`, anything may go wrong on the way:
+    /// the relay dies between its record and its sends, or loses its lock
+    /// while recording; a replica takes only some of what waits for it, dies
+    /// before acknowledging one, or says nothing, or its report is lost.
+    /// Answers whether anything moved.
+    async fn round(&mut self, mut storm: Option<&mut Walk>) -> bool {
+        let mut chance = |n: usize| storm.as_deref_mut().is_some_and(|w| w.below(n) == 0);
+        if !chance(1) {
+            // The backoffs ran out: out of a storm, nothing waits for a clock.
+            sqlx::query("UPDATE sync.replicas SET retry_after = now()")
+                .execute(&mut *self.conn)
+                .await
+                .expect("waits over");
+        }
+        let mut tx = self.conn.begin().await.expect("a transaction");
+        self.engine.observe(&mut tx).await.expect("observed");
+        tx.commit().await.expect("commit");
+        let live: BTreeSet<Uuid> = sqlx::query_scalar("SELECT id FROM t_replicas WHERE live")
+            .fetch_all(&mut *self.conn)
+            .await
+            .expect("live")
+            .into_iter()
+            .collect();
+        let relay = relay(&self.engine, &self.codecs);
+        let mut tx = self
+            .conn
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .expect("a transaction");
+        let outcome = relay.record(&mut tx).await.expect("recorded");
+        if chance(12) {
+            self.history
+                .push("the relay lost its lock while recording".to_owned());
+            drop(tx);
+        } else {
             tx.commit().await.expect("commit");
-            let mut tx = self
-                .conn
-                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        }
+        let before: BTreeMap<Uuid, usize> = self
+            .replicas
+            .keys()
+            .chain(live.iter())
+            .map(|r| (*r, self.wire.ids(*r).len()))
+            .collect();
+        let sent = if chance(12) {
+            self.history
+                .push("the relay died before it sent".to_owned());
+            0
+        } else {
+            relay
+                .publish(&mut self.conn, &self.wire)
                 .await
-                .expect("a transaction");
-            let notes = pending(&mut tx, 1000).await.expect("pending");
-            if notes.is_empty() {
-                return deltas;
-            }
-            let live: BTreeSet<Uuid> = sqlx::query_scalar("SELECT id FROM t_replicas WHERE live")
-                .fetch_all(&mut *tx)
-                .await
-                .expect("live")
-                .into_iter()
-                .collect();
-            let mut by_scope: BTreeMap<Option<Uuid>, Vec<Note>> = BTreeMap::new();
-            for note in notes {
-                by_scope.entry(note.scope).or_default().push(note);
-            }
-            let mut planned = Vec::new();
-            for (scope, notes) in by_scope {
-                let changes: Vec<Change> = notes.iter().map(|n| n.change.clone()).collect();
-                let mut delta = self.engine.plan(&mut tx, &changes).await.expect("plan");
-                if let Some(replica) = scope {
-                    delta.keep_only(replica);
-                }
-                let dead: Vec<Uuid> = Engine::replicas(&delta)
-                    .difference(&live)
-                    .copied()
-                    .collect();
+                .expect("published")
+                .sent
+        };
+        for (replica, count) in before {
+            assert!(
+                live.contains(&replica) || self.wire.ids(replica).len() == count,
+                "{replica} is not live and was sent something; last steps: {:#?}",
+                self.last_steps()
+            );
+        }
+        let mut moved = outcome.done + sent > 0;
+        let targets: Vec<Uuid> = self.wire.queues.lock().unwrap().keys().copied().collect();
+        for replica in targets {
+            let take = storm.as_deref_mut().map_or(usize::MAX, |w| w.below(4));
+            let model = self.replicas.entry(replica).or_default();
+            for _ in 0..take {
+                let Some(bytes) = self.wire.next(replica) else {
+                    break;
+                };
+                model.receive(&bytes, &RULES);
+                moved = true;
+                let orphans = model.orphans(&RULES);
                 assert!(
-                    dead.is_empty(),
-                    "{dead:?} are not live and are sent something; last steps: {:#?}",
+                    orphans.is_empty(),
+                    "{replica} holds rows without their parents: {orphans:?}; last steps: {:#?}",
                     &self.history[self.history.len().saturating_sub(8)..]
                 );
-                planned.push((notes, delta));
-            }
-            if let Some(walk) = walk.as_deref_mut() {
-                if walk.below(2) == 0 {
-                    let mut other = self.pool.acquire().await.expect("a second connection");
-                    if let Step::Wrote(what) = step(&mut other, walk, &self.partitions).await {
-                        self.history.push(format!("between plan and load: {what}"));
-                    }
+                if storm.as_deref_mut().is_some_and(|w| w.below(15) == 0) {
+                    // It died after its commit, before acknowledging.
+                    break;
                 }
+                self.wire.acknowledge(replica);
             }
-            let mut loaded = Vec::new();
-            for (_, delta) in &mut planned {
-                loaded.push(
-                    self.engine
-                        .load(&mut tx, &self.codecs, delta, usize::MAX)
-                        .await
-                        .expect("load"),
-                );
+        }
+        let replicas: Vec<Uuid> = self.replicas.keys().copied().collect();
+        for replica in replicas {
+            if storm.as_deref_mut().is_some_and(|w| w.below(3) == 0) {
+                continue;
             }
-            tx.commit().await.expect("commit");
-            for ((_, delta), loaded) in planned.iter().zip(&loaded) {
-                self.deliver(delta, loaded);
+            let Some(up) = self.replicas[&replica].up() else {
+                continue;
+            };
+            crate::filing::file(&mut self.conn, &self.codecs, &up, replica, &())
+                .await
+                .expect("filed");
+            moved = true;
+            if storm.as_deref_mut().is_some_and(|w| w.below(10) == 0) {
+                // Filed, and the uplink's answer lost: it says it again.
+                continue;
             }
-            let mut tx = self.conn.begin().await.expect("a transaction");
-            for (notes, delta) in &planned {
-                self.engine.record(&mut tx, delta).await.expect("record");
-                let ids: Vec<i64> = notes.iter().map(|n| n.id).collect();
-                mark_done(&mut tx, &ids).await.expect("mark");
-            }
-            tx.commit().await.expect("commit");
-            for delta in planned.iter().map(|(_, delta)| delta) {
-                for replica in Engine::replicas(delta) {
+            self.replicas
+                .get_mut(&replica)
+                .expect("modelled")
+                .delivered(&up);
+        }
+        moved
+    }
+
+    /// Rounds without a fault until nothing moves: every note planned, every
+    /// outbox sent, every message applied and confirmed. Then each replica
+    /// holds what the engine records it holding.
+    async fn settle(&mut self) {
+        let faults = std::mem::take(&mut *self.wire.faults.lock().unwrap());
+        for _ in 0..200 {
+            if !self.round(None).await {
+                *self.wire.faults.lock().unwrap() = faults;
+                let replicas: Vec<Uuid> = self.replicas.keys().copied().collect();
+                for replica in replicas {
                     self.assert_recorded(replica).await;
                 }
+                return;
             }
-            deltas.extend(planned.into_iter().map(|(_, delta)| delta));
         }
+        panic!(
+            "the system did not settle; last steps: {:#?}",
+            self.last_steps()
+        );
     }
 
-    /// What one plan sends, applied to each replica's model as the replica
-    /// applies its messages; a row that could not be sent waits for the fix.
-    fn deliver(&mut self, delta: &Delta, loaded: &Loaded) {
-        for unsent in &loaded.failed {
-            assert!(
-                unsent.reason.contains("a value this build cannot encode"),
-                "{unsent:?} could not go, and nothing but the bug should stop a row"
-            );
-            self.quarantined
-                .insert((unsent.replica, unsent.table.to_owned(), unsent.key.clone()));
-        }
-        for replica in Engine::replicas(delta) {
-            let held = self.held.entry(replica).or_default();
-            // A snapshot's end sweeps every row of the tables it names that
-            // the snapshot did not send.
-            if delta.snapshots.contains(&replica) {
-                let swept = self.engine.snapshot_tables();
-                held.retain(|(table, _), _| !swept.contains(&table.as_str()));
-            }
-            for table in self.engine.rows(delta, loaded, replica) {
-                for (bytes, key) in table.upserts.iter().zip(&table.keys) {
-                    let row = serde_json::from_slice(bytes).expect("a row as JSON");
-                    held.insert((table.table.clone(), key.parts.join("|")), row);
-                }
-                for key in &table.deletes {
-                    held.remove(&(table.table.clone(), key.parts.join("|")));
-                }
-            }
-            for ((table, key), row) in held.iter() {
-                for (child, columns, parent) in REFERENCES {
-                    if child != table {
-                        continue;
-                    }
-                    if let Some(parent_key) = key_of(row, columns) {
-                        assert!(
-                            held.contains_key(&((*parent).to_owned(), parent_key.clone())),
-                            "{replica} was sent {table} {key} without its {parent} {parent_key}; \
-                             last steps: {:#?}",
-                            &self.history[self.history.len().saturating_sub(8)..],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The engine records `replica` holding exactly what it was sent.
+    /// The engine records `replica` holding exactly what it holds.
     async fn assert_recorded(&mut self, replica: Uuid) {
         let recorded: BTreeSet<(String, String)> =
             sqlx::query_as("SELECT relation, row_key FROM sync.held WHERE replica_id = $1")
@@ -545,13 +582,26 @@ impl World {
                 .into_iter()
                 .collect();
         let holds: BTreeSet<(String, String)> = self
-            .held
+            .replicas
             .get(&replica)
-            .map(|held| held.keys().cloned().collect())
+            .map(|m| m.rows.keys().cloned().collect())
             .unwrap_or_default();
+        let live: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM t_replicas WHERE id = $1 AND live)")
+                .bind(replica)
+                .fetch_one(&mut *self.conn)
+                .await
+                .expect("live");
+        if !live {
+            assert!(
+                recorded.is_empty(),
+                "{replica} is not live and is recorded holding {recorded:?}"
+            );
+            return;
+        }
         assert!(
             recorded == holds,
-            "{replica}: recorded other than sent:\n  recorded, not sent {:?}\n  sent, not recorded {:?}\n  last steps: {:#?}",
+            "{replica}: recorded other than held:\n  recorded, not held {:?}\n  held, not recorded {:?}\n  last steps: {:#?}",
             recorded.difference(&holds).collect::<Vec<_>>(),
             holds.difference(&recorded).collect::<Vec<_>>(),
             self.last_steps(),
@@ -563,39 +613,31 @@ impl World {
     }
 
     /// Each live replica holds exactly what its strategies say, every row as
-    /// it is now, and the engine records exactly what it holds; one not live
-    /// is recorded as holding nothing. A replica with rows set aside for it is
-    /// left out until the fix lets them through.
+    /// it is now; one not live is recorded as holding nothing. A replica with
+    /// rows set aside for it is left out until the fix lets them through.
     async fn assert_holdings(&mut self, seed: u64, step: usize) {
-        let replicas: Vec<(Uuid, bool)> = sqlx::query_as(
-            "SELECT r.id, coalesce(v.live, false) FROM fixture.t_replicas r \
-               LEFT JOIN t_replicas v ON v.id = r.id ORDER BY r.id",
-        )
-        .fetch_all(&mut *self.conn)
-        .await
-        .expect("replicas");
-        for (replica, live) in replicas {
-            let recorded: BTreeSet<(String, String)> =
-                sqlx::query_as("SELECT relation, row_key FROM sync.held WHERE replica_id = $1")
-                    .bind(replica)
-                    .fetch_all(&mut *self.conn)
-                    .await
-                    .expect("held")
-                    .into_iter()
-                    .collect();
-            if !live {
-                assert!(
-                    recorded.is_empty(),
-                    "seed {seed:#x}, after step {step}: {replica} is not live and is recorded holding {recorded:?}"
-                );
+        let replicas: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM t_replicas WHERE live ORDER BY id")
+                .fetch_all(&mut *self.conn)
+                .await
+                .expect("replicas");
+        let quarantined: BTreeSet<Uuid> =
+            sqlx::query_scalar::<_, Uuid>("SELECT DISTINCT replica_id FROM sync.quarantine")
+                .fetch_all(&mut *self.conn)
+                .await
+                .expect("quarantine")
+                .into_iter()
+                .collect();
+        for replica in replicas {
+            if quarantined.contains(&replica) {
                 continue;
             }
-            self.assert_recorded(replica).await;
-            let held = self.held.get(&replica).cloned().unwrap_or_default();
+            let held = self
+                .replicas
+                .get(&replica)
+                .map(|m| m.rows.clone())
+                .unwrap_or_default();
             let holds: BTreeSet<(String, String)> = held.keys().cloned().collect();
-            if self.quarantined.iter().any(|(r, _, _)| *r == replica) {
-                continue;
-            }
             let should = expected(&mut self.conn, replica).await;
             assert!(
                 holds == should,
@@ -605,10 +647,11 @@ impl World {
                 holds.difference(&should).collect::<Vec<_>>(),
                 self.last_steps(),
             );
-            for ((table, key), row) in &held {
+            for ((table, key), bytes) in &held {
+                let row: serde_json::Value = serde_json::from_slice(bytes).expect("JSON");
                 let now = self.current(table, key).await;
                 assert!(
-                    Some(row) == now.as_ref(),
+                    Some(&row) == now.as_ref(),
                     "seed {seed:#x}, after step {step}, {replica} holds {table} {key} as\n  {row}\n  and it is now\n  {now:?}\n  last steps: {:#?}",
                     self.last_steps(),
                 );
@@ -630,18 +673,12 @@ impl World {
         Some(serde_json::from_slice(bytes).expect("JSON"))
     }
 
-    /// Notes again, for its replica alone, every row set aside: what the
-    /// relay does once a deploy fixed what refused them.
+    /// What a relay does once a deploy fixed what refused them: every row
+    /// set aside goes again.
     async fn retry_quarantine(&mut self) {
-        for (replica, table, key) in std::mem::take(&mut self.quarantined) {
-            sqlx::query("INSERT INTO sync.notes (kind, relation, row_key, scope) VALUES ('row', $1, $2, $3)")
-                .bind(table)
-                .bind(key)
-                .bind(replica)
-                .execute(&mut *self.conn)
-                .await
-                .expect("noted again");
-        }
+        crate::relay::retry_quarantine(&mut self.conn)
+            .await
+            .expect("noted again");
     }
 }
 
@@ -923,7 +960,32 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
 async fn every_replica_holds_exactly_what_its_strategies_say(pool: crate::DbPool) {
     let mut world = world(pool).await;
     for seed in SEEDS {
-        walk_from(&mut world, seed).await;
+        walk_from(&mut world, seed, None).await;
+    }
+}
+
+/// Whatever goes wrong on the way — sends that fail or are refused for good,
+/// a relay that dies between its record and its sends or loses its lock
+/// while recording, replicas that take part of what waits for them, die
+/// before acknowledging, say nothing or are not heard — every replica holds
+/// what the engine records it holding each time the system settles, never
+/// a row without its parent on the way, and once the faults stop and the
+/// fix is deployed, exactly what it should: with nobody touching the data,
+/// and without a provisioning to cover for what went wrong.
+#[sqlx::test(migrations = false)]
+async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    for seed in &SEEDS[..3] {
+        let faults = Faults {
+            fail: 20,
+            refuse_one_in: 4,
+        };
+        walk_from(&mut world, *seed, Some(faults)).await;
+        let (failed, refused) = *world.wire.failed.lock().unwrap();
+        assert!(
+            failed > 0 && refused > 0,
+            "seed {seed:#x}: the storm was none"
+        );
     }
 }
 
@@ -939,7 +1001,16 @@ const SEEDS: [u64; 8] = [
     0x1357_9BDF_2468_ACE0,
 ];
 
-async fn walk_from(world: &mut World, seed: u64) {
+/// Provisionings the walk asked for itself, or that a replica's coming and
+/// going asked for: any more were the engine covering for something.
+async fn resyncs(conn: &mut Conn) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM sync.notes WHERE kind = 'resync'")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("resyncs")
+}
+
+async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
     // What the previous walk left behind: every replica starts from a snapshot.
     sqlx::query(
         "INSERT INTO sync.notes (partition_id, kind, replica_id) \
@@ -948,21 +1019,40 @@ async fn walk_from(world: &mut World, seed: u64) {
     .execute(&mut *world.conn)
     .await
     .expect("resync");
-    world.sync(None).await;
+    world.settle().await;
+    *world.wire.faults.lock().unwrap() = faults.unwrap_or_default();
     let mut walk = Walk(seed);
+    let mut storm = Walk(seed ^ 0xFFFF);
     world.history.clear();
+    let before = resyncs(&mut world.conn).await;
+    let mut asked = 0;
     for n in 0..400 {
         let last = n == 399;
         match step(&mut world.conn, &mut walk, &world.partitions).await {
-            Step::Wrote(what) => world.history.push(what),
+            Step::Wrote(what) => {
+                if what == "58"
+                    || what == "59"
+                    || what == "60"
+                    || what == "61"
+                    || what == "62"
+                    || what == "63"
+                {
+                    asked += 1;
+                }
+                world.history.push(what);
+            }
             Step::Skipped => {}
             Step::Cured => {
                 world.history.push("the fix".to_owned());
                 world.retry_quarantine().await;
             }
         }
+        if faults.is_some() && walk.below(2) == 0 {
+            world.round(Some(&mut storm)).await;
+        }
         if walk.below(3) == 0 || last {
             if last {
+                *world.wire.faults.lock().unwrap() = Faults::default();
                 for table in ["t_kinds", "t_sizes"] {
                     sqlx::query(&format!(
                         "UPDATE fixture.{table} SET name = 'cured' WHERE name = $1"
@@ -972,20 +1062,27 @@ async fn walk_from(world: &mut World, seed: u64) {
                     .await
                     .expect("the fix");
                 }
-                world.sync(None).await;
+                world.settle().await;
                 world.retry_quarantine().await;
             }
-            world.sync(Some(&mut walk)).await;
-            if last {
-                world.sync(None).await;
-            }
+            world.settle().await;
             world.assert_holdings(seed, n).await;
         }
     }
+    let quarantined: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.quarantine")
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("quarantine");
+    assert_eq!(
+        quarantined, 0,
+        "seed {seed:#x}: still set aside after the fix"
+    );
+    let resynced = resyncs(&mut world.conn).await - before;
+    // A replica the transport refuses again and again, or whose outbox
+    // outgrows its bound, is provisioned again: rare, never the rule.
     assert!(
-        world.quarantined.is_empty(),
-        "seed {seed:#x}: still set aside after the fix: {:?}",
-        world.quarantined
+        resynced <= asked * 2 + 3,
+        "seed {seed:#x}: {resynced} provisionings for {asked} asked for"
     );
 }
 
@@ -999,21 +1096,26 @@ async fn a_changed_row_goes_again_to_every_replica_holding_it(pool: crate::DbPoo
         .execute(&mut *world.conn)
         .await
         .expect("a product");
-    world.sync(None).await;
+    world.settle().await;
     sqlx::query("UPDATE fixture.t_products SET name = 'q' WHERE id = $1")
         .bind(product)
         .execute(&mut *world.conn)
         .await
         .expect("a rename");
-    let deltas = world.sync(None).await;
-    let sent: usize = deltas
-        .iter()
-        .flat_map(|d| d.upserts.values())
-        .flat_map(|t| t.values())
-        .filter(|keys| keys.contains(&product.to_string()))
+    world.settle().await;
+    let renamed = world
+        .replicas
+        .values()
+        .filter(|m| {
+            m.rows
+                .get(&("t_products".to_owned(), product.to_string()))
+                .is_some_and(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(bytes).expect("JSON")["name"] == "q"
+                })
+        })
         .count();
     assert_eq!(
-        sent, 2,
+        renamed, 2,
         "both live holdings of the partition get the new name"
     );
 }
@@ -1230,7 +1332,7 @@ async fn notes_are_planned_in_one_snapshot_or_not_at_all(pool: crate::DbPool) {
 #[sqlx::test(migrations = false)]
 async fn notes_this_build_cannot_read_hold_back_none_behind_them(pool: crate::DbPool) {
     let mut world = world(pool).await;
-    world.sync(None).await;
+    world.settle().await;
     for _ in 0..5 {
         sqlx::query("INSERT INTO sync.notes (kind) VALUES ('row')")
             .execute(&mut *world.conn)

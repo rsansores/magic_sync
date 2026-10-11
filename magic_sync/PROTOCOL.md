@@ -384,7 +384,10 @@ this safety net.
 - A row is sent with every row it points at that the replica lacks, and is
   taken back only once nothing the replica keeps points at it.
 - Every message carries a number of its own, and the numbers a replica is
-  sent rise within an epoch in the order it is sent them.
+  sent rise within an epoch in the order it is sent them. What a message
+  carries is recorded before it is sent, and a message that the transport
+  did not take is sent again, under the same number, before anything after
+  it.
 - A replica that leaves the last messages it was sent unconfirmed, while
   nothing newer goes to it, is provisioned again after a while: the transport
   may have lost them.

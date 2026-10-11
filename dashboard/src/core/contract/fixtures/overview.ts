@@ -76,7 +76,7 @@ export default {
       ],
       "total": 4
     },
-    "pending": 3,
+    "pending": 0,
     "quarantine": {
       "first": [
         {
@@ -101,7 +101,7 @@ export default {
         "failures": 0,
         "last_error": null,
         "owed": 0,
-        "parked": 3,
+        "parked": 2,
         "pending": 0,
         "quarantined": 1,
         "replica": "00000000-0000-7000-8000-000000000002",
@@ -117,15 +117,15 @@ export default {
         "backlog": null,
         "failures": 1,
         "last_error": "00000000-0000-7000-8000-000000000001 unreachable",
-        "owed": 3,
+        "owed": 1,
         "parked": 0,
-        "pending": 3,
+        "pending": 0,
         "quarantined": 0,
         "replica": "00000000-0000-7000-8000-000000000001",
         "retry_at": "2026-01-01T00:00:00.123456Z",
         "sent_at": null,
         "state": "unreachable",
-        "unconfirmed": false,
+        "unconfirmed": true,
         "unfiled": 0,
         "waiting_since": null
       },
@@ -184,11 +184,11 @@ export default {
   },
   "tables": [
     {
-      "in_flight": 3,
+      "in_flight": 6,
       "parked": 1,
-      "pending": 3,
+      "pending": 0,
       "quarantined": 1,
-      "replicas": 2,
+      "replicas": 3,
       "synced": false,
       "table": "items",
       "unfiled": 0

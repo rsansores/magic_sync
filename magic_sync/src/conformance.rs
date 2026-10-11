@@ -311,6 +311,10 @@ mod server {
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(60),
             ),
+            bound: crate::relay::Bound {
+                messages: 1_000,
+                bytes: 1 << 30,
+            },
         };
         let mut snapshots: Vec<String> = Vec::new();
         let mut out = String::new();
@@ -318,17 +322,19 @@ mod server {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
             loop {
                 let kept = Kept::default();
-                let mut tx = pool
-                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
-                    .await
-                    .unwrap();
-                let prepared = relay.prepare(&mut tx).await.unwrap();
+                let mut conn = pool.acquire().await.unwrap();
+                let mut tx = sqlx::Connection::begin_with(
+                    &mut *conn,
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ",
+                )
+                .await
+                .unwrap();
+                let done = relay.record(&mut tx).await.unwrap().done;
                 tx.commit().await.unwrap();
-                let Some(prepared) = prepared else { break };
-                let sent = relay.publish(&kept, prepared).await;
-                let mut tx = pool.begin().await.unwrap();
-                relay.record(&mut tx, sent).await.unwrap();
-                tx.commit().await.unwrap();
+                relay.publish(&mut conn, &kept).await.unwrap();
+                if done == 0 {
+                    break;
+                }
                 for bytes in kept.0.into_inner().unwrap() {
                     let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
                     let snapshot = match &mut message.body {

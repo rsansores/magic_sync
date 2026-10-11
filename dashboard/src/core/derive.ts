@@ -41,6 +41,8 @@ export interface ReplicaRow {
   /** When it last said it applied a message. */
   heardAt: number | null
   pending: number
+  /** Messages written for it that the transport has not taken yet. */
+  owed: number
   unconfirmed: boolean
   quarantined: number
   parked: number
@@ -179,6 +181,7 @@ function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
     silentFor,
     heardAt: timeOf(r.applied_at),
     pending: r.pending,
+    owed: r.owed,
     unconfirmed: r.unconfirmed,
     quarantined: r.quarantined,
     parked: r.parked,

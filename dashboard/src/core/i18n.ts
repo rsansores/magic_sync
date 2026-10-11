@@ -69,6 +69,10 @@ const en: MessageTable = {
     one: '{n} change on its way.',
     other: '{n} changes on their way.',
   },
+  'replica.owed': {
+    one: '{n} message waits to be sent to it.',
+    other: '{n} messages wait to be sent to it.',
+  },
   'replica.applying': 'Applying what it was sent.',
   'replica.backlog': {
     one: '{n} row of its own is not at the server yet.',
@@ -216,6 +220,10 @@ const es: MessageTable = {
   'replica.pending': {
     one: '{n} cambio en camino.',
     other: '{n} cambios en camino.',
+  },
+  'replica.owed': {
+    one: '{n} mensaje espera enviársele.',
+    other: '{n} mensajes esperan enviársele.',
   },
   'replica.applying': 'Aplicando lo que se le envió.',
   'replica.backlog': {

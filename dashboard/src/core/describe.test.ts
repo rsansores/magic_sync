@@ -44,11 +44,11 @@ describe('describeReplica', () => {
     expect(describeReplica(away, speech())).toEqual([
       'Cannot be reached.',
       'Tried again now.',
-      '3 changes on their way.',
+      '1 message waits to be sent to it.',
     ])
     expect(describeReplica({ ...away, retryAt: null }, speech())).toEqual([
       'Cannot be reached.',
-      '3 changes on their way.',
+      '1 message waits to be sent to it.',
     ])
   })
 
@@ -71,11 +71,10 @@ describe('describeTable', () => {
   it('says each figure of a table that is behind in a sentence of its own', () => {
     const items = summary().tables.find((t) => t.table === 'items')!
     expect(describeTable(items, speech())).toEqual([
-      '3 changes waiting to be sent.',
-      '3 rows on their way.',
+      '6 rows on their way.',
       '1 row set aside.',
       '1 change held back.',
-      '2 replicas are behind on it.',
+      '3 replicas are behind on it.',
     ])
     expect(describeTable({ ...items, synced: true }, speech())).toEqual(['In sync everywhere.'])
   })

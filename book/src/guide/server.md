@@ -59,8 +59,12 @@ When sending fails, say whether a retry may help:
 ```
 
 > **What happens:** either way, that replica waits out a backoff while every
-> other replica carries on, and everything it is owed is noted again for it
-> alone; a refusal shows in its `last_error`. A send that does not answer
+> other replica carries on; the message stays first in its outbox, with
+> everything after it, and goes again, in order, when the backoff ends. A
+> refusal shows in its `last_error`; a message refused for good again and
+> again, or an outbox grown past its bound, is dropped and the replica
+> provisioned again — an alarm. The same message always goes under the same
+> `id`. A send that does not answer
 > within `send_timeout` is a transient failure. The engine never hands a
 > transport a message larger than its limit: a row too big for any message is
 > set aside instead.
@@ -89,10 +93,11 @@ is planned and sent again by the next relay, as after a crash:
 >   like: one of them runs the relay, the others stand by and take over if it
 >   goes away.
 > - While it holds the lock, it reads the noted changes, plans what each
->   replica should hold against what it holds, sends the difference through
->   your transport, and records what each replica now holds — on the lock's own
->   connection, so a process that lost the lock cannot record over the one
->   that took it.
+>   replica should hold against what it holds, and — in one transaction on the
+>   lock's own connection, so a process that lost the lock cannot record over
+>   the one that took it — records what each replica will hold and writes the
+>   messages that carry the difference to the replica's outbox. Then it sends
+>   every outbox through your transport.
 > - When it takes the lock — usually after a deploy — and every hour, it tries
 >   again whatever it set aside: notes it could not plan, rows it could not
 >   send, uploads it could not file. A deploy that fixed the cause lets them

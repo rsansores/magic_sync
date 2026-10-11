@@ -17,7 +17,7 @@ use crate::wire::Codec;
 use crate::Error;
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 use std::future::Future;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -80,9 +80,14 @@ impl Senders for Anyone {
 pub struct Settings {
     /// How large a message the transport takes.
     pub limits: Limits,
-    /// Notes planned per pass, and how many a replica left out of passes may
-    /// be owed before it is provisioned again instead.
+    /// Notes planned per pass.
     pub batch: NonZeroU32,
+    /// Messages a replica's outbox may hold — written for it and not yet
+    /// taken by the transport, while it cannot be reached — before they are
+    /// dropped and it is provisioned again instead, which is an alarm.
+    pub outbox_messages: NonZeroU32,
+    /// Bytes its outbox may hold, likewise.
+    pub outbox_bytes: NonZeroU64,
     /// The advisory lock only the running relay holds.
     pub lock_key: i64,
     /// The role every transaction of the engine's own assumes, when the
@@ -121,6 +126,8 @@ impl Default for Settings {
                 bytes: 512 * 1024,
             },
             batch: NonZeroU32::new(500).expect("not zero"),
+            outbox_messages: NonZeroU32::new(10_000).expect("not zero"),
+            outbox_bytes: NonZeroU64::new(256 << 20).expect("not zero"),
             // "SYNCENGN"
             lock_key: 0x5359_4e43_454e_474e,
             role: None,
@@ -391,8 +398,9 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         Ok(Some(filed))
     }
 
-    /// One pass now, as the relay, for a host's tests or a tool: what was
-    /// done, or `None` when another process runs the relay.
+    /// One pass now, as the relay, for a host's tests or a tool: how many
+    /// notes it planned and messages it sent, or `None` when another
+    /// process runs the relay.
     ///
     /// # Errors
     ///
@@ -407,37 +415,38 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         done.map(Some)
     }
 
-    /// One pass, as the relay holding `lock`: what was done.
-    async fn pass(&self, lock: &mut Lock) -> Result<usize, Error> {
-        let relay = Relay {
+    fn relay(&self) -> Relay<'_, S::Known> {
+        Relay {
             engine: &self.engine,
             codecs: &self.codecs,
             limits: self.settings.limits,
             batch: i64::from(self.settings.batch.get()),
             timeout: self.settings.send_timeout,
             backoff: self.settings.replica_backoff,
-        };
-        let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
+            bound: relay::Bound {
+                messages: i64::from(self.settings.outbox_messages.get()),
+                bytes: i64::try_from(self.settings.outbox_bytes.get()).unwrap_or(i64::MAX),
+            },
+        }
+    }
+
+    /// One pass, as the relay holding `lock`: the notes planned and
+    /// recorded with the messages they send, then every outbox sent. What
+    /// was done: notes, and messages sent.
+    async fn pass(&self, lock: &mut Lock) -> Result<usize, Error> {
+        let relay = self.relay();
+        let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
         self.engine.observe(&mut tx).await?;
         tx.commit().await?;
-        let prepared = {
-            // One snapshot for the notes, the plan and the rows it loads.
-            let mut tx = begin(
-                &self.pool,
+        // One snapshot for the notes, the plan and the rows it loads, and
+        // what it records commits only while this process is the relay.
+        let mut tx = lock
+            .fenced(
                 "BEGIN ISOLATION LEVEL REPEATABLE READ",
                 self.settings.role.as_deref(),
             )
             .await?;
-            let prepared = relay.prepare(&mut tx).await?;
-            tx.rollback().await?;
-            prepared
-        };
-        let Some(prepared) = prepared else {
-            return Ok(0);
-        };
-        let sent = relay.publish(&self.transport, prepared).await;
-        let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
-        let outcome = relay.record(&mut tx, sent).await?;
+        let outcome = relay.record(&mut tx).await?;
         tx.commit().await?;
         for (note, why) in &outcome.parked {
             tracing::error!(
@@ -446,10 +455,11 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 "sync: a note parked — it is planned again after a deploy"
             );
         }
-        for (replica, why) in &outcome.failing {
+        let published = relay.publish(&mut lock.conn, &self.transport).await?;
+        for (replica, why) in &published.failing {
             tracing::warn!(%replica, why, "sync: a replica could not be sent to — it waits, the others carry on");
         }
-        Ok(outcome.done)
+        Ok(outcome.done + published.sent)
     }
 
     /// The relay, for as long as this process holds `lock`.
@@ -517,7 +527,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// the inbox again, all of it: an upload that fails again holds back no
     /// other.
     async fn retry(&self, lock: &mut Lock) -> Result<(), Error> {
-        let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
+        let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
         let unparked = relay::unpark(&mut tx).await?;
         let retried = relay::retry_quarantine(&mut tx).await?;
         tx.commit().await?;
@@ -592,7 +602,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// bug), never repair data.
     async fn watch(&self, lock: &mut Lock) {
         let healed = async {
-            let mut tx = lock.fenced(self.settings.role.as_deref()).await?;
+            let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
             let healed =
                 relay::heal(&mut tx, &self.engine, self.settings.unconfirmed_after).await?;
             tx.commit().await?;
@@ -728,8 +738,12 @@ impl Lock {
     /// A transaction on the lock's own connection: it commits only while this
     /// process holds the lock, so a relay that lost it cannot write over the
     /// one that took it.
-    async fn fenced(&mut self, role: Option<&str>) -> Result<Transaction<'_, Postgres>, Error> {
-        let mut tx = self.conn.begin().await?;
+    async fn fenced(
+        &mut self,
+        statement: &'static str,
+        role: Option<&str>,
+    ) -> Result<Transaction<'_, Postgres>, Error> {
+        let mut tx = self.conn.begin_with(statement).await?;
         assume(&mut tx, role).await?;
         Ok(tx)
     }

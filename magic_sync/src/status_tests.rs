@@ -39,7 +39,7 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
 
     // The replica says it applied everything it was sent.
     let (epoch, last): (Uuid, i64) = sqlx::query_as(
-        "SELECT e.epoch, r.last_sequence FROM sync.epoch e, sync.replicas r WHERE r.replica_id = $1",
+        "SELECT e.epoch, c.last_sequence FROM sync.epoch e, sync.chains c WHERE c.replica_id = $1",
     )
     .bind(a)
     .fetch_one(&mut *conn)
@@ -106,56 +106,42 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
 }
 
 /// A transport that fails at random and queues what it takes, per replica,
-/// until the replica takes it: a message can be on its way for a while.
+/// until the replica takes it — a message can be on its way for a while —
+/// and the replicas, as the protocol says they behave.
 struct Mailbox {
-    walk: Mutex<crate::testkit::Walk>,
-    failure_rate: Mutex<u64>,
-    queues: Mutex<BTreeMap<Uuid, std::collections::VecDeque<Body>>>,
-    replicas: Mutex<BTreeMap<Uuid, Modelled>>,
-}
-
-impl Transport for Mailbox {
-    fn send(
-        &self,
-        replica: Uuid,
-        message: Vec<u8>,
-        _id: &str,
-    ) -> impl Future<Output = Result<(), Error>> + Send {
-        let fails =
-            self.walk.lock().unwrap().below(100) < *self.failure_rate.lock().unwrap() as usize;
-        let result = if fails {
-            Err(Error::Transport {
-                reason: "the network".into(),
-                transient: true,
-            })
-        } else {
-            self.queues
-                .lock()
-                .unwrap()
-                .entry(replica)
-                .or_default()
-                .push_back(body(&message));
-            Ok(())
-        };
-        async move { result }
-    }
+    wire: crate::model::Wire,
+    replicas: Mutex<BTreeMap<Uuid, crate::model::Model>>,
 }
 
 impl Mailbox {
     /// `replica` takes up to `count` messages, in order: what it applied
     /// last, and what it holds.
     fn take(&self, replica: Uuid, count: usize) -> (u64, BTreeMap<Uuid, String>) {
-        let mut queues = self.queues.lock().unwrap();
-        let queue = queues.entry(replica).or_default();
         let mut replicas = self.replicas.lock().unwrap();
         let held = replicas.entry(replica).or_default();
         for _ in 0..count {
-            let Some(message) = queue.pop_front() else {
+            let Some(message) = self.wire.next(replica) else {
                 break;
             };
-            held.apply(message);
+            held.receive(&message, &crate::model::Rules::ANY);
+            self.wire.acknowledge(replica);
         }
-        (held.last, held.items.clone())
+        let items = held
+            .rows
+            .iter()
+            .map(|((_, key), bytes)| {
+                let row = ItemRow::decode(bytes.as_slice()).expect("an item");
+                (key.parse().expect("a uuid"), row.name)
+            })
+            .collect();
+        (held.applied.as_ref().map_or(0, |(_, s)| *s), items)
+    }
+
+    fn failing(&self, rate: usize) {
+        *self.wire.faults.lock().unwrap() = crate::model::Faults {
+            fail: rate,
+            refuse_one_in: 0,
+        };
     }
 }
 
@@ -167,11 +153,10 @@ impl Mailbox {
 async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPool) {
     let world = world(pool).await;
     let chaos = Mailbox {
-        walk: Mutex::new(crate::testkit::Walk(0x5EED)),
-        failure_rate: Mutex::new(20),
-        queues: Mutex::new(BTreeMap::new()),
+        wire: crate::model::Wire::new(0x5EED),
         replicas: Mutex::new(BTreeMap::new()),
     };
+    chaos.failing(20);
     let mut walk = crate::testkit::Walk(0xACC0);
     let mut synced_seen = 0;
     let should = || async {
@@ -200,7 +185,7 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
         // fix deployed, so replicas can settle.
         let calm = step % 40 >= 28;
         if step % 40 == 28 {
-            *chaos.failure_rate.lock().unwrap() = 0;
+            chaos.failing(0);
             BUGGY.set(false);
             let mut conn = world.pool.acquire().await.unwrap();
             unpark(&mut conn).await.unwrap();
@@ -210,7 +195,7 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
                 .await
                 .unwrap();
         } else if step % 40 == 0 {
-            *chaos.failure_rate.lock().unwrap() = 20;
+            chaos.failing(20);
             BUGGY.set(true);
         }
         if !calm {
@@ -231,7 +216,7 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
             }
         }
         if calm || walk.below(2) == 0 {
-            world.pass_with(&chaos).await;
+            world.pass(&chaos.wire).await;
         }
         for replica in world.replicas {
             // It takes some of what waits for it, and says so — or not yet.
@@ -267,7 +252,7 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
     );
 
     // The network back and the fix deployed: everything settles.
-    *chaos.failure_rate.lock().unwrap() = 0;
+    chaos.failing(0);
     BUGGY.set(false);
     let mut conn = world.pool.acquire().await.unwrap();
     unpark(&mut conn).await.unwrap();
@@ -278,7 +263,7 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
         .unwrap();
     drop(conn);
     for _ in 0..50 {
-        if world.pass_with(&chaos).await.done == 0 {
+        if world.pass(&chaos.wire).await.done == 0 {
             break;
         }
     }
@@ -336,13 +321,11 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
 
     let pool = &world.pool;
     let last = |replica: Uuid| async move {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT last_sequence FROM sync.replicas WHERE replica_id = $1",
-        )
-        .bind(replica)
-        .fetch_one(pool)
-        .await
-        .unwrap() as u64
+        sqlx::query_scalar::<_, i64>("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
+            .bind(replica)
+            .fetch_one(pool)
+            .await
+            .unwrap() as u64
     };
     world.acknowledge(a, last(a).await).await;
     let half = world.overview(Scope::All).await;
@@ -488,16 +471,15 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
     let two = world.item("two").await;
     let three = world.item("three").await;
     sqlx::query(
-        "INSERT INTO sync.notes (kind, relation, row_key, partition_id, scope) \
-         VALUES ('row', 'items', 'not-a-key', $1, $2)",
+        "INSERT INTO sync.notes (kind, relation, row_key, partition_id) \
+         VALUES ('row', 'items', 'not-a-key', $1)",
     )
-    .bind(world.partition)
-    .bind(refusing)
+    .bind(Uuid::now_v7())
     .execute(&world.pool)
     .await
     .unwrap();
-    // Changes the planner set aside, one of each kind: owed to or about
-    // `refusing`, or of a partition no replica in the scope belongs to.
+    // Changes the planner set aside, one of each kind: about `refusing`, or
+    // of a partition no replica in the scope belongs to — the one above too.
     sqlx::query(
         "INSERT INTO sync.notes (kind, relation, replica_id, partition_id, parked_at, attempts, last_error) \
          VALUES ('members', 'list_members', NULL, $3, now(), 1, 'a bug'), \
@@ -588,7 +570,9 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
         .await
         .unwrap();
 
-    // Then `one` changes and `two` retires, for every state of a row.
+    // Then `one` changes, `two` retires and `four` is written, for every
+    // state of a row.
+    let four = world.item("four").await;
     world
         .exec(
             "UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2",
@@ -604,7 +588,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
         )
         .await;
     let mut rows = Vec::new();
-    for key in [one, two, three] {
+    for key in [one, two, three, four] {
         rows.push(
             world
                 .engine
@@ -726,7 +710,7 @@ async fn a_change_owed_to_one_replica_outdates_no_other(pool: crate::DbPool) {
     let one = world.item("one").await;
     world.pass(&wire).await;
     let last: i64 =
-        sqlx::query_scalar("SELECT last_sequence FROM sync.replicas WHERE replica_id = $1")
+        sqlx::query_scalar("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
             .bind(b)
             .fetch_one(&world.pool)
             .await
@@ -898,8 +882,8 @@ async fn a_row_reaching_a_replica_through_two_groups_counts_once(pool: crate::Db
 }
 
 /// One replica out of reach is the network's to settle, not a fix to deploy:
-/// the health stays healthy, and the changes owed to it alone do not make
-/// the backlog look stuck.
+/// the health stays healthy, and what waits for it waits in its outbox, not
+/// on the planner, so the backlog does not look stuck.
 #[sqlx::test(migrations = false)]
 async fn a_replica_out_of_reach_leaves_the_health_healthy(pool: crate::DbPool) {
     let world = world(pool).await;
@@ -912,10 +896,16 @@ async fn a_replica_out_of_reach_leaves_the_health_healthy(pool: crate::DbPool) {
     let overview = world.overview(Scope::All).await;
     assert_eq!(overview.health.failing.total, 1);
     assert!(overview.health.healthy, "{:?}", overview.health);
+    assert_eq!((overview.health.pending, overview.health.oldest), (0, None));
+    let out_of_reach = overview
+        .replicas
+        .first
+        .iter()
+        .find(|r| r.replica == a)
+        .unwrap();
     assert_eq!(
-        (overview.health.pending, overview.health.oldest),
-        (1, None),
-        "owed to the replica out of reach alone: not waiting on the planner"
+        (out_of_reach.owed, out_of_reach.state),
+        (1, ReplicaState::Unreachable)
     );
 }
 

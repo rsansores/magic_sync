@@ -76,7 +76,8 @@ state: ReplicaState,
  */
 pending: number, 
 /**
- * Of those, the ones owed to it alone after a send to it failed.
+ * Messages written for it that the transport has not taken yet: what
+ * waits for it, in order, while it cannot be reached.
  */
 owed: number, 
 /**
@@ -100,7 +101,8 @@ unfiled: number,
  */
 failures: number, 
 /**
- * The last failed send's error.
+ * The last failed send's error — or, failing none, why what waited for
+ * it was last dropped and it was provisioned again.
  */
 last_error: string | null, 
 /**
@@ -223,7 +225,7 @@ table: string | null,
  */
 key: string | null, 
 /**
- * The replica it is about, or owed to alone.
+ * The replica it is about.
  */
 replica: string | null, 
 /**
@@ -344,8 +346,7 @@ healthy: boolean,
  */
 pending: number, 
 /**
- * When the oldest change the planner is due to get to was noted: one
- * owed to a replica out of reach waits for it, and is not counted here.
+ * When the oldest change not yet planned was noted.
  */
 oldest: string | null, 
 /**
