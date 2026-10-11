@@ -246,7 +246,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             drop(tx);
             conn.close_on_drop();
             match stop {
-                Stop::Culprit(culprit) => care.refuse(culprit)?,
+                Stop::Culprits(culprits) => care.refuse(culprits)?,
                 Stop::Failed(e) if e.is_refusal() && care.heed() => {}
                 Stop::Failed(e) => return Err(e),
             }

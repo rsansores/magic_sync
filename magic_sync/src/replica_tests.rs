@@ -53,8 +53,12 @@ async fn world(pool: SqlitePool) -> World {
 }
 
 async fn world_with(pool: SqlitePool, settings: Settings) -> World {
+    world_over(pool, TABLES, settings).await
+}
+
+async fn world_over(pool: SqlitePool, tables: &str, settings: Settings) -> World {
     let pool = settled(pool).await;
-    sqlx::raw_sql(TABLES).execute(&pool).await.expect("tables");
+    sqlx::raw_sql(tables).execute(&pool).await.expect("tables");
     install(&mut pool.acquire().await.unwrap(), &codecs())
         .await
         .expect("installed");
@@ -1372,6 +1376,60 @@ async fn a_row_still_pointed_at_is_retired_or_rejected_never_a_failed_message(po
     ))
     .await;
     assert_eq!(w.items().await, ["back"]);
+}
+
+/// A mirrored table whose foreign key is deferred fails the commit of a
+/// message that sends a row without its parent, and that message would come
+/// again for ever: the row is refused, as one the database refuses at once,
+/// and the rest of the message is applied — however many rows are in it.
+#[sqlx::test(migrations = false)]
+async fn a_row_whose_deferred_parent_is_missing_is_refused_not_the_message(pool: SqlitePool) {
+    let tables = TABLES.replace(
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL,",
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL \
+         REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED,",
+    );
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let parent = Uuid::from_u128(1);
+    let price = |id: Uuid| {
+        let row = Price {
+            id,
+            cents: 1,
+            updated_at: at(0),
+        };
+        (key(&[&id.to_string()]), json(&row))
+    };
+    let orphans: Vec<Uuid> = (10..510).map(Uuid::from_u128).collect();
+    let mut rows = vec![price(parent)];
+    rows.extend(orphans.iter().map(|id| price(*id)));
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts("items", vec![item(parent, "parent")]),
+            upserts("prices", rows),
+        ],
+    ))
+    .await;
+    assert_eq!(
+        w.texts("SELECT lower(hex(id)) FROM prices").await.len(),
+        1,
+        "the price with a parent"
+    );
+    assert_eq!(w.count("SELECT count(*) FROM sync_rejections").await, 500);
+    assert_eq!(w.items().await, ["parent"]);
+    // Sent again with its parent, a refused row is taken and no more reported.
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            upserts("items", vec![item(orphans[0], "late")]),
+            upserts("prices", vec![price(orphans[0])]),
+        ],
+    ))
+    .await;
+    assert_eq!(w.count("SELECT count(*) FROM prices").await, 2);
+    assert_eq!(w.count("SELECT count(*) FROM sync_rejections").await, 499);
 }
 
 /// A row the replica's own rows point at through a key that would cascade
@@ -3608,6 +3666,37 @@ async fn a_two_way_row_that_cannot_be_held_for_its_edit_is_rejected_alone(pool: 
         w.texts("SELECT title FROM tasks").await,
         ["stuck"],
         "the held one let go of once filed"
+    );
+}
+
+/// A row whose refusal rolls the whole message back is found by applying it
+/// again, so a message of many costs one rerun for each: five hundred of five
+/// hundred and five are all refused, and the message applied, in seconds.
+#[sqlx::test(migrations = false)]
+async fn five_hundred_rows_that_each_roll_the_message_back_are_all_refused(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec(
+        "CREATE TRIGGER doomed BEFORE INSERT ON items WHEN NEW.name = 'doom' \
+         BEGIN SELECT RAISE(ROLLBACK, 'doomed'); END",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<_> = (0..505u128)
+        .map(|n| {
+            item(
+                Uuid::from_u128(n + 1),
+                if n % 101 < 100 { "doom" } else { "fine" },
+            )
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    w.receive(&down(1, "", vec![upserts("items", rows)])).await;
+    assert_eq!(w.items().await.len(), 5);
+    assert_eq!(w.rejected().await.len(), 500);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
     );
 }
 

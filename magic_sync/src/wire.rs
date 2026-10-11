@@ -276,6 +276,17 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.retire(conn, keys, held)
     }
 
+    /// The keys of `keys` whose row points at one this replica does not hold
+    /// ([`row::unparented`]).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn unparented<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        keys: &'a [Key],
+    ) -> Fut<'a, Vec<Key>> {
+        self.ops.unparented(conn, keys)
+    }
+
     /// Every key this side holds.
     #[cfg(feature = "sqlite")]
     pub(crate) fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
@@ -397,6 +408,8 @@ trait Ops<P>: Send + Sync {
     ) -> Fut<'a, row::Retired>;
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
+    #[cfg(feature = "sqlite")]
+    fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
     fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
@@ -715,5 +728,10 @@ where
     #[cfg(feature = "sqlite")]
     fn live_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
         Box::pin(row::live_keys::<R>(conn))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::unparented::<R>(conn, keys))
     }
 }

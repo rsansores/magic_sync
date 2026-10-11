@@ -119,6 +119,46 @@ mod imp {
         }
     }
 
+    /// The foreign keys of `table`, as `(parent, its columns, the parent's
+    /// columns)`: a key naming no parent columns names the parent's primary
+    /// key.
+    pub(crate) async fn pointing_from(
+        conn: &mut Conn,
+        table: &str,
+    ) -> Result<Vec<(String, Vec<String>, Vec<String>)>, Error> {
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT f.id, f."table", f."from", f."to"
+                 FROM pragma_foreign_key_list(?1) f ORDER BY f.id, f.seq"#,
+        )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut out: Vec<(i64, String, Vec<String>, Vec<String>)> = Vec::new();
+        for (id, parent, from, to) in rows {
+            if out.last().is_none_or(|(last, ..)| *last != id) {
+                out.push((id, parent, Vec::new(), Vec::new()));
+            }
+            let (.., from_columns, to_columns) = out.last_mut().expect("just pushed");
+            from_columns.push(from);
+            to_columns.extend(to);
+        }
+        let mut keys = Vec::with_capacity(out.len());
+        for (_, parent, from, to) in out {
+            if to.len() == from.len() {
+                keys.push((parent, from, to));
+                continue;
+            }
+            let primary: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk",
+            )
+            .bind(&parent)
+            .fetch_all(&mut *conn)
+            .await?;
+            keys.push((parent, from, primary));
+        }
+        Ok(keys)
+    }
+
     /// The foreign keys that point at rows of `table`, whatever they do on
     /// delete — refuse it (`NO ACTION`, `RESTRICT`, deferred or not), or
     /// change the row that points (`CASCADE`, `SET NULL`, `SET DEFAULT`),

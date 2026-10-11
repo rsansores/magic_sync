@@ -645,6 +645,57 @@ pub(crate) async fn retire_by_keys<R: Row>(
     Ok(retired)
 }
 
+/// The keys of `keys` whose row points, through a foreign key, at a row the
+/// database does not hold: what a deferred key refuses at commit, found
+/// before it does — none when the connection enforces no foreign key. A key
+/// with a null column points at nothing.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn unparented<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<Key>, Error> {
+    let enforced: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *exec)
+        .await?;
+    if enforced == 0 {
+        return Ok(Vec::new());
+    }
+    let missing: Vec<String> = crate::dialect::pointing_from(exec, R::TABLE)
+        .await?
+        .into_iter()
+        .map(|(parent, from, to)| {
+            let set = |c: &String| format!("{}.{}", R::QUALIFIED, ident(c));
+            let known: Vec<String> = from
+                .iter()
+                .zip(&to)
+                .map(|(f, t)| format!("p.{} = {}", ident(t), set(f)))
+                .collect();
+            let present: Vec<String> = from
+                .iter()
+                .map(|f| format!("{} IS NOT NULL", set(f)))
+                .collect();
+            format!(
+                "({} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {}))",
+                present.join(" AND "),
+                ident(&parent),
+                known.join(" AND ")
+            )
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kinds = key_kinds::<R>();
+    let mut orphans = Vec::new();
+    for chunk in keys.chunks(keys_per_statement::<R>()) {
+        let mut qb =
+            sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(R::KEY), R::QUALIFIED));
+        key_filter::<R>(&mut qb, chunk);
+        qb.push(format!(" AND ({})", missing.join(" OR ")));
+        for row in qb.build().fetch_all(&mut *exec).await? {
+            orphans.push(key_of_row(&row, &kinds)?);
+        }
+    }
+    Ok(orphans)
+}
+
 /// Runs the statement `build` makes for `keys` in a savepoint, adding the
 /// rows it touched to `affected`; when the database refuses it, runs it key
 /// by key, and answers the keys refused, with why.

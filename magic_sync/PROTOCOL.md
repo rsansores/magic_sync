@@ -212,8 +212,10 @@ If a row does not decode, if the replica's database refuses it for its data
 the replica **must** leave that row as it was, apply everything else, and
 record a **rejection** (section 6) in the same transaction. Nothing a message
 carries fails it — not even a row whose refusal rolls the whole transaction
-back (a trigger's `RAISE(ROLLBACK)`): the replica applies the message again,
-row by row, with that row rejected before it is tried. Only a failure of the
+back (a trigger's `RAISE(ROLLBACK)`), nor one a deferred foreign key would
+refuse at commit because the row it points at is not held: the replica
+applies the message again, row by row, with those rows rejected before they
+are tried. Only a failure of the
 replica's own storage (the database is unavailable, the disk is full, the
 file is damaged) fails the message: then the replica **must not**
 acknowledge it, and it will be delivered again.
