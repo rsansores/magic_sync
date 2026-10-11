@@ -235,6 +235,13 @@ the replica owns, set to when it was retired. Retired rows are out of
 everything the replica offers its users, but stay for what points at them. A
 retired row the server sends again becomes live.
 
+A row of a table written on both sides that the replica edited, and whose
+edit the server has not filed yet (section 7), is retired too when it is let
+go of, rather than deleted: the edit still goes up, as the row is. Once the
+server files it (4.4), the replica lets go of the row. Where the table has
+nothing to retire it by, the replica refuses to let it go (section 6), and
+the server sends the delete again later.
+
 ### 4.4 `Filed`
 
 The server answers each upload (section 7) once it has filed it. On `Filed`,
@@ -333,8 +340,9 @@ For a table the replica writes and the server mirrors:
    What the replica writes while applying what the server sent is not
    noted: it is the server's already. A row of a table written on both sides
    begins on the server; the replica edits only its own columns of it, and
-   only those edits go up. A record without a version is history, written
-   once.
+   only those edits go up: it **must** refuse an insert of one, an update
+   of a column it does not own, and a delete unless the table is keyed by
+   the replica. A record without a version is history, written once.
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only

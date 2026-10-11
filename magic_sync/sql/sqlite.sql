@@ -69,6 +69,15 @@ CREATE TABLE sync_rejections (
     PRIMARY KEY (table_name, row_key)
 );
 
+-- Rows of tables written on both sides the server let go of while what this
+-- replica wrote of them had not reached it: kept retired, and let go of once
+-- the server files it.
+CREATE TABLE sync_leaving (
+    relation TEXT NOT NULL,
+    row_key  TEXT NOT NULL,
+    PRIMARY KEY (relation, row_key)
+);
+
 -- What this replica wrote, noted in the writing transaction by a trigger on
 -- each table that goes up: one note per row — the table and its key (its
 -- parts as text, joined by |) — and how many writes it noted (`writes`). An

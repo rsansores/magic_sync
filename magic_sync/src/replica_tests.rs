@@ -21,7 +21,8 @@ CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, na
 CREATE TABLE shelves (aisle BLOB NOT NULL, slot INTEGER NOT NULL, label TEXT NOT NULL, revision INTEGER NOT NULL,
     PRIMARY KEY (aisle, slot));
 CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL, cents INTEGER NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE tasks (id BLOB PRIMARY KEY NOT NULL, title TEXT NOT NULL, done INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE tasks (id BLOB PRIMARY KEY NOT NULL, title TEXT NOT NULL, done INTEGER NOT NULL, updated_at TEXT NOT NULL,
+    retired_at TEXT);
 CREATE TABLE readings (replica_id BLOB NOT NULL, id BLOB NOT NULL, value INTEGER NOT NULL, at INTEGER NOT NULL,
     PRIMARY KEY (replica_id, id));
 CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL, what TEXT NOT NULL);
@@ -276,8 +277,17 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: 
         };
         assert_eq!(state().await, expected, "after {step}");
         if step == "rows" {
-            // The replica's own column, kept through the server's edits.
+            // The replica's own column, kept through the server's edits —
+            // and filed, so the server's deletes let the row go.
             w.exec("UPDATE tasks SET done = 1").await.unwrap();
+            let up = w.up(0, false).await.expect("the edit");
+            w.receive(
+                &Body::Filed(Filed {
+                    uploads: up.uploads,
+                })
+                .encoded(),
+            )
+            .await;
         }
     }
     assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
@@ -1040,16 +1050,44 @@ async fn a_two_way_row_keeps_the_replicas_columns_and_sends_only_its_edits(pool:
     );
     assert_eq!(up.tables[0].keys, [key(&[&id.to_string()])]);
 
+    // The server's columns are its own, and so is letting a row go: the
+    // replica's database refuses either.
+    for refused in ["UPDATE tasks SET title = 'mine'", "DELETE FROM tasks"] {
+        assert!(w.exec(refused).await.is_err(), "{refused}");
+    }
+
+    // Let go of while its edit is on its way: kept retired until the edit
+    // is filed, then let go of.
     w.receive(&down(
         3,
         "",
         vec![deletes("tasks", vec![key(&[&id.to_string()])])],
     ))
     .await;
-    assert_eq!(w.count("SELECT count(*) FROM tasks").await, 0);
     assert_eq!(
-        w.count("SELECT count(*) FROM sync_notes WHERE upload IS NULL")
+        w.count("SELECT count(*) FROM tasks WHERE retired_at IS NOT NULL")
             .await,
+        1,
+        "held retired for its edit"
+    );
+    assert!(
+        w.rejected().await.is_empty(),
+        "let go of, as far as the server is told"
+    );
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM tasks").await,
+        0,
+        "filed: let go of"
+    );
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
         0,
         "letting go of the server's row notes nothing"
     );

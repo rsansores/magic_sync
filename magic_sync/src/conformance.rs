@@ -46,13 +46,16 @@ pub struct Price {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Written on both sides: the server's title, the replica's `done`.
+/// Written on both sides: the server's title, the replica's `done`. One the
+/// server lets go of while the replica's edit is on its way is kept retired
+/// until the edit is filed.
 #[derive(sqlx::FromRow, Clone, Debug, PartialEq, Serialize, Deserialize, crate::Row)]
 #[row(
     table = "tasks",
     schema = "fixture",
     mirror = "both",
-    sync = "broadcast"
+    sync = "broadcast",
+    retired = "retired_at"
 )]
 pub struct Task {
     pub id: Uuid,
@@ -207,7 +210,7 @@ mod server {
         revision BIGINT NOT NULL, PRIMARY KEY (aisle, slot));
     CREATE TABLE fixture.prices (id UUID PRIMARY KEY, cents BIGINT NOT NULL, updated_at TIMESTAMPTZ NOT NULL);
     CREATE TABLE fixture.tasks (id UUID PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL);
+        updated_at TIMESTAMPTZ NOT NULL, retired_at TIMESTAMPTZ);
     ";
 
     /// Each step's statements, run before its pass.
@@ -222,7 +225,7 @@ mod server {
                ('0192f6a0-0000-7000-8000-000000000b01', 2, 'bottom', 1800000000000);
              INSERT INTO fixture.prices VALUES
                ('0192f6a0-0000-7000-8000-000000000c01', 9007199254740993, '2027-01-15 08:00:00.123456+00');
-             INSERT INTO fixture.tasks VALUES
+             INSERT INTO fixture.tasks (id, title, done, updated_at) VALUES
                ('0192f6a0-0000-7000-8000-000000000d01', 'count', false, '2027-01-15 08:00:00+00');",
         ),
         (

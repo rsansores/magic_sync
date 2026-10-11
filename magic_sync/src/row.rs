@@ -554,12 +554,14 @@ pub(crate) struct Retired {
 /// of the replica's own still points at — through a foreign key that would
 /// refuse the delete, checked now whether it is deferred or not — is kept
 /// with its retired column set; and one the database refuses to let go is
-/// answered apart, so it cannot fail the rest. A transient failure is the
-/// error.
+/// answered apart, so it cannot fail the rest. With `hold`, none is deleted:
+/// each is kept retired, for what the replica wrote of it has not reached
+/// the server yet. A transient failure is the error.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn retire_by_keys<R: Row>(
     exec: &mut Conn,
     keys: &[Key],
+    hold: bool,
 ) -> Result<Retired, Error> {
     let pointed: Vec<String> = crate::dialect::restricting(exec, R::TABLE, R::KEY)
         .await?
@@ -590,7 +592,11 @@ pub(crate) async fn retire_by_keys<R: Row>(
             qb.push(&unpointed);
             qb
         };
-        let refused = one_by_one(exec, chunk, delete, &mut retired.deleted).await?;
+        let refused = if hold {
+            Vec::new()
+        } else {
+            one_by_one(exec, chunk, delete, &mut retired.deleted).await?
+        };
         let left: Vec<Key> = chunk
             .iter()
             .filter(|key| !refused.iter().any(|(r, _)| r == *key))
@@ -600,10 +606,18 @@ pub(crate) async fn retire_by_keys<R: Row>(
         let Some(column) = R::RETIRED else {
             let held = key_select::<R>(exec, &left).await?;
             retired.refused.extend(held.into_iter().map(|key| {
-                let why = format!(
-                    "a row here points at it, and `{}` has no retired column to keep it by",
-                    R::TABLE
-                );
+                let why = if hold {
+                    format!(
+                        "what this replica wrote of it has not reached the server, and `{}` \
+                         has no retired column to keep it by",
+                        R::TABLE
+                    )
+                } else {
+                    format!(
+                        "a row here points at it, and `{}` has no retired column to keep it by",
+                        R::TABLE
+                    )
+                };
                 (key, why)
             }));
             continue;
@@ -1179,7 +1193,7 @@ mod tests {
                 .map_err(|e| e.to_string()),
             Ok(())
         );
-        let retired = retire_by_keys::<Order>(&mut conn, &[order.key()])
+        let retired = retire_by_keys::<Order>(&mut conn, &[order.key()], false)
             .await
             .unwrap();
         assert_eq!(retired.deleted, 1);

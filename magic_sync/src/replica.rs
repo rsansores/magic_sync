@@ -71,7 +71,9 @@ struct Trigger {
 ///   integer);
 /// - a record without a version is history: an update of one is refused;
 /// - a row of a table written on both sides begins on the server: an insert
-///   is refused, and only an update of the columns the replica owns goes up.
+///   is refused, so is an update of a column the replica does not own, and a
+///   delete unless the table is keyed by the replica; only an update of the
+///   columns the replica owns goes up.
 ///
 /// A write the engine makes while it applies what the server sent is noted
 /// by none and refused by none.
@@ -182,21 +184,35 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
                 let why =
                     format!("a row of `{table}` begins on the server: a replica only edits it");
                 out.push(refuse("INSERT", QUIET, why));
-                let owned: Vec<String> = codec
-                    .table
-                    .columns
+                let (owned, theirs): (Vec<&crate::row::Column>, Vec<&crate::row::Column>) =
+                    codec.table.columns.iter().partition(|c| c.replica_owned);
+                let changed = theirs
                     .iter()
-                    .filter(|c| c.replica_owned)
-                    .map(|c| ident(c.name))
-                    .collect();
+                    .map(|c| format!("OLD.{0} IS NOT NEW.{0}", ident(c.name)))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                let why = format!(
+                    "`{table}` is the server's but for the columns a replica owns: a replica \
+                     edits only those"
+                );
+                out.push(refuse("UPDATE", &format!("{QUIET} AND ({changed})"), why));
                 let of = if owned.is_empty() {
                     String::new()
                 } else {
+                    let owned: Vec<String> = owned.iter().map(|c| ident(c.name)).collect();
                     format!(" OF {}", owned.join(", "))
                 };
                 let body = format!("{guard}{}{gone}", note("NEW"));
                 out.push(noting("UPDATE", &of, QUIET, body));
-                out.push(noting("DELETE", "", QUIET, note("OLD")));
+                if codec.takes_deletes() {
+                    out.push(noting("DELETE", "", QUIET, note("OLD")));
+                } else {
+                    let why = format!(
+                        "a row of `{table}` is let go of by the server: a replica deletes one \
+                         only of a table keyed by it"
+                    );
+                    out.push(refuse("DELETE", QUIET, why));
+                }
             }
             Mirror::ServerOnly => {}
         }
@@ -465,7 +481,7 @@ async fn act<P: Sync + 'static>(
 ) -> Result<Received, Error> {
     match body {
         Body::Filed(message) => {
-            filed(conn, &message).await?;
+            filed(conn, codecs, &message).await?;
             Ok(Received::Filed)
         }
         Body::Down(down) => {
@@ -702,6 +718,14 @@ async fn apply<P: Sync + 'static>(
         }
         let held: Vec<String> = applied.held.iter().map(key_text).collect();
         cleared(conn, &table.table, &held).await?;
+        sqlx::query(
+            "DELETE FROM sync_leaving WHERE relation = $1 \
+               AND row_key IN (SELECT value FROM json_each($2))",
+        )
+        .bind(&table.table)
+        .bind(json(&held))
+        .execute(&mut *conn)
+        .await?;
         if naming {
             // Every row it carried, taken or refused: a refused one keeps
             // what the replica had of it, and its rejection, and is not swept.
@@ -726,15 +750,51 @@ async fn apply<P: Sync + 'static>(
 }
 
 /// Lets go of the rows of `keys`: the ones the database refuses to let go
-/// are rejected, the rest are no longer ones to report.
+/// are rejected, the rest are no longer ones to report. A row of a table
+/// written on both sides whose edits have not reached the server is held
+/// retired until they have ([`filed`]), so the edits are not lost.
 #[cfg(feature = "sqlite")]
 async fn let_go<P: Sync + 'static>(
     conn: &mut Conn,
     codec: &Codec<P>,
     keys: &[Key],
     sequence: i64,
-) -> Result<crate::row::Retired, Error> {
-    let retired = codec.retire(conn, keys).await?;
+) -> Result<(), Error> {
+    let noted: HashSet<String> = if matches!(codec.table.mirror, crate::row::Mirror::Both) {
+        sqlx::query_scalar(
+            "SELECT row_key FROM sync_notes WHERE relation = $1 \
+               AND row_key IN (SELECT value FROM json_each($2))",
+        )
+        .bind(codec.table.name)
+        .bind(json(&keys.iter().map(key_text).collect::<Vec<_>>()))
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        HashSet::new()
+    };
+    let (held, free): (Vec<Key>, Vec<Key>) = keys
+        .iter()
+        .cloned()
+        .partition(|key| noted.contains(&key_text(key)));
+    let mut retired = codec.retire(conn, &free, false).await?;
+    let holding = codec.retire(conn, &held, true).await?;
+    let leaving: Vec<String> = held
+        .iter()
+        .filter(|key| !holding.refused.iter().any(|(r, _)| r == *key))
+        .map(key_text)
+        .collect();
+    sqlx::query(
+        "INSERT OR IGNORE INTO sync_leaving (relation, row_key) \
+         SELECT $1, value FROM json_each($2)",
+    )
+    .bind(codec.table.name)
+    .bind(json(&leaving))
+    .execute(&mut *conn)
+    .await?;
+    retired.kept += holding.kept;
+    retired.refused.extend(holding.refused);
     for (key, why) in &retired.refused {
         reject(conn, codec.table.name, &[key_text(key)], why, sequence).await?;
     }
@@ -748,10 +808,17 @@ async fn let_go<P: Sync + 'static>(
         tracing::info!(
             table = codec.table.name,
             kept = retired.kept,
-            "sync: rows let go but still pointed at here — retired"
+            "sync: rows let go but still pointed at here, or with edits on their way — retired"
         );
     }
-    Ok(retired)
+    tracing::debug!(
+        table = codec.table.name,
+        deleted = retired.deleted,
+        kept = retired.kept,
+        refused = retired.refused.len(),
+        "sync: rows let go of"
+    );
+    Ok(())
 }
 
 /// Notes rows the replica could not take, or let go of, for the server to
@@ -844,14 +911,7 @@ async fn end_snapshot<P: Sync + 'static>(
             .into_iter()
             .filter(|key| !named.contains(&key_text(key)))
             .collect();
-        let retired = let_go(conn, codec, &stale, sequence).await?;
-        tracing::info!(
-            table,
-            deleted = retired.deleted,
-            kept = retired.kept,
-            refused = retired.refused.len(),
-            "sync: snapshot swept what it did not name"
-        );
+        let_go(conn, codec, &stale, sequence).await?;
     }
     sqlx::query("DELETE FROM sync_snapshot_keys")
         .execute(&mut *conn)
@@ -866,9 +926,14 @@ async fn end_snapshot<P: Sync + 'static>(
 /// done — unless the row was written since, which goes up again. A number
 /// no upload of this replica has, or that a note was sent under again since,
 /// names nothing: whether it was meant for another replica, or for this one
-/// before it was restored.
+/// before it was restored. A row the server let go of, held for its edits,
+/// is let go of once they are filed.
 #[cfg(feature = "sqlite")]
-async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Error> {
+async fn filed<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    message: &envelope::Filed,
+) -> Result<(), Error> {
     let uploads: Vec<i64> = message
         .uploads
         .iter()
@@ -877,9 +942,37 @@ async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Error> 
     sqlx::query(
         "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) AND writes = sent",
     )
-        .bind(json(&uploads))
-        .execute(&mut *conn)
-        .await?;
+    .bind(json(&uploads))
+    .execute(&mut *conn)
+    .await?;
+    let done: Vec<(String, String)> = sqlx::query_as(
+        "DELETE FROM sync_leaving AS l WHERE NOT EXISTS (SELECT 1 FROM sync_notes n \
+           WHERE n.relation = l.relation AND n.row_key = l.row_key) \
+         RETURNING relation, row_key",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for codec in codecs {
+        let keys: Vec<Key> = done
+            .iter()
+            .filter(|(table, _)| table == codec.table.name)
+            .filter_map(|(_, key)| {
+                let parts: Vec<String> = key.split('|').map(str::to_owned).collect();
+                codec.key(&parts).ok()
+            })
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let retired = codec.retire(conn, &keys, false).await?;
+        for (key, why) in retired.refused {
+            tracing::error!(
+                table = codec.table.name,
+                key = key_text(&key),
+                "sync: a row let go of, whose edits are filed, the database keeps — retired: {why}"
+            );
+        }
+    }
     Ok(())
 }
 
