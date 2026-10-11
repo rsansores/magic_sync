@@ -18,8 +18,10 @@ The first release: the engine extracted from the system it was built in.
   and `Engine::triggers` prints the triggers a host's migrations write; the
   server refuses to start while one is missing, disabled or different. On a
   replica, `replica::install` migrates and installs in one transaction,
-  `replica::triggers` writes the triggers for a host's migrations, and
-  `check` holds the database to exactly those.
+  `replica::migration` writes each released step (never edited) and
+  `replica::triggers` the triggers for a host's migrations, and `check`
+  holds the database to exactly those, and every connection to settings
+  the engine can keep its word on.
 - Replicas are provisioned when they become live or move partition, and
   forgotten when they stop being live; no host call needed.
 - The replica protocol (`PROTOCOL.md`, `proto/sync.proto`), version 1; the

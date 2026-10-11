@@ -182,6 +182,18 @@ impl Uplinked {
     }
 }
 
+/// `pool`'s database, through connections set as a replica's must be
+/// ([`crate::replica::check`]).
+#[cfg(feature = "sqlite")]
+pub async fn settled(pool: sqlx::SqlitePool) -> sqlx::SqlitePool {
+    let options = (*pool.connect_options())
+        .clone()
+        .pragma("recursive_triggers", "ON");
+    sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("the same database")
+}
+
 /// Where the golden uploads are kept: what the replica sends, captured on
 /// the sqlite side, filed by the postgres side's server.
 pub const GOLDEN_UP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/to_server.txt");

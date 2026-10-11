@@ -24,7 +24,8 @@ build upgraded is refused by an earlier one rather than misread.
   on a replica, in one transaction.
 - **With migrations**, the upgrade is a migration of yours that runs the
   release's step, as your first one ran [`POSTGRES_SCHEMA`] (on a replica,
-  [`SQLITE_SCHEMA`]): the changelog names it. Print the triggers again
+  the step itself, [`replica::migration`]`(n)` for version `n`, which also
+  records the version): the changelog names it. Print the triggers again
   ([The tables](tables.md)) in the same migration: a release may write them
   differently, and the server refuses to start while one differs.
 
@@ -73,5 +74,5 @@ upgrade them together.
 
 [`SCHEMA_VERSION`]: ../api/server/magic_sync/constant.SCHEMA_VERSION.html
 [`POSTGRES_SCHEMA`]: ../api/server/magic_sync/constant.POSTGRES_SCHEMA.html
-[`SQLITE_SCHEMA`]: ../api/replica/magic_sync/constant.SQLITE_SCHEMA.html
+[`replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
 [`PROTOCOL`]: ../api/server/magic_sync/envelope/constant.PROTOCOL.html

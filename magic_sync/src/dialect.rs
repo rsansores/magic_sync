@@ -116,11 +116,13 @@ mod imp {
         }
     }
 
-    /// The foreign keys that refuse to let a row of `table` go while a row
-    /// points at it — `NO ACTION` or `RESTRICT` on delete, deferred or not —
+    /// The foreign keys that point at rows of `table`, whatever they do on
+    /// delete — refuse it (`NO ACTION`, `RESTRICT`, deferred or not), or
+    /// change the row that points (`CASCADE`, `SET NULL`, `SET DEFAULT`),
+    /// which would change a row of the replica's own the server never sent —
     /// as `(child, its columns, the parent's columns)`. A key naming no
     /// parent columns names the parent's primary key, `key`.
-    pub(crate) async fn restricting(
+    pub(crate) async fn pointing(
         conn: &mut Conn,
         table: &str,
         key: &[&str],
@@ -129,7 +131,6 @@ mod imp {
             r#"SELECT m.name, f.id, f."from", f."to"
                  FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) f
                 WHERE m.type = 'table' AND f."table" = ?1 COLLATE NOCASE
-                  AND upper(f.on_delete) IN ('NO ACTION', 'RESTRICT')
                 ORDER BY m.name, f.id, f.seq"#,
         )
         .bind(table)

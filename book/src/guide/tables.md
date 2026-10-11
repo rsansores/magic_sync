@@ -99,11 +99,11 @@ declaration changes.
 > sets `retired_at` instead: the product stays for the receipt, and your
 > screens leave retired rows out. Offered again, it is live again.
 
-Same two ways for the engine's part: your migrations run
-[`magic_sync::SQLITE_SCHEMA`] and the script [`magic_sync::replica::triggers`]
-writes for your codecs — print it once and paste it into the migration that
-creates the tables, and again when a table is added or changes how it
-travels:
+Same two ways for the engine's part: your migrations run the engine's
+first step, [`magic_sync::replica::migration`]`(1)`, and the script
+[`magic_sync::replica::triggers`] writes for your codecs — print them once
+and paste them into the migration that creates the tables, and the triggers
+again when a table is added or changes how it travels:
 
 ```rust,ignore
 {{#include ../../snippets/src/replica.rs:triggers}}
@@ -122,7 +122,7 @@ over the database your migrations build.
 
 [`magic_sync::POSTGRES_SCHEMA`]: ../api/server/magic_sync/constant.POSTGRES_SCHEMA.html
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers
-[`magic_sync::SQLITE_SCHEMA`]: ../api/replica/magic_sync/constant.SQLITE_SCHEMA.html
+[`magic_sync::replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
 [`magic_sync::replica::install`]: ../api/replica/magic_sync/replica/fn.install.html
 [`magic_sync::replica::check`]: ../api/replica/magic_sync/replica/fn.check.html
 [`magic_sync::replica::triggers`]: ../api/replica/magic_sync/replica/fn.triggers.html

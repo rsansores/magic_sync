@@ -1,13 +1,13 @@
--- The sync engine: a replica's side, version 1. The engine applies it in one
--- transaction with the triggers its tables need (replica::install); a host
--- with migrations runs it in one, with replica::triggers' script.
+-- The sync engine on a replica: the step to version 1, as released. Never
+-- edited: a later version is a step of its own. `replica::migration(1)` is
+-- this step and the version it brings the database to.
 
--- The version of this schema: the engine refuses to run against another.
+-- The version of the engine's tables: the engine refuses to run against
+-- another.
 CREATE TABLE sync_version (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
 );
-INSERT INTO sync_version (id, version) VALUES (1, 1);
 
 -- Present only while the engine applies what the server sent, inside that
 -- transaction: the triggers note no write it makes, and refuse none.
@@ -92,7 +92,6 @@ CREATE TABLE sync_notes (
     relation  TEXT    NOT NULL,
     row_key   TEXT    NOT NULL,
     writes    INTEGER NOT NULL DEFAULT 1,
-    noted_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     upload    INTEGER,
     sent      INTEGER,
     sent_at   TEXT,

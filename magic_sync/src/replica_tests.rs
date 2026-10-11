@@ -9,7 +9,7 @@
 //! lanes that do not wait for one another.
 
 use super::*;
-use crate::conformance::{codecs, json, Event, Price, Reading, Shelf, Task, Uplinked};
+use crate::conformance::{codecs, json, settled, Event, Price, Reading, Shelf, Task, Uplinked};
 use crate::envelope::{Backlog, Down, EndSnapshot, Filed, Key as WireKey, Table, ToReplica};
 use crate::run::replica::{Replica, Settings};
 use crate::testkit::ItemRow;
@@ -48,6 +48,7 @@ async fn world(pool: SqlitePool) -> World {
 }
 
 async fn world_with(pool: SqlitePool, settings: Settings) -> World {
+    let pool = settled(pool).await;
     sqlx::raw_sql(TABLES).execute(&pool).await.expect("tables");
     install(&mut pool.acquire().await.unwrap(), &codecs())
         .await
@@ -216,6 +217,7 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 /// changes nothing the second time.
 #[sqlx::test(migrations = false)]
 async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: SqlitePool) {
+    let pool = settled(pool).await;
     use crate::conformance::{golden, GOLDEN, NEXT_EPOCH, REPLICA, UPLOAD};
     let w = world(pool).await;
     // A check of the replica's own, which the server's rows may fail.
@@ -380,6 +382,7 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: 
 /// `MAGIC_SYNC_BLESS=1` writes it anew.
 #[sqlx::test(migrations = false)]
 async fn the_golden_upload_is_what_the_replica_sends(pool: SqlitePool) {
+    let pool = settled(pool).await;
     use crate::conformance::{hex, matches_golden, GOLDEN_UP, REPLICA, UPLOAD};
     let w = world(pool).await;
     w.exec(&format!(
@@ -407,6 +410,7 @@ async fn the_golden_upload_is_what_the_replica_sends(pool: SqlitePool) {
 /// goes on from where it was.
 #[sqlx::test(migrations = false)]
 async fn every_malformed_message_of_the_corpus_is_taken_as_such(pool: SqlitePool) {
+    let pool = settled(pool).await;
     use crate::conformance::{golden, EPOCH as SERVER, MALFORMED};
     let w = world(pool).await;
     let provisioned = Body::EndSnapshot(EndSnapshot {
@@ -1072,6 +1076,101 @@ async fn a_row_still_pointed_at_is_retired_or_rejected_never_a_failed_message(po
     assert_eq!(w.items().await, ["back"]);
 }
 
+/// A row the replica's own rows point at through a key that would cascade
+/// or set them null is kept, retired, like one a key would refuse to let
+/// go: letting it go would change rows of the replica's that the server
+/// never sent.
+#[sqlx::test(migrations = false)]
+async fn a_row_let_go_never_changes_the_replicas_own_rows_through_their_keys(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec(
+        "CREATE TABLE tags (id INTEGER PRIMARY KEY, item_id BLOB REFERENCES items (id) ON DELETE CASCADE);
+         CREATE TABLE marks (id INTEGER PRIMARY KEY, item_id BLOB REFERENCES items (id) ON DELETE SET NULL);
+         CREATE TABLE stamps (id INTEGER PRIMARY KEY,
+             item_id BLOB DEFAULT x'00' REFERENCES items (id) ON DELETE SET DEFAULT);",
+    )
+    .await
+    .unwrap();
+    let [tagged, marked, stamped, free] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "items",
+            vec![
+                item(tagged, "tagged"),
+                item(marked, "marked"),
+                item(stamped, "stamped"),
+                item(free, "free"),
+            ],
+        )],
+    ))
+    .await;
+    for (table, id) in [("tags", tagged), ("marks", marked), ("stamps", stamped)] {
+        sqlx::query(&format!("INSERT INTO {table} (item_id) VALUES ($1)"))
+            .bind(id)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    let gone = [tagged, marked, stamped, free].map(|id| key(&[&id.to_string()]));
+    w.receive(&down(2, "", vec![deletes("items", gone.to_vec())]))
+        .await;
+    assert_eq!(
+        w.texts("SELECT name FROM items WHERE retired_at IS NOT NULL ORDER BY name")
+            .await,
+        ["marked", "stamped", "tagged"]
+    );
+    assert_eq!(
+        w.count("SELECT count(*) FROM items").await,
+        3,
+        "free is gone"
+    );
+    let pointing = w
+        .count(
+            "SELECT (SELECT count(*) FROM tags WHERE item_id IS NOT NULL) \
+                  + (SELECT count(*) FROM marks WHERE item_id IS NOT NULL) \
+                  + (SELECT count(*) FROM stamps WHERE item_id <> x'00')",
+        )
+        .await;
+    assert_eq!(pointing, 3, "the replica's own rows as they were");
+    assert!(w.rejected().await.is_empty());
+}
+
+/// A row an `INSERT OR REPLACE` deletes to make room — another row with the
+/// same value of a unique column — goes up as gone: the replica's
+/// connections fire triggers on what a conflict replaces.
+#[sqlx::test(migrations = false)]
+async fn a_row_a_replace_deletes_goes_up_as_gone(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("CREATE UNIQUE INDEX one_reading_a_value ON readings (value)")
+        .await
+        .unwrap();
+    let [first, second] = ids();
+    for (id, at) in [(first, 1), (second, 2)] {
+        sqlx::query(
+            "INSERT OR REPLACE INTO readings (replica_id, id, value, at) VALUES ($1, $2, 7, $3)",
+        )
+        .bind(w.me)
+        .bind(id)
+        .bind(at)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    }
+    let up = w.up(0, false).await.expect("the writes");
+    let readings = up.tables.iter().filter(|t| t.table == "readings");
+    let deleted: Vec<String> = readings
+        .clone()
+        .flat_map(|t| t.deletes.iter().map(|k| k.parts.join("|")))
+        .collect();
+    let written: Vec<String> = readings
+        .flat_map(|t| t.keys.iter().map(|k| k.parts.join("|")))
+        .collect();
+    assert_eq!(deleted, [format!("{}|{first}", w.me)]);
+    assert_eq!(written, [format!("{}|{second}", w.me)]);
+}
+
 /// Rejections from before a snapshot began are forgotten when it ends: it
 /// sent again everything the replica should hold.
 #[sqlx::test(migrations = false)]
@@ -1389,6 +1488,7 @@ async fn what_the_replica_wrote_is_pending_until_the_server_filed_it(pool: Sqlit
 /// come, every note is.
 #[sqlx::test(migrations = false)]
 async fn no_answer_forgets_a_write_it_did_not_carry(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let settings = Outbox {
         limits: Limits {
             rows: 3,
@@ -1678,6 +1778,7 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
 /// counted — rather than offered for ever.
 #[sqlx::test(migrations = false)]
 async fn a_message_up_fits_the_transport_and_a_row_too_large_is_set_aside(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let limits = Limits {
         rows: 100,
         bytes: envelope::ENVELOPE_ROOM + 600,
@@ -1726,7 +1827,7 @@ async fn a_message_up_fits_the_transport_and_a_row_too_large_is_set_aside(pool: 
 /// the rows are offered again when the replica runs again.
 #[sqlx::test(migrations = false)]
 async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool: SqlitePool) {
-    let w = world(pool.clone()).await;
+    let w = world(pool).await;
     sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
         .bind(Uuid::now_v7())
         .execute(&w.pool)
@@ -1739,9 +1840,15 @@ async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool:
     assert!(up.tables.is_empty());
     assert_eq!(up.backlog.unwrap().tables[0].set_aside, 1);
 
-    let again = Replica::new(pool, codecs(), w.me, w.uplink.clone(), Settings::default())
-        .await
-        .unwrap();
+    let again = Replica::new(
+        w.pool.clone(),
+        codecs(),
+        w.me,
+        w.uplink.clone(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
     again.send_lane(0, false).await.unwrap();
     let (_, up) = w.uplink.taken().pop().unwrap();
     assert_eq!(up.tables[0].upserts.len(), 1, "offered again");
@@ -1751,6 +1858,7 @@ async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool:
 /// another.
 #[sqlx::test(migrations = false)]
 async fn a_lane_that_fails_holds_back_no_other(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let settings = Settings {
         lanes: vec![
             Lane {
@@ -1842,6 +1950,7 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
 /// report: the server would take the refused rows for applied.
 #[sqlx::test(migrations = false)]
 async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let settings = Settings {
         outbox: Outbox {
             rejections: std::num::NonZeroUsize::MIN,
@@ -2034,6 +2143,7 @@ async fn only_a_table_keyed_by_its_replica_sends_its_deletes(pool: SqlitePool) {
 /// included — and every row goes, once.
 #[sqlx::test(migrations = false)]
 async fn every_message_up_fits_whatever_it_carries(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let limits = Limits {
         rows: 500,
         bytes: envelope::ENVELOPE_ROOM + 700,
@@ -2095,6 +2205,7 @@ async fn every_message_up_fits_whatever_it_carries(pool: SqlitePool) {
 /// The tables the suite runs on are their rows, column for column.
 #[sqlx::test(migrations = false)]
 async fn the_suites_tables_are_their_rows(pool: SqlitePool) {
+    let pool = settled(pool).await;
     sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
     let codecs = codecs();
     let tables: Vec<&crate::row::Table> = codecs.iter().map(|c| &c.table).collect();
@@ -2109,6 +2220,7 @@ async fn the_suites_tables_are_their_rows(pool: SqlitePool) {
 /// primary key.
 #[sqlx::test(migrations = false)]
 async fn a_table_that_is_not_its_row_is_refused_with_every_difference(pool: SqlitePool) {
+    let pool = settled(pool).await;
     sqlx::raw_sql(
         "CREATE TABLE events (id BLOB NOT NULL, what BLOB, extra TEXT, PRIMARY KEY (id, extra))",
     )
@@ -2216,17 +2328,31 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
     assert!(script.contains("sync_note_readings_update"));
 
     let cases = [
-        "DROP TRIGGER sync_note_readings_update; CREATE TRIGGER sync_note_readings_update \
-         AFTER UPDATE ON readings BEGIN INSERT INTO sync_notes (relation, row_key) VALUES ('readings', NEW.id); END",
-        "DROP TRIGGER sync_note_events_delete",
-        "CREATE TRIGGER sync_note_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
-        "CREATE TRIGGER by_hand AFTER INSERT ON receipts BEGIN \
-         INSERT INTO sync_notes (relation, row_key) VALUES ('receipts', NEW.id); END",
+        (
+            "DROP TRIGGER sync_note_readings_update; CREATE TRIGGER sync_note_readings_update \
+             AFTER UPDATE ON readings BEGIN INSERT INTO sync_notes (relation, row_key) VALUES ('readings', NEW.id); END",
+            "the trigger `sync_note_readings_update` is not the one replica::triggers writes",
+        ),
+        (
+            "DROP TRIGGER sync_note_events_delete",
+            "the trigger `sync_note_events_delete` is missing",
+        ),
+        (
+            "CREATE TRIGGER sync_note_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
+            "the trigger `sync_note_gone_insert` is not one of the engine's",
+        ),
+        (
+            "CREATE TRIGGER by_hand AFTER INSERT ON receipts BEGIN \
+             INSERT INTO sync_notes (relation, row_key) VALUES ('receipts', NEW.id); END",
+            "the trigger `by_hand` is not one of the engine's",
+        ),
     ];
-    for case in cases {
+    for (case, why) in cases {
         sqlx::raw_sql(case).execute(&mut *conn).await.unwrap();
-        let refused = check(&mut conn, &codecs()).await;
-        assert!(refused.is_err(), "{case}");
+        match check(&mut conn, &codecs()).await {
+            Err(Error::Misuse(refused)) => assert!(refused.contains(why), "{case}: {refused}"),
+            other => panic!("{case}: {other:?}"),
+        }
         if case.contains("by_hand") {
             sqlx::raw_sql("DROP TRIGGER by_hand")
                 .execute(&mut *conn)
@@ -2235,14 +2361,81 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
         }
         install(&mut conn, &codecs()).await.expect("put right");
     }
-    sqlx::raw_sql("PRAGMA synchronous = OFF")
+
+    // A host's own trigger may be named as it likes: install leaves it.
+    sqlx::raw_sql("CREATE TRIGGER sync_audit AFTER INSERT ON receipts BEGIN SELECT 1; END")
         .execute(&mut *conn)
         .await
         .unwrap();
-    assert!(
-        check(&mut conn, &codecs()).await.is_err(),
-        "commits not durable"
-    );
+    install(&mut conn, &codecs())
+        .await
+        .expect("installed again");
+    let audit: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'sync_audit'")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(audit, 1, "the host's own trigger stays");
+}
+
+/// A connection the engine cannot keep its word on is refused, naming the
+/// setting: commits that are not durable, a journal that cannot roll back,
+/// triggers that miss what a conflict replaces.
+#[sqlx::test(migrations = false)]
+async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: SqlitePool) {
+    let w = world(pool).await;
+    for (set, why) in [
+        ("PRAGMA synchronous = NORMAL", "`synchronous` below FULL"),
+        (
+            "PRAGMA journal_mode = MEMORY",
+            "`journal_mode` OFF or MEMORY",
+        ),
+        ("PRAGMA journal_mode = OFF", "`journal_mode` OFF or MEMORY"),
+        (
+            "PRAGMA recursive_triggers = OFF",
+            "`recursive_triggers` off",
+        ),
+    ] {
+        let mut conn = w.pool.acquire().await.unwrap();
+        sqlx::raw_sql(set).execute(&mut *conn).await.unwrap();
+        match check(&mut conn, &codecs()).await {
+            Err(Error::Misuse(refused)) => assert!(refused.contains(why), "{set}: {refused}"),
+            other => panic!("{set}: {other:?}"),
+        }
+        conn.detach();
+    }
+}
+
+/// Each released step of the engine's tables is as it was released, and
+/// brings a database to its version: a step is never edited, a later
+/// version is a step of its own.
+#[sqlx::test(migrations = false)]
+async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    let released: [u64; crate::SCHEMA_VERSION as usize] = [0xa8c1_fda6_a7da_f674];
+    let fnv = |text: &str| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    for (version, pinned) in (1..=crate::SCHEMA_VERSION).zip(released) {
+        let step = migration(version).expect("a released step");
+        assert_eq!(
+            fnv(&step),
+            pinned,
+            "step {version} was edited: {:#x}",
+            fnv(&step)
+        );
+        sqlx::raw_sql(&step).execute(&mut *conn).await.unwrap();
+        assert_eq!(schema_version(&mut conn).await.unwrap(), version);
+    }
+    assert_eq!(migration(0), None);
+    assert_eq!(migration(crate::SCHEMA_VERSION + 1), None);
+    sqlx::raw_sql(TABLES).execute(&mut *conn).await.unwrap();
+    install(&mut conn, &codecs())
+        .await
+        .expect("nothing left to migrate");
 }
 
 /// A database whose engine tables are of another version is refused, with
@@ -2250,6 +2443,7 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
 /// a later build wrote.
 #[sqlx::test(migrations = false)]
 async fn a_database_of_another_version_is_refused_with_the_way_forward(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let mut conn = pool.acquire().await.unwrap();
     sqlx::raw_sql(TABLES).execute(&mut *conn).await.unwrap();
     let Err(Error::Misuse(why)) = check(&mut conn, &codecs()).await else {
@@ -2278,13 +2472,17 @@ async fn a_database_of_another_version_is_refused_with_the_way_forward(pool: Sql
 /// triggers go in together, or not at all.
 #[sqlx::test(migrations = false)]
 async fn an_install_that_fails_leaves_nothing_half_done(pool: SqlitePool) {
+    let pool = settled(pool).await;
     let mut conn = pool.acquire().await.unwrap();
     // `tasks` is missing: its triggers cannot be created.
     sqlx::raw_sql(&TABLES.replace("CREATE TABLE tasks", "CREATE TABLE not_tasks"))
         .execute(&mut *conn)
         .await
         .unwrap();
-    assert!(install(&mut conn, &codecs()).await.is_err());
+    match install(&mut conn, &codecs()).await {
+        Err(Error::Database(e)) => assert!(e.to_string().contains("no such table"), "{e}"),
+        other => panic!("{other:?}"),
+    }
     let left: i64 =
         sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name LIKE 'sync%'")
             .fetch_one(&mut *conn)
@@ -2338,6 +2536,7 @@ fn a_json_row_carries_its_columns_by_name_and_big_integers_as_text() {
 /// statement holding a borrow across an await quietly stops them being.
 #[sqlx::test(migrations = false)]
 async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
+    let pool = settled(pool).await;
     fn spawnable<T: Send>(_: T) {}
     let w = world(pool).await;
     spawnable(w.replica.receive(&[]));

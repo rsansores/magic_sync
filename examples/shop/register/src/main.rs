@@ -100,13 +100,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = arg("--bind", "127.0.0.1");
     let file = arg("--db", &format!("register-{port}.db"));
 
+    // ANCHOR: pool
     let pool = SqlitePool::connect_with(
         SqliteConnectOptions::new()
             .filename(&file)
             .create_if_missing(true)
-            .foreign_keys(true),
+            .foreign_keys(true)
+            .pragma("recursive_triggers", "ON"),
     )
     .await?;
+    // ANCHOR_END: pool
     sqlx::raw_sql(include_str!("../schema.sql"))
         .execute(&pool)
         .await?;

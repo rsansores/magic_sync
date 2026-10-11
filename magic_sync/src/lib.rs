@@ -195,12 +195,6 @@ pub const SCHEMA_VERSION: i32 = 1;
 #[cfg(feature = "postgres")]
 pub const POSTGRES_SCHEMA: &str = include_str!("../sql/postgres.sql");
 
-/// A replica's schema at [`SCHEMA_VERSION`], as one SQL script: a host with
-/// migrations runs it in one, before the triggers [`replica::triggers`]
-/// prints.
-#[cfg(feature = "sqlite")]
-pub const SQLITE_SCHEMA: &str = include_str!("../sql/sqlite.sql");
-
 use __private::Db;
 
 #[cfg(all(test, feature = "postgres"))]

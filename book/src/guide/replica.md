@@ -17,9 +17,19 @@ implement [`Identity`] instead, answering `None` until it does: nothing goes
 up until then. `run` sends up until the future it is given resolves,
 finishing what it is sending.
 
-`Replica::new` refuses a database whose commits are not durable (SQLite's
-`synchronous` below `FULL`, which sqlx's pools keep by default): a message
-the replica acknowledged must still be applied after a power cut.
+`Replica::new` refuses a connection the engine cannot keep its word on, and
+so does every message it applies, on whichever connection of the pool:
+commits that are not durable (`synchronous` below `FULL`, which sqlx's pools
+keep by default), since a message the replica acknowledged must still be
+applied after a power cut; a journal that cannot roll back (`journal_mode`
+`OFF` or `MEMORY`), since a message is applied whole or not at all; and
+triggers that miss the rows a conflict replaces (`recursive_triggers`, off
+by default), since a row an `INSERT OR REPLACE` deletes must go up as gone.
+Set them in the pool's options, so every connection has them:
+
+```rust,ignore
+{{#include ../../../examples/shop/register/src/main.rs:pool}}
+```
 
 ## Taking what the server sends
 

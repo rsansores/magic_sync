@@ -3,7 +3,7 @@
 //! refuses for a while goes again.
 
 use super::*;
-use crate::conformance::{codecs, Uplinked};
+use crate::conformance::{codecs, settled, Uplinked};
 use crate::envelope::{self, Body, Down, Key as WireKey, Table};
 use crate::testkit::ItemRow;
 use prost::Message as _;
@@ -21,6 +21,7 @@ CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL, what TEXT NOT NULL);
 ";
 
 async fn pool(pool: SqlitePool) -> SqlitePool {
+    let pool = settled(pool).await;
     sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
     replica::install(&mut pool.acquire().await.unwrap(), &codecs())
         .await
@@ -150,7 +151,11 @@ async fn nothing_goes_up_until_the_replica_knows_who_it_is(pool_: SqlitePool) {
 async fn a_replica_does_not_start_over_a_database_it_cannot_run_against(pool: SqlitePool) {
     sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
     let refused = Replica::new(pool, codecs(), Uuid::nil(), Uplinked::default(), settings()).await;
-    assert!(refused.is_err());
+    match refused {
+        Err(Error::Misuse(why)) => assert!(why.contains("tables are version 0"), "{why}"),
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(_) => panic!("started"),
+    }
 }
 
 /// Settings a replica cannot run with are refused when it is built: a wait

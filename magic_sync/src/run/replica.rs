@@ -195,7 +195,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// ([`Error::Protocol`]). Nothing of it was applied.
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        replica::durable(&mut tx).await?;
+        replica::settled(&mut tx).await?;
         let received = replica::receive(&mut tx, &self.codecs, bytes).await?;
         tx.commit().await?;
         if matches!(

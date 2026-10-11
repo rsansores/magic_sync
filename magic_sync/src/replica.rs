@@ -47,10 +47,27 @@ pub(crate) fn keys_of<P: Sync + 'static>(
 // ---------------------------------------------------------------------------
 // The engine's tables and triggers.
 
-/// The engine's migrations, in order: the `n`th brings a replica database
-/// from version `n` to `n + 1`.
+/// The engine's steps, in order, each as released and never edited: the
+/// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
 #[cfg(feature = "sqlite")]
-const MIGRATIONS: [&str; crate::SCHEMA_VERSION as usize] = [crate::SQLITE_SCHEMA];
+const MIGRATIONS: [&str; crate::SCHEMA_VERSION as usize] = [include_str!("../sql/sqlite/1.sql")];
+
+/// The engine's step to `version` of its tables on a replica, as one SQL
+/// script that also records the version it brings them to — `None` for a
+/// version no build of the engine has had yet. [`install`] runs every step a
+/// database lacks, in order; a host with migrations runs each, in one of its
+/// own: the first in the migration that creates its tables, before
+/// [`triggers`]' script, and each later one when a release brings it (its
+/// changelog says). A step is never edited once released.
+#[cfg(feature = "sqlite")]
+#[must_use]
+pub fn migration(version: i32) -> Option<String> {
+    let step = MIGRATIONS.get(usize::try_from(version.checked_sub(1)?).ok()?)?;
+    Some(format!(
+        "{step}\nINSERT INTO sync_version (id, version) VALUES (1, {version}) \
+         ON CONFLICT (id) DO UPDATE SET version = excluded.version;\n"
+    ))
+}
 
 /// A trigger the engine needs on a replica database.
 #[cfg(feature = "sqlite")]
@@ -222,9 +239,9 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
 
 /// The triggers a replica database needs for `codecs`, as one SQL script: a
 /// host with migrations puts it in the one that creates the tables, after
-/// [`SQLITE_SCHEMA`](crate::SQLITE_SCHEMA), and again whenever a table is
-/// added or changes how it travels; [`check`] refuses a database whose
-/// triggers are not these.
+/// the engine's first step ([`migration`]), and again whenever a table is
+/// added or changes how it travels, or a release writes them otherwise;
+/// [`check`] refuses a database whose triggers are not these.
 #[cfg(feature = "sqlite")]
 #[must_use]
 pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
@@ -256,11 +273,11 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// one missing or extra, nullable on one side only, of a type its field does
 /// not decode, keyed otherwise — with every difference named; triggers that
 /// are not the ones [`triggers`] writes — one missing, one that differs, or
-/// one left from a table that no longer travels; or commits that are not
-/// durable (`synchronous` below `FULL`), since a message is acknowledged
-/// once its commit returns. [`Replica::new`]
-/// runs it; a host with migrations also runs it in a test, over the database
-/// its migrations build.
+/// one left from a table that no longer travels; or a connection the engine
+/// cannot keep its word on — `synchronous` below `FULL`, `journal_mode`
+/// `OFF` or `MEMORY`, `recursive_triggers` off — which the pool's options
+/// set. [`Replica::new`] runs it; a host with migrations also runs it in a
+/// test, over the database its migrations build.
 ///
 /// [`Replica::new`]: crate::Replica::new
 ///
@@ -312,7 +329,7 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
         }
     }
     let ours = |name: &str, sql: &str| {
-        name.starts_with("sync_") || sql.contains("sync_notes") || sql.contains("sync_applying")
+        engines(name) || sql.contains("sync_notes") || sql.contains("sync_applying")
     };
     if let Some((name, _)) = live
         .iter()
@@ -322,25 +339,49 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
             "the trigger `{name}` is not one of the engine's: a table that no longer travels, or one written by hand — drop it"
         )));
     }
-    durable(conn).await?;
+    settled(conn).await?;
     Ok(())
 }
 
-/// Refuses a connection whose commits are not durable (`synchronous` below
-/// `FULL`): a message is acknowledged once its commit returns. A setting of
-/// each connection, so each one a message is applied through is asked.
+/// Whether a trigger of this name is one the engine writes (and [`install`]
+/// replaces): a host's own may be named anything else.
 #[cfg(feature = "sqlite")]
-pub(crate) async fn durable(conn: &mut Conn) -> Result<(), Error> {
+fn engines(name: &str) -> bool {
+    name.starts_with("sync_note_") || name.starts_with("sync_refuse_")
+}
+
+/// Refuses a connection the engine cannot keep its word on, each setting of
+/// which is the connection's own — so each one a message is applied through
+/// is asked: commits that are not durable (`synchronous` below `FULL`), since
+/// a message is acknowledged once its commit returns; a journal that cannot
+/// roll a transaction back (`journal_mode` `OFF` or `MEMORY`), since a
+/// message is applied whole or not at all; and triggers that do not fire on
+/// the rows a conflict replaces (`recursive_triggers` off), since a row an
+/// `INSERT OR REPLACE` deletes would then never go up as gone.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
     let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
         .fetch_one(&mut *conn)
         .await?;
-    if synchronous < 2 {
-        return Err(Error::Misuse(
-            "the database's commits are not durable (`synchronous` below FULL): a message acknowledged could be lost"
-                .to_owned(),
-        ));
-    }
-    Ok(())
+    let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut *conn)
+        .await?;
+    let recursive: i64 = sqlx::query_scalar("PRAGMA recursive_triggers")
+        .fetch_one(&mut *conn)
+        .await?;
+    let refused = if synchronous < 2 {
+        "its commits are not durable (`synchronous` below FULL): a message acknowledged could be lost"
+    } else if ["off", "memory"].contains(&journal.to_lowercase().as_str()) {
+        "it cannot roll a transaction back after a crash (`journal_mode` OFF or MEMORY): a message could be half applied"
+    } else if recursive == 0 {
+        "its triggers miss the rows a conflict replaces (`recursive_triggers` off): a row an \
+         INSERT OR REPLACE deletes would never go up as gone — set it ON in the pool's options"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Misuse(format!(
+        "the database's connection: {refused}"
+    )))
 }
 
 /// Brings a replica database to what this build runs against, in one
@@ -359,24 +400,21 @@ pub(crate) async fn durable(conn: &mut Conn) -> Result<(), Error> {
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
     let version = schema_version(&mut tx).await?;
-    let Some(due) = usize::try_from(version)
-        .ok()
-        .and_then(|v| MIGRATIONS.get(v..))
-    else {
+    if version > crate::SCHEMA_VERSION {
         return Err(Error::Misuse(format!(
             "the engine's tables are version {version}, later than this build's {}",
             crate::SCHEMA_VERSION
         )));
-    };
-    for script in due {
-        sqlx::Executor::execute(&mut *tx, *script).await?;
     }
-    let ours: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'sync\\_%' ESCAPE '\\'",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    for name in ours {
+    for step in version + 1..=crate::SCHEMA_VERSION {
+        let script = migration(step).expect("a step of this build");
+        sqlx::Executor::execute(&mut *tx, script.as_str()).await?;
+    }
+    let live: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            .fetch_all(&mut *tx)
+            .await?;
+    for name in live.into_iter().filter(|name| engines(name)) {
         sqlx::query(&format!("DROP TRIGGER {}", ident(&name)))
             .execute(&mut *tx)
             .await?;
@@ -787,11 +825,10 @@ async fn let_go<P: Sync + 'static>(
         .iter()
         .cloned()
         .partition(|key| noted.contains(&key_text(key)));
-    let mut retired = codec.retire(conn, &free, false).await?;
-    let holding = codec.retire(conn, &held, true).await?;
+    let retired = codec.retire(conn, &free, &held).await?;
     let leaving: Vec<String> = held
         .iter()
-        .filter(|key| !holding.refused.iter().any(|(r, _)| r == *key))
+        .filter(|key| !retired.refused.iter().any(|(r, _)| r == *key))
         .map(key_text)
         .collect();
     sqlx::query(
@@ -802,8 +839,6 @@ async fn let_go<P: Sync + 'static>(
     .bind(json(&leaving))
     .execute(&mut *conn)
     .await?;
-    retired.kept += holding.kept;
-    retired.refused.extend(holding.refused);
     for (key, why) in &retired.refused {
         reject(conn, codec.table.name, &[key_text(key)], why, sequence).await?;
     }
@@ -973,7 +1008,7 @@ async fn filed<P: Sync + 'static>(
         if keys.is_empty() {
             continue;
         }
-        let retired = codec.retire(conn, &keys, false).await?;
+        let retired = codec.retire(conn, &keys, &[]).await?;
         for (key, why) in retired.refused {
             tracing::error!(
                 table = codec.table.name,

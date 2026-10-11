@@ -551,19 +551,24 @@ pub(crate) struct Retired {
 
 /// Lets go of the rows of `keys` on a replica, one by one as far as the
 /// database is concerned: a row nothing here points at is deleted; one a row
-/// of the replica's own still points at — through a foreign key that would
-/// refuse the delete, checked now whether it is deferred or not — is kept
-/// with its retired column set; and one the database refuses to let go is
-/// answered apart, so it cannot fail the rest. With `hold`, none is deleted:
-/// each is kept retired, for what the replica wrote of it has not reached
-/// the server yet. A transient failure is the error.
+/// of the replica's own still points at — through any foreign key, checked
+/// now whether it is deferred or not, and whatever it does on delete: a
+/// cascade or a set-null would change the replica's own row — is kept with
+/// its retired column set; and one the database refuses to let go is
+/// answered apart, so it cannot fail the rest. The rows of `held` are kept
+/// retired whatever points at them, for what the replica wrote of them has
+/// not reached the server yet. A transient failure is the error.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn retire_by_keys<R: Row>(
     exec: &mut Conn,
     keys: &[Key],
-    hold: bool,
+    held: &[Key],
 ) -> Result<Retired, Error> {
-    let pointed: Vec<String> = crate::dialect::restricting(exec, R::TABLE, R::KEY)
+    let mut retired = Retired::default();
+    if keys.is_empty() && held.is_empty() {
+        return Ok(retired);
+    }
+    let pointed: Vec<String> = crate::dialect::pointing(exec, R::TABLE, R::KEY)
         .await?
         .into_iter()
         .map(|(child, from, to)| {
@@ -584,57 +589,58 @@ pub(crate) async fn retire_by_keys<R: Row>(
     } else {
         format!(" AND NOT ({})", pointed.join(" OR "))
     };
-    let mut retired = Retired::default();
-    for chunk in keys.chunks(keys_per_statement::<R>()) {
-        let delete = |keys: &[Key]| {
-            let mut qb = sqlx::QueryBuilder::new(format!("DELETE FROM {}", R::QUALIFIED));
-            key_filter::<R>(&mut qb, keys);
-            qb.push(&unpointed);
-            qb
-        };
-        let refused = if hold {
-            Vec::new()
-        } else {
-            one_by_one(exec, chunk, delete, &mut retired.deleted).await?
-        };
-        let left: Vec<Key> = chunk
-            .iter()
-            .filter(|key| !refused.iter().any(|(r, _)| r == *key))
-            .cloned()
-            .collect();
-        retired.refused.extend(refused);
-        let Some(column) = R::RETIRED else {
-            let held = key_select::<R>(exec, &left).await?;
-            retired.refused.extend(held.into_iter().map(|key| {
-                let why = if hold {
-                    format!(
-                        "what this replica wrote of it has not reached the server, and `{}` \
-                         has no retired column to keep it by",
-                        R::TABLE
-                    )
-                } else {
-                    format!(
-                        "a row here points at it, and `{}` has no retired column to keep it by",
-                        R::TABLE
-                    )
-                };
-                (key, why)
-            }));
-            continue;
-        };
-        let retire = |keys: &[Key]| {
-            let mut qb = sqlx::QueryBuilder::new(format!(
-                "UPDATE {} SET {} = {}",
-                R::QUALIFIED,
-                ident(column),
-                crate::dialect::NOW
-            ));
-            key_filter::<R>(&mut qb, keys);
-            qb.push(format!(" AND {} IS NULL", ident(column)));
-            qb
-        };
-        let refused = one_by_one(exec, &left, retire, &mut retired.kept).await?;
-        retired.refused.extend(refused);
+    for (keys, hold) in [(keys, false), (held, true)] {
+        for chunk in keys.chunks(keys_per_statement::<R>()) {
+            let delete = |keys: &[Key]| {
+                let mut qb = sqlx::QueryBuilder::new(format!("DELETE FROM {}", R::QUALIFIED));
+                key_filter::<R>(&mut qb, keys);
+                qb.push(&unpointed);
+                qb
+            };
+            let refused = if hold {
+                Vec::new()
+            } else {
+                one_by_one(exec, chunk, delete, &mut retired.deleted).await?
+            };
+            let left: Vec<Key> = chunk
+                .iter()
+                .filter(|key| !refused.iter().any(|(r, _)| r == *key))
+                .cloned()
+                .collect();
+            retired.refused.extend(refused);
+            let Some(column) = R::RETIRED else {
+                let kept = key_select::<R>(exec, &left).await?;
+                retired.refused.extend(kept.into_iter().map(|key| {
+                    let why = if hold {
+                        format!(
+                            "what this replica wrote of it has not reached the server, and `{}` \
+                             has no retired column to keep it by",
+                            R::TABLE
+                        )
+                    } else {
+                        format!(
+                            "a row here points at it, and `{}` has no retired column to keep it by",
+                            R::TABLE
+                        )
+                    };
+                    (key, why)
+                }));
+                continue;
+            };
+            let retire = |keys: &[Key]| {
+                let mut qb = sqlx::QueryBuilder::new(format!(
+                    "UPDATE {} SET {} = {}",
+                    R::QUALIFIED,
+                    ident(column),
+                    crate::dialect::NOW
+                ));
+                key_filter::<R>(&mut qb, keys);
+                qb.push(format!(" AND {} IS NULL", ident(column)));
+                qb
+            };
+            let refused = one_by_one(exec, &left, retire, &mut retired.kept).await?;
+            retired.refused.extend(refused);
+        }
     }
     Ok(retired)
 }
@@ -1193,7 +1199,7 @@ mod tests {
                 .map_err(|e| e.to_string()),
             Ok(())
         );
-        let retired = retire_by_keys::<Order>(&mut conn, &[order.key()], false)
+        let retired = retire_by_keys::<Order>(&mut conn, &[order.key()], &[])
             .await
             .unwrap();
         assert_eq!(retired.deleted, 1);

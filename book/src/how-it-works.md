@@ -544,7 +544,7 @@ runners.
 | File | What it is |
 |---|---|
 | `sql/postgres.sql` | the server's schema |
-| `sql/sqlite.sql` | a replica's schema |
+| `sql/sqlite/` | a replica's schema, one step per version |
 | `proto/sync.proto` | the engine's messages, for a replica in another language |
 
 The derive lives in its own crate, `magic_sync_derive`, re-exported as

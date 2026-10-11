@@ -187,8 +187,10 @@ their deletes ignored.
      overwritten;
    - a row the replica had retired (4.3) becomes live again.
 2. **Deletes.** For each key in `deletes`: delete the row. If a row of the
-   replica's own points at it — through a foreign key that would refuse the
-   delete, whether checked at once or at commit — retire it instead (4.3);
+   replica's own points at it — through any foreign key: one that would
+   refuse the delete, checked at once or at commit, and one that would
+   cascade or set the pointing row's columns, which would change a row the
+   server never sent — retire it instead (4.3);
    where the table has nothing to retire it by, or the database refuses to
    let it go, keep it and record a rejection (section 6).
 
