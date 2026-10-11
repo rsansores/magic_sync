@@ -19,8 +19,13 @@ cargo test -p magic_sync --features sqlite
 Each run includes the derive's suite (`magic_sync/tests/derive.rs`), which
 builds every case under `magic_sync/tests/derive/` as a host would, on that
 side: what it accepts compiles, and each misuse fails with the message checked
-in beside it. A change to a message is written anew with `TRYBUILD=overwrite`,
-and read before it is committed.
+in beside it. The messages are the compiler's words, so they are held to one
+release of rustc, named in the test (`PINNED`); on any other the suite builds
+what is accepted and says it left the messages alone. CI's `diagnostics` job
+runs them on the pinned one. A change to a message is written anew with that
+toolchain and `TRYBUILD=overwrite`, and read before it is committed. A
+misuse the derive refuses has a case under `tests/derive/fail/`; a new
+refusal comes with its case.
 
 Some tests compare what the engine makes with a file checked in — the
 messages generated from `proto/sync.proto`, the replica's golden messages,
@@ -82,13 +87,21 @@ build is one side): run `cargo fmt` and `cargo clippy` with
   the book's snippets; `cargo clippy -D warnings` of the engine on each side
   (the derive with the replica's), of the example's two programs, and of the
   snippets on each side; the derive's docs with `-D warnings`.
-- **dependencies** — `cargo deny check` (advisories, licenses, sources;
-  `deny.toml`) and `cargo machete` over every workspace.
-- **test-server** — the server's suite against PostgreSQL 14 and 18.
+- **dependencies** — `cargo deny check` (advisories, licenses, sources and
+  unmaintained crates anywhere in the graph; `deny.toml`) of the workspace, the
+  example's two programs and the book's snippets; **unused** — `cargo machete`
+  over every workspace.
+- **workflows** — zizmor over `.github/`: every action pinned to a commit,
+  no token left behind by a checkout, no expression injected into a script.
+- **test-server** — the server's suite against PostgreSQL 14 and 18, and the
+  book's snippets built on the server's side.
+- **diagnostics** — the derive's refusals, message by message, on the pinned
+  rustc.
 - **test-replica** — a replica's suite, and the snippets' test of the README.
 - **public-api** — each side's API against `magic_sync/public-api/`.
 - **msrv** — each side builds on Rust 1.85.
-- **example-page** — the dashboard and the shop's page build from source.
+- **example-page** — the dashboard builds from source, and the shop's page
+  (formatting, lint, types) over it.
 - **dashboard** — its formatting, lint, types, unused code (knip), tests,
   and the packed tarball as npm and TypeScript read it.
 - **site** — the book and both sides' API docs build, the docs with

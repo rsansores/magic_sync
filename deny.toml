@@ -1,15 +1,21 @@
-# What `cargo deny check` holds the engine's dependencies to, on both sides
-# (it reads the graph with every feature on: no build, so the two sides do
-# not meet).
+# What `cargo deny check` holds the dependencies to: the engine's, on both
+# sides (it reads the graph with every feature on: no build, so the two sides
+# do not meet), and those of the example's programs and the book's snippets,
+# each a workspace of its own.
 
 [graph]
 all-features = true
 
 [advisories]
-# A vulnerability or an unmaintained crate fails; a yanked version too.
+# A vulnerability fails, and so does an unmaintained crate anywhere in the
+# graph (by default only a direct dependency is looked at); a yanked version too.
 yanked = "deny"
+unmaintained = "all"
 
 [licenses]
+# The example's programs and the book's snippets (publish = false) carry no
+# license of their own.
+private = { ignore = true }
 # What a crate licensed MIT OR Apache-2.0 may depend on.
 allow = [
     "Apache-2.0",

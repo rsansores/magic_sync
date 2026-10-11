@@ -3,14 +3,16 @@ name: Release
 # A tag `v<version>` on a commit of main releases it: CI runs on the tag, and
 # only once it is green, and the tag is the version everywhere, is anything
 # published — the derive, then the engine, then the dashboard, then the book.
-# The secrets live in the `release` environment, which may ask a maintainer
-# to approve before a job of it starts.
+# Each publication is a job of its own that skips what the registry already
+# has, so a release that stopped half-way is finished by running its failed
+# jobs again. No job that builds holds a token: the tarballs CI verified are
+# what is published. The credentials live in the `release` environment, which
+# may ask a maintainer to approve before a job of it starts.
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: release
@@ -21,84 +23,155 @@ env:
 
 jobs:
   ci:
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yml
 
   versions:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - run: scripts/check-versions.sh "${GITHUB_REF_NAME#v}"
       - name: The tag is on main
         run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
   # crates.io: the engine pins the derive at its own version, so the derive
   # goes first. `cargo publish` waits until a crate is in the index before it
-  # returns.
-  crates:
+  # returns. The token is the short-lived one crates.io gives this workflow
+  # when the crate trusts it (Trusted Publishing); the first release of a
+  # crate, before it can, falls back to the environment's CARGO_REGISTRY_TOKEN.
+  derive:
     needs: [ci, versions]
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --locked -p magic_sync_derive
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # A build of the engine is one side: the server's is the one verified.
-      - run: cargo publish --locked -p magic_sync --features postgres
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  # npm: the dashboard reads the engine's JSON, and goes out at its version.
-  dashboard:
-    needs: crates
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
       id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: scripts/publish-crate.sh magic_sync_derive "${GITHUB_REF_NAME#v}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+
+  engine:
+    needs: derive
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: scripts/publish-crate.sh magic_sync "${GITHUB_REF_NAME#v}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+
+  # npm: the dashboard reads the engine's JSON, and goes out at its version.
+  # It is packed (which builds it) in a job with no credentials, and the
+  # tarball is what is published.
+  dashboard-pack:
+    needs: engine
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: dashboard/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - run: pnpm install --frozen-lockfile --ignore-scripts
       # `prepack` copies the licenses in and builds.
-      - run: pnpm pack --pack-destination "$RUNNER_TEMP"
-      - run: npm publish "$RUNNER_TEMP"/magic_sync_dashboard-*.tgz --provenance --access public
+      - run: pnpm pack --pack-destination "$RUNNER_TEMP/tarball"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dashboard-tarball
+          path: ${{ runner.temp }}/tarball/magic_sync_dashboard-*.tgz
+          if-no-files-found: error
+
+  dashboard:
+    needs: dashboard-pack
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: dashboard-tarball
+          path: ${{ runner.temp }}/tarball
+      - name: Publish, unless npm has the version already
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          if npm view "magic_sync_dashboard@$version" version >/dev/null 2>&1; then
+            echo "magic_sync_dashboard $version is on npm already"
+          else
+            npm publish "$RUNNER_TEMP"/tarball/magic_sync_dashboard-*.tgz --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # GitHub Pages (Settings → Pages → Source: GitHub Actions): the book and
   # each side's API, as of the release.
   pages:
-    needs: crates
+    needs: engine
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: mdbook@0.5.4,lychee@0.24.2
       - run: scripts/site.sh
       - run: scripts/check-links.sh
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: target/site
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

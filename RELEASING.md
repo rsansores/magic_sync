@@ -7,11 +7,28 @@ everywhere, publishes the derive, then the engine, then the dashboard, then
 the book with each side's API on GitHub Pages. Nothing is published from a
 workstation.
 
-Once, in the repository's settings: an environment `release` holding the
-secrets `CARGO_REGISTRY_TOKEN` (crates.io, allowed to publish both crates)
-and `NPM_TOKEN` (npm, allowed to publish `magic_sync_dashboard`), with the
-maintainers who approve a release as its reviewers; and Pages served from
-GitHub Actions.
+Nothing that compiles holds a credential. CI's `package` job builds and
+verifies the tarball of each crate on the tagged commit; the release publishes
+those tarballs as they are (`cargo publish --no-verify`, in
+`scripts/publish-crate.sh`), so no build script or proc macro runs next to a
+token. The dashboard is packed by a job with no credentials, and the tarball is
+what a second job publishes. Every action is pinned to a commit
+(`.github/dependabot.yml` proposes the new ones), and CI's `workflows` job
+runs [zizmor](https://docs.zizmor.sh) over the workflows.
+
+Once, in the repository's settings:
+
+- an environment `release`, with the maintainers who approve a release as its
+  reviewers; Pages served from GitHub Actions;
+- on crates.io, a Trusted Publisher for each of `magic_sync_derive` and
+  `magic_sync` (this repository, workflow `release.yml`, environment
+  `release`): the release asks crates.io for a token that lives for the job.
+  A trusted publisher is set up on a crate that exists, so the first
+  release of each crate has no one yet to trust it: it publishes with the
+  environment's secret `CARGO_REGISTRY_TOKEN` (a token scoped to publishing new
+  crates), which is deleted once the publishers are set;
+- in the environment, the secret `NPM_TOKEN` (npm, allowed to publish
+  `magic_sync_dashboard`).
 
 ## 1. The version
 
@@ -53,16 +70,17 @@ git push origin v<version>
 The release workflow refuses a tag that is not on main, or that is not the
 version of every place in step 1, or whose changelog entry is missing. A
 release that fails half-way — the derive published, the engine refused —
-is finished by fixing the cause and running the failed jobs again: crates.io
-and npm refuse a version published twice, so a job that published is not
-run again.
+is finished by fixing the cause and running the failed jobs again (or all of
+them: a job whose version the registry already has says so and succeeds
+without publishing it again).
 
 ## What CI checks before a release can happen
 
 Every pull request packs both crates and verifies each tarball builds on each
 side (`cargo package --workspace --features magic_sync/postgres`, then
 `magic_sync/sqlite`), packs the dashboard and lints the tarball, checks the
-versions, builds the book with both sides' API, and checks its links. The
+versions, builds the book with both sides' API, checks its links, and audits
+the workflows. The
 crates carry their licenses (`LICENSE-MIT`, `LICENSE-APACHE`, linked from the
 root) and the README; the dashboard's `prepack` copies the licenses in.
 

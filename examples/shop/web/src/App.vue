@@ -116,7 +116,11 @@ function pageOf(url: string) {
           <button>Add</button>
         </form>
         <table>
-          <tr><th>Name</th><th>Price</th><th></th></tr>
+          <tr>
+            <th>Name</th>
+            <th>Price</th>
+            <th></th>
+          </tr>
           <template v-for="p in state?.products" :key="p.id">
             <tr>
               <template v-if="editing?.id === p.id">
@@ -146,7 +150,11 @@ function pageOf(url: string) {
       <section>
         <h2>Receipts filed here</h2>
         <table>
-          <tr><th>Register</th><th>Qty</th><th>Total</th></tr>
+          <tr>
+            <th>Register</th>
+            <th>Qty</th>
+            <th>Total</th>
+          </tr>
           <tr v-for="r in state?.receipts" :key="r.id">
             <td>{{ names[r.register_id] ?? r.register_id.slice(-12) }}</td>
             <td>{{ r.quantity }}</td>
@@ -200,7 +208,9 @@ function pageOf(url: string) {
 <style>
 body {
   margin: 0;
-  font: 15px/1.45 system-ui, sans-serif;
+  font:
+    15px/1.45 system-ui,
+    sans-serif;
   color: #1d2433;
   background: #f6f7fb;
 }

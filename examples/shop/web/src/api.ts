@@ -42,7 +42,8 @@ async function ask<T>(method: string, url: string, body?: unknown): Promise<T> {
 
 export const api = {
   state: () => ask<ShopState>('GET', '/api/state'),
-  addProduct: (name: string, price_cents: number) => ask<void>('POST', '/api/products', { name, price_cents }),
+  addProduct: (name: string, price_cents: number) =>
+    ask<void>('POST', '/api/products', { name, price_cents }),
   editProduct: (id: string, name: string, price_cents: number) =>
     ask<void>('PUT', `/api/products/${id}`, { name, price_cents }),
   deleteProduct: (id: string) => ask<void>('DELETE', `/api/products/${id}`),
