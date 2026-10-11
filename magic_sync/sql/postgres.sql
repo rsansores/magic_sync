@@ -324,7 +324,9 @@ BEGIN
     END IF;
     IF TG_OP <> 'INSERT' THEN
         v_old := to_jsonb(OLD);
-        IF TG_OP = 'UPDATE' AND (v_old - v_owned) = (v_new - v_owned) THEN
+        -- As text: a number written at another scale (1.0, 1.00) is equal
+        -- as jsonb, and reads otherwise on a replica.
+        IF TG_OP = 'UPDATE' AND (v_old - v_owned)::text = (v_new - v_owned)::text THEN
             RETURN NULL;
         END IF;
         SELECT string_agg(v_old ->> k, '|' ORDER BY n) INTO v_old_key

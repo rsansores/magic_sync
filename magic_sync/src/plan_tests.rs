@@ -1829,3 +1829,27 @@ async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate
         "an active view that is not there: {why}"
     );
 }
+
+/// An update that writes a number at another scale is a change: it reads
+/// otherwise on a replica, though PostgreSQL holds the two equal.
+#[sqlx::test(migrations = false)]
+async fn a_number_written_at_another_scale_is_noted(pool: crate::DbPool) {
+    let mut conn = bare(&pool).await;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.prices (id INTEGER PRIMARY KEY, amount NUMERIC NOT NULL); \
+         CREATE TRIGGER sync_note_row AFTER INSERT OR UPDATE OR DELETE ON fixture.prices \
+         FOR EACH ROW EXECUTE FUNCTION sync.note_row('prices', '', '1', 'id', '0'); \
+         INSERT INTO fixture.prices VALUES (1, 1.0); \
+         DELETE FROM sync.notes; \
+         UPDATE fixture.prices SET amount = 1.00; \
+         UPDATE fixture.prices SET amount = 1.00;",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("written");
+    let noted: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.notes")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("notes");
+    assert_eq!(noted, 1, "the new scale, and not the same value again");
+}
