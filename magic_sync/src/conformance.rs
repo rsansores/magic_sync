@@ -116,7 +116,7 @@ pub const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/to_r
 /// The messages of a golden file, as `(name, outcome, bytes)`, in order:
 /// one line each — its name, what the other side makes of it, and the
 /// message in hex. Lines of what a replica then holds (`holds …`) are
-/// not messages.
+/// [`holds`]'.
 pub fn golden(text: &str) -> Vec<(String, String, Vec<u8>)> {
     text.lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("holds "))
@@ -129,6 +129,20 @@ pub fn golden(text: &str) -> Vec<(String, String, Vec<u8>)> {
                 .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
                 .collect();
             (name.to_owned(), outcome.to_owned(), bytes)
+        })
+        .collect()
+}
+
+/// What a golden file says a replica holds after each step, as
+/// `(step, json)`: the lines `holds step json`.
+#[cfg(feature = "sqlite")]
+pub fn holds(text: &str) -> Vec<(String, serde_json::Value)> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("holds "))
+        .map(|line| {
+            let (step, json) = line.split_once(' ').expect("a step and what it holds");
+            let json = serde_json::from_str(json).expect("what it holds, as json");
+            (step.to_owned(), json)
         })
         .collect()
 }
@@ -497,6 +511,8 @@ mod server {
                ('0192f6a0-0000-7000-8000-000000000d01', 'count', false, '2027-01-15 08:00:00+00');",
             None,
         ),
+        // The transport delivers the first message again.
+        ("again", "", None),
         (
             "update",
             "UPDATE fixture.items SET name = 'a2' WHERE name = 'a';
@@ -521,12 +537,27 @@ mod server {
         ("cut", RESYNC, Some(1)),
         ("snapshot", RESYNC, None),
         // A message the transport loses: the next follows one the replica
-        // never got.
+        // never got. Then, in the gap, a message of another epoch, and one
+        // that follows the last applied: neither applies until a snapshot.
         ("lost", "UPDATE fixture.items SET name = 'a3' WHERE name = 'a2';", None),
         ("gap", "UPDATE fixture.items SET name = 'a4' WHERE name = 'a3';", None),
         ("healed", RESYNC, None),
         // The replica's upload, filed, answered.
         ("filed", "", None),
+        // A row whose version is older than the one the replica holds — a
+        // server restored, or its clock set back: taken all the same.
+        (
+            "older",
+            "UPDATE fixture.prices SET cents = 125, updated_at = '2027-01-15 07:00:00+00';",
+            None,
+        ),
+        // A message with a field this build does not know, top level and in
+        // its body: what it knows of it applies.
+        (
+            "unknown_field",
+            "UPDATE fixture.items SET name = 'a5' WHERE name = 'a4';",
+            None,
+        ),
         // The server installed again: a new epoch begins with a snapshot.
         (
             "epoch",
@@ -543,6 +574,77 @@ mod server {
             None,
         ),
         ("empty_snapshot", RESYNC, None),
+    ];
+
+    /// What the replica the golden file's header describes holds after each
+    /// step, and what it then does of its own, as the file's `holds` lines
+    /// say it: written by hand, from what the protocol says, never from
+    /// what a build does.
+    const HOLDS: &[(&str, &str)] = &[
+        (
+            "rows",
+            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"]}"#,
+        ),
+        (
+            "again",
+            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"]}"#,
+        ),
+        (
+            "update",
+            r#"{"items":["a2","b"],"prices":["250"],"rejected":[],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "refused",
+            r#"{"items":["a2","b"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "delete",
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "cut",
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "snapshot",
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "lost",
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "gap",
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "healed",
+            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "filed",
+            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "older",
+            r#"{"items":["a4","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "unknown_field",
+            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "epoch",
+            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+        ),
+        (
+            "emptied",
+            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[]}"#,
+        ),
+        (
+            "empty_snapshot",
+            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[]}"#,
+        ),
     ];
 
     /// What the server sends the replica, as long as it takes them.
@@ -616,23 +718,32 @@ mod server {
         let uploads = std::fs::read_to_string(GOLDEN_UP).expect("the golden uploads");
         let mut snapshots: Vec<String> = Vec::new();
         let mut out = String::new();
+        let line = |out: &mut String, step: &str, outcome: &str, bytes: &[u8]| {
+            out.push_str(&format!("{step} {outcome} {}\n", hex(bytes)));
+        };
+        // The first message, delivered again; the last the replica applied.
+        let mut first: Option<Vec<u8>> = None;
+        let mut applied = (0, 0);
         for (step, sql, takes) in STEPS {
+            let holds = HOLDS
+                .iter()
+                .find(|(s, _)| s == step)
+                .expect("what it holds")
+                .1;
+            if *step == "again" {
+                line(
+                    &mut out,
+                    step,
+                    "already",
+                    first.as_ref().expect("a first message"),
+                );
+                out.push_str(&format!("holds {step} {holds}\n"));
+                continue;
+            }
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
             *kept.takes.lock().unwrap() = *takes;
             if *step == "filed" {
-                for (_, _, bytes) in golden(&uploads) {
-                    server
-                        .receive(REPLICA.parse().unwrap(), &bytes)
-                        .await
-                        .unwrap();
-                }
-                let filed: i64 = sqlx::query_scalar(
-                    "SELECT (SELECT count(*) FROM fixture.readings) + (SELECT count(*) FROM fixture.events)",
-                )
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                assert_eq!(filed, 2, "the golden upload is filed");
+                file_uploads(&server, &pool, &uploads).await;
             }
             loop {
                 sqlx::query("UPDATE sync.replicas SET retry_after = NULL")
@@ -647,10 +758,12 @@ mod server {
             }
             for bytes in std::mem::take(&mut *kept.sent.lock().unwrap()) {
                 let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
-                let snapshot = match &mut message.body {
-                    Some(Body::Down(m)) => Some(&mut m.snapshot_id),
-                    Some(Body::EndSnapshot(m)) => Some(&mut m.snapshot_id),
-                    _ => None,
+                let (snapshot, place) = match &mut message.body {
+                    Some(Body::Down(m)) => (Some(&mut m.snapshot_id), Some((m.sequence, m.nonce))),
+                    Some(Body::EndSnapshot(m)) => {
+                        (Some(&mut m.snapshot_id), Some((m.sequence, m.nonce)))
+                    }
+                    _ => (None, None),
                 };
                 if let Some(id) = snapshot.filter(|id| !id.is_empty()) {
                     let at = snapshots.iter().position(|s| s == id).unwrap_or_else(|| {
@@ -666,13 +779,125 @@ mod server {
                     (Some(Body::EndSnapshot(_)), _) => "ended",
                     _ => "filed",
                 };
-                out.push_str(&format!(
-                    "{step} {outcome} {}\n",
-                    hex(&message.encode_to_vec())
-                ));
+                if let Some(place) = place.filter(|_| matches!(outcome, "applied" | "ended")) {
+                    applied = place;
+                }
+                let mut bytes = message.encode_to_vec();
+                if *step == "unknown_field" {
+                    bytes = with_unknown_fields(&message);
+                }
+                first.get_or_insert_with(|| bytes.clone());
+                line(&mut out, step, outcome, &bytes);
             }
+            if *step == "gap" {
+                let (sequence, nonce) = applied;
+                let follows = |epoch: &str| {
+                    Body::Down(crate::envelope::Down {
+                        tables: Vec::new(),
+                        sequence: sequence + 1_000,
+                        epoch: epoch.to_owned(),
+                        previous: sequence,
+                        previous_nonce: nonce,
+                        nonce: nonce_of(sequence + 1_000),
+                        ..crate::envelope::Down::default()
+                    })
+                    .encoded()
+                };
+                line(
+                    &mut out,
+                    step,
+                    "gap",
+                    &follows("0192f6a0-0000-7000-8000-0000000e90ff"),
+                );
+                line(&mut out, step, "gap", &follows(EPOCH));
+            }
+            out.push_str(&format!("holds {step} {holds}\n"));
         }
         out
+    }
+
+    /// `message` with a field this build does not know added to it, and to
+    /// its body.
+    fn with_unknown_fields(message: &ToReplica) -> Vec<u8> {
+        const UNKNOWN: [u8; 2] = [15 << 3, 1];
+        let mut body = match &message.body {
+            Some(Body::Down(m)) => m.encode_to_vec(),
+            Some(Body::EndSnapshot(m)) => m.encode_to_vec(),
+            _ => panic!("a Down or an EndSnapshot"),
+        };
+        body.extend(UNKNOWN);
+        let tag = match &message.body {
+            Some(Body::Down(_)) => 2 << 3 | 2,
+            _ => 3 << 3 | 2,
+        };
+        let mut bytes = vec![1 << 3, u8::try_from(message.protocol).unwrap(), tag];
+        prost::encoding::encode_varint(body.len() as u64, &mut bytes);
+        bytes.extend(body);
+        bytes.extend(UNKNOWN);
+        bytes
+    }
+
+    /// Files each golden upload, and holds the server to what its line says
+    /// it makes of it: `filed`, its rows filed and answered; `confirmed`,
+    /// what it applied recorded; `quarantined`, the row it refused set aside
+    /// for it; `agrees`, its digests compared with nothing to provision;
+    /// `ignored`, nothing of what it says of itself taken.
+    async fn file_uploads(server: &Server<Anyone, Kept>, pool: &crate::DbPool, uploads: &str) {
+        let replica: Uuid = REPLICA.parse().unwrap();
+        let scalar = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(replica)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        };
+        let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND replica_id = $1";
+        let applied =
+            "SELECT coalesce(applied_sequence, 0) FROM sync.replicas WHERE replica_id = $1";
+        for (name, outcomes, bytes) in golden(uploads) {
+            let up = crate::envelope::Up::decode(bytes.as_slice()).unwrap();
+            let (provisioned, confirmed) = (scalar(resyncs).await, scalar(applied).await);
+            server.receive(replica, &bytes).await.unwrap();
+            let outcomes: Vec<&str> = outcomes.split(',').collect();
+            for outcome in &outcomes {
+                match *outcome {
+                    "filed" => {
+                        let filed: i64 = sqlx::query_scalar(
+                            "SELECT (SELECT count(*) FROM fixture.readings) \
+                                  + (SELECT count(*) FROM fixture.events)",
+                        )
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                        assert_eq!(filed, 2, "{name}: its rows filed");
+                    }
+                    "confirmed" => assert_eq!(
+                        scalar(applied).await,
+                        i64::try_from(up.sequence).unwrap(),
+                        "{name}: what it applied, recorded"
+                    ),
+                    "quarantined" => assert_eq!(
+                        scalar(
+                            "SELECT count(*) FROM sync.quarantine \
+                              WHERE replica_id = $1 AND cause = 'replica'"
+                        )
+                        .await,
+                        i64::try_from(up.rejected.len()).unwrap(),
+                        "{name}: what it refused, set aside"
+                    ),
+                    "agrees" | "ignored" => {}
+                    other => panic!("{name}: an outcome this suite does not know: {other}"),
+                }
+            }
+            if outcomes.contains(&"ignored") {
+                assert_eq!(scalar(applied).await, confirmed, "{name}: nothing recorded");
+            }
+            assert_eq!(
+                scalar(resyncs).await,
+                provisioned,
+                "{name}: nothing provisioned again"
+            );
+        }
     }
 
     /// The golden messages are what this build's server sends: regenerated
@@ -681,9 +906,17 @@ mod server {
     #[sqlx::test(migrations = false)]
     async fn the_golden_messages_are_what_the_server_sends(pool: crate::DbPool) {
         let header = "# What the server sends one replica, step by step: `step outcome hex` per\n\
-                      # message, `outcome` what the replica makes of it (the transport loses the\n\
-                      # `lost` one). Generated by conformance::server; applied by the replica\n\
-                      # conformance suite, which reads each step by its name.\n";
+                      # message, `outcome` what the replica makes of it — applied, ended, filed,\n\
+                      # already, gap — or `lost`, which the transport loses. After a step,\n\
+                      # `holds step json`: what the replica then holds, per table its rows as\n\
+                      # text (items: name, and ` retired`; shelves: label and revision; prices:\n\
+                      # cents; tasks: title and done), and its rejections as `table key`.\n\
+                      # The replica: its own check refuses a shelf labelled `refused`; after\n\
+                      # `rows` it marks its task done (its own column), has that filed, and\n\
+                      # writes a receipt pointing at item b; at `filed`, the golden upload's\n\
+                      # rows are its own, sent under its number.\n\
+                      # Generated by conformance::server; applied by the replica conformance\n\
+                      # suite, which reads each step by its name.\n";
         matches_golden(GOLDEN, &format!("{header}{}", sent(pool).await));
     }
 }

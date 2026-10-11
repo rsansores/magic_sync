@@ -19,7 +19,7 @@ use crate::run::replica::{Replica, Settings};
 use crate::testkit::ItemRow;
 use chrono::{TimeZone, Utc};
 use sqlx::SqlitePool;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const TABLES: &str = "
 CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT);
@@ -218,147 +218,130 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 // ---------------------------------------------------------------------------
 // What the server really sends.
 
-/// The server's own messages (`tests/golden`, captured from the postgres
-/// side's relay) leave the replica holding, step by step, what the server
-/// holds — its encodings, its numbering, its snapshots whole, cut short and
-/// superseded, a message lost on the way and the gap it leaves, a new
-/// epoch, an answer to an upload — as a replica with a check of its own and
-/// a row of its own pointing at the server's holds it: a row it refuses
-/// kept as it was, one it points at retired. Every message delivered twice
-/// changes nothing the second time.
-#[sqlx::test(migrations = false)]
-async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: SqlitePool) {
-    let pool = settled(pool).await;
-    use crate::conformance::{golden, GOLDEN, NEXT_EPOCH, REPLICA, UPLOAD};
-    let w = world(pool).await;
-    // A check of the replica's own, which the server's rows may fail.
+/// The replica the golden messages are for, as the golden file's header
+/// says it is: the suite's, with a check of its own that refuses a shelf
+/// labelled `refused`.
+async fn golden_replica(pool: SqlitePool) -> World {
+    let w = world(settled(pool).await).await;
     w.exec(
         "CREATE TRIGGER no_refused BEFORE UPDATE ON shelves WHEN NEW.label = 'refused' \
          BEGIN SELECT RAISE(ABORT, 'a label this replica refuses'); END",
     )
     .await
     .unwrap();
-    let messages = golden(&std::fs::read_to_string(GOLDEN).expect("the golden messages"));
-    let mut steps: Vec<&str> = Vec::new();
-    for (step, _, _) in &messages {
-        if steps.last() != Some(&step.as_str()) {
-            steps.push(step);
+    w
+}
+
+/// What `w` holds, as the golden file's `holds` lines say it.
+async fn golden_holds(w: &World) -> serde_json::Value {
+    let all = |sql: &'static str| w.texts(sql);
+    serde_json::json!({
+        "items": all(
+            "SELECT name || CASE WHEN retired_at IS NULL THEN '' ELSE ' retired' END \
+             FROM items ORDER BY name",
+        )
+        .await,
+        "shelves": all("SELECT label || ' ' || revision FROM shelves ORDER BY slot").await,
+        "prices": all("SELECT CAST(cents AS TEXT) FROM prices").await,
+        "tasks": all("SELECT title || ' ' || done FROM tasks").await,
+        "rejected": w.rejected().await,
+    })
+}
+
+/// The golden messages of `step`, delivered to `w` as the golden file says
+/// — but `lost` ones — each made what its line says, and each but a gap
+/// delivered again, changing nothing; then what the replica does of its own
+/// after the step, as the file's header says.
+async fn follow_golden(w: &World, messages: &[(String, String, Vec<u8>)], step: &str) {
+    use crate::conformance::{REPLICA, UPLOAD};
+    for (_, expected, bytes) in messages.iter().filter(|(s, _, _)| s == step) {
+        if expected == "lost" {
+            continue;
+        }
+        if step == "filed" {
+            // The replica's own upload, sent under the golden number.
+            w.exec(&format!(
+                "INSERT INTO readings (replica_id, id, value, at) \
+                 VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
+                 UPDATE sync_notes SET upload = {}, sent = writes, \
+                   sent_at = '2000-01-01T00:00:00.000Z';",
+                REPLICA.replace('-', ""),
+                i64::try_from(UPLOAD).unwrap()
+            ))
+            .await
+            .unwrap();
+        }
+        let got = w.receive(bytes).await;
+        assert_eq!(outcome(&got), expected, "{step}: {got:?}");
+        if expected != "gap" {
+            let again = w.receive(bytes).await;
+            assert!(
+                matches!(again, Received::AlreadyApplied | Received::Filed),
+                "{step}, delivered again: {again:?}"
+            );
         }
     }
-    let state = || async {
-        let all = |sql: &'static str| w.texts(sql);
-        (
-            all(
-                "SELECT name || CASE WHEN retired_at IS NULL THEN '' ELSE ' retired' END \
-                 FROM items ORDER BY name",
-            )
-            .await,
-            all("SELECT label || ' ' || revision FROM shelves ORDER BY slot").await,
-            all("SELECT CAST(cents AS TEXT) FROM prices").await,
-            all("SELECT title || ' ' || done FROM tasks").await,
+    if step == "rows" {
+        // The replica's own column, kept through the server's edits — and
+        // filed, so the server's deletes let the row go; and a row of its
+        // own pointing at the server's.
+        w.exec("UPDATE tasks SET done = 1").await.unwrap();
+        let up = w.up(0, false).await.expect("the edit");
+        w.receive(
+            &Body::Filed(Filed {
+                uploads: up.uploads,
+            })
+            .encoded(),
         )
-    };
-    let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    let a2 = (
-        owned(&["a2", "b retired"]),
-        owned(&["top2 1800000000001"]),
-        owned(&["250"]),
-        owned(&["recount 1"]),
-    );
-    for step in steps {
-        for (_, expected, bytes) in messages.iter().filter(|(s, _, _)| s == step) {
-            if expected == "lost" {
-                continue;
-            }
-            if step == "filed" {
-                // The replica's own upload, sent under the golden number.
-                w.exec(&format!(
-                    "INSERT INTO readings (replica_id, id, value, at) \
-                     VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
-                     UPDATE sync_notes SET upload = {}, sent = writes, \
-                       sent_at = '2000-01-01T00:00:00.000Z';",
-                    REPLICA.replace('-', ""),
-                    i64::try_from(UPLOAD).unwrap()
-                ))
-                .await
-                .unwrap();
-            }
-            let got = w.receive(bytes).await;
-            assert_eq!(outcome(&got), expected, "{step}: {got:?}");
-            if expected != "gap" {
-                let again = w.receive(bytes).await;
-                assert!(
-                    matches!(again, Received::AlreadyApplied | Received::Filed),
-                    "{step}, delivered again: {again:?}"
-                );
-            }
+        .await;
+        w.exec(
+            "INSERT INTO receipts (id, item_id) \
+             VALUES (1, x'0192f6a0000070008000000000000a02')",
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// The steps of the golden messages, in order.
+fn golden_steps(messages: &[(String, String, Vec<u8>)]) -> Vec<String> {
+    let mut steps: Vec<String> = Vec::new();
+    for (step, _, _) in messages {
+        if steps.last() != Some(step) {
+            steps.push(step.clone());
         }
+    }
+    steps
+}
+
+/// The server's own messages (`tests/golden`, captured from the postgres
+/// side's relay) leave the replica holding, step by step, what the file
+/// says — its encodings, its numbering, its snapshots whole, cut short and
+/// superseded, a message lost on the way and the gap it leaves, a new
+/// epoch, an answer to an upload, a version older than the one held, a
+/// field it does not know — as a replica with a check of its own and a row
+/// of its own pointing at the server's holds it: a row it refuses kept as
+/// it was, one it points at retired. Every message delivered twice changes
+/// nothing the second time.
+#[sqlx::test(migrations = false)]
+async fn the_servers_own_messages_leave_the_replica_holding_what_the_file_says(pool: SqlitePool) {
+    use crate::conformance::{golden, holds, GOLDEN, NEXT_EPOCH};
+    let w = golden_replica(pool).await;
+    let text = std::fs::read_to_string(GOLDEN).expect("the golden messages");
+    let messages = golden(&text);
+    let expected: BTreeMap<String, serde_json::Value> = holds(&text).into_iter().collect();
+    for step in golden_steps(&messages) {
+        follow_golden(&w, &messages, &step).await;
         if step == "filed" {
             assert_eq!(w.count("SELECT count(*) FROM sync_notes").await, 0, "filed");
         }
-        let expected = match step {
-            "rows" => Some((
-                owned(&["a", "b"]),
-                owned(&["top 1800000000000", "bottom 1800000000000"]),
-                owned(&["9007199254740993"]),
-                owned(&["count 0"]),
-            )),
-            "update" => Some((
-                owned(&["a2", "b"]),
-                owned(&["top2 1800000000001", "bottom 1800000000000"]),
-                owned(&["250"]),
-                owned(&["recount 1"]),
-            )),
-            "refused" => Some((
-                owned(&["a2", "b"]),
-                owned(&["top2 1800000000001", "bottom 1800000000000"]),
-                owned(&["250"]),
-                owned(&["recount 1"]),
-            )),
-            "delete" | "snapshot" | "lost" | "gap" => Some(a2.clone()),
-            "cut" => None,
-            "healed" | "filed" | "epoch" => Some((
-                owned(&["a4", "b retired"]),
-                owned(&["top2 1800000000001"]),
-                owned(&["250"]),
-                owned(&["recount 1"]),
-            )),
-            "emptied" | "empty_snapshot" => Some((owned(&["b retired"]), vec![], vec![], vec![])),
-            other => panic!("a step this suite does not know: {other}"),
-        };
-        if let Some(expected) = expected {
-            assert_eq!(state().await, expected, "after {step}");
+        let held = golden_holds(&w).await;
+        if std::env::var_os("MAGIC_SYNC_HOLDS").is_some() {
+            println!("holds {step} {held}");
+            continue;
         }
-        match step {
-            "rows" => {
-                // The replica's own column, kept through the server's edits —
-                // and filed, so the server's deletes let the row go; and a
-                // row of its own pointing at the server's.
-                w.exec("UPDATE tasks SET done = 1").await.unwrap();
-                let up = w.up(0, false).await.expect("the edit");
-                w.receive(
-                    &Body::Filed(Filed {
-                        uploads: up.uploads,
-                    })
-                    .encoded(),
-                )
-                .await;
-                w.exec(
-                    "INSERT INTO receipts (id, item_id) \
-                     VALUES (1, x'0192f6a0000070008000000000000a02')",
-                )
-                .await
-                .unwrap();
-            }
-            "refused" | "snapshot" | "healed" | "epoch" => {
-                assert_eq!(
-                    w.rejected().await,
-                    ["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],
-                    "after {step}: refused, and kept so"
-                );
-            }
-            _ => {}
-        }
+        let expected = expected.get(&step).expect("what it holds after the step");
+        assert_eq!(&held, expected, "after {step}");
     }
     let applied: String = sqlx::query_scalar("SELECT epoch FROM sync_applied")
         .fetch_one(&w.pool)
@@ -368,14 +351,24 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: 
     assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
 }
 
-/// What the replica sends up is the golden upload the server's suite files:
-/// rows of its own, keyed by it, and history, under a number of its own.
-/// `MAGIC_SYNC_BLESS=1` writes it anew.
+/// What the replica of the golden messages sends up, once it followed them
+/// up to the upload's step, is the golden uploads the server's suite files:
+/// rows of its own, keyed by it, and history, under a number of its own,
+/// with what it refused and what it applied, sealed as the server sealed
+/// it; then its digests; then the same with a seal the server never made.
+/// `MAGIC_SYNC_BLESS=1` writes them anew.
 #[sqlx::test(migrations = false)]
-async fn the_golden_upload_is_what_the_replica_sends(pool: SqlitePool) {
-    let pool = settled(pool).await;
-    use crate::conformance::{hex, matches_golden, GOLDEN_UP, REPLICA, UPLOAD};
-    let w = world(pool).await;
+async fn the_golden_uploads_are_what_the_replica_sends(pool: SqlitePool) {
+    use crate::conformance::{golden, hex, matches_golden, GOLDEN, GOLDEN_UP, REPLICA, UPLOAD};
+    let w = golden_replica(pool).await;
+    let text = std::fs::read_to_string(GOLDEN).expect("the golden messages");
+    let messages = golden(&text);
+    for step in golden_steps(&messages)
+        .iter()
+        .take_while(|step| *step != "filed")
+    {
+        follow_golden(&w, &messages, step).await;
+    }
     w.exec(&format!(
         "INSERT INTO readings (replica_id, id, value, at) \
          VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
@@ -384,16 +377,32 @@ async fn the_golden_upload_is_what_the_replica_sends(pool: SqlitePool) {
     ))
     .await
     .unwrap();
-    let mut up = w.up(0, false).await.expect("the upload");
-    assert_eq!(up.uploads.len(), 1);
-    up.uploads = vec![UPLOAD];
-    let header = "# What a replica sends up: `name outcome hex` per message. Generated by the\n\
-                  # replica's suite; filed by the server's (conformance::server), whose answer is\n\
-                  # the golden `filed` step.\n";
-    matches_golden(
-        GOLDEN_UP,
-        &format!("{header}upload filed {}\n", hex(&up.encode_to_vec())),
-    );
+    let mut upload = w.up(0, false).await.expect("the upload");
+    assert_eq!(upload.uploads.len(), 1);
+    assert!(!upload.rejected.is_empty() && upload.sequence > 0);
+    upload.uploads = vec![UPLOAD];
+    let digests = w.up(0, true).await.expect("the digests");
+    assert!(!digests.digests.is_empty());
+    let mut forged = digests.clone();
+    forged.mac = vec![0; forged.mac.len()];
+    let header = "# What a replica sends up: `name outcomes hex` per message, `outcomes` what\n\
+                  # the server makes of it — filed: its rows filed and answered; confirmed: what\n\
+                  # it applied recorded; quarantined: what it refused set aside; agrees: its\n\
+                  # digests compared, nothing provisioned; ignored: nothing it says of itself\n\
+                  # taken. Generated by the replica's suite, from the golden messages up to\n\
+                  # their `filed` step; filed by the server's (conformance::server) at that\n\
+                  # step, whose answer is in it.\n";
+    let lines = [
+        ("upload", "filed,confirmed,quarantined", &upload),
+        ("digests", "confirmed,agrees", &digests),
+        ("forged", "ignored", &forged),
+    ];
+    let text: String = lines
+        .iter()
+        .map(|(name, outcomes, up)| format!("{name} {outcomes} {}\n", hex(&up.encode_to_vec())))
+        .collect();
+    matches_golden(GOLDEN_UP, &format!("{header}{text}"));
+    assert_eq!(golden(&text).len(), 3);
 }
 
 /// What a replica made of a message, as the corpora name it.

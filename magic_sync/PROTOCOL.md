@@ -554,15 +554,27 @@ server                                         replica
 
 ## 11. Conformance checklist
 
-The engine's repository holds test vectors, each line a name and a message
-in hex: `tests/golden/to_replica.txt`, what the server sends one replica
-step by step — a provisioning of several messages, updates, a row the
-replica's own check refuses, a delete of a row a row of its own points at,
-a snapshot cut short and the one that supersedes it, a message lost on the
-way and the gap after it, a new epoch, the answer to an upload; the
-replica's suite (`src/replica_tests.rs`) says what a replica holds after
-each step. `tests/golden/malformed.txt`, messages a replica takes as
-malformed; and `tests/golden/to_server.txt`, an upload the server files.
+The engine's repository holds test vectors, each line a name, what the
+other side makes of the message, and the message in hex; each file's header
+says how to read it.
+
+- `tests/golden/to_replica.txt`: what the server sends one replica, step by
+  step — a provisioning of several messages, the first delivered again,
+  updates, a row the replica's own check refuses, a delete of a row a row
+  of its own points at, a snapshot cut short and the one that supersedes
+  it, a message lost on the way, the gap after it and what comes during the
+  gap, the answer to an upload, a version older than the one held, a field
+  the replica does not know, a new epoch. Each message says what the
+  replica makes of it (`applied`, `ended`, `filed`, `already`, `gap`, or
+  `lost` on the way), and each step is followed by a `holds` line: what
+  the replica then holds, as JSON.
+- `tests/golden/malformed.txt`: messages no server sends — and the few
+  that set the scene between them — each with what a replica makes of it,
+  `malformed` for most.
+- `tests/golden/to_server.txt`: what a replica sends up after the steps
+  of `to_replica.txt` before its upload is answered — its rows, its
+  rejections and what it applied; its digests; the same with a seal the
+  server never made — each with what the server makes of it.
 
 A replica implementation is complete when:
 
