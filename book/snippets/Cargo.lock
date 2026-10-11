@@ -701,10 +701,13 @@ name = "magic_sync"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hmac",
  "magic_sync_derive",
  "prost",
+ "rand",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
