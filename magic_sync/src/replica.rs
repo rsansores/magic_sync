@@ -11,7 +11,7 @@ use crate::wire::Codec;
 use {
     crate::dialect::{ident, literal},
     crate::envelope::Up,
-    crate::envelope::{framed, opened, Body, Down, EndSnapshot, Table, ToReplica},
+    crate::envelope::{framed, Body, Down, EndSnapshot, Table, ToReplica},
     crate::row::{key_text, Key, KeyKind},
     crate::{Conn, Error},
     prost::Message as _,
@@ -1803,6 +1803,7 @@ async fn gather<P: Sync + 'static>(
             table: codec.table.name.to_owned(),
             ..Table::default()
         };
+        let mut len = framed(part.table.len());
         let mut missing = Vec::new();
         for (key, id) in keys {
             if let Some((_, e)) = encoded.failed.iter().find(|(k, _)| *k == key) {
@@ -1814,13 +1815,8 @@ async fn gather<P: Sync + 'static>(
                 continue;
             };
             let wire = wire_of(&key);
-            let opening = if part.upserts.is_empty() {
-                opened(&part.table)
-            } else {
-                0
-            };
-            let weight = framed(bytes.len()) + framed(wire.encoded_len()) + opening;
-            if framed(bytes.len()) + framed(wire.encoded_len()) + opened(&part.table) > largest {
+            let added = framed(bytes.len()) + framed(wire.encoded_len());
+            if framed(framed(part.table.len()) + added) > largest {
                 let why = format!(
                     "a row of {} bytes, more than a message carries",
                     bytes.len()
@@ -1828,11 +1824,13 @@ async fn gather<P: Sync + 'static>(
                 aside.push((id, why));
                 continue;
             }
+            let weight = growth(len, added, part.upserts.is_empty());
             if full || weight > budget {
                 full = true;
                 continue;
             }
             budget -= weight;
+            len += added;
             part.upserts.push(bytes.clone());
             part.keys.push(wire);
             carried.push(id);
@@ -1851,19 +1849,17 @@ async fn gather<P: Sync + 'static>(
             table: codec.table.name.to_owned(),
             ..Table::default()
         };
+        let mut len = framed(part.table.len());
         for (key, id) in keys {
             let wire = wire_of(&key);
-            let opening = if part.deletes.is_empty() {
-                opened(&part.table)
-            } else {
-                0
-            };
-            let weight = framed(wire.encoded_len()) + opening;
+            let added = framed(wire.encoded_len());
+            let weight = growth(len, added, part.deletes.is_empty());
             if full || weight > budget {
                 full = true;
                 continue;
             }
             budget -= weight;
+            len += added;
             part.deletes.push(wire);
             carried.push(id);
         }
@@ -1887,6 +1883,14 @@ async fn gather<P: Sync + 'static>(
         .execute(&mut *conn)
         .await?;
     Ok(Gathered { tables, carried })
+}
+
+/// What a field of `added` bytes costs a message, added to a table's part
+/// of `len` bytes: itself, and what the part's own length grows by — or,
+/// for a part not in the message yet, the part whole.
+#[cfg(feature = "sqlite")]
+fn growth(len: usize, added: usize, new: bool) -> usize {
+    framed(len + added) - if new { 0 } else { framed(len) }
 }
 
 #[cfg(feature = "sqlite")]

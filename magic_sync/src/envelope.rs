@@ -208,6 +208,7 @@ pub(crate) fn framed(len: usize) -> usize {
 
 /// What a table's part weighs in a message before it holds anything: its
 /// name, and its own tag and length (at most five bytes of length).
+#[cfg(feature = "postgres")]
 pub(crate) fn opened(table: &str) -> usize {
     framed(table.len()) + 6
 }

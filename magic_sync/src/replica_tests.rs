@@ -2019,11 +2019,27 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
     );
 }
 
-/// A message up fills the transport's bytes and never outgrows them, every
-/// byte counted: each one that left a row for the next is short of the
-/// limit by less than that row and what it reserves for its number. A row
-/// no message can carry is set aside — and counted — rather than offered
-/// for ever; one that fills a message alone goes.
+/// The upload's number as a message carries it: a packed field of one.
+fn number_field(up: &Up) -> usize {
+    up.uploads
+        .first()
+        .map_or(0, |n| framed(prost::encoding::encoded_len_varint(*n)))
+}
+
+/// What the next upload's first row would have added to `up`'s part of its
+/// table.
+fn joining(up: &Up, next: &Up) -> usize {
+    let part = up.tables[0].encoded_len();
+    let row = &next.tables[0];
+    let added = framed(row.upserts[0].len()) + framed(row.keys[0].encoded_len());
+    framed(part + added) - framed(part)
+}
+
+/// A message up fills the transport's bytes to the byte and never outgrows
+/// them: each one that left a row for the next had no room for it, with
+/// nine bytes kept for its number. A row no message can carry is set aside
+/// — and counted — rather than offered for ever; one that fills a message
+/// alone goes.
 #[sqlx::test(migrations = false)]
 async fn a_message_up_fills_the_transport_and_a_row_too_large_is_set_aside(pool: SqlitePool) {
     let limits = Limits::new(100, 5000).unwrap();
@@ -2045,9 +2061,7 @@ async fn a_message_up_fills_the_transport_and_a_row_too_large_is_set_aside(pool:
             1 + usize::try_from(seed % 900).unwrap()
         })
         .collect();
-    // Alone, the largest that goes, and the smallest that never can.
-    let alone = 5000 - 150;
-    sizes.extend([alone, 5000]);
+    sizes.extend([4850, 5000]);
     for size in &sizes {
         sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
             .bind(Uuid::now_v7())
@@ -2060,19 +2074,14 @@ async fn a_message_up_fills_the_transport_and_a_row_too_large_is_set_aside(pool:
     while let Some(up) = w.up(1, false).await {
         ups.push(up);
     }
-    let weight = |up: &Up| {
-        let table = &up.tables[0];
-        framed(table.upserts[0].len()) + framed(table.keys[0].encoded_len()) + opened(&table.table)
-    };
     for (up, next) in ups.iter().zip(ups.iter().skip(1)) {
         let used = up.encoded_len();
         assert!(used <= limits.bytes(), "{used} bytes");
-        // Nine bytes reserved for the number, a few for the table's length.
-        let short = limits.bytes() - used;
+        let room = limits.bytes() + number_field(up) - used - framed(9);
         assert!(
-            short < weight(next) + 16,
-            "{short} bytes left, and the next row weighs {}",
-            weight(next)
+            room < joining(up, next),
+            "{room} bytes of room left, and the next row takes {}",
+            joining(up, next)
         );
     }
     let rows: usize = ups.iter().map(|up| up.tables[0].upserts.len()).sum();
@@ -2083,6 +2092,128 @@ async fn a_message_up_fills_the_transport_and_a_row_too_large_is_set_aside(pool:
         (progress[0].set_aside, progress[0].unfiled),
         (1, i64::try_from(rows).unwrap())
     );
+}
+
+/// On the main lane too a message fills the transport's bytes, short only
+/// of what it keeps for its number, its confirmation and its backlog.
+#[sqlx::test(migrations = false)]
+async fn a_message_up_the_main_lane_fills_the_transport_too(pool: SqlitePool) {
+    let limits = Limits::new(100, 5000).unwrap();
+    let settings = Settings {
+        outbox: Outbox {
+            limits,
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    for n in 0..40 {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+            .bind(Uuid::now_v7())
+            .bind("w".repeat(100 + n * 17))
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    let mut ups = Vec::new();
+    while let Some(up) = w.up(0, false).await {
+        if up.tables.is_empty() {
+            break;
+        }
+        ups.push(up);
+    }
+    for (up, next) in ups.iter().zip(ups.iter().skip(1)) {
+        let short = limits.bytes() - up.encoded_len();
+        assert!(
+            short < joining(up, next) + 64,
+            "{short} bytes short, and the next row takes {}",
+            joining(up, next)
+        );
+    }
+}
+
+/// The edges, to the byte, on a lane with nothing but rows: a row that
+/// fills a message alone goes, one a byte larger is set aside; a second row
+/// that fills what the first left goes with it, one a byte larger waits.
+#[sqlx::test(migrations = false)]
+async fn a_message_up_is_full_to_the_byte(pool: SqlitePool) {
+    let limits = Limits::new(100, 5000).unwrap();
+    let settings = Settings {
+        outbox: Outbox {
+            limits,
+            ..Outbox::default()
+        },
+        lanes: vec![Lane::new("main", &[]), Lane::new("history", &["events"])],
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    let id = Uuid::from_u128(7);
+    let row = |n: usize| {
+        json(&Event {
+            id,
+            what: "w".repeat(n),
+        })
+        .len()
+    };
+    let key = framed(wire_of(&vec![crate::row::KeyPart::Uuid(id)]).encoded_len());
+    let part = |rows: &[usize]| framed(6) + rows.iter().map(|r| framed(*r) + key).sum::<usize>();
+    let bare = Up {
+        protocol: envelope::PROTOCOL,
+        ..Up::default()
+    }
+    .encoded_len();
+    // What a message of these rows takes, as the outbox counts it.
+    let message = |rows: &[usize]| bare + framed(9) + framed(part(rows));
+    let fills = |taken: &[usize]| {
+        (1..5000)
+            .find(|n| message(&[taken, &[row(*n)]].concat()) == limits.bytes())
+            .expect("a size that fills the message to the byte")
+    };
+    let alone = fills(&[]);
+    let first = row(300);
+    let second = fills(&[first]);
+    let write = |n: usize| {
+        let pool = w.pool.clone();
+        async move {
+            sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+                .bind(Uuid::now_v7())
+                .bind("w".repeat(n))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    let carried = |up: Option<Up>| {
+        up.map_or(Vec::new(), |up| {
+            up.tables
+                .iter()
+                .flat_map(|t| t.upserts.iter().map(Vec::len))
+                .collect::<Vec<_>>()
+        })
+    };
+    for (sizes, expected) in [
+        (vec![alone], vec![vec![row(alone)]]),
+        (vec![alone + 1], vec![]),
+        (vec![300, second], vec![vec![first, row(second)]]),
+        (
+            vec![300, second + 1],
+            vec![vec![first], vec![row(second + 1)]],
+        ),
+    ] {
+        for size in &sizes {
+            write(*size).await;
+        }
+        let mut sent = Vec::new();
+        loop {
+            let rows = carried(w.up(1, false).await);
+            if rows.is_empty() {
+                break;
+            }
+            sent.push(rows);
+        }
+        assert_eq!(sent, expected, "{sizes:?}");
+        w.exec("DELETE FROM sync_notes").await.unwrap();
+    }
 }
 
 /// A message the uplink refuses for good does not come back for ever: its
@@ -2301,19 +2432,15 @@ async fn digests_go_only_with_the_message_they_were_read_against(pool: SqlitePoo
     let mut conn = w.pool.acquire().await.unwrap();
     let fresh = held(&mut conn, &codecs()).await.unwrap();
     let mut tx = w.pool.begin().await.unwrap();
-    let up = outbox(
-        &mut tx,
-        &codecs(),
-        &lanes,
-        0,
-        &Outbox::default(),
-        Some(fresh),
-        None,
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .up;
+    let small = Outbox {
+        limits: Limits::new(10, 5000).unwrap(),
+        ..Outbox::default()
+    };
+    let up = outbox(&mut tx, &codecs(), &lanes, 0, &small, Some(fresh), None)
+        .await
+        .unwrap()
+        .unwrap()
+        .up;
     assert_eq!(
         up.digests
             .iter()
@@ -2322,6 +2449,27 @@ async fn digests_go_only_with_the_message_they_were_read_against(pool: SqlitePoo
             .count,
         1
     );
+}
+
+/// Once the server heard what was applied, an upload of rows says it no
+/// more: the last applied goes when it is news, or with digests or a gap.
+#[sqlx::test(migrations = false)]
+async fn the_last_applied_goes_only_when_it_is_news(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![item(Uuid::now_v7(), "a")])],
+    ))
+    .await;
+    assert_eq!(w.up(0, false).await.unwrap().sequence, BASE + 1);
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let up = w.up(0, false).await.unwrap();
+    assert_eq!((up.tables.len(), up.sequence), (1, 0));
 }
 
 /// Each lane keeps its own pace: one the uplink fails on does not hold back
