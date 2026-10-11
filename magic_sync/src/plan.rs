@@ -253,7 +253,7 @@ const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 /// The engine's schema, one script per version: a database at version `n`
 /// runs the scripts after the `n`th, in one transaction. Each script ends by
 /// writing its version.
-const MIGRATIONS: [&str; crate::SCHEMA_VERSION as usize] = [crate::POSTGRES_SCHEMA];
+const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [crate::POSTGRES_SCHEMA];
 
 /// The server's engine, built once from the codecs and the schema by the
 /// [`Server`](crate::Server), which hands it out for what a host asks of it:
@@ -589,7 +589,7 @@ async fn migrate(conn: &mut Conn) -> Result<(), Error> {
     if from > MIGRATIONS.len() {
         return Err(Error::Misuse(format!(
             "the engine's schema is version {installed}, from a later build than this one ({})",
-            crate::SCHEMA_VERSION
+            crate::SERVER_SCHEMA_VERSION
         )));
     }
     for script in &MIGRATIONS[from..] {
@@ -872,7 +872,7 @@ impl Engine {
                 replicas.relation
             )));
         }
-        let needed = crate::SCHEMA_VERSION;
+        let needed = crate::SERVER_SCHEMA_VERSION;
         match version(conn).await? {
             Some(v) if v == needed => {}
             Some(v) if v > needed => {

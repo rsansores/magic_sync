@@ -13,7 +13,7 @@ The first release: the engine extracted from the system it was built in.
 - `Server` and `Replica` runners: what a host builds, runs and hands what
   arrives. The steps they are built on are the engine's own.
 - `Server::install`, `replica::install` and `replica::check` for the engine's
-  schema and triggers; a schema version both sides check. On the server the
+  schema and triggers; each side checks a schema version of its own. On the server the
   schema is installed or upgraded in one transaction, one process at a time,
   and `Engine::triggers` prints the triggers a host's migrations write; the
   server refuses to start while one is missing, disabled or different. On a

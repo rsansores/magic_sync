@@ -120,7 +120,8 @@ that a replica of an earlier version cannot read raises `PROTOCOL` in
 ## A change to the engine's tables
 
 The engine's schema on each side is a list of steps (`MIGRATIONS` in
-`src/plan.rs` and `src/replica.rs`), one per `SCHEMA_VERSION`. A released
-step is never edited: a change is a new step, `SCHEMA_VERSION` raised by one,
+`src/plan.rs` and `src/replica.rs`), one per `SERVER_SCHEMA_VERSION` or `REPLICA_SCHEMA_VERSION`, each side counting
+its own. A released step is never edited: a change is a new step, that side's
+version raised by one,
 and a test that upgrades a database of the version before it. The changelog
 says so, and names the step for hosts with migrations of their own.

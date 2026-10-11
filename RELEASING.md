@@ -50,7 +50,7 @@ says whether every place agrees; CI runs it.
 Move the *unreleased* entry of `CHANGELOG.md` to `## <version> — <date>`. It
 says, for a host upgrading:
 
-- whether the stored schema changed (`SCHEMA_VERSION`): the step from the
+- whether the stored schema changed (`SERVER_SCHEMA_VERSION`, `REPLICA_SCHEMA_VERSION`: each side's own): the step from the
   version before, for a host with migrations of its own, and that the server's
   processes of the earlier build are stopped before the upgrade (the book's
   *Upgrading*);

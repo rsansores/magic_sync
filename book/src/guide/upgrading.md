@@ -7,12 +7,16 @@ changes without losing anything.
 
 ## The engine's schema
 
-Each side's database holds the engine's own tables at a version,
-[`SCHEMA_VERSION`]. A build runs against a database at its own version only:
-`Server::new` and `Replica::new` refuse any other, naming both.
+Each side's database holds the engine's own tables at a version of that
+side's own: [`SERVER_SCHEMA_VERSION`] for the server's, and
+[`REPLICA_SCHEMA_VERSION`] for a replica's. They count different steps and
+move independently: a release that changes only the server's tables leaves the
+replicas' version where it was, and the other way round. A build runs against
+a database at its own version only: `Server::new` and `Replica::new` refuse
+any other, naming both.
 
-A release that changes those tables raises `SCHEMA_VERSION` and brings the
-step from each earlier version with it: one script per version, applied in
+A release that changes one side's tables raises that side's version and
+brings the step from each earlier version with it: one script per version, applied in
 order, in one transaction — never edited once released. So the engine's
 tables move forward one step at a time, and never back: a database a later
 build upgraded is refused by an earlier one rather than misread.
@@ -72,7 +76,8 @@ carries (`status::CONTRACT`), and refuses another rather than draw it wrong.
 The crate and the package are released together, at the same version:
 upgrade them together.
 
-[`SCHEMA_VERSION`]: ../api/server/magic_sync/constant.SCHEMA_VERSION.html
+[`SERVER_SCHEMA_VERSION`]: ../api/server/magic_sync/constant.SERVER_SCHEMA_VERSION.html
+[`REPLICA_SCHEMA_VERSION`]: ../api/replica/magic_sync/constant.REPLICA_SCHEMA_VERSION.html
 [`POSTGRES_SCHEMA`]: ../api/server/magic_sync/constant.POSTGRES_SCHEMA.html
 [`replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
 [`PROTOCOL`]: ../api/server/magic_sync/envelope/constant.PROTOCOL.html

@@ -185,11 +185,19 @@ pub type Conn = sqlx::PgConnection;
 #[cfg(feature = "sqlite")]
 pub type Conn = sqlx::SqliteConnection;
 
-/// The version of the engine's schema, on both sides: the engine refuses to
-/// run against a database that installed another.
-pub const SCHEMA_VERSION: i32 = 1;
+/// The version of the engine's tables on the server's side: the server
+/// refuses to run against a database that installed another. It counts the
+/// server's own steps, independent of the replicas' version.
+#[cfg(feature = "postgres")]
+pub const SERVER_SCHEMA_VERSION: i32 = 1;
 
-/// The server's schema at [`SCHEMA_VERSION`], as one SQL script: a host with
+/// The version of the engine's tables on a replica: the replica refuses to
+/// run against a database that installed another. It counts the replica's own
+/// steps (`replica::migration`), independent of the server's version.
+#[cfg(feature = "sqlite")]
+pub const REPLICA_SCHEMA_VERSION: i32 = 1;
+
+/// The server's schema at [`SERVER_SCHEMA_VERSION`], as one SQL script: a host with
 /// migrations runs it in one, before the migration that writes the triggers
 /// [`plan::Engine::triggers`] prints.
 #[cfg(feature = "postgres")]

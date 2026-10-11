@@ -50,7 +50,7 @@ pub(crate) fn keys_of<P: Sync + 'static>(
 /// The engine's steps, in order, each as released and never edited: the
 /// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
 #[cfg(feature = "sqlite")]
-const MIGRATIONS: [&str; crate::SCHEMA_VERSION as usize] = [include_str!("../sql/sqlite/1.sql")];
+const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [include_str!("../sql/sqlite/1.sql")];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
 /// script that also records the version it brings them to — `None` for a
@@ -287,7 +287,7 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
-    let (version, needed) = (schema_version(conn).await?, crate::SCHEMA_VERSION);
+    let (version, needed) = (schema_version(conn).await?, crate::REPLICA_SCHEMA_VERSION);
     if version > needed {
         return Err(Error::Misuse(format!(
             "the engine's tables are version {version}, from a later build than this one \
@@ -400,13 +400,13 @@ pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
     let version = schema_version(&mut tx).await?;
-    if version > crate::SCHEMA_VERSION {
+    if version > crate::REPLICA_SCHEMA_VERSION {
         return Err(Error::Misuse(format!(
             "the engine's tables are version {version}, later than this build's {}",
-            crate::SCHEMA_VERSION
+            crate::REPLICA_SCHEMA_VERSION
         )));
     }
-    for step in version + 1..=crate::SCHEMA_VERSION {
+    for step in version + 1..=crate::REPLICA_SCHEMA_VERSION {
         let script = migration(step).expect("a step of this build");
         sqlx::Executor::execute(&mut *tx, script.as_str()).await?;
     }

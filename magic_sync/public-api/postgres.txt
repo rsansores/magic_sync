@@ -923,7 +923,7 @@ impl core::marker::UnsafeUnpin for magic_sync::run::server::Settings
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::server::Settings
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Settings
 pub const magic_sync::POSTGRES_SCHEMA: &str
-pub const magic_sync::SCHEMA_VERSION: i32
+pub const magic_sync::SERVER_SCHEMA_VERSION: i32
 pub trait magic_sync::Columns: crate::__private::Sealed
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
 pub const magic_sync::Row::KEY: &'static [&'static str]

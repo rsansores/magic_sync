@@ -410,7 +410,7 @@ impl core::marker::Unpin for magic_sync::run::replica::Settings
 impl core::marker::UnsafeUnpin for magic_sync::run::replica::Settings
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Settings
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Settings
-pub const magic_sync::SCHEMA_VERSION: i32
+pub const magic_sync::REPLICA_SCHEMA_VERSION: i32
 pub trait magic_sync::Columns: crate::__private::Sealed
 pub trait magic_sync::Identity: core::marker::Send + core::marker::Sync + 'static
 pub fn magic_sync::Identity::id(&self, &mut magic_sync::Conn) -> impl core::future::future::Future<Output = core::result::Result<core::option::Option<uuid::Uuid>, magic_sync::Error>> + core::marker::Send

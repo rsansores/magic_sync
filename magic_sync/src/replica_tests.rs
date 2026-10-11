@@ -3142,14 +3142,14 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::SCHEMA_VERSION as usize] = [0x7f10_e071_c3e4_898e];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x7f10_e071_c3e4_898e];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
     };
     let mut conn = pool.acquire().await.unwrap();
-    for (version, pinned) in (1..=crate::SCHEMA_VERSION).zip(released) {
+    for (version, pinned) in (1..=crate::REPLICA_SCHEMA_VERSION).zip(released) {
         let step = migration(version).expect("a released step");
         assert_eq!(
             fnv(&step),
@@ -3161,7 +3161,7 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
         assert_eq!(schema_version(&mut conn).await.unwrap(), version);
     }
     assert_eq!(migration(0), None);
-    assert_eq!(migration(crate::SCHEMA_VERSION + 1), None);
+    assert_eq!(migration(crate::REPLICA_SCHEMA_VERSION + 1), None);
     sqlx::raw_sql(TABLES).execute(&mut *conn).await.unwrap();
     install(&mut conn, &codecs())
         .await
