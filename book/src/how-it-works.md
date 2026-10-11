@@ -302,19 +302,24 @@ merely sent.
 ## 5. The life of a change, replica to server
 
 A replica writes its own rows (records, and its columns of two-way tables).
-A trigger notes each write in the writing transaction (`sync_notes`: the table
-and the key), so no write path can forget. The replica's upward loop gathers
+A trigger notes each write in the writing transaction (`sync_notes`: one
+note per row — the table and the key — counting its writes), so no write path
+can forget, and a row written a thousand times is one note. The replica's upward loop gathers
 the noted rows **as they are now** — a row edited twice goes up once, with its
 last version — into an [`envelope::Up`], and hands it to the host's uplink. A
 row that is gone by then goes as its key, but only for a table keyed by its
 replica (`ORIGIN`): history a replica pruned before it went up is not the
 server's to delete.
 
-Every send of an upload draws a number of its own, a resend included. The
-server answers every upload it filed with a `Filed` message, after its
-transaction commits, and the replica lets go of the notes that send carried —
-a note sent again since waits for the answer to that send, so a late answer
-never forgets a write it did not carry. An upload the server does not answer
+Every send of an upload draws a random number of its own, a resend included,
+stamped on its notes in the transaction that makes it. The server answers
+every upload it filed with a `Filed` message, after its transaction commits,
+and the replica lets go of the notes that send carried — a note sent again
+since waits for the answer to that send, and a row written since goes up
+again, so a late answer never forgets a write it did not carry. An answer
+that arrives before the replica recorded the send counts all the same; one
+meant for another replica, or for this one before it was restored, names
+nothing of its. An upload the server does not answer
 goes again after a while. An upload stays within the transport's size; a row
 that can never fit, or that the transport refuses for good, is set aside and
 counted in the backlog until the replica runs again. So the replica always

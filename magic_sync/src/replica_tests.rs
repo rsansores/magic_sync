@@ -1198,13 +1198,16 @@ async fn what_the_replica_wrote_is_pending_until_the_server_filed_it(pool: Sqlit
 }
 
 /// Whatever the order uploads are sent, lost, sent again and answered in —
-/// late answers included — a write is forgotten only once the server filed
-/// an upload that carried it.
+/// late answers, answers that overtake the transport's own, and answers
+/// meant for another replica included — and however often a row is written
+/// meanwhile, a row's note is forgotten only once the server filed an upload
+/// that carried the row as its last write left it; and once the answers
+/// come, every note is.
 #[sqlx::test(migrations = false)]
 async fn no_answer_forgets_a_write_it_did_not_carry(pool: SqlitePool) {
     let settings = Outbox {
         limits: Limits {
-            rows: 50,
+            rows: 3,
             bytes: 1 << 20,
         },
         resend_after: std::time::Duration::from_secs(3600),
@@ -1213,7 +1216,9 @@ async fn no_answer_forgets_a_write_it_did_not_carry(pool: SqlitePool) {
     let lanes = Settings::default().lanes;
     let w = world(pool).await;
     for walk in 1..=5_u64 {
-        w.exec("DELETE FROM sync_notes").await.unwrap();
+        w.exec("DELETE FROM sync_notes; DELETE FROM readings")
+            .await
+            .unwrap();
         forgets_nothing_unfiled(&w, &lanes, &settings, walk).await;
     }
 }
@@ -1261,6 +1266,113 @@ async fn a_late_answer_forgets_only_what_its_upload_carried(pool: SqlitePool) {
     );
 }
 
+/// A row written many times is one note, and goes up once, as its last
+/// write left it; one written again while its upload is on its way is not
+/// forgotten by that upload's answer, and goes again.
+#[sqlx::test(migrations = false)]
+async fn a_row_written_often_goes_up_once_as_it_is_last(pool: SqlitePool) {
+    let w = world(pool).await;
+    let id = Uuid::now_v7();
+    let w = &w;
+    let write = |value: i64| {
+        let sql = format!(
+            "INSERT INTO readings (replica_id, id, value, at) VALUES (x'{}', x'{}', {value}, {value}) \
+             ON CONFLICT (replica_id, id) DO UPDATE SET value = excluded.value, at = excluded.at",
+            w.me.simple(),
+            id.simple()
+        );
+        async move { w.exec(&sql).await }
+    };
+    for value in 1..=5 {
+        write(value).await.unwrap();
+    }
+    assert_eq!(w.count("SELECT count(*) FROM sync_notes").await, 1);
+    let up = w.up(0, false).await.expect("the row");
+    assert_eq!(up.tables[0].upserts.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&up.tables[0].upserts[0]).unwrap();
+    assert_eq!(sent["value"], "5", "as its last write left it");
+    write(6).await.unwrap();
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
+        1,
+        "written since: the answer does not forget it"
+    );
+    let again = w.up(0, false).await.expect("the row, again");
+    let sent: serde_json::Value = serde_json::from_slice(&again.tables[0].upserts[0]).unwrap();
+    assert_eq!(sent["value"], "6");
+    assert_ne!(again.uploads, up.uploads, "a fresh number");
+}
+
+/// The server's answer may reach the replica before the replica records
+/// that the transport took the upload: it is not lost, and nothing goes
+/// again. An answer of a number no upload of this replica carries — meant
+/// for another, or for this one before it was restored — forgets nothing.
+#[sqlx::test(migrations = false)]
+async fn an_answer_that_overtakes_the_send_or_is_not_ours_is_read_right(pool: SqlitePool) {
+    let w = world(pool).await;
+    let lanes = Settings::default().lanes;
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let mut tx = w.pool.begin().await.unwrap();
+    let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &Outbox::default(), false)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    let number = outgoing.up.uploads[0];
+    assert!(number > 0 && i64::try_from(number).is_ok());
+    for stranger in [number ^ 1, number.wrapping_add(1), 1] {
+        w.receive(
+            &Body::Filed(Filed {
+                uploads: vec![stranger],
+            })
+            .encoded(),
+        )
+        .await;
+    }
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
+        1,
+        "none of ours"
+    );
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: vec![number],
+        })
+        .encoded(),
+    )
+    .await;
+    let mut tx = w.pool.begin().await.unwrap();
+    delivered(&mut tx, &outgoing).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(w.count("SELECT count(*) FROM sync_notes").await, 0, "filed");
+    assert!(
+        w.up(0, false).await.is_none_or(|up| up.tables.is_empty()),
+        "nothing goes again"
+    );
+}
+
+/// The server's answer to the upload numbered `number`.
+async fn answer(w: &World, number: u64) {
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: vec![number],
+        })
+        .encoded(),
+    )
+    .await;
+}
+
 /// One seeded walk of [`no_answer_forgets_a_write_it_did_not_carry`].
 async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, walk: u64) {
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15 ^ walk.wrapping_mul(0x2545_f491_4f6c_dd1d);
@@ -1270,21 +1382,31 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
         seed ^= seed << 17;
         usize::try_from(seed % below as u64).unwrap()
     };
-    // The sends the server got, each with its number and the notes it
-    // carried: an answer names the number.
-    let mut received: Vec<(u64, Vec<i64>)> = Vec::new();
-    let mut ever_filed: HashSet<i64> = HashSet::new();
-    let mut noted: HashSet<i64> = HashSet::new();
-    for _ in 0..150 {
-        match next(6) {
-            0 => {
-                sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
-                    .bind(Uuid::now_v7())
-                    .execute(&w.pool)
-                    .await
-                    .unwrap();
+    let rows: [Uuid; 4] = ids();
+    let key = |id: &Uuid| format!("{}|{id}", w.me);
+    // Per row, the writes made to it, and the latest write a filed upload
+    // carried.
+    let mut written: HashMap<String, u64> = HashMap::new();
+    let mut filed: HashMap<String, u64> = HashMap::new();
+    // The sends the server got, each with its number and, per row it
+    // carried, the writes made to it by then.
+    let mut received: Vec<(u64, Vec<(String, u64)>)> = Vec::new();
+    for step in 0..300 {
+        let last = step >= 250;
+        match if last { 3 + next(3) } else { next(8) } {
+            0 | 1 => {
+                let id = rows[next(rows.len())];
+                w.exec(&format!(
+                    "INSERT INTO readings (replica_id, id, value, at) VALUES (x'{}', x'{}', 1, {step}) \
+                     ON CONFLICT (replica_id, id) DO UPDATE SET value = value + 1, at = {step}",
+                    w.me.simple(),
+                    id.simple()
+                ))
+                .await
+                .unwrap();
+                *written.entry(key(&id)).or_default() += 1;
             }
-            1 | 2 => {
+            2 | 3 => {
                 let mut tx = w.pool.begin().await.unwrap();
                 let outgoing = outbox(&mut tx, &codecs(), lanes, 0, settings, false)
                     .await
@@ -1294,15 +1416,35 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
                 let Some(&number) = outgoing.up.uploads.first() else {
                     continue;
                 };
-                // Lost on the way, or taken by the server.
-                if next(2) == 0 {
-                    received.push((number, outgoing.notes.clone()));
+                let carried: Vec<(String, u64)> = outgoing
+                    .up
+                    .tables
+                    .iter()
+                    .flat_map(|t| t.keys.iter().chain(&t.deletes))
+                    .map(|k| {
+                        let k = k.parts.join("|");
+                        let at = written.get(&k).copied().unwrap_or_default();
+                        (k, at)
+                    })
+                    .collect();
+                // Lost on the way, or taken by the server — whose answer
+                // may come before the replica records the send.
+                if last || next(2) == 0 {
+                    if !last && next(3) == 0 {
+                        for (k, at) in &carried {
+                            let seen = filed.entry(k.clone()).or_default();
+                            *seen = (*seen).max(*at);
+                        }
+                        answer(w, number).await;
+                    } else {
+                        received.push((number, carried));
+                    }
                 }
                 let mut tx = w.pool.begin().await.unwrap();
                 delivered(&mut tx, &outgoing).await.unwrap();
                 tx.commit().await.unwrap();
             }
-            3 | 4 => {
+            4 => {
                 // Time passes: whatever was sent and not answered goes again.
                 w.exec("UPDATE sync_notes SET sent_at = '2000-01-01T00:00:00.000Z' WHERE sent_at IS NOT NULL")
                     .await
@@ -1310,33 +1452,41 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
             }
             5 if !received.is_empty() => {
                 // An answer, of any send the server got, in any order.
-                let (number, notes) = received.remove(next(received.len()));
-                ever_filed.extend(notes);
-                w.receive(
-                    &Body::Filed(Filed {
-                        uploads: vec![number],
-                    })
-                    .encoded(),
-                )
-                .await;
+                let (number, carried) = received.remove(next(received.len()));
+                for (k, at) in carried {
+                    let seen = filed.entry(k).or_default();
+                    *seen = (*seen).max(at);
+                }
+                answer(w, number).await;
+            }
+            6 => {
+                // An answer meant for another replica.
+                answer(w, u64::try_from(next(usize::MAX)).unwrap() | 1).await;
             }
             _ => {}
         }
-        let now: HashSet<i64> = sqlx::query_scalar("SELECT id FROM sync_notes")
+        let noted: HashSet<String> = sqlx::query_scalar("SELECT row_key FROM sync_notes")
             .fetch_all(&w.pool)
             .await
             .unwrap()
             .into_iter()
             .collect();
-        noted.extend(now.iter().copied());
-        for forgotten in noted.difference(&now) {
-            assert!(
-                ever_filed.contains(forgotten),
-                "walk {walk}: note {forgotten} forgotten, and no send that carried it was filed"
-            );
+        for (row, writes) in &written {
+            if !noted.contains(row) {
+                assert!(
+                    filed.get(row).is_some_and(|at| at >= writes),
+                    "walk {walk}, step {step}: {row} forgotten, and no filed upload carried its \
+                     last write ({writes}; filed {:?})",
+                    filed.get(row)
+                );
+            }
         }
     }
-    assert!(!ever_filed.is_empty(), "walk {walk} filed something");
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
+        0,
+        "walk {walk}: once the answers come, every note goes"
+    );
 }
 
 /// A message up never outgrows the transport's bytes: what does not fit

@@ -70,28 +70,25 @@ CREATE TABLE sync_rejections (
 );
 
 -- What this replica wrote, noted in the writing transaction by a trigger on
--- each table that goes up: the table and the row's key (its parts as text,
--- joined by |). An upload carries noted rows as they are by then, under a
--- number of its own (`upload`), and a note leaves once the server says it
--- filed that upload. A note that cannot go as it is waits, `set_aside` with
--- why, until the replica runs again.
+-- each table that goes up: one note per row — the table and its key (its
+-- parts as text, joined by |) — and how many writes it noted (`writes`). An
+-- upload carries noted rows as they are by then, under a random number of
+-- its own (`upload`, stamped when it is made) and the writes it carried
+-- (`sent`); `sent_at` once the transport took it. A note leaves once the
+-- server says it filed that upload, unless the row was written since. A
+-- note that cannot go as it is waits, `set_aside` with why, until the
+-- replica runs again or the row is written again.
 CREATE TABLE sync_notes (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    id        INTEGER PRIMARY KEY,
     relation  TEXT    NOT NULL,
     row_key   TEXT    NOT NULL,
+    writes    INTEGER NOT NULL DEFAULT 1,
     noted_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     upload    INTEGER,
+    sent      INTEGER,
     sent_at   TEXT,
-    set_aside TEXT
+    set_aside TEXT,
+    UNIQUE (relation, row_key)
 );
 
-CREATE INDEX sync_notes_unsent ON sync_notes (id) WHERE upload IS NULL;
 CREATE INDEX sync_notes_upload ON sync_notes (upload) WHERE upload IS NOT NULL;
-
--- The last upload number drawn: every send draws a fresh one, so the
--- server's answer to an upload never names notes another one carried.
-CREATE TABLE sync_uploads (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
-    last INTEGER NOT NULL
-);
-INSERT INTO sync_uploads (id, last) VALUES (1, 0);

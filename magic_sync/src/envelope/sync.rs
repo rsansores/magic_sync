@@ -114,7 +114,9 @@ pub struct Up {
     #[prost(uint64, tag = "6")]
     pub sequence: u64,
     /// The number of this upload, when it carries rows: a fresh one on every
-    /// send, from 1 to 2^63 - 1. The server answers with Filed once it filed it.
+    /// send, drawn at random from 1 to 2^63 - 1, so no answer meant for another
+    /// replica, or for this one before a restore, names it. The server answers
+    /// with Filed once it filed it.
     #[prost(uint64, repeated, tag = "7")]
     pub uploads: ::prost::alloc::vec::Vec<u64>,
     /// The version of the protocol the replica speaks.

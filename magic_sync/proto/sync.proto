@@ -91,7 +91,9 @@ message Up {
   string epoch = 5;
   uint64 sequence = 6;
   // The number of this upload, when it carries rows: a fresh one on every
-  // send, from 1 to 2^63 - 1. The server answers with Filed once it filed it.
+  // send, drawn at random from 1 to 2^63 - 1, so no answer meant for another
+  // replica, or for this one before a restore, names it. The server answers
+  // with Filed once it filed it.
   repeated uint64 uploads = 7;
   // The version of the protocol the replica speaks.
   uint32 protocol = 8;

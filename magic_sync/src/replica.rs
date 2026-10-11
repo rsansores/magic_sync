@@ -63,7 +63,8 @@ struct Trigger {
 ///
 /// - the server's tables (catalog) refuse a write that is not the engine's:
 ///   a replica's own edit would be overwritten, and never go up;
-/// - a table that goes up notes every write in `sync_notes` — the row's key,
+/// - a table that goes up notes every write in `sync_notes`, one note per
+///   row, counting its writes — the row's key,
 ///   in the one form keys are compared in, and on an update that changes it
 ///   the old key too, which is gone — and refuses a key stored in a form the
 ///   engine does not read back (a uuid is a 16-byte blob, an integer an
@@ -78,6 +79,10 @@ struct Trigger {
 fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
     use crate::row::Mirror;
     const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
+    // A row noted again is one note, written once more: a hot row goes up
+    // once, as it is by then, and a write since clears what set it aside.
+    const NOTED: &str =
+        "ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, set_aside = NULL";
     let mut out = Vec::new();
     for codec in codecs {
         let table = codec.table.name;
@@ -126,13 +131,13 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
         );
         let note = |row: &str| {
             format!(
-                "INSERT INTO sync_notes (relation, row_key) VALUES ({}, {}); ",
+                "INSERT INTO sync_notes (relation, row_key) VALUES ({}, {}) {NOTED}; ",
                 literal(table),
                 key(row)
             )
         };
         let gone = format!(
-            "INSERT INTO sync_notes (relation, row_key) SELECT {}, {} WHERE {} IS NOT {}; ",
+            "INSERT INTO sync_notes (relation, row_key) SELECT {}, {} WHERE {} IS NOT {} {NOTED}; ",
             literal(table),
             key("OLD"),
             key("OLD"),
@@ -857,8 +862,11 @@ async fn end_snapshot<P: Sync + 'static>(
     Ok(())
 }
 
-/// The server filed these uploads: the notes they carried are done. A
-/// number no upload has is ignored.
+/// The server filed these uploads: the notes their latest send carried are
+/// done — unless the row was written since, which goes up again. A number
+/// no upload of this replica has, or that a note was sent under again since,
+/// names nothing: whether it was meant for another replica, or for this one
+/// before it was restored.
 #[cfg(feature = "sqlite")]
 async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Error> {
     let uploads: Vec<i64> = message
@@ -866,7 +874,9 @@ async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Error> 
         .iter()
         .filter_map(|u| i64::try_from(*u).ok())
         .collect();
-    sqlx::query("DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1))")
+    sqlx::query(
+        "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) AND writes = sent",
+    )
         .bind(json(&uploads))
         .execute(&mut *conn)
         .await?;
@@ -914,8 +924,8 @@ impl From<&envelope::TableBacklog> for UpProgress {
 pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
     Ok(sqlx::query_as(
         "SELECT relation AS \"table\", \
-                sum(set_aside IS NULL AND upload IS NULL) AS unsent, \
-                sum(set_aside IS NULL AND upload IS NOT NULL) AS unfiled, \
+                sum(set_aside IS NULL AND (sent_at IS NULL OR writes > sent)) AS unsent, \
+                sum(set_aside IS NULL AND sent_at IS NOT NULL AND writes = sent) AS unfiled, \
                 sum(set_aside IS NOT NULL) AS set_aside \
            FROM sync_notes GROUP BY relation ORDER BY relation",
     )
@@ -1189,10 +1199,18 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     let gathered = gather(conn, codecs, notes, settings.limits, budget).await?;
     up.tables = gathered.tables;
     if !gathered.carried.is_empty() {
-        let number: i64 = sqlx::query_scalar(
-            "UPDATE sync_uploads SET last = last + 1 WHERE id = 1 RETURNING last",
+        // A random number, a fresh one on every send: no answer meant for
+        // another replica, or for this one before a restore, names its notes.
+        let number: i64 = sqlx::query_scalar("SELECT (random() & 9223372036854775807) | 1")
+            .fetch_one(&mut *conn)
+            .await?;
+        sqlx::query(
+            "UPDATE sync_notes SET upload = $1, sent = writes, sent_at = NULL \
+              WHERE id IN (SELECT value FROM json_each($2))",
         )
-        .fetch_one(&mut *conn)
+        .bind(number)
+        .bind(json(&gathered.carried))
+        .execute(&mut *conn)
         .await?;
         up.uploads = vec![u64::try_from(number).unwrap_or_default()];
     }
@@ -1223,8 +1241,9 @@ struct Note {
 }
 
 /// Up to a message's rows of notes to send on `lane`, oldest first: the ones
-/// never sent, and the ones sent longer than `resend_after` ago — or, by a
-/// clock set back since, in the future — that the server never said it
+/// never sent, or whose send the transport did not take, or written since
+/// they were sent, and the ones sent longer than `resend_after` ago — or, by
+/// a clock set back since, in the future — that the server never said it
 /// filed.
 #[cfg(feature = "sqlite")]
 async fn unsent(
@@ -1250,7 +1269,7 @@ async fn unsent(
     Ok(sqlx::query_as(&format!(
         "SELECT id, relation, row_key FROM sync_notes \
           WHERE set_aside IS NULL \
-            AND (upload IS NULL \
+            AND (sent_at IS NULL OR writes > sent \
                  OR sent_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{} seconds') \
                  OR sent_at > {now}) {filter} \
           ORDER BY id LIMIT $1",
@@ -1261,9 +1280,9 @@ async fn unsent(
     .await?)
 }
 
-/// Keys of one table, each with the notes of it.
+/// Keys of one table, each with its note.
 #[cfg(feature = "sqlite")]
-type Keyed = Vec<(Key, Vec<i64>)>;
+type Keyed = Vec<(Key, i64)>;
 
 /// Notes made into a message's tables.
 #[cfg(feature = "sqlite")]
@@ -1290,7 +1309,7 @@ async fn gather<P: Sync + 'static>(
 ) -> Result<Gathered, Error> {
     let mut aside: Vec<(i64, String)> = Vec::new();
     let mut done: Vec<i64> = Vec::new();
-    // Per table, each key with the notes of it, in the order first noted.
+    // Per table, each key with its note, in the order first noted.
     let mut keyed: HashMap<&str, Keyed> = HashMap::new();
     for note in &notes {
         let Some(codec) = codec_of(codecs, &note.relation).filter(|c| c.goes_up()) else {
@@ -1305,11 +1324,10 @@ async fn gather<P: Sync + 'static>(
                 continue;
             }
         };
-        let keys = keyed.entry(codec.table.name).or_default();
-        match keys.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, ids)) => ids.push(note.id),
-            None => keys.push((key, vec![note.id])),
-        }
+        keyed
+            .entry(codec.table.name)
+            .or_default()
+            .push((key, note.id));
     }
     let mut carried = Vec::new();
     let mut tables = Vec::new();
@@ -1326,13 +1344,13 @@ async fn gather<P: Sync + 'static>(
             ..Table::default()
         };
         let mut missing = Vec::new();
-        for (key, ids) in keys {
+        for (key, id) in keys {
             if let Some((_, e)) = encoded.failed.iter().find(|(k, _)| *k == key) {
-                aside.extend(ids.iter().map(|id| (*id, e.to_string())));
+                aside.push((id, e.to_string()));
                 continue;
             }
             let Some((_, bytes)) = encoded.rows.iter().find(|(k, _)| *k == key) else {
-                missing.push((key, ids));
+                missing.push((key, id));
                 continue;
             };
             let wire = wire_of(&key);
@@ -1349,7 +1367,7 @@ async fn gather<P: Sync + 'static>(
                     "a row of {} bytes, more than a message carries",
                     bytes.len()
                 );
-                aside.extend(ids.iter().map(|id| (*id, why.clone())));
+                aside.push((id, why));
                 continue;
             }
             if full || weight > budget {
@@ -1359,7 +1377,7 @@ async fn gather<P: Sync + 'static>(
             budget -= weight;
             part.upserts.push(bytes.clone());
             part.keys.push(wire);
-            carried.extend(ids);
+            carried.push(id);
         }
         if !part.upserts.is_empty() {
             tables.push(part);
@@ -1367,7 +1385,7 @@ async fn gather<P: Sync + 'static>(
         if codec.takes_deletes() {
             gone.push((codec, missing));
         } else {
-            done.extend(missing.into_iter().flat_map(|(_, ids)| ids));
+            done.extend(missing.into_iter().map(|(_, id)| id));
         }
     }
     for (codec, keys) in gone.into_iter().rev() {
@@ -1375,7 +1393,7 @@ async fn gather<P: Sync + 'static>(
             table: codec.table.name.to_owned(),
             ..Table::default()
         };
-        for (key, ids) in keys {
+        for (key, id) in keys {
             let wire = wire_of(&key);
             let opening = if part.deletes.is_empty() {
                 opened(&part.table)
@@ -1389,7 +1407,7 @@ async fn gather<P: Sync + 'static>(
             }
             budget -= weight;
             part.deletes.push(wire);
-            carried.extend(ids);
+            carried.push(id);
         }
         if !part.deletes.is_empty() {
             tables.push(part);
@@ -1453,7 +1471,8 @@ async fn unreported(
         .collect())
 }
 
-/// The transport took `outgoing`: its notes wait for the server's
+/// The transport took `outgoing`: its notes — the ones still under its
+/// number, the server's answer may have come first — wait for the server's
 /// [`Filed`](envelope::Filed), its rejections are reported (unless refused
 /// again since), and the server of its epoch knows what was applied. Run it
 /// in one transaction.
@@ -1461,8 +1480,8 @@ async fn unreported(
 pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
     if let Some(number) = outgoing.up.uploads.first() {
         sqlx::query(&format!(
-            "UPDATE sync_notes SET upload = $1, sent_at = {} \
-              WHERE id IN (SELECT value FROM json_each($2))",
+            "UPDATE sync_notes SET sent_at = {} \
+              WHERE upload = $1 AND id IN (SELECT value FROM json_each($2))",
             crate::dialect::NOW
         ))
         .bind(i64::try_from(*number).unwrap_or(i64::MAX))
@@ -1519,10 +1538,18 @@ pub(crate) async fn set_aside(
     why: &str,
 ) -> Result<(), Error> {
     sqlx::query(
-        "UPDATE sync_notes SET set_aside = $1 WHERE id IN (SELECT value FROM json_each($2))",
+        "UPDATE sync_notes SET set_aside = $1 \
+          WHERE upload = $3 AND id IN (SELECT value FROM json_each($2))",
     )
     .bind(why)
     .bind(json(&outgoing.notes))
+    .bind(
+        outgoing
+            .up
+            .uploads
+            .first()
+            .map(|n| i64::try_from(*n).unwrap_or_default()),
+    )
     .execute(&mut *conn)
     .await?;
     Ok(())

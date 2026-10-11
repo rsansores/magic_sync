@@ -240,7 +240,11 @@ retired row the server sends again becomes live.
 The server answers each upload (section 7) once it has filed it. On `Filed`,
 the replica **must** forget the notes those uploads carried — the ones whose
 latest send carried that number, and no other: a note sent again since is
-forgotten only on the answer to that send.
+forgotten only on the answer to that send, and a row written since the send
+goes up again. A number none of its sends carries — meant for another
+replica, or for this one before it was restored — names nothing. The answer
+may arrive before the replica recorded that the transport took the upload:
+it counts all the same.
 
 ---
 
@@ -340,8 +344,9 @@ For a table the replica writes and the server mirrors:
    - upserts parents first, in the order the tables point at one another,
      then deletes children first;
    - in `uploads`, the number of this upload: a **fresh** one on every send,
-     resends included, from 1 to 2^63 − 1, never reused (a counter the
-     replica keeps);
+     resends included, drawn **at random** from 1 to 2^63 − 1, so an answer
+     meant for another replica, or for this replica before it was restored
+     from an older copy, never names its notes;
    - within the transport's size limit: what does not fit waits for the next
      upload. A row that can never fit, or that the transport refuses for
      good, is set aside — kept, counted in the backlog, never sent until the
@@ -505,7 +510,8 @@ A replica implementation is complete when:
 - [ ] it acknowledges the transport only after committing;
 - [ ] it reports the last applied `(epoch, sequence)` to the server;
 - [ ] it notes its own writes in the writing transaction, uploads them as they
-      are within the transport's limit, gives every send a fresh number, and
-      forgets on `Filed` only the notes that send carried;
+      are within the transport's limit, gives every send a fresh random
+      number, and forgets on `Filed` only the notes that send carried, as it
+      carried them;
 - [ ] it reports digests with the fingerprint above (optional, recommended);
 - [ ] it says its backlog when it changes (optional, recommended).
