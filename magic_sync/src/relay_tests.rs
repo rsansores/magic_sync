@@ -185,6 +185,7 @@ impl World {
                 messages: 1_000,
                 bytes: 1 << 30,
             },
+            concurrency: 4,
         }
     }
 
@@ -762,6 +763,7 @@ async fn a_replica_away_long_is_owed_one_provisioning_not_every_change(pool: cra
             messages: 4,
             bytes: 1 << 30,
         },
+        concurrency: 4,
         ..world.relay()
     };
     wire.failing.lock().unwrap().insert(a, true);
@@ -1929,3 +1931,67 @@ async fn a_kept_upload_filed_again_files_only_its_rows(pool: crate::DbPool) {
 
 #[path = "status_tests.rs"]
 mod status;
+
+/// Replicas are sent to side by side, as many at once as the relay says and
+/// no more, each its messages one after the other, in order.
+#[sqlx::test(migrations = false)]
+async fn replicas_are_sent_to_side_by_side_each_in_order(pool: crate::DbPool) {
+    /// A transport slow to take a message, counting the sends under way.
+    #[derive(Default)]
+    struct Slow {
+        fake: Fake,
+        under_way: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+    impl Transport for Slow {
+        async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.under_way.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.under_way.fetch_sub(1, SeqCst);
+            self.fake.send(replica, message, id).await
+        }
+    }
+    let world = world(pool).await;
+    for name in ["one", "two", "three"] {
+        world.item(name).await;
+    }
+    for (concurrency, most) in [(1, 1), (2, 2), (8, 2)] {
+        sqlx::query(
+            "INSERT INTO sync.notes (kind, replica_id) SELECT 'resync', id FROM fixture.t_replicas",
+        )
+        .execute(&world.pool)
+        .await
+        .unwrap();
+        let slow = Slow::default();
+        let relay = Relay {
+            limits: Limits {
+                rows: 1,
+                bytes: 1 << 20,
+            },
+            concurrency,
+            ..world.relay()
+        };
+        world.pass_relay(&relay, &slow).await;
+        assert_eq!(
+            slow.most.load(std::sync::atomic::Ordering::SeqCst),
+            most,
+            "{concurrency} at once"
+        );
+        let sent = slow.fake.sent.lock().unwrap();
+        for replica in world.replicas {
+            let numbers: Vec<u64> = sent
+                .iter()
+                .filter(|(r, _)| *r == replica)
+                .map(|(_, m)| match m {
+                    Body::Down(d) => d.sequence,
+                    Body::EndSnapshot(e) => e.sequence,
+                    Body::Filed(_) => 0,
+                })
+                .collect();
+            assert_eq!(numbers.len(), 4, "three rows and the end of the snapshot");
+            assert!(numbers.is_sorted(), "in order: {numbers:?}");
+        }
+    }
+}

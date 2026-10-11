@@ -104,6 +104,8 @@ pub(crate) struct Relay<'a, P> {
     pub(crate) backoff: crate::run::Backoff,
     /// How much a replica's outbox may hold.
     pub(crate) bound: Bound,
+    /// Replicas sent to at once.
+    pub(crate) concurrency: usize,
 }
 
 /// What recording a pass did.
@@ -531,8 +533,10 @@ impl<P: Sync + 'static> Relay<'_, P> {
 
     /// Sends every replica its outbox, in order, each message within the
     /// timeout, on `conn` — the relay's lock's — with no transaction open:
-    /// each message leaves the outbox once the transport took it. A replica
-    /// a send fails to keeps the rest, and waits out its backoff before it is
+    /// each message leaves the outbox once the transport took it. Up to
+    /// `concurrency` replicas are sent to at once, each its messages one
+    /// after the other, so one slow replica holds back no other. A replica a
+    /// send fails to keeps the rest, and waits out its backoff before it is
     /// sent to again; one that is waiting is not sent to.
     pub(crate) async fn publish<T: Transport>(
         &self,
@@ -549,78 +553,99 @@ impl<P: Sync + 'static> Relay<'_, P> {
         )
         .fetch_all(&mut *conn)
         .await?;
+        let conn = tokio::sync::Mutex::new(conn);
+        let jobs = due.into_iter().map(|replica| {
+            let job: Job<'_, _> = Box::pin(self.publish_to(&conn, transport, replica, epoch));
+            job
+        });
         let mut published = Published::default();
-        for replica in due {
-            let (sent, failure) = self.send(conn, transport, replica, epoch).await?;
+        for done in at_most(self.concurrency, jobs).await {
+            let (sent, failing) = done?;
             published.sent += sent;
-            let Some(e) = failure else {
-                sqlx::query(
-                    "INSERT INTO sync.replicas AS r (replica_id, last_sent_at, waiting_since) \
-                     VALUES ($1, now(), now()) \
-                     ON CONFLICT (replica_id) DO UPDATE SET last_sent_at = now(), \
-                       waiting_since = coalesce(r.waiting_since, now()), \
-                       failures = 0, retry_after = NULL, last_error = NULL, refusals = 0",
-                )
-                .bind(replica)
-                .execute(&mut *conn)
-                .await?;
-                continue;
-            };
-            let permanent = !e.is_transient();
-            let why = if permanent {
-                format!("the transport refuses a message for good: {e}")
-            } else {
-                e.to_string()
-            };
-            sqlx::query(
-                "INSERT INTO sync.replicas (replica_id) VALUES ($1) \
-                 ON CONFLICT (replica_id) DO NOTHING",
-            )
-            .bind(replica)
-            .execute(&mut *conn)
-            .await?;
-            let refusals: i32 = sqlx::query_scalar(
-                "UPDATE sync.replicas SET \
-                   last_sent_at = CASE WHEN $2 THEN now() ELSE last_sent_at END, \
-                   waiting_since = CASE WHEN $2 THEN coalesce(waiting_since, now()) ELSE waiting_since END, \
-                   failures = failures + 1, last_error = $3, \
-                   refusals = CASE WHEN $4 THEN refusals + 1 ELSE refusals END, \
-                   retry_after = now() + make_interval(secs => \
-                     least($5 * power(2, least(failures, 32)), $6)) \
-                 WHERE replica_id = $1 RETURNING refusals",
-            )
-            .bind(replica)
-            .bind(sent > 0)
-            .bind(stored(&why))
-            .bind(permanent)
-            .bind(self.backoff.first.as_secs_f64())
-            .bind(self.backoff.max.as_secs_f64())
-            .fetch_one(&mut *conn)
-            .await?;
-            if refusals >= REFUSALS {
-                sqlx::query("UPDATE sync.replicas SET refusals = 0 WHERE replica_id = $1")
-                    .bind(replica)
-                    .execute(&mut *conn)
-                    .await?;
-                let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-                collapse(
-                    &mut tx,
-                    replica,
-                    &format!("the transport refused its next message for good {refusals} times: provisioned again — {why}"),
-                )
-                .await?;
-                tx.commit().await?;
-            }
-            published.failing.push((replica, why));
+            published.failing.extend(failing);
         }
         Ok(published)
     }
 
+    /// Sends `replica` its outbox and records how that went: how many
+    /// messages went, and why a send failed, if one did.
+    async fn publish_to<T: Transport>(
+        &self,
+        conn: &tokio::sync::Mutex<&mut Conn>,
+        transport: &T,
+        replica: Uuid,
+        epoch: Uuid,
+    ) -> Result<(usize, Option<(Uuid, String)>), Error> {
+        let (sent, failure) = self.send(conn, transport, replica, epoch).await?;
+        let mut conn = conn.lock().await;
+        let conn: &mut Conn = &mut conn;
+        let Some(e) = failure else {
+            sqlx::query(
+                "INSERT INTO sync.replicas AS r (replica_id, last_sent_at, waiting_since) \
+                 VALUES ($1, now(), now()) \
+                 ON CONFLICT (replica_id) DO UPDATE SET last_sent_at = now(), \
+                   waiting_since = coalesce(r.waiting_since, now()), \
+                   failures = 0, retry_after = NULL, last_error = NULL, refusals = 0",
+            )
+            .bind(replica)
+            .execute(&mut *conn)
+            .await?;
+            return Ok((sent, None));
+        };
+        let permanent = !e.is_transient();
+        let why = if permanent {
+            format!("the transport refuses a message for good: {e}")
+        } else {
+            e.to_string()
+        };
+        sqlx::query(
+            "INSERT INTO sync.replicas (replica_id) VALUES ($1) \
+             ON CONFLICT (replica_id) DO NOTHING",
+        )
+        .bind(replica)
+        .execute(&mut *conn)
+        .await?;
+        let refusals: i32 = sqlx::query_scalar(
+            "UPDATE sync.replicas SET \
+               last_sent_at = CASE WHEN $2 THEN now() ELSE last_sent_at END, \
+               waiting_since = CASE WHEN $2 THEN coalesce(waiting_since, now()) ELSE waiting_since END, \
+               failures = failures + 1, last_error = $3, \
+               refusals = CASE WHEN $4 THEN refusals + 1 ELSE refusals END, \
+               retry_after = now() + make_interval(secs => \
+                 least($5 * power(2, least(failures, 32)), $6)) \
+             WHERE replica_id = $1 RETURNING refusals",
+        )
+        .bind(replica)
+        .bind(sent > 0)
+        .bind(stored(&why))
+        .bind(permanent)
+        .bind(self.backoff.first.as_secs_f64())
+        .bind(self.backoff.max.as_secs_f64())
+        .fetch_one(&mut *conn)
+        .await?;
+        if refusals >= REFUSALS {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            sqlx::query("UPDATE sync.replicas SET refusals = 0 WHERE replica_id = $1")
+                .bind(replica)
+                .execute(&mut *tx)
+                .await?;
+            collapse(
+                &mut tx,
+                replica,
+                &format!("the transport refused its next message for good {refusals} times: provisioned again — {why}"),
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        Ok((sent, Some((replica, why))))
+    }
+
     /// Sends `replica` its outbox in order until a send fails: how many
-    /// went, and the failure.
+    /// went, and the failure. The connection is taken only to read and
+    /// trim the outbox, never across a send.
     async fn send<T: Transport>(
         &self,
-        conn: &mut Conn,
+        conn: &tokio::sync::Mutex<&mut Conn>,
         transport: &T,
         replica: Uuid,
         epoch: Uuid,
@@ -634,7 +659,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             )
             .bind(replica)
             .bind(after)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut **conn.lock().await)
             .await?;
             if page.is_empty() {
                 return Ok((sent, None));
@@ -663,13 +688,45 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 sqlx::query("DELETE FROM sync.outbox WHERE replica_id = $1 AND sequence <= $2")
                     .bind(replica)
                     .bind(after)
-                    .execute(&mut *conn)
+                    .execute(&mut **conn.lock().await)
                     .await?;
             }
             if failure.is_some() {
                 return Ok((sent, failure));
             }
         }
+    }
+}
+
+/// A replica's publishing, boxed so many run side by side.
+type Job<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Runs `jobs`, at most `limit` at once, and answers what each ended with.
+async fn at_most<'a, T>(limit: usize, jobs: impl IntoIterator<Item = Job<'a, T>>) -> Vec<T> {
+    let mut jobs = jobs.into_iter();
+    let mut running: Vec<Job<'a, T>> = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        running.extend(jobs.by_ref().take(limit.max(1) - running.len()));
+        if running.is_empty() {
+            return out;
+        }
+        std::future::poll_fn(|cx| {
+            let before = out.len();
+            running.retain_mut(|job| match job.as_mut().poll(cx) {
+                std::task::Poll::Ready(done) => {
+                    out.push(done);
+                    false
+                }
+                std::task::Poll::Pending => true,
+            });
+            if out.len() > before {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
     }
 }
 

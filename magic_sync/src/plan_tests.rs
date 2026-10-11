@@ -388,6 +388,7 @@ fn relay<'a>(engine: &'a Engine, codecs: &'a [Codec<()>]) -> crate::relay::Relay
             messages: 50,
             bytes: 1 << 30,
         },
+        concurrency: 4,
     }
 }
 

@@ -115,6 +115,9 @@ pub struct Settings {
     pub backoff: Backoff,
     /// How long one send may take before its replica counts as unreachable.
     pub send_timeout: Duration,
+    /// Replicas sent to at once, each its messages in order: so many sends
+    /// wait on the transport side by side.
+    pub concurrency: NonZeroU32,
     /// How long a replica a send failed to waits before it is tried again.
     pub replica_backoff: Backoff,
     /// How long a replica may leave a message unconfirmed, with nothing sent
@@ -150,6 +153,7 @@ impl Default for Settings {
             idle: Duration::from_secs(1),
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
             send_timeout: Duration::from_secs(30),
+            concurrency: NonZeroU32::new(16).expect("not zero"),
             replica_backoff: Backoff::new(Duration::from_secs(2), Duration::from_secs(15 * 60)),
             unconfirmed_after: Duration::from_secs(60 * 60),
             standby: Duration::from_secs(30),
@@ -487,6 +491,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 messages: i64::from(self.settings.outbox_messages.get()),
                 bytes: i64::try_from(self.settings.outbox_bytes.get()).unwrap_or(i64::MAX),
             },
+            concurrency: usize::try_from(self.settings.concurrency.get()).unwrap_or(usize::MAX),
         }
     }
 

@@ -262,7 +262,9 @@ owed: its outbox is dropped when the snapshot is written.
 outbox (`sync.outbox`) as it is filled, and what it carries is recorded in
 `sync.held` with its number, in the same transaction that marks the notes
 done. Only once that commits does the relay publish: each replica's outbox,
-in order, a message leaving it once the transport took it. So the server
+in order, a message leaving it once the transport took it — up to
+`Settings::concurrency` replicas at once, so one slow to take its messages
+holds back no other. So the server
 decides what a replica will hold before anything goes, and nothing goes that
 is not recorded: a relay that dies after the commit loses nothing — whoever
 runs the relay next sends the outbox — and one that dies before it sent
