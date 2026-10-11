@@ -239,16 +239,19 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let done: Vec<i64> = notes.iter().map(|n| n.id).chain(covered).collect();
         crate::plan::mark_done(conn, &done).await?;
         outcome.done = notes.len();
-        for (id, why) in &outcome.parked {
-            sqlx::query(
-                "UPDATE sync.notes SET parked_at = now(), attempts = attempts + 1, last_error = $2 \
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(stored(why))
-            .execute(&mut *conn)
-            .await?;
-        }
+        let (ids, whys): (Vec<i64>, Vec<String>) = outcome
+            .parked
+            .iter()
+            .map(|(id, why)| (*id, stored(why)))
+            .unzip();
+        sqlx::query(
+            "UPDATE sync.notes n SET parked_at = now(), attempts = attempts + 1, last_error = p.why \
+               FROM unnest($1::bigint[], $2::text[]) AS p(id, why) WHERE n.id = p.id",
+        )
+        .bind(&ids)
+        .bind(&whys)
+        .execute(&mut *conn)
+        .await?;
         outcome.collapsed = self.bound(conn, &replicas).await?;
         Ok(outcome)
     }
@@ -957,27 +960,36 @@ pub(crate) async fn resync(conn: &mut Conn, replica: Uuid) -> Result<bool, Error
 /// Sets `unsent` aside: each row stays owed to its replica until a retry
 /// gets it there. The replica keeps whatever version of it it had.
 async fn quarantine(conn: &mut Conn, unsent: &[Unsent]) -> Result<(), Error> {
+    let Some(first) = unsent.first() else {
+        return Ok(());
+    };
+    tracing::error!(
+        rows = unsent.len(),
+        replica = %first.replica,
+        table = first.table,
+        key = first.key,
+        reason = first.reason,
+        "sync: rows quarantined for replicas, the first of them named — fix the cause and they go on the next retry"
+    );
+    let mut rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for row in unsent {
-        tracing::error!(
-            replica = %row.replica,
-            table = row.table,
-            key = row.key,
-            reason = row.reason,
-            "sync: a row quarantined for a replica — fix the cause and it goes on the next retry"
-        );
-        sqlx::query(
-            "INSERT INTO sync.quarantine AS q (replica_id, relation, row_key, cause, reason) \
-             VALUES ($1, $2, $3, 'server', $4) \
-             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET cause = EXCLUDED.cause, \
-               reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1, carried = NULL",
-        )
-        .bind(row.replica)
-        .bind(row.table)
-        .bind(&row.key)
-        .bind(stored(&row.reason))
-        .execute(&mut *conn)
-        .await?;
+        rows.0.push(row.replica);
+        rows.1.push(row.table);
+        rows.2.push(row.key.as_str());
+        rows.3.push(stored(&row.reason));
     }
+    sqlx::query(
+        "INSERT INTO sync.quarantine AS q (replica_id, relation, row_key, cause, reason) \
+         SELECT r, t, k, 'server', w FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[]) AS u(r, t, k, w) \
+         ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET cause = EXCLUDED.cause, \
+           reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1, carried = NULL",
+    )
+    .bind(&rows.0)
+    .bind(&rows.1)
+    .bind(&rows.2)
+    .bind(&rows.3)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

@@ -38,7 +38,7 @@ export default {
           "id": 6,
           "key": "not-a-key",
           "kind": "row",
-          "last_error": "`not-a-key` is not a key of `id`",
+          "last_error": "`items`: `not-a-key` is no value of the key column `id`",
           "parked_at": "2026-01-01T00:00:00.123456Z",
           "replica": null,
           "table": "items"

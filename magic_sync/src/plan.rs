@@ -423,8 +423,10 @@ pub(crate) fn parse_key(columns: &[Column], text: &str) -> Result<Key, Error> {
         .iter()
         .zip(parts)
         .map(|(column, part)| {
-            KeyPart::parse(column.key, part)
-                .ok_or_else(|| Error::Misuse(format!("`{part}` is not a key of `{}`", column.name)))
+            KeyPart::parse(column.key, part).ok_or_else(|| Error::Malformed {
+                table: String::new(),
+                reason: format!("`{part}` is no value of the key column `{}`", column.name),
+            })
         })
         .collect()
 }
@@ -917,18 +919,6 @@ impl Engine {
                 )
             })
             .collect();
-        let primary_keys: Vec<(String, String, Vec<String>)> = sqlx::query_as(
-            "SELECT n.nspname::text, c.relname::text,
-                    ARRAY(SELECT a.attname::text FROM unnest(i.indkey) AS k(n)
-                          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.n)
-               FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indrelid
-               JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE i.indisprimary",
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-
         let mut plans: Vec<Plan> = Vec::with_capacity(tables.len());
         for t in &tables {
             let relation = Relation {
@@ -954,12 +944,8 @@ impl Engine {
             // The key is the declaration's, in its order: notes write keys in
             // it, so it has to be the primary key's columns.
             let declared: BTreeSet<&str> = t.key.iter().copied().collect();
-            let primary = primary_keys
-                .iter()
-                .find(|(s, n, _)| *s == relation.schema && *n == relation.name);
-            if primary.is_none_or(|(_, _, cols)| {
-                cols.iter().map(String::as_str).collect::<BTreeSet<_>>() != declared
-            }) {
+            let primary = crate::dialect::primary_key(conn, t.schema, t.name).await?;
+            if primary.iter().map(String::as_str).collect::<BTreeSet<_>>() != declared {
                 return Err(Error::Misuse(format!(
                     "`{}.{}` is mirrored keyed by {:?}, which is not its primary key",
                     t.schema, t.name, t.key
@@ -1052,18 +1038,64 @@ impl Engine {
             }
         }
 
-        let columns: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT table_schema::text, table_name::text, column_name::text \
-               FROM information_schema.columns",
+        let partition = replicas.partition.unwrap_or_default();
+        let replicas_typed = typed_columns(conn, replicas.relation).await?;
+        let type_of = |columns: &[(String, String)], column: &str| {
+            columns
+                .iter()
+                .find(|(c, _)| c == column)
+                .map(|(_, t)| t.clone())
+        };
+        if replicas_typed.is_empty() {
+            return Err(Error::Misuse(format!(
+                "the replicas' relation `{}` is no table or view of the database",
+                replicas.relation
+            )));
+        }
+        for column in ["id", partition].into_iter().filter(|c| !c.is_empty()) {
+            if type_of(&replicas_typed, column).as_deref() != Some("uuid") {
+                return Err(Error::Misuse(format!(
+                    "the replicas' relation `{}` has no uuid column `{column}`",
+                    replicas.relation
+                )));
+            }
+        }
+        readable(
+            conn,
+            &format!("SELECT s.id FROM {} LIMIT 0", Self::replicas_of(replicas)),
+            &format!(
+                "the replicas, `{}` where `{}`",
+                replicas.relation, replicas.live
+            ),
         )
-        .fetch_all(&mut *conn)
         .await?;
+        let mut noted: Vec<Relation> = plans.iter().map(|p| p.relation.clone()).collect();
+        noted.extend(
+            plans
+                .iter()
+                .filter_map(|p| p.group.as_ref())
+                .flat_map(|g| [g.members.clone(), g.assigned.clone()]),
+        );
+        for relation in &noted {
+            let columns = typed_columns(conn, &relation.sql()).await?;
+            // The triggers note the partition of every row that has one.
+            if type_of(&columns, partition).is_some_and(|t| t != "uuid") {
+                return Err(Error::Misuse(format!(
+                    "{} has a column `{partition}` that is not a uuid: the replicas are \
+                     partitioned by the uuid of that name",
+                    relation.sql()
+                )));
+            }
+        }
         for plan in &plans {
-            let has = |column: &str| {
-                columns.iter().any(|(s, t, c)| {
-                    *s == plan.relation.schema && *t == plan.relation.name && c == column
-                })
-            };
+            readable(
+                conn,
+                &format!("SELECT 1 FROM {} LIMIT 0", plan.active),
+                &format!("the active rows of `{}`, `{}`", plan.table, plan.active),
+            )
+            .await?;
+            let columns = typed_columns(conn, &plan.relation.sql()).await?;
+            let has = |column: &str| type_of(&columns, column).is_some();
             let missing = match plan.route {
                 Route::Broadcast => replicas.partition.filter(|p| !has(p)),
                 Route::Assigned(column) if !has(column) => Some(column),
@@ -1138,14 +1170,15 @@ impl Engine {
     /// The live replicas, as a subquery `s(id, partition)`: each once, in
     /// the first of its partitions should the relation repeat it.
     pub(crate) fn replicas_sql(&self) -> String {
-        let partition = self
-            .replicas
-            .partition
-            .map_or("NULL::uuid".to_owned(), ident);
+        Self::replicas_of(self.replicas)
+    }
+
+    fn replicas_of(replicas: Replicas) -> String {
+        let partition = replicas.partition.map_or("NULL::uuid".to_owned(), ident);
         format!(
             "(SELECT DISTINCT ON (id) id, {partition} AS partition FROM {} WHERE {} \
                ORDER BY id, {partition}) AS s",
-            self.replicas.relation, self.replicas.live
+            replicas.relation, replicas.live
         )
     }
 
@@ -2541,6 +2574,34 @@ fn group_of(
         assigned: assigned_table.clone(),
         assigned_replica: assigned_replica.clone(),
     })
+}
+
+/// The columns of `relation` — a table or a view, as SQL names it — with
+/// their types, as the catalog has them whatever the role may read of it;
+/// none when there is no such relation.
+async fn typed_columns(conn: &mut Conn, relation: &str) -> Result<Vec<(String, String)>, Error> {
+    Ok(sqlx::query_as(
+        "SELECT a.attname::text, format_type(a.atttypid, NULL) FROM pg_attribute a \
+          WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(relation)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// Refuses a declaration whose SQL — `what`, read as `sql` — the database
+/// does not run.
+async fn readable(conn: &mut Conn, sql: &str, what: &str) -> Result<(), Error> {
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let read = sqlx::query(sql).execute(&mut *tx).await;
+    tx.rollback().await?;
+    match read {
+        Err(sqlx::Error::Database(e)) => Err(Error::Misuse(format!(
+            "{what} does not read: {}",
+            e.message()
+        ))),
+        other => other.map(|_| ()).map_err(Error::from),
+    }
 }
 
 /// Parents before children; a cycle between mirrored tables is refused.

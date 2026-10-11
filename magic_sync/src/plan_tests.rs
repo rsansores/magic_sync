@@ -1772,3 +1772,60 @@ async fn a_changed_declaration_provisions_every_replica_again(pool: crate::DbPoo
     engine.observe(&mut tx).await.expect("observed again");
     assert_eq!(resyncs(&mut tx).await.expect("resyncs"), live, "once");
 }
+
+/// A declaration of the replicas, or of a table, that the database does not
+/// hold as it says is refused when the engine reads it, naming what is
+/// wrong — never at the first write, or the first pass.
+#[sqlx::test(migrations = false)]
+async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate::DbPool) {
+    let mut conn = bare(&pool).await;
+    let codecs = codecs();
+    let refused = |result: Result<String, Error>| match result {
+        Err(Error::Misuse(why)) => why,
+        other => panic!("not refused: {other:?}"),
+    };
+    for (replicas, named) in [
+        (
+            Replicas::relation("fixture.nowhere").table("t_replicas"),
+            "no table or view",
+        ),
+        (
+            Replicas::relation("fixture.t_replicas")
+                .table("t_replicas")
+                .live("alive"),
+            "does not read",
+        ),
+        (
+            Replicas::relation("fixture.t_replicas")
+                .table("t_replicas")
+                .partitioned_by("retired_at"),
+            "no uuid column `retired_at`",
+        ),
+    ] {
+        let why = refused(Engine::triggers(&mut conn, &codecs, replicas).await);
+        assert!(why.contains(named), "{why}");
+    }
+    // A table whose partition column is no uuid would fail every write its
+    // trigger notes.
+    sqlx::raw_sql(
+        "ALTER TABLE fixture.t_list_members ALTER COLUMN partition_id TYPE text; \
+         DROP VIEW t_kinds;",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("altered");
+    let why = refused(Engine::triggers(&mut conn, &codecs, REPLICAS).await);
+    assert!(
+        why.contains("t_list_members") && why.contains("not a uuid"),
+        "{why}"
+    );
+    sqlx::raw_sql("ALTER TABLE fixture.t_list_members ALTER COLUMN partition_id TYPE uuid USING partition_id::uuid")
+        .execute(&mut *conn)
+        .await
+        .expect("altered back");
+    let why = refused(Engine::triggers(&mut conn, &codecs, REPLICAS).await);
+    assert!(
+        why.contains("t_kinds") && why.contains("does not read"),
+        "an active view that is not there: {why}"
+    );
+}
