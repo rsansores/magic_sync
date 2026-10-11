@@ -151,9 +151,6 @@ struct Ready {
 /// What one pass writes, a chunk at a time: each replica's message being
 /// filled, and the messages filled and not yet numbered and written.
 struct Writer {
-    /// The snapshot the plan read: what the rows it sends are recorded as
-    /// held from.
-    snapshot: String,
     epoch: Uuid,
     /// What seals the epoch's messages.
     secret: Vec<u8>,
@@ -378,7 +375,6 @@ impl<P: Sync + 'static> Relay<'_, P> {
             .map(|replica| (*replica, Uuid::now_v7().to_string()))
             .collect();
         let mut writer = Writer {
-            snapshot: delta.snapshot.clone(),
             epoch,
             secret: secret.to_vec(),
             packers: self
@@ -867,18 +863,23 @@ impl Writer {
         .bind(&outbox.3)
         .execute(&mut *conn)
         .await?;
+        // Each version recorded with the newest note of its row the pass
+        // sees, looked up once per row however many replicas it goes to.
         sqlx::query(
-            "INSERT INTO sync.held (replica_id, relation, row_key, snapshot, sequence) \
-             SELECT r, t, k, $5::pg_snapshot, s \
-               FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) AS u(r, t, k, s) \
+            "WITH u AS (SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
+                            AS u(r, t, k, s)), \
+                  n AS (SELECT t, k, (SELECT max(id) FROM sync.notes n \
+                                       WHERE n.kind = 'row' AND n.relation = r.t AND n.row_key = r.k) AS noted \
+                          FROM (SELECT DISTINCT t, k FROM u) AS r) \
+             INSERT INTO sync.held (replica_id, relation, row_key, noted, sequence) \
+             SELECT u.r, u.t, u.k, coalesce(n.noted, 0), u.s FROM u JOIN n USING (t, k) \
              ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET \
-               sent_at = now(), snapshot = EXCLUDED.snapshot, sequence = EXCLUDED.sequence",
+               sent_at = now(), noted = EXCLUDED.noted, sequence = EXCLUDED.sequence",
         )
         .bind(&held.0)
         .bind(&held.1)
         .bind(&held.2)
         .bind(&held.3)
-        .bind(&self.snapshot)
         .execute(&mut *conn)
         .await?;
         // A row set aside, carried again — or let go of again, after the
@@ -1063,16 +1064,15 @@ pub(crate) async fn unpark(conn: &mut Conn) -> Result<u64, Error> {
 }
 
 /// Notes every quarantined row again, unless such a note is pending; answers
-/// how many. A note of the row as of no transaction at all: every replica
-/// holding a version of it holds that change already, so it goes only where
-/// it is missing — where it was set aside. When it gets there, it leaves the
-/// quarantine.
+/// how many. A retry, no change: every replica holding a version of the row
+/// holds it as it is, so it goes only where it is missing — where it was set
+/// aside. When it gets there, it leaves the quarantine.
 pub(crate) async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
     let done = sqlx::query(
-        "INSERT INTO sync.notes (kind, relation, row_key, xid) \
-         SELECT DISTINCT 'row', q.relation, q.row_key, '0'::xid8 FROM sync.quarantine q \
+        "INSERT INTO sync.notes (kind, relation, row_key) \
+         SELECT DISTINCT 'retry', q.relation, q.row_key FROM sync.quarantine q \
           WHERE NOT EXISTS (SELECT 1 FROM sync.notes n \
-                             WHERE n.done_at IS NULL AND n.kind = 'row' AND n.xid = '0'::xid8 \
+                             WHERE n.done_at IS NULL AND n.kind = 'retry' \
                                AND n.relation = q.relation AND n.row_key = q.row_key)",
     )
     .execute(&mut *conn)

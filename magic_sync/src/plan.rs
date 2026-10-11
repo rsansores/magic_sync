@@ -163,9 +163,6 @@ pub(crate) struct Delta {
     /// Replicas being provisioned: what they held is forgotten and what they
     /// should hold sent whole, then everything else swept on their side.
     pub(crate) snapshots: BTreeSet<Uuid>,
-    /// The snapshot the plan read, as PostgreSQL writes one: a row sent from
-    /// it holds the change of every transaction it sees.
-    pub(crate) snapshot: String,
     /// What was planned, for [`Engine::replan`] to plan it again around a
     /// row that cannot go.
     pub(crate) notes: Vec<Note>,
@@ -202,8 +199,9 @@ pub(crate) enum Change {
         table: String,
         key: String,
         previous: Option<serde_json::Value>,
-        /// The transaction that noted it.
-        xid: i64,
+        /// A row set aside, tried again where it was set aside: no change
+        /// of it, so a replica holding a version of it holds this one.
+        retry: bool,
     },
     /// A member joined or left a group of a grouped table's members table: the
     /// member row, as it was or is.
@@ -374,6 +372,16 @@ fn held_by(f: &str, table: &str) -> String {
     )
 }
 
+/// Whether the version of a row that the held row aliased `h` was sent at
+/// is older than the row: `newest`, the newest note of a change of it among
+/// those in question, is past the newest that version saw. The planner asks
+/// it of the notes it plans, the status of every pending one: one predicate,
+/// so the two agree. A note's number, unlike its transaction's, rises in
+/// the order a row's changes commit, and survives a dump and a restore.
+pub(crate) fn stale(newest: &str) -> String {
+    format!("coalesce({newest} > h.noted, false)")
+}
+
 /// Every one of `columns` of the row aliased `alias` holds a value.
 fn not_null(alias: &str, columns: &[String]) -> String {
     columns
@@ -396,7 +404,7 @@ CREATE TEMP TABLE IF NOT EXISTS sync_live (replica_id UUID) ON COMMIT DELETE ROW
 CREATE TEMP TABLE IF NOT EXISTS sync_fresh (replica_id UUID) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_batch (id BIGINT) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_changed (
-    rel INTEGER, relation TEXT, row_key TEXT, xid XID8) ON COMMIT DELETE ROWS;
+    rel INTEGER, relation TEXT, row_key TEXT, noted BIGINT) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_regrouped (rel INTEGER, relation TEXT, row_key TEXT)
     ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_reassigned (rel INTEGER, relation TEXT, replica_id UUID)
@@ -416,7 +424,7 @@ CREATE TEMP TABLE IF NOT EXISTS sync_kept (
     replica_id UUID, rel INTEGER, row_key TEXT, round INTEGER,
     sends BOOLEAN, up BOOLEAN, down BOOLEAN) ON COMMIT DELETE ROWS;
 CREATE OR REPLACE TEMP VIEW sync_holds AS
-    SELECT h.replica_id, h.relation, h.row_key, h.snapshot, h.refused >= h.sequence AS refused
+    SELECT h.replica_id, h.relation, h.row_key, h.noted, h.refused >= h.sequence AS refused
       FROM sync.held h
      WHERE NOT EXISTS (SELECT 1 FROM sync_fresh f WHERE f.replica_id = h.replica_id);
 ";
@@ -924,7 +932,8 @@ impl Engine {
                    JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
                    JOIN pg_class parent ON parent.oid = c.confrelid
                    JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
-                  WHERE c.contype = 'f' AND c.conparentid = 0",
+                  WHERE c.contype = 'f' AND c.conparentid = 0
+                  ORDER BY 1, 2, 3, 4, 5, 6",
             )
             .fetch_all(&mut *conn)
             .await?;
@@ -1422,9 +1431,6 @@ impl Engine {
              sync_reassigned, sync_released, sync_blocked, sync_wanted, sync_suspect, sync_kept",
         )
         .await?;
-        delta.snapshot = sqlx::query_scalar("SELECT pg_current_snapshot()::text")
-            .fetch_one(&mut *conn)
-            .await?;
         sqlx::query(&format!(
             "INSERT INTO sync_live SELECT s.id FROM {}",
             self.replicas_sql()
@@ -1499,8 +1505,8 @@ impl Engine {
     }
 
     /// The notes of the plan, as what changed: the rows, by their key in the
-    /// one form keys are compared in, with the latest transaction that
-    /// changed each; the parents each pointed at before; the members that
+    /// one form keys are compared in, with the newest note of a change of
+    /// each (0: tried again only); the parents each pointed at before; the members that
     /// moved; the groups given or taken.
     async fn note(&self, conn: &mut Conn, notes: &[Note]) -> Result<Asked, Error> {
         let mut changed: BTreeMap<(usize, String), i64> = BTreeMap::new();
@@ -1513,7 +1519,7 @@ impl Engine {
                     table,
                     key,
                     previous,
-                    xid,
+                    retry,
                 } => {
                     let i = self.index(table).ok_or_else(|| {
                         Error::Misuse(format!(
@@ -1544,8 +1550,10 @@ impl Engine {
                         );
                         released.insert((i, key.clone(), reference.parent, parent));
                     }
-                    let latest = changed.entry((i, key)).or_default();
-                    *latest = (*latest).max(*xid);
+                    let newest = changed.entry((i, key)).or_default();
+                    if !retry {
+                        *newest = (*newest).max(note.id);
+                    }
                 }
                 Change::Members { table, member } => {
                     for (i, g) in self.groups_through(table, |g| &g.members) {
@@ -1570,16 +1578,15 @@ impl Engine {
             .bind(&ids)
             .execute(&mut *conn)
             .await?;
-        let (keys, xids): (Vec<_>, Vec<i64>) = changed.into_iter().unzip();
+        let (keys, noted): (Vec<_>, Vec<i64>) = changed.into_iter().unzip();
         sqlx::query(
             "INSERT INTO sync_changed \
-             SELECT r, t, k, x::text::xid8 FROM unnest($1::int4[], $2::text[], $3::text[], $4::int8[]) \
-                 AS u(r, t, k, x)",
+             SELECT * FROM unnest($1::int4[], $2::text[], $3::text[], $4::int8[])",
         )
         .bind(keys.iter().map(|(i, _)| rel(*i)).collect::<Vec<_>>())
         .bind(keys.iter().map(|(i, _)| name(*i)).collect::<Vec<_>>())
         .bind(keys.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>())
-        .bind(&xids)
+        .bind(&noted)
         .execute(&mut *conn)
         .await?;
         sqlx::query(
@@ -2044,7 +2051,7 @@ impl Engine {
                  SELECT s.replica_id, s.rel, s.row_key, s.round, lacks OR stale, lacks OR stale OR doubt, \
                         lacks OR doubt \
                    FROM (SELECT s.*, h.replica_id IS NULL OR h.refused AS lacks, \
-                                coalesce(NOT pg_visible_in_snapshot(c.xid, h.snapshot), false) AS stale, \
+                                {} AS stale, \
                                 d.replica_id IS NOT NULL AS doubt \
                            FROM sync_staged s \
                            LEFT JOIN sync_holds h ON h.replica_id = s.replica_id AND h.relation = {} \
@@ -2054,6 +2061,7 @@ impl Engine {
                                                    AND d.row_key = s.row_key \
                           WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = s.replica_id \
                                                AND b.rel = s.rel AND b.row_key = s.row_key)) AS s",
+                stale("c.noted"),
                 literal(self.plans[i].table)
             ),
         };
@@ -2428,7 +2436,6 @@ struct Noted {
     row_key: Option<String>,
     replica_id: Option<Uuid>,
     previous: Option<serde_json::Value>,
-    xid: i64,
 }
 
 impl Noted {
@@ -2439,11 +2446,11 @@ impl Noted {
             "resync" => Change::Resync {
                 replica: self.replica_id?,
             },
-            "row" => Change::Row {
+            "row" | "retry" => Change::Row {
+                retry: self.kind == "retry",
                 table: self.relation?,
                 key: self.row_key?,
                 previous: self.previous,
-                xid: self.xid,
             },
             "members" => Change::Members {
                 table: self.relation?,
@@ -2460,7 +2467,8 @@ impl Noted {
 
 /// The notes this build reads: one it cannot, from a later build, is left
 /// where a later build finds it, and holds back none behind it.
-const READABLE: &str = "((kind = 'row' AND relation IS NOT NULL AND row_key IS NOT NULL) \
+const READABLE: &str =
+    "((kind IN ('row', 'retry') AND relation IS NOT NULL AND row_key IS NOT NULL) \
      OR (kind = 'members' AND relation IS NOT NULL AND previous IS NOT NULL) \
      OR (kind = 'assigned' AND relation IS NOT NULL AND replica_id IS NOT NULL) \
      OR (kind = 'resync' AND replica_id IS NOT NULL))";
@@ -2480,7 +2488,7 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
         )));
     }
     let rows: Vec<Noted> = sqlx::query_as(&format!(
-        "SELECT id, kind, relation, row_key, replica_id, previous, xid::text::bigint AS xid \
+        "SELECT id, kind, relation, row_key, replica_id, previous \
            FROM sync.notes WHERE done_at IS NULL AND parked_at IS NULL AND {READABLE} \
           ORDER BY id LIMIT $1"
     ))

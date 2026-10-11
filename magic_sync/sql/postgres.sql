@@ -27,13 +27,12 @@ COMMENT ON COLUMN sync.version.declared IS
 -- relay that holds the engine's lock.
 CREATE TABLE sync.notes (
     id           BIGSERIAL   PRIMARY KEY,
-    kind         TEXT        NOT NULL CHECK (kind IN ('row', 'members', 'assigned', 'resync')),
+    kind         TEXT        NOT NULL CHECK (kind IN ('row', 'retry', 'members', 'assigned', 'resync')),
     relation     TEXT,
     row_key      TEXT,
     replica_id   UUID,
     partition_id UUID,
     previous     JSONB,
-    xid          XID8        NOT NULL DEFAULT pg_current_xact_id(),
     noted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     done_at      TIMESTAMPTZ,
     parked_at    TIMESTAMPTZ,
@@ -50,26 +49,28 @@ CREATE INDEX notes_pending ON sync.notes (id) WHERE done_at IS NULL AND parked_a
 CREATE INDEX notes_done ON sync.notes (done_at) WHERE done_at IS NOT NULL;
 -- A replica's provisioning is noted once, however many reasons ask for it.
 CREATE INDEX notes_resync ON sync.notes (replica_id) WHERE kind = 'resync' AND done_at IS NULL;
--- Whether a row has a change pending, by the row: what a retry notes once,
--- where a row stands, and the pending changes of a table the planner reads.
-CREATE INDEX notes_rows ON sync.notes (relation, row_key) WHERE kind = 'row' AND done_at IS NULL;
+-- A row's notes, by the row, newest last: the newest a version sent saw,
+-- whether a change is pending, what a retry notes once.
+CREATE INDEX notes_rows ON sync.notes (relation, row_key, id) WHERE kind IN ('row', 'retry');
 
 COMMENT ON TABLE sync.notes IS
     'Every change to a mirrored table or a group table, and every replica to provision '
     'again, noted in the transaction that made it. It says what changed, never who receives '
     'it: the planner works that out when it reads the note.';
 COMMENT ON COLUMN sync.notes.kind IS
-    'row: a row of relation changed. members: a row joined or left a group. assigned: a '
-    'group was given to or taken from replica_id. resync: replica_id is provisioned again.';
+    'row: a row of relation changed. retry: a row set aside is tried again where it was set '
+    'aside, and nothing else. members: a row joined or left a group. assigned: a group was '
+    'given to or taken from replica_id. resync: replica_id is provisioned again.';
 COMMENT ON COLUMN sync.notes.row_key IS
     'The changed row''s primary key, its parts joined by |, in key order.';
 COMMENT ON COLUMN sync.notes.previous IS
     'For a row: the columns it points at other mirrored rows with, as they were before an '
     'update or a delete, so a parent it no longer points at can be let go — and nothing else '
     'of the row. For a member: the member row.';
-COMMENT ON COLUMN sync.notes.xid IS
-    'The transaction that noted it. A replica sent a row from a snapshot that sees it already '
-    'holds this change.';
+COMMENT ON COLUMN sync.notes.id IS
+    'Rises with every note. Writers of one row take turns on its lock, so the notes of a row '
+    'rise in the order their changes committed: a version of the row sent while its newest '
+    'note was n holds every change noted up to n, and none after.';
 COMMENT ON COLUMN sync.notes.done_at IS
     'When the relay recorded what the note asked for and wrote its messages to the outbox. '
     'NULL: pending.';
@@ -87,7 +88,7 @@ CREATE TABLE sync.held (
     relation     TEXT        NOT NULL,
     row_key      TEXT        NOT NULL,
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    snapshot     PG_SNAPSHOT NOT NULL,
+    noted        BIGINT      NOT NULL,
     sequence     BIGINT      NOT NULL,
     refused      BIGINT,
     PRIMARY KEY (replica_id, relation, row_key)
@@ -110,9 +111,9 @@ COMMENT ON COLUMN sync.held.refused IS
     'still goes, and a refused delete is sent again; not held for progress, closure shown to '
     'users, or digests. Cleared once the replica applies a later message that carries the row. '
     'NULL: taken.';
-COMMENT ON COLUMN sync.held.snapshot IS
-    'The snapshot the row was last sent from: a change noted by a transaction it sees is in '
-    'what the replica holds, and one by any other is not.';
+COMMENT ON COLUMN sync.held.noted IS
+    'The newest note of the row when the version the replica holds was read: a note of it '
+    'past this one is a change the replica does not hold. 0: none.';
 
 -- Rows taken back from a replica, until it says it applied the message that
 -- took them: a refusal of that message is a delete it could not carry out,

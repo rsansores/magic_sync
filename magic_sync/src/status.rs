@@ -11,7 +11,7 @@
 //! Every answer a dashboard reads serializes as the JSON of contract
 //! [`CONTRACT`], and carries that number.
 
-use crate::plan::{parse_key, Engine};
+use crate::plan::{parse_key, stale, Engine};
 
 pub use crate::replica::UpProgress;
 use crate::Error;
@@ -554,12 +554,12 @@ pub struct Listing {
 const CONFIRMED: &str =
     "coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = e.epoch, false)";
 
-/// Whether a row a replica holds `h` has changed since it was sent: a
-/// pending change of it by a transaction its snapshot does not see.
-const OUTDATED: &str =
-    "EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
-                          AND n.relation = h.relation AND n.row_key = h.row_key \
-                          AND NOT pg_visible_in_snapshot(n.xid, h.snapshot))";
+/// The newest pending change of each row of the table `$1`, joined once
+/// to the rows replicas hold of it, `h`, as `p`: a held row is outdated when
+/// it is older ([`stale`](crate::plan::stale)).
+const PENDING: &str = "LEFT JOIN (SELECT row_key, max(id) AS noted FROM sync.notes \
+                                  WHERE kind = 'row' AND done_at IS NULL AND relation = $1 \
+                                  GROUP BY row_key) p ON p.row_key = h.row_key";
 
 /// The pending notes a scope sees: `$1` every one, else those of the
 /// partitions `$2` (or of none), about the replicas `$3` (or any).
@@ -775,9 +775,9 @@ impl Engine {
             let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
                 "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
                  h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
-                              {OUTDATED} AS outdated \
+                              {} AS outdated \
                          FROM sync.held h CROSS JOIN sync.epoch e \
-                         LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
+                         LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
                         WHERE h.relation = $1 AND h.replica_id = ANY($2) AND h.refused IS NULL) \
                  SELECT coalesce(w.replica_id, h.replica_id), \
                         count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
@@ -786,7 +786,8 @@ impl Engine {
                         count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND NOT h.confirmed), \
                         count(*) FILTER (WHERE $3 AND w.key IS NULL AND h.key IS NOT NULL) \
                    FROM w FULL JOIN h ON w.replica_id = h.replica_id AND w.key = h.key \
-                  GROUP BY 1"
+                  GROUP BY 1",
+                stale("p.noted")
             ))
             .bind(table)
             .bind(&replicas)
@@ -856,11 +857,11 @@ impl Engine {
             .collect();
         let ruled = self.wanted_sql(i, "true").is_some();
         let held: Vec<(Uuid, bool, bool)> = sqlx::query_as(&format!(
-            "SELECT h.replica_id, {CONFIRMED}, \
-                    {OUTDATED} \
+            "SELECT h.replica_id, {CONFIRMED}, {} \
                FROM sync.held h CROSS JOIN sync.epoch e \
-               LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-              WHERE h.relation = $1 AND h.row_key = $2 AND h.replica_id = ANY($3)"
+               LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
+              WHERE h.relation = $1 AND h.row_key = $2 AND h.replica_id = ANY($3)",
+            stale("p.noted")
         ))
         .bind(table)
         .bind(key)

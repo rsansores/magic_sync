@@ -140,6 +140,20 @@ jobs:
       - run: cargo test --locked -p magic_sync --features postgres
       - run: cargo test --locked --manifest-path book/snippets/Cargo.toml --features server
 
+  # The server's database moved between two clusters mid-walk, pg_dump into
+  # pg_restore, the first one's transaction ids far ahead of the second's.
+  moved-database:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: PG_BIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" scripts/moved-database.sh
+
   # The derive's refusals, with the compiler's own words: held to the one
   # rustc the messages checked in were written with (`magic_sync/tests/derive.rs`
   # names it; the other jobs build what the derive accepts and leave the

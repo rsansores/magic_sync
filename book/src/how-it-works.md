@@ -58,7 +58,7 @@ content of a change, only *that* something changed.
 | **mirrored table** | a table that exists on both sides with the same columns |
 | **note** | a record, written in the same transaction as a change, that a row (or a group, or a replica) changed |
 | **held set** | `sync.held`: which rows each replica holds, according to the server |
-| **snapshot** | the snapshot of the database a held row was last sent from: which transactions' changes it holds |
+| **noted** | the newest note of a row when the version a replica holds was read: which of its changes that version holds |
 | **retired** | a row the replica let go of but kept, because a row of its own still points at it |
 | **relay** | the server process that turns notes into messages, one at a time per server |
 | **transport** | whatever carries messages between server and replicas |
@@ -219,12 +219,18 @@ apart could undo what another sends — take back a parent a child planned
 elsewhere still needs.
 
 **What a replica's version holds.** Every plan reads one snapshot of the
-database. When a replica is recorded as holding a row, that snapshot is
-recorded with it. Later, a note for that row sends it again only if the
-snapshot did not see the note's transaction: a change the replica already
-received is never sent twice — not even one committed while a transaction
-older than it was still running — and a change committed *after* the plan
-read (by a transaction that started earlier) is never missed.
+database. When a replica is recorded as holding a row, the newest note of
+that row the snapshot sees is recorded with it. Writers of one row take
+turns on its lock, so a row's notes are numbered in the order its changes
+committed: a later note of it is a change the replica lacks, and sends the
+row again; an earlier one is a change it holds, and sends nothing. A change
+committed *after* the plan read — by a transaction that started earlier,
+or took its transaction id first — is never missed, and a change the
+replica already received is never sent twice. The numbers are a sequence's,
+so a database dumped and restored, or moved to another cluster, keeps
+them: its transaction ids start over, and nothing depends on them. (Logical
+replication carries no sequences: a database moved by it has them set, as
+for every serial column, before its relay runs.)
 
 ### 4.3 Loading
 

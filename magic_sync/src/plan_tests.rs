@@ -1980,7 +1980,7 @@ async fn a_note_for_a_table_no_row_declares_is_refused_not_dropped(pool: crate::
         table: "t_gone".to_owned(),
         key: Uuid::now_v7().to_string(),
         previous: None,
-        xid: 1,
+        retry: false,
     };
     let mut tx = world
         .conn
@@ -2687,4 +2687,152 @@ async fn a_role_that_may_not_create_temporary_tables_is_refused_at_start(pool: c
     .await
     .expect("the role dropped");
     assert!(why.contains("TEMPORARY"), "{why}");
+}
+
+/// The live replicas of `partition`.
+async fn live_in(conn: &mut Conn, partition: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM fixture.t_replicas WHERE live AND partition_id = $1 ORDER BY id",
+    )
+    .bind(partition)
+    .fetch_all(conn)
+    .await
+    .expect("replicas")
+}
+
+/// Two writers of one row commit in another order than they took their
+/// transaction ids, and a pass in between sends the row as the first commit
+/// left it: the second commit goes too.
+#[sqlx::test(migrations = false)]
+async fn a_row_written_last_by_the_older_transaction_goes_again(pool: crate::DbPool) {
+    let mut world = world(pool.clone()).await;
+    let partition = world.partitions[1];
+    let product = Uuid::now_v7();
+    sqlx::query("INSERT INTO fixture.t_products (id, partition_id, name) VALUES ($1, $2, 'p')")
+        .bind(product)
+        .bind(partition)
+        .execute(&mut *world.conn)
+        .await
+        .expect("a product");
+    world.settle().await;
+    let mut older = pool.begin().await.expect("a transaction");
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *older)
+        .await
+        .expect("the older transaction's id");
+    let replica = live_in(&mut world.conn, partition).await[0];
+    note_resync(&mut world.conn, Some(partition), replica)
+        .await
+        .expect("a provisioning");
+    sqlx::query("UPDATE fixture.t_products SET name = 'newer' WHERE id = $1")
+        .bind(product)
+        .execute(&mut *world.conn)
+        .await
+        .expect("the newer transaction's write");
+    // A pass that plans the provisioning alone sends the row as it is now.
+    world.batch = 1;
+    world.round(None).await;
+    world.batch = 100;
+    sqlx::query("UPDATE fixture.t_products SET name = 'older' WHERE id = $1")
+        .bind(product)
+        .execute(&mut *older)
+        .await
+        .expect("the older transaction's write");
+    older.commit().await.expect("committed");
+    world.settle().await;
+    world.assert_holdings(0, 0).await;
+}
+
+/// `url` naming the database `database` instead.
+fn on_database(url: &str, database: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let (server, _) = base.rsplit_once('/').expect("a URL with a database");
+    match query {
+        Some(query) => format!("{server}/{database}?{query}"),
+        None => format!("{server}/{database}"),
+    }
+}
+
+/// The server's database moved to another cluster between two passes —
+/// `pg_dump` into `pg_restore`, as a migration or a restore from a logical
+/// backup moves it — keeps sending what changes, whatever the transaction
+/// ids of the two clusters. `scripts/moved-database.sh` runs it between two
+/// clusters, the first one's transaction ids far ahead of the second's;
+/// `MAGIC_SYNC_MOVED_URL` names the second.
+#[sqlx::test(migrations = false)]
+#[ignore = "needs a second cluster: scripts/moved-database.sh"]
+async fn a_database_moved_to_another_cluster_keeps_sending_what_changes(pool: crate::DbPool) {
+    let moved = std::env::var("MAGIC_SYNC_MOVED_URL").expect("MAGIC_SYNC_MOVED_URL");
+    let from = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let mut world = world(pool).await;
+    let product = Uuid::now_v7();
+    sqlx::query("INSERT INTO fixture.t_products (id, partition_id, name) VALUES ($1, $2, 'p')")
+        .bind(product)
+        .bind(world.partitions[1])
+        .execute(&mut *world.conn)
+        .await
+        .expect("a product");
+    world.settle().await;
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("its name");
+    let target = format!("moved_{}", Uuid::now_v7().simple());
+    let mut admin = sqlx::PgConnection::connect(&moved)
+        .await
+        .expect("the second cluster");
+    sqlx::raw_sql(&format!("CREATE DATABASE {target}"))
+        .execute(&mut admin)
+        .await
+        .expect("a database to move to");
+    let mut dump = std::process::Command::new("pg_dump")
+        .args([
+            "--format=custom",
+            "--dbname",
+            &on_database(&from, &database),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("pg_dump");
+    let restored = std::process::Command::new("pg_restore")
+        .args([
+            "--no-owner",
+            "--exit-on-error",
+            "--dbname",
+            &on_database(&moved, &target),
+        ])
+        .stdin(dump.stdout.take().expect("the dump"))
+        .status()
+        .expect("pg_restore");
+    let dumped = dump.wait().expect("pg_dump");
+    assert!(
+        dumped.success() && restored.success(),
+        "pg_dump | pg_restore failed"
+    );
+    world.pool = crate::DbPool::connect(&on_database(&moved, &target))
+        .await
+        .expect("the moved database");
+    world.conn = world.pool.acquire().await.expect("a connection");
+    sqlx::raw_sql("SET lock_timeout = '100ms'")
+        .execute(&mut *world.conn)
+        .await
+        .expect("a lock timeout");
+    let tables: Vec<&Table> = world.codecs.iter().map(|c| &c.table).collect();
+    world.engine = Engine::new(&mut world.conn, &tables, REPLICAS)
+        .await
+        .expect("the engine, moved");
+    sqlx::query("UPDATE fixture.t_products SET name = 'moved' WHERE id = $1")
+        .bind(product)
+        .execute(&mut *world.conn)
+        .await
+        .expect("a rename");
+    world.settle().await;
+    world.assert_holdings(0, 0).await;
+    drop(world);
+    sqlx::raw_sql(&format!("DROP DATABASE {target} WITH (FORCE)"))
+        .execute(&mut admin)
+        .await
+        .expect("the moved database dropped");
 }

@@ -577,8 +577,8 @@ async fn refuse(
         }
     }
     sqlx::query(
-        "INSERT INTO sync.held AS h (replica_id, relation, row_key, snapshot, sequence, refused) \
-         VALUES ($1, $2, $3, pg_current_snapshot(), $4, $4) \
+        "INSERT INTO sync.held AS h (replica_id, relation, row_key, noted, sequence, refused) \
+         VALUES ($1, $2, $3, 0, $4, $4) \
          ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET refused = EXCLUDED.refused",
     )
     .bind(replica)
