@@ -240,14 +240,15 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
 /// The triggers a replica database needs for `codecs`, as one SQL script: a
 /// host with migrations puts it in the one that creates the tables, after
 /// the engine's first step ([`migration`]), and again whenever a table is
-/// added or changes how it travels, or a release writes them otherwise;
-/// [`check`] refuses a database whose triggers are not these.
+/// added or changes how it travels, or a release writes them otherwise: each
+/// trigger is dropped if it exists before it is created, so the script runs
+/// again over what an earlier run wrote. [`check`] refuses a database whose triggers are not these.
 #[cfg(feature = "sqlite")]
 #[must_use]
 pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
     generated(codecs)
         .into_iter()
-        .map(|t| t.sql + ";\n")
+        .map(|t| format!("DROP TRIGGER IF EXISTS {};\n{};\n", ident(&t.name), t.sql))
         .collect()
 }
 

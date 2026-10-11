@@ -3046,6 +3046,34 @@ async fn rows_by_key_are_the_ones_not_retired(pool: SqlitePool) {
 // ---------------------------------------------------------------------------
 // The database the engine runs against.
 
+async fn live_triggers(conn: &mut sqlx::SqliteConnection) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .fetch_all(conn)
+        .await
+        .unwrap()
+}
+
+/// A host's migration prints the triggers again whenever a table changes, so
+/// the script replaces what is there rather than failing on it.
+#[sqlx::test(migrations = false)]
+async fn the_triggers_script_runs_again_over_what_it_wrote(pool: SqlitePool) {
+    let w = world(pool).await;
+    let mut conn = w.pool.acquire().await.unwrap();
+    let script = triggers(&codecs());
+    let before = live_triggers(&mut conn).await;
+
+    sqlx::raw_sql(&script).execute(&mut *conn).await.expect("a second run");
+    sqlx::raw_sql(&script).execute(&mut *conn).await.expect("a third run");
+    assert_eq!(live_triggers(&mut conn).await, before);
+
+    sqlx::raw_sql("ALTER TABLE readings ADD COLUMN later TEXT")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&script).execute(&mut *conn).await.expect("after a column is added");
+    assert_eq!(live_triggers(&mut conn).await, before);
+}
+
 /// The engine's triggers are checked as they are, not by name: one that
 /// differs, one missing, and one left from a table that no longer travels
 /// are each refused; installing puts them right, in one transaction.
