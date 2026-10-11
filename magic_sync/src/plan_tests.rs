@@ -2434,3 +2434,229 @@ async fn a_follower_something_points_at_keeps_its_parent(pool: crate::DbPool) {
     world.settle().await;
     assert!(holds(&world).is_empty(), "{:?}", holds(&world));
 }
+
+/// Each declaration the schema cannot honour is refused when the engine
+/// reads it, naming the table and what is wrong.
+#[sqlx::test(migrations = false)]
+async fn a_declaration_the_schema_cannot_honour_is_refused_naming_it(pool: crate::DbPool) {
+    let mut conn = bare(&pool).await;
+    let codecs = codecs();
+    for (alteration, named) in [
+        (
+            "ALTER TABLE fixture.t_sizes DROP CONSTRAINT t_sizes_pkey CASCADE; \
+             ALTER TABLE fixture.t_sizes ADD PRIMARY KEY (code, partition_id);",
+            "`fixture.t_sizes` is mirrored keyed by [\"code\"], which is not its primary key",
+        ),
+        (
+            "ALTER TABLE fixture.t_kinds ADD COLUMN parent_id UUID REFERENCES fixture.t_kinds (id);",
+            "`t_kinds` points at itself",
+        ),
+        (
+            "ALTER TABLE fixture.t_families ADD COLUMN kind_id UUID REFERENCES fixture.t_kinds (id);",
+            "point at each other in a cycle",
+        ),
+        (
+            "ALTER TABLE fixture.t_emails DROP CONSTRAINT t_emails_customer_id_fkey;",
+            "`t_emails` follows `customer_id`, which is not a key into a mirrored table",
+        ),
+        (
+            "ALTER TABLE fixture.t_customers ADD UNIQUE (name); \
+             ALTER TABLE fixture.t_orders ADD COLUMN customer_name TEXT \
+                 REFERENCES fixture.t_customers (name);",
+            "`t_orders` points at `t_customers` by [\"name\"], which is not its key",
+        ),
+        (
+            "ALTER TABLE fixture.t_calls DROP COLUMN replica_id CASCADE; \
+             CREATE VIEW t_calls AS SELECT * FROM fixture.t_calls WHERE retired_at IS NULL;",
+            "`t_calls` is sent by `replica_id`, which it does not have",
+        ),
+        (
+            "ALTER TABLE fixture.t_products DROP COLUMN partition_id CASCADE; \
+             CREATE VIEW t_products AS SELECT * FROM fixture.t_products WHERE retired_at IS NULL;",
+            "`t_products` is sent by `partition_id`, which it does not have",
+        ),
+        (
+            "ALTER TABLE fixture.t_list_members DROP CONSTRAINT t_list_members_customer_id_fkey;",
+            "`t_customers` is grouped by `t_list_members` and `t_replica_lists`, but no member key points at it",
+        ),
+        (
+            "ALTER TABLE fixture.t_replica_lists DROP CONSTRAINT t_replica_lists_list_id_fkey;",
+            "the two do not point at one table of groups",
+        ),
+    ] {
+        sqlx::raw_sql(&format!("DROP SCHEMA fixture CASCADE; {SCHEMA} {alteration}"))
+            .execute(&mut *conn)
+            .await
+            .expect(alteration);
+        match Engine::triggers(&mut conn, &codecs, REPLICAS).await {
+            Err(Error::Misuse(why)) => assert!(why.contains(named), "{alteration}\n{why}"),
+            other => panic!("{alteration}: not refused: {other:?}"),
+        }
+    }
+}
+
+/// A table mirrored for the first time that already has rows reached no
+/// replica: installing its trigger provisions every live replica, once.
+#[sqlx::test(migrations = false)]
+async fn a_table_mirrored_for_the_first_time_with_rows_provisions_every_replica(
+    pool: crate::DbPool,
+) {
+    let mut world = world(pool).await;
+    world.settle().await;
+    sqlx::raw_sql(
+        "DROP TRIGGER sync_note_row ON fixture.t_sizes; \
+         INSERT INTO fixture.t_sizes (code, partition_id, name) VALUES (7, gen_random_uuid(), 's');",
+    )
+    .execute(&mut *world.conn)
+    .await
+    .expect("a size written before its table was noted");
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let pending = || "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
+    for _ in 0..2 {
+        let mut tx = world.conn.begin().await.expect("a transaction");
+        Engine::install(&mut tx, &tables, REPLICAS)
+            .await
+            .expect("installed");
+        tx.commit().await.expect("committed");
+    }
+    let resyncs: i64 = sqlx::query_scalar(pending())
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("resyncs");
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM t_replicas WHERE live")
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("live");
+    assert_eq!(resyncs, live, "every live replica, once");
+}
+
+/// A replica asked to be provisioned again — by the host, by the relay —
+/// is noted once while one is pending, in its partition, and again once
+/// that one is done.
+#[sqlx::test(migrations = false)]
+async fn a_replica_is_provisioned_once_however_often_it_is_asked(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    world.settle().await;
+    let (replica, partition): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, partition_id FROM fixture.t_replicas WHERE live LIMIT 1")
+            .fetch_one(&mut *world.conn)
+            .await
+            .expect("a replica");
+    async fn noted(conn: &mut Conn, replica: Uuid) -> Result<(i64, Option<Uuid>), sqlx::Error> {
+        sqlx::query_as(
+            "SELECT count(*), min(partition_id::text)::uuid FROM sync.notes \
+              WHERE kind = 'resync' AND replica_id = $1 AND done_at IS NULL",
+        )
+        .bind(replica)
+        .fetch_one(conn)
+        .await
+    }
+    note_resync(&mut world.conn, Some(partition), replica)
+        .await
+        .expect("noted");
+    note_resync(&mut world.conn, Some(partition), replica)
+        .await
+        .expect("noted again");
+    assert!(
+        !crate::relay::resync(&mut world.conn, replica)
+            .await
+            .expect("asked by the relay"),
+        "one is pending"
+    );
+    assert_eq!(
+        noted(&mut world.conn, replica).await.expect("notes"),
+        (1, Some(partition))
+    );
+    world.settle().await;
+    assert!(crate::relay::resync(&mut world.conn, replica)
+        .await
+        .expect("asked again"));
+    assert_eq!(
+        noted(&mut world.conn, replica).await.expect("notes"),
+        (1, Some(partition)),
+        "in its partition"
+    );
+}
+
+/// Done notes older than the age kept are pruned; newer ones, and every
+/// pending one, are kept.
+#[sqlx::test(migrations = false)]
+async fn done_notes_are_pruned_once_older_than_kept(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    sqlx::raw_sql(
+        "DELETE FROM sync.notes; \
+         INSERT INTO sync.notes (kind, replica_id, done_at) VALUES \
+           ('resync', gen_random_uuid(), now() - interval '2 hours'), \
+           ('resync', gen_random_uuid(), now() - interval '2 hours'), \
+           ('resync', gen_random_uuid(), now() - interval '30 minutes'), \
+           ('resync', gen_random_uuid(), NULL);",
+    )
+    .execute(&mut *world.conn)
+    .await
+    .expect("notes");
+    let pruned = prune(&mut world.conn, Duration::from_secs(3600))
+        .await
+        .expect("pruned");
+    assert_eq!(pruned, 2);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.notes")
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("left");
+    assert_eq!(left, 2, "the newer done one, and the pending one");
+}
+
+/// A table that only travels with others is owed what the engine decided
+/// to send: progress counts what each replica holds of it, and what is set
+/// aside for it there besides.
+#[sqlx::test(migrations = false)]
+async fn progress_counts_a_table_with_no_rule_by_what_was_decided(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[0];
+    let (kind, other) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::raw_sql(&format!(
+        "INSERT INTO fixture.t_kinds (id, partition_id, name) VALUES ('{kind}', '{partition}', 'k'), \
+                ('{other}', '{partition}', 'k'); \
+         INSERT INTO fixture.t_products (id, partition_id, kind_id, name) \
+         VALUES (gen_random_uuid(), '{partition}', '{kind}', 'p'), (gen_random_uuid(), '{partition}', '{other}', 'p');"
+    ))
+    .execute(&mut *world.conn)
+    .await
+    .expect("two kinds, each a product's");
+    world.settle().await;
+    let replica: Uuid = sqlx::query_scalar(
+        "SELECT id FROM fixture.t_replicas WHERE partition_id = $1 AND live ORDER BY id LIMIT 1",
+    )
+    .bind(partition)
+    .fetch_one(&mut *world.conn)
+    .await
+    .expect("a replica");
+    let kinds = |progress: crate::status::Progress| {
+        progress.replicas[0]
+            .tables
+            .iter()
+            .find(|t| t.table == "t_kinds")
+            .map(|t| (t.should, t.holds, t.quarantined))
+            .expect("kinds")
+    };
+    let scope = [replica];
+    let progress = world
+        .engine
+        .progress(&mut world.conn, crate::status::Scope::Replicas(&scope))
+        .await
+        .expect("progress");
+    assert_eq!(kinds(progress), (2, 2, 0));
+    sqlx::query("UPDATE fixture.t_kinds SET name = $2 WHERE id = $1")
+        .bind(other)
+        .bind(POISON)
+        .execute(&mut *world.conn)
+        .await
+        .expect("a kind this build cannot encode");
+    world.settle().await;
+    let progress = world
+        .engine
+        .progress(&mut world.conn, crate::status::Scope::Replicas(&scope))
+        .await
+        .expect("progress");
+    assert_eq!(kinds(progress), (2, 1, 1), "one held, one set aside");
+}
