@@ -208,11 +208,23 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 
 /// The server's own messages (`tests/golden`, captured from the postgres
 /// side's relay) leave the replica holding, step by step, what the server
-/// holds — its encodings, its numbering and its snapshots as they are.
+/// holds — its encodings, its numbering, its snapshots whole, cut short and
+/// superseded, a message lost on the way and the gap it leaves, a new
+/// epoch, an answer to an upload — as a replica with a check of its own and
+/// a row of its own pointing at the server's holds it: a row it refuses
+/// kept as it was, one it points at retired. Every message delivered twice
+/// changes nothing the second time.
 #[sqlx::test(migrations = false)]
 async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: SqlitePool) {
-    use crate::conformance::{golden, GOLDEN};
+    use crate::conformance::{golden, GOLDEN, NEXT_EPOCH, REPLICA, UPLOAD};
     let w = world(pool).await;
+    // A check of the replica's own, which the server's rows may fail.
+    w.exec(
+        "CREATE TRIGGER no_refused BEFORE UPDATE ON shelves WHEN NEW.label = 'refused' \
+         BEGIN SELECT RAISE(ABORT, 'a label this replica refuses'); END",
+    )
+    .await
+    .unwrap();
     let messages = golden(&std::fs::read_to_string(GOLDEN).expect("the golden messages"));
     let mut steps: Vec<&str> = Vec::new();
     for (step, _) in &messages {
@@ -220,77 +232,211 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: 
             steps.push(step);
         }
     }
-    let stray = || async {
-        // A row the server no longer has, held here: a snapshot sweeps it.
-        sqlx::raw_sql(&format!(
-            "INSERT INTO sync_applying VALUES (1); \
-             INSERT INTO items (id, partition_id, name) VALUES (x'{}', x'00', 'stray'); \
-             DELETE FROM sync_applying;",
-            Uuid::now_v7().simple()
-        ))
-        .execute(&w.pool)
-        .await
-        .unwrap();
-    };
     let state = || async {
         let all = |sql: &'static str| w.texts(sql);
         (
-            all("SELECT name FROM items ORDER BY name").await,
+            all(
+                "SELECT name || CASE WHEN retired_at IS NULL THEN '' ELSE ' retired' END \
+                 FROM items ORDER BY name",
+            )
+            .await,
             all("SELECT label || ' ' || revision FROM shelves ORDER BY slot").await,
             all("SELECT CAST(cents AS TEXT) FROM prices").await,
             all("SELECT title || ' ' || done FROM tasks").await,
         )
     };
     let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let a2 = (
+        owned(&["a2", "b retired"]),
+        owned(&["top2 1800000000001"]),
+        owned(&["250"]),
+        owned(&["recount 1"]),
+    );
     for step in steps {
-        if step.contains("snapshot") {
-            stray().await;
-        }
-        for (_, bytes) in messages.iter().filter(|(s, _)| s == step) {
-            let received = w.receive(bytes).await;
-            assert!(
-                matches!(received, Received::Applied(_) | Received::SnapshotEnded),
+        let received: Vec<Received> = {
+            let mut out = Vec::new();
+            for (_, bytes) in messages.iter().filter(|(s, _)| s == step) {
+                if step == "lost" {
+                    continue;
+                }
+                if step == "filed" {
+                    // The replica's own upload, sent under the golden number.
+                    w.exec(&format!(
+                        "INSERT INTO readings (replica_id, id, value, at) \
+                         VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
+                         UPDATE sync_notes SET upload = {}, sent = writes, \
+                           sent_at = '2000-01-01T00:00:00.000Z';",
+                        REPLICA.replace('-', ""),
+                        i64::try_from(UPLOAD).unwrap()
+                    ))
+                    .await
+                    .unwrap();
+                }
+                out.push(w.receive(bytes).await);
+                if step != "gap" {
+                    let again = w.receive(bytes).await;
+                    assert!(
+                        matches!(again, Received::AlreadyApplied | Received::Filed),
+                        "{step}, delivered again: {again:?}"
+                    );
+                }
+            }
+            out
+        };
+        match step {
+            "gap" => assert!(
+                received.iter().all(|r| matches!(r, Received::Gap)),
                 "{step}: {received:?}"
-            );
+            ),
+            "filed" => {
+                assert!(
+                    matches!(received.as_slice(), [Received::Filed]),
+                    "{received:?}"
+                );
+                assert_eq!(w.count("SELECT count(*) FROM sync_notes").await, 0, "filed");
+            }
+            "lost" => {}
+            _ => assert!(
+                received
+                    .iter()
+                    .all(|r| matches!(r, Received::Applied(_) | Received::SnapshotEnded)),
+                "{step}: {received:?}"
+            ),
         }
         let expected = match step {
-            "rows" => (
+            "rows" => Some((
                 owned(&["a", "b"]),
                 owned(&["top 1800000000000", "bottom 1800000000000"]),
                 owned(&["9007199254740993"]),
                 owned(&["count 0"]),
-            ),
-            "update" => (
+            )),
+            "update" => Some((
                 owned(&["a2", "b"]),
                 owned(&["top2 1800000000001", "bottom 1800000000000"]),
                 owned(&["250"]),
                 owned(&["recount 1"]),
-            ),
-            "delete" | "snapshot" => (
-                owned(&["a2"]),
+            )),
+            "refused" => Some((
+                owned(&["a2", "b"]),
+                owned(&["top2 1800000000001", "bottom 1800000000000"]),
+                owned(&["250"]),
+                owned(&["recount 1"]),
+            )),
+            "delete" | "snapshot" | "lost" | "gap" => Some(a2.clone()),
+            "cut" => None,
+            "healed" | "filed" | "epoch" => Some((
+                owned(&["a4", "b retired"]),
                 owned(&["top2 1800000000001"]),
                 owned(&["250"]),
                 owned(&["recount 1"]),
-            ),
-            "emptied" | "empty_snapshot" => (vec![], vec![], vec![], vec![]),
+            )),
+            "emptied" | "empty_snapshot" => Some((owned(&["b retired"]), vec![], vec![], vec![])),
             other => panic!("a step this suite does not know: {other}"),
         };
-        assert_eq!(state().await, expected, "after {step}");
-        if step == "rows" {
-            // The replica's own column, kept through the server's edits —
-            // and filed, so the server's deletes let the row go.
-            w.exec("UPDATE tasks SET done = 1").await.unwrap();
-            let up = w.up(0, false).await.expect("the edit");
-            w.receive(
-                &Body::Filed(Filed {
-                    uploads: up.uploads,
-                })
-                .encoded(),
-            )
-            .await;
+        if let Some(expected) = expected {
+            assert_eq!(state().await, expected, "after {step}");
+        }
+        match step {
+            "rows" => {
+                // The replica's own column, kept through the server's edits —
+                // and filed, so the server's deletes let the row go; and a
+                // row of its own pointing at the server's.
+                w.exec("UPDATE tasks SET done = 1").await.unwrap();
+                let up = w.up(0, false).await.expect("the edit");
+                w.receive(
+                    &Body::Filed(Filed {
+                        uploads: up.uploads,
+                    })
+                    .encoded(),
+                )
+                .await;
+                w.exec(
+                    "INSERT INTO receipts (id, item_id) \
+                     VALUES (1, x'0192f6a0000070008000000000000a02')",
+                )
+                .await
+                .unwrap();
+            }
+            "refused" | "snapshot" | "healed" | "epoch" => {
+                assert_eq!(
+                    w.rejected().await,
+                    ["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],
+                    "after {step}: refused, and kept so"
+                );
+            }
+            _ => {}
         }
     }
+    let applied: String = sqlx::query_scalar("SELECT epoch FROM sync_applied")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(applied, NEXT_EPOCH);
     assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
+}
+
+/// What the replica sends up is the golden upload the server's suite files:
+/// rows of its own, keyed by it, and history, under a number of its own.
+/// `MAGIC_SYNC_BLESS=1` writes it anew.
+#[sqlx::test(migrations = false)]
+async fn the_golden_upload_is_what_the_replica_sends(pool: SqlitePool) {
+    use crate::conformance::{hex, matches_golden, GOLDEN_UP, REPLICA, UPLOAD};
+    let w = world(pool).await;
+    w.exec(&format!(
+        "INSERT INTO readings (replica_id, id, value, at) \
+         VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
+         INSERT INTO events (id, what) VALUES (x'0192f6a0000070008000000000000e02', 'opened');",
+        REPLICA.replace('-', "")
+    ))
+    .await
+    .unwrap();
+    let mut up = w.up(0, false).await.expect("the upload");
+    assert_eq!(up.uploads.len(), 1);
+    up.uploads = vec![UPLOAD];
+    let header = "# What a replica sends up: `name hex` per message. Generated by the replica's\n\
+                  # suite; filed by the server's (conformance::server), whose answer is the golden\n\
+                  # `filed` step.\n";
+    matches_golden(
+        GOLDEN_UP,
+        &format!("{header}upload {}\n", hex(&up.encode_to_vec())),
+    );
+}
+
+/// Every message no server sends — the corpus in `tests/golden` — is
+/// malformed to the replica: acknowledged, nothing applied, and the replica
+/// goes on from where it was.
+#[sqlx::test(migrations = false)]
+async fn every_malformed_message_of_the_corpus_is_taken_as_such(pool: SqlitePool) {
+    use crate::conformance::{golden, EPOCH as SERVER, MALFORMED};
+    let w = world(pool).await;
+    let provisioned = Body::EndSnapshot(EndSnapshot {
+        snapshot_id: "provisioned".to_owned(),
+        sequence: 100,
+        epoch: SERVER.to_owned(),
+        ..EndSnapshot::default()
+    })
+    .encoded();
+    w.receive(&provisioned).await;
+    let corpus = golden(&std::fs::read_to_string(MALFORMED).expect("the corpus"));
+    assert!(corpus.len() >= 10);
+    for (case, bytes) in corpus {
+        let got = w.receive(&bytes).await;
+        assert!(matches!(got, Received::Malformed(_)), "{case}: {got:?}");
+    }
+    let applied: (String, i64) = sqlx::query_as("SELECT epoch, sequence FROM sync_applied")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(applied, (SERVER.to_owned(), 100));
+    let next = Body::Down(Down {
+        tables: vec![upserts("items", vec![item(Uuid::now_v7(), "after")])],
+        sequence: 101,
+        previous: 100,
+        epoch: SERVER.to_owned(),
+        ..Down::default()
+    })
+    .encoded();
+    assert!(matches!(w.receive(&next).await, Received::Applied(_)));
 }
 
 // ---------------------------------------------------------------------------

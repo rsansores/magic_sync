@@ -115,7 +115,6 @@ pub const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/to_r
 
 /// The golden messages, as `(step, bytes)`, in the order they were sent:
 /// one line each, the step's name and the message in hex.
-#[cfg(feature = "sqlite")]
 pub fn golden(text: &str) -> Vec<(String, Vec<u8>)> {
     text.lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -183,22 +182,144 @@ impl Uplinked {
     }
 }
 
+/// Where the golden uploads are kept: what the replica sends, captured on
+/// the sqlite side, filed by the postgres side's server.
+pub const GOLDEN_UP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/to_server.txt");
+
+/// Where the messages no server sends are kept, each one a replica must
+/// take as malformed: acknowledged, nothing applied.
+pub const MALFORMED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/malformed.txt");
+
+/// The replica the golden messages are for, and the server installations
+/// they come from.
+pub const REPLICA: &str = "0192f6a0-0000-7000-8000-0000000000aa";
+pub const EPOCH: &str = "0192f6a0-0000-7000-8000-00000000e90c";
+#[cfg(feature = "sqlite")]
+pub const NEXT_EPOCH: &str = "0192f6a0-0000-7000-8000-00000000e90d";
+
+/// The number the golden upload is sent under, pinned: a replica draws a
+/// random one.
+#[cfg(feature = "sqlite")]
+pub const UPLOAD: u64 = 0x0192_f6a0_0000_7001;
+
+/// `bytes` as a golden line's hex.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Holds `text` against the golden file `path`; `MAGIC_SYNC_BLESS=1` writes
+/// it.
+pub fn matches_golden(path: &str, text: &str) {
+    if std::env::var_os("MAGIC_SYNC_BLESS").is_some() {
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let checked_in = std::fs::read_to_string(path).unwrap_or_default();
+    assert!(
+        checked_in == text,
+        "{path} is not what this build sends: run its test with MAGIC_SYNC_BLESS=1, then the \
+         other side's suite against the result, and commit it"
+    );
+}
+
+/// Messages no server sends, each named for what is wrong with it: a
+/// replica of any build takes each as malformed (PROTOCOL.md 4.0, 4.1, 4.2).
+/// They follow a replica provisioned by a snapshot of nothing, `EndSnapshot`
+/// 100 of [`EPOCH`].
+pub fn malformed() -> Vec<(&'static str, Vec<u8>)> {
+    use crate::envelope::{Body, Down, EndSnapshot, ToReplica};
+    use prost::Message as _;
+    let down = |sequence: u64, previous: u64, snapshot: &str, epoch: &str| {
+        Body::Down(Down {
+            snapshot_id: snapshot.to_owned(),
+            tables: Vec::new(),
+            sequence,
+            epoch: epoch.to_owned(),
+            previous,
+        })
+    };
+    let message = |protocol: u32, body: Option<Body>| ToReplica { protocol, body }.encode_to_vec();
+    let mut truncated = message(1, Some(down(101, 100, "", EPOCH)));
+    truncated.truncate(truncated.len() - 3);
+    vec![
+        ("no_message", vec![0xff, 0xff, 0xff]),
+        ("truncated", truncated),
+        ("no_protocol", message(0, Some(down(101, 100, "", EPOCH)))),
+        ("no_body", message(1, None)),
+        ("unknown_body", vec![0x08, 0x01, 0x4a, 0x02, 0x08, 0x01]),
+        ("sequence_zero", message(1, Some(down(0, 0, "s", EPOCH)))),
+        (
+            "sequence_too_large",
+            message(1, Some(down(1 << 63, 100, "", EPOCH))),
+        ),
+        ("epoch_no_uuid", message(1, Some(down(101, 100, "", "e")))),
+        (
+            "follows_itself",
+            message(1, Some(down(101, 101, "", EPOCH))),
+        ),
+        (
+            "follows_a_later_one",
+            message(1, Some(down(101, 102, "", EPOCH))),
+        ),
+        (
+            "follows_nothing_and_begins_nothing",
+            message(1, Some(down(101, 0, "", EPOCH))),
+        ),
+        (
+            "of_a_snapshot_not_in_progress",
+            message(
+                1,
+                Some(down(
+                    101,
+                    100,
+                    "0192f6a0-0000-7000-8000-000000005fff",
+                    EPOCH,
+                )),
+            ),
+        ),
+        (
+            "ends_a_snapshot_not_in_progress",
+            message(
+                1,
+                Some(Body::EndSnapshot(EndSnapshot {
+                    snapshot_id: "0192f6a0-0000-7000-8000-000000005fff".to_owned(),
+                    tables: vec!["items".to_owned()],
+                    sequence: 101,
+                    epoch: EPOCH.to_owned(),
+                    previous: 100,
+                })),
+            ),
+        ),
+    ]
+}
+
+/// The malformed corpus is what [`malformed`] builds: a replica in another
+/// language reads its cases from the file.
+#[test]
+fn the_malformed_corpus_is_the_one_checked_in() {
+    let header = "# Messages no server sends: `case hex` per message. A replica provisioned by an\n\
+                  # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, of nothing, takes each\n\
+                  # as malformed: it acknowledges it and applies nothing (PROTOCOL.md 4.0, 4.1, 4.2).\n";
+    let text: String = malformed()
+        .iter()
+        .map(|(case, bytes)| format!("{case} {}\n", hex(bytes)))
+        .collect();
+    matches_golden(MALFORMED, &format!("{header}{text}"));
+}
+
 /// The server's side of the golden messages: a server with every table of
-/// the suite, one replica, and a pass of the real relay per step, each
-/// message it sends that replica kept. What varies from run to run — the
-/// installation's epoch, the snapshot ids a pass draws — is pinned, so the
-/// same build sends the same bytes.
+/// the suite and one replica, run step by step — the real relay's passes,
+/// and the real filing of the golden upload — each message it sends that
+/// replica kept. What varies from run to run — the snapshot ids a pass
+/// draws — is pinned, so the same build sends the same bytes.
 #[cfg(all(test, feature = "postgres"))]
 mod server {
     use super::*;
     use crate::envelope::{Body, Limits, ToReplica};
-    use crate::plan::{Engine, Replicas};
-    use crate::relay::{Relay, Transport};
+    use crate::plan::Replicas;
+    use crate::run::server::{Anyone, Server, Settings, Transport};
     use prost::Message as _;
-    use std::sync::Mutex;
-
-    pub const EPOCH: &str = "0192f6a0-0000-7000-8000-00000000e90c";
-    pub const REPLICA: &str = "0192f6a0-0000-7000-8000-0000000000aa";
+    use std::sync::{Arc, Mutex};
 
     const SCHEMA: &str = "
     CREATE SCHEMA fixture;
@@ -211,10 +332,20 @@ mod server {
     CREATE TABLE fixture.prices (id UUID PRIMARY KEY, cents BIGINT NOT NULL, updated_at TIMESTAMPTZ NOT NULL);
     CREATE TABLE fixture.tasks (id UUID PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL, retired_at TIMESTAMPTZ);
+    CREATE TABLE fixture.readings (replica_id UUID NOT NULL, id UUID NOT NULL, value BIGINT NOT NULL,
+        at BIGINT NOT NULL, PRIMARY KEY (replica_id, id));
+    CREATE TABLE fixture.events (id UUID PRIMARY KEY, what TEXT NOT NULL);
     ";
 
-    /// Each step's statements, run before its pass.
-    pub const STEPS: &[(&str, &str)] = &[
+    const RESYNC: &str =
+        "INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');";
+
+    /// Each step: its name, the statements run before its pass, and how many
+    /// of its messages the transport takes before it fails (`None`: all).
+    /// The replica's suite reads the steps by name.
+    pub const STEPS: &[(&str, &str, Option<usize>)] = &[
+        // The first messages to a replica: its provisioning, of several
+        // messages (two rows each).
         (
             "rows",
             "INSERT INTO fixture.items (id, partition_id, name) VALUES
@@ -227,6 +358,7 @@ mod server {
                ('0192f6a0-0000-7000-8000-000000000c01', 9007199254740993, '2027-01-15 08:00:00.123456+00');
              INSERT INTO fixture.tasks (id, title, done, updated_at) VALUES
                ('0192f6a0-0000-7000-8000-000000000d01', 'count', false, '2027-01-15 08:00:00+00');",
+            None,
         ),
         (
             "update",
@@ -234,29 +366,54 @@ mod server {
              UPDATE fixture.shelves SET label = 'top2', revision = 1800000000001 WHERE slot = 1;
              UPDATE fixture.prices SET cents = 250, updated_at = '2027-01-15 08:00:01+00';
              UPDATE fixture.tasks SET title = 'recount', updated_at = '2027-01-15 08:00:01+00';",
+            None,
         ),
+        // A row the replica refuses (its own check): it keeps what it had.
+        (
+            "refused",
+            "UPDATE fixture.shelves SET label = 'refused', revision = 1800000000002 WHERE slot = 1;",
+            None,
+        ),
+        // A row a row of the replica's own points at: retired, not deleted.
         (
             "delete",
             "DELETE FROM fixture.items WHERE name = 'b'; DELETE FROM fixture.shelves WHERE slot = 2;",
+            None,
         ),
+        // A snapshot cut short by the transport, superseded by the next.
+        ("cut", RESYNC, Some(1)),
+        ("snapshot", RESYNC, None),
+        // A message the transport loses: the next follows one the replica
+        // never got.
+        ("lost", "UPDATE fixture.items SET name = 'a3' WHERE name = 'a2';", None),
+        ("gap", "UPDATE fixture.items SET name = 'a4' WHERE name = 'a3';", None),
+        ("healed", RESYNC, None),
+        // The replica's upload, filed, answered.
+        ("filed", "", None),
+        // The server installed again: a new epoch begins with a snapshot.
         (
-            "snapshot",
-            "INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');",
+            "epoch",
+            "UPDATE sync.epoch SET epoch = '0192f6a0-0000-7000-8000-00000000e90d';
+             DELETE FROM sync.outbox; DELETE FROM sync.held; DELETE FROM sync.gone;
+             UPDATE sync.chains SET last_sequence = NULL, snapshot_sequence = NULL, snapshot_end = NULL;
+             INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');",
+            None,
         ),
         (
             "emptied",
             "DELETE FROM fixture.items; DELETE FROM fixture.shelves; DELETE FROM fixture.prices;
              DELETE FROM fixture.tasks;",
+            None,
         ),
-        (
-            "empty_snapshot",
-            "INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');",
-        ),
+        ("empty_snapshot", RESYNC, None),
     ];
 
-    /// What the relay sends the replica.
-    #[derive(Default)]
-    struct Kept(Mutex<Vec<Vec<u8>>>);
+    /// What the server sends the replica, as long as it takes them.
+    #[derive(Clone, Default)]
+    struct Kept {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        takes: Arc<Mutex<Option<usize>>>,
+    }
 
     impl Transport for Kept {
         async fn send(
@@ -265,7 +422,17 @@ mod server {
             message: Vec<u8>,
             _id: &str,
         ) -> Result<(), crate::Error> {
-            self.0.lock().unwrap().push(message);
+            let mut takes = self.takes.lock().unwrap();
+            if *takes == Some(0) {
+                return Err(crate::Error::Transport {
+                    reason: "cut".into(),
+                    transient: true,
+                });
+            }
+            if let Some(n) = takes.as_mut() {
+                *n -= 1;
+            }
+            self.sent.lock().unwrap().push(message);
             Ok(())
         }
     }
@@ -285,80 +452,73 @@ mod server {
             .execute(&mut *conn)
             .await
             .unwrap();
-        let codecs = codecs();
-        let tables: Vec<&crate::row::Table> = codecs
-            .iter()
-            .filter(|c| c.sent_down())
-            .map(|c| &c.table)
-            .collect();
-        let replicas = Replicas {
-            relation: "fixture.t_replicas",
-            table: "t_replicas",
-            live: "live",
-            partition: None,
-        };
         drop(conn);
-        let mut tx = pool.begin().await.unwrap();
-        let engine = Engine::install(&mut tx, &tables, replicas).await.unwrap();
-        tx.commit().await.unwrap();
-        let relay = Relay {
-            engine: &engine,
-            codecs: &codecs,
+        let replicas = Replicas::new("fixture.t_replicas", "t_replicas", "live");
+        let kept = Kept::default();
+        let settings = Settings {
             limits: Limits {
-                rows: 100,
+                rows: 2,
                 bytes: 1 << 20,
             },
-            batch: 100,
-            timeout: std::time::Duration::from_secs(5),
-            backoff: crate::run::Backoff::new(
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(60),
-            ),
-            bound: crate::relay::Bound {
-                messages: 1_000,
-                bytes: 1 << 30,
-            },
+            ..Settings::default()
         };
+        let server = Server::install(
+            pool.clone(),
+            codecs(),
+            replicas,
+            kept.clone(),
+            Anyone(pool.clone()),
+            settings,
+        )
+        .await
+        .unwrap();
+        let uploads = std::fs::read_to_string(GOLDEN_UP).expect("the golden uploads");
         let mut snapshots: Vec<String> = Vec::new();
         let mut out = String::new();
-        for (step, sql) in STEPS {
+        for (step, sql, takes) in STEPS {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
-            loop {
-                let kept = Kept::default();
-                let mut conn = pool.acquire().await.unwrap();
-                let mut tx = sqlx::Connection::begin_with(
-                    &mut *conn,
-                    "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            *kept.takes.lock().unwrap() = *takes;
+            if *step == "filed" {
+                for (_, bytes) in golden(&uploads) {
+                    server
+                        .receive(REPLICA.parse().unwrap(), &bytes)
+                        .await
+                        .unwrap();
+                }
+                let filed: i64 = sqlx::query_scalar(
+                    "SELECT (SELECT count(*) FROM fixture.readings) + (SELECT count(*) FROM fixture.events)",
                 )
+                .fetch_one(&pool)
                 .await
                 .unwrap();
-                let done = relay.record(&mut tx).await.unwrap().done;
-                tx.commit().await.unwrap();
-                relay.publish(&mut conn, &kept).await.unwrap();
-                if done == 0 {
+                assert_eq!(filed, 2, "the golden upload is filed");
+            }
+            loop {
+                sqlx::query("UPDATE sync.replicas SET retry_after = NULL")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let before = kept.sent.lock().unwrap().len();
+                server.pass_now().await.unwrap();
+                if kept.sent.lock().unwrap().len() == before || takes.is_some() {
                     break;
                 }
-                for bytes in kept.0.into_inner().unwrap() {
-                    let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
-                    let snapshot = match &mut message.body {
-                        Some(Body::Down(m)) => Some(&mut m.snapshot_id),
-                        Some(Body::EndSnapshot(m)) => Some(&mut m.snapshot_id),
-                        _ => None,
-                    };
-                    if let Some(id) = snapshot.filter(|id| !id.is_empty()) {
-                        let at = snapshots.iter().position(|s| s == id).unwrap_or_else(|| {
-                            snapshots.push(id.clone());
-                            snapshots.len() - 1
-                        });
-                        *id = format!("0192f6a0-0000-7000-8000-{:012x}", 0x5000 + at);
-                    }
-                    let hex: String = message
-                        .encode_to_vec()
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    out.push_str(&format!("{step} {hex}\n"));
+            }
+            for bytes in std::mem::take(&mut *kept.sent.lock().unwrap()) {
+                let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
+                let snapshot = match &mut message.body {
+                    Some(Body::Down(m)) => Some(&mut m.snapshot_id),
+                    Some(Body::EndSnapshot(m)) => Some(&mut m.snapshot_id),
+                    _ => None,
+                };
+                if let Some(id) = snapshot.filter(|id| !id.is_empty()) {
+                    let at = snapshots.iter().position(|s| s == id).unwrap_or_else(|| {
+                        snapshots.push(id.clone());
+                        snapshots.len() - 1
+                    });
+                    *id = format!("0192f6a0-0000-7000-8000-{:012x}", 0x5000 + at);
                 }
+                out.push_str(&format!("{step} {}\n", hex(&message.encode_to_vec())));
             }
         }
         out
@@ -370,17 +530,8 @@ mod server {
     #[sqlx::test(migrations = false)]
     async fn the_golden_messages_are_what_the_server_sends(pool: crate::DbPool) {
         let header = "# What the server sends one replica, step by step: `step hex` per message.\n\
-                      # Generated by conformance::server; applied by the replica conformance suite.\n";
-        let generated = format!("{header}{}", sent(pool).await);
-        if std::env::var_os("MAGIC_SYNC_BLESS").is_some() {
-            std::fs::create_dir_all(std::path::Path::new(GOLDEN).parent().unwrap()).unwrap();
-            std::fs::write(GOLDEN, &generated).unwrap();
-        }
-        let checked_in = std::fs::read_to_string(GOLDEN).unwrap_or_default();
-        assert!(
-            checked_in == generated,
-            "tests/golden/to_replica.txt is not what the server sends: run this test with \
-             MAGIC_SYNC_BLESS=1, then the sqlite suite against the result, and commit it"
-        );
+                      # Generated by conformance::server; applied by the replica conformance suite,\n\
+                      # which reads each step by its name (the transport loses the `lost` one).\n";
+        matches_golden(GOLDEN, &format!("{header}{}", sent(pool).await));
     }
 }

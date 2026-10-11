@@ -497,6 +497,16 @@ server                                         replica
 
 ## 11. Conformance checklist
 
+The engine's repository holds test vectors, each line a name and a message
+in hex: `tests/golden/to_replica.txt`, what the server sends one replica
+step by step — a provisioning of several messages, updates, a row the
+replica's own check refuses, a delete of a row a row of its own points at,
+a snapshot cut short and the one that supersedes it, a message lost on the
+way and the gap after it, a new epoch, the answer to an upload; the
+replica's suite (`src/replica_tests.rs`) says what a replica holds after
+each step. `tests/golden/malformed.txt`, messages a replica takes as
+malformed; and `tests/golden/to_server.txt`, an upload the server files.
+
 A replica implementation is complete when:
 
 - [ ] it reads every message as a `ToReplica`, leaves one of a later protocol
