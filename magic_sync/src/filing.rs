@@ -193,7 +193,7 @@ async fn file_parts<P: Sync + 'static>(
     }
     // What it refused first: a row it applied a message of and refused is
     // not held, and stays in quarantine.
-    rejected(conn, codecs, sender, &upload.rejected).await?;
+    rejected(conn, codecs, sender, &standing, &upload.rejected).await?;
     if acknowledge(conn, sender, &standing, &upload.epoch, upload.sequence).await? {
         gap(conn, sender, &standing, upload).await?;
         compare(conn, codecs, sender, &standing, upload).await?;
@@ -292,14 +292,19 @@ async fn delete_guarded<P: Sync + 'static>(
     }
 }
 
-/// Rows `replica` reported it could not take: no longer counted as held, and
-/// quarantined, so a retry after a fix sends them again. Only a row the
-/// server records sending it: a rejection of anything else — a row it was
-/// never sent, one reported twice — names nothing to set aside.
+/// Rows `replica` reported it could not take, or let go of: each refused —
+/// still held, for what takes rows back, and not for what it holds — and
+/// quarantined, so a retry after a fix sends it, or its delete, again. Only
+/// a refusal of the last message that carried the row: one of an older
+/// message (a newer version went since), or of another epoch, names
+/// nothing; one of a delete re-records the row it could not let go of. A
+/// rejection of anything else — a table the server does not send, no key
+/// or one that is not the table's, a message never sent it — is malformed.
 async fn rejected<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     replica: Uuid,
+    standing: &Standing,
     rejected: &[envelope::Rejected],
 ) -> Result<(), Error> {
     for row in rejected {
@@ -316,16 +321,44 @@ async fn rejected<P: Sync + 'static>(
             continue;
         };
         let key = key_text(&key);
-        let held = sqlx::query(
-            "DELETE FROM sync.held WHERE replica_id = $1 AND relation = $2 AND row_key = $3",
+        if Uuid::parse_str(&row.epoch).ok() != Some(standing.epoch) {
+            tracing::debug!(%replica, table = row.table, key, "upload: a rejection of another epoch's message — left out");
+            continue;
+        }
+        let Some(sequence) = i64::try_from(row.sequence)
+            .ok()
+            .filter(|s| *s > 0 && standing.last.is_some_and(|last| *s <= last))
+        else {
+            tracing::error!(%replica, table = row.table, key, sequence = row.sequence, "upload: a rejection of a message never sent it — malformed, left out");
+            continue;
+        };
+        if standing.snapshot.is_some_and(|began| sequence < began) {
+            tracing::debug!(%replica, table = row.table, key, "upload: a rejection from before its last provisioning — left out");
+            continue;
+        }
+        // The row as the message left it: held, taken back by it — then the
+        // replica could not let it go — or, after a snapshot that began
+        // before it, swept by its end.
+        let refused = sqlx::query(
+            "WITH taken AS (DELETE FROM sync.gone \
+                             WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence = $4 \
+                             RETURNING 1), \
+                  older AS (SELECT 1 FROM sync.gone \
+                             WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence <> $4) \
+             INSERT INTO sync.held AS h (replica_id, relation, row_key, horizon, sequence, refused) \
+             SELECT $1, $2, $3, '0'::xid8, $4, $4 \
+              WHERE EXISTS (SELECT 1 FROM taken) OR NOT EXISTS (SELECT 1 FROM older) \
+             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET refused = EXCLUDED.refused \
+              WHERE h.sequence <= EXCLUDED.refused",
         )
         .bind(replica)
         .bind(codec.table.name)
         .bind(&key)
+        .bind(sequence)
         .execute(&mut *conn)
         .await?;
-        if held.rows_affected() == 0 {
-            tracing::warn!(%replica, table = row.table, key, "upload: a rejection of a row the server does not record sending it — left out");
+        if refused.rows_affected() == 0 {
+            tracing::debug!(%replica, table = row.table, key, "upload: a rejection of a version sent again since — left out");
             continue;
         }
         let reason = stored(&format!("rejected by the replica: {}", row.reason));
@@ -346,7 +379,7 @@ async fn rejected<P: Sync + 'static>(
             table = row.table,
             key,
             reason,
-            "sync: a replica could not take a row — quarantined until a fix lets it through"
+            "sync: a replica could not take a row, or let it go — quarantined until a fix lets it through"
         );
     }
     Ok(())
@@ -408,6 +441,20 @@ async fn acknowledge(
     .bind(standing.last)
     .execute(&mut *conn)
     .await?;
+    sqlx::query("DELETE FROM sync.gone WHERE replica_id = $1 AND sequence <= $2")
+        .bind(replica)
+        .bind(sequence)
+        .execute(&mut *conn)
+        .await?;
+    // A row it refused is taken once it applied a later message carrying it.
+    sqlx::query(
+        "UPDATE sync.held SET refused = NULL \
+          WHERE replica_id = $1 AND refused IS NOT NULL AND sequence > refused AND sequence <= $2",
+    )
+    .bind(replica)
+    .bind(sequence)
+    .execute(&mut *conn)
+    .await?;
     // A row set aside for it leaves the quarantine once it applied the
     // message that carried it again — not when it is sent: it may refuse it
     // again, and an older version it applied says nothing of this one.
@@ -444,6 +491,7 @@ async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) ->
     );
     for sql in [
         "DELETE FROM sync.outbox",
+        "DELETE FROM sync.gone",
         "UPDATE sync.chains SET last_sequence = NULL, snapshot_sequence = NULL",
     ] {
         sqlx::query(sql).execute(&mut *conn).await?;
@@ -520,10 +568,8 @@ async fn compare<P: Sync + 'static>(
     let mut differ = Vec::new();
     for digest in &upload.digests {
         let keys: Vec<String> = sqlx::query_scalar(
-            "SELECT h.row_key FROM sync.held h WHERE h.replica_id = $1 AND h.relation = $2 \
-               AND NOT EXISTS (SELECT 1 FROM sync.quarantine q \
-                                WHERE q.replica_id = h.replica_id AND q.relation = h.relation \
-                                  AND q.row_key = h.row_key AND q.cause = 'replica')",
+            "SELECT row_key FROM sync.held \
+              WHERE replica_id = $1 AND relation = $2 AND refused IS NULL",
         )
         .bind(replica)
         .bind(&digest.table)

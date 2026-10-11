@@ -38,6 +38,7 @@ impl Rules {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Rejection {
     pub(crate) reason: String,
+    pub(crate) epoch: String,
     pub(crate) sequence: u64,
     pub(crate) reported: bool,
 }
@@ -74,6 +75,9 @@ pub(crate) struct Model {
     /// It missed a message, and waits for a snapshot to begin.
     pub(crate) gap: bool,
     pub(crate) rejections: BTreeMap<Row, Rejection>,
+    /// Rows a row of its own points at, in a table with nothing to retire
+    /// them by: it cannot let them go.
+    pub(crate) pinned: BTreeSet<Row>,
 }
 
 impl Model {
@@ -159,8 +163,11 @@ impl Model {
             Body::EndSnapshot(end) => {
                 let snapshot = self.snapshot.take().expect("begun, or malformed");
                 for table in end.tables.iter().rev() {
-                    self.rejections
-                        .retain(|(t, _), r| t != table || r.sequence >= snapshot.began);
+                    let epoch = self.applied.as_ref().map(|(e, _)| e.clone());
+                    self.rejections.retain(|(t, _), r| {
+                        t != table
+                            || (Some(&r.epoch) == epoch.as_ref() && r.sequence >= snapshot.began)
+                    });
                     let stale: Vec<Row> = self
                         .rows
                         .keys()
@@ -179,10 +186,11 @@ impl Model {
     /// Lets go of `row`, unless a row it holds points at it: then it is
     /// rejected, as a database's foreign key would refuse the delete.
     fn let_go(&mut self, row: Row, sequence: u64, rules: &Rules) {
-        let pointed = self
-            .rows
-            .iter()
-            .any(|((table, _), bytes)| (rules.parents)(table, bytes).contains(&row));
+        let pointed = self.pinned.contains(&row)
+            || self
+                .rows
+                .iter()
+                .any(|((table, _), bytes)| (rules.parents)(table, bytes).contains(&row));
         if pointed {
             self.reject(row, "pointed at", sequence);
             return;
@@ -192,10 +200,16 @@ impl Model {
     }
 
     fn reject(&mut self, row: Row, reason: &str, sequence: u64) {
+        let epoch = self
+            .applied
+            .as_ref()
+            .map(|(e, _)| e.clone())
+            .unwrap_or_default();
         self.rejections.insert(
             row,
             Rejection {
                 reason: reason.to_owned(),
+                epoch,
                 sequence,
                 reported: false,
             },
@@ -212,12 +226,15 @@ impl Model {
             .rejections
             .iter()
             .filter(|(_, r)| !r.reported)
+            .filter(|(_, r)| self.applied.as_ref().is_some_and(|(e, _)| *e == r.epoch))
             .map(|((table, key), r)| Rejected {
                 table: table.clone(),
                 key: Some(crate::envelope::Key {
                     parts: key.split('|').map(str::to_owned).collect(),
                 }),
                 reason: r.reason.clone(),
+                epoch: r.epoch.clone(),
+                sequence: r.sequence,
             })
             .collect();
         let mut up = Up {
@@ -243,7 +260,8 @@ impl Model {
                 .map(|k| k.parts.join("|"))
                 .unwrap_or_default();
             if let Some(r) = self.rejections.get_mut(&(rejected.table.clone(), key)) {
-                r.reported = true;
+                // Unless refused again since.
+                r.reported |= r.sequence == rejected.sequence;
             }
         }
         if up.sequence > 0 {

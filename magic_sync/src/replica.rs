@@ -679,29 +679,34 @@ async fn apply<P: Sync + 'static>(
             continue;
         };
         let applied = codec.apply_down(conn, table.upserts.clone()).await?;
-        for refused in &applied.rejected {
-            let key = match &refused.key {
+        let mut refused = Vec::new();
+        for row in &applied.rejected {
+            let key = match &row.key {
                 Some(key) => Some(key_text(key)),
-                None => wire_key(codec, table.keys.get(refused.at)),
+                None => wire_key(codec, table.keys.get(row.at)),
             };
             reject(
                 conn,
                 &table.table,
-                &Vec::from_iter(key),
-                &refused.reason,
+                &Vec::from_iter(key.clone()),
+                &row.reason,
                 sequence,
             )
             .await?;
+            refused.extend(key);
         }
         let held: Vec<String> = applied.held.iter().map(key_text).collect();
         cleared(conn, &table.table, &held).await?;
         if naming {
+            // Every row it carried, taken or refused: a refused one keeps
+            // what the replica had of it, and its rejection, and is not swept.
+            let named: Vec<&String> = held.iter().chain(refused.iter()).collect();
             sqlx::query(
                 "INSERT OR IGNORE INTO sync_snapshot_keys (table_name, row_key) \
                  SELECT $1, value FROM json_each($2)",
             )
             .bind(&table.table)
-            .bind(json(&held))
+            .bind(json(&named))
             .execute(&mut *conn)
             .await?;
         }
@@ -761,10 +766,12 @@ async fn reject(
         "sync: rows this replica cannot take or let go of — rejected, for the server to hear of: {why}"
     );
     sqlx::query(
-        "INSERT INTO sync_rejections (table_name, row_key, reason, sequence) \
-         SELECT $1, value, $3, $4 FROM json_each($2) WHERE true \
+        "INSERT INTO sync_rejections (table_name, row_key, reason, epoch, sequence) \
+         SELECT $1, value, $3, (SELECT epoch FROM sync_applied WHERE id = 1), $4 \
+           FROM json_each($2) WHERE true \
          ON CONFLICT (table_name, row_key) DO UPDATE SET reason = EXCLUDED.reason, \
-           sequence = EXCLUDED.sequence, rejected_at = EXCLUDED.rejected_at, reported_at = NULL",
+           epoch = EXCLUDED.epoch, sequence = EXCLUDED.sequence, \
+           rejected_at = EXCLUDED.rejected_at, reported_at = NULL",
     )
     .bind(table)
     .bind(json(keys))
@@ -811,11 +818,14 @@ async fn end_snapshot<P: Sync + 'static>(
             );
             continue;
         };
-        sqlx::query("DELETE FROM sync_rejections WHERE table_name = $1 AND sequence < $2")
-            .bind(table)
-            .bind(began)
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query(
+            "DELETE FROM sync_rejections WHERE table_name = $1 \
+               AND (sequence < $2 OR epoch <> (SELECT epoch FROM sync_applied WHERE id = 1))",
+        )
+        .bind(table)
+        .bind(began)
+        .execute(&mut *conn)
+        .await?;
         let named: HashSet<String> =
             sqlx::query_scalar("SELECT row_key FROM sync_snapshot_keys WHERE table_name = $1")
                 .bind(table)
@@ -1410,29 +1420,33 @@ fn wire_of(key: &Key) -> envelope::Key {
     }
 }
 
-/// The rejections the server has not heard of, oldest first, up to `limit`,
-/// each with the message that refused it.
+/// The rejections of this epoch the server has not heard of, oldest first,
+/// up to `limit`, each with the message that refused it: one of another
+/// epoch is of a server that is gone, and its snapshot clears it.
 #[cfg(feature = "sqlite")]
 async fn unreported(
     conn: &mut Conn,
     limit: usize,
 ) -> Result<Vec<(envelope::Rejected, i64)>, Error> {
-    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT table_name, row_key, reason, sequence FROM sync_rejections \
-          WHERE reported_at IS NULL ORDER BY rejected_at, table_name, row_key LIMIT $1",
+    let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT table_name, row_key, reason, epoch, sequence FROM sync_rejections \
+          WHERE reported_at IS NULL AND epoch = (SELECT epoch FROM sync_applied WHERE id = 1) \
+          ORDER BY rejected_at, table_name, row_key LIMIT $1",
     )
     .bind(i64::try_from(limit).unwrap_or(i64::MAX))
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(table, key, reason, sequence)| {
+        .map(|(table, key, reason, epoch, sequence)| {
             let row = envelope::Rejected {
                 table,
                 key: Some(envelope::Key {
                     parts: key.split('|').map(str::to_owned).collect(),
                 }),
                 reason,
+                epoch,
+                sequence: u64::try_from(sequence).unwrap_or_default(),
             };
             (row, sequence)
         })

@@ -128,6 +128,11 @@ message Rejected {
   string table = 1;
   Key key = 2;
   string reason = 3;
+  // The message whose row, or delete, the replica refused: the server
+  // ignores a rejection of a message older than the last one that carried
+  // the row, or of another epoch.
+  string epoch = 4;
+  uint64 sequence = 5;
 }
 
 // What a replica holds of one table: how many rows, and a fingerprint of

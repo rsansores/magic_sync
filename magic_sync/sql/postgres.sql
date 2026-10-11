@@ -80,6 +80,7 @@ CREATE TABLE sync.held (
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     horizon      XID8        NOT NULL,
     sequence     BIGINT      NOT NULL,
+    refused      BIGINT,
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
@@ -94,9 +95,27 @@ COMMENT ON COLUMN sync.held.sent_at IS
 COMMENT ON COLUMN sync.held.sequence IS
     'The message that carried the row: the replica holds it once it has acknowledged a '
     'message at or past this one. Until then the row is on its way.';
+COMMENT ON COLUMN sync.held.refused IS
+    'The message whose version of the row — or whose delete of it — the replica refused: it '
+    'keeps what it had, or nothing. Held for every decision that takes rows back, so a delete '
+    'still goes, and a refused delete is sent again; not held for progress, closure shown to '
+    'users, or digests. Cleared once the replica applies a later message that carries the row. '
+    'NULL: taken.';
 COMMENT ON COLUMN sync.held.horizon IS
     'The xmin of the snapshot the row was last sent from: every transaction before it had '
     'finished, so a change it noted is in what the replica holds.';
+
+-- Rows taken back from a replica, until it says it applied the message that
+-- took them: a refusal of that message is a delete it could not carry out,
+-- and the row is held again, refused; a refusal of an older one is of a
+-- version it no longer matters it did not take.
+CREATE TABLE sync.gone (
+    replica_id UUID   NOT NULL,
+    relation   TEXT   NOT NULL,
+    row_key    TEXT   NOT NULL,
+    sequence   BIGINT NOT NULL,
+    PRIMARY KEY (replica_id, relation, row_key)
+);
 
 -- Every message the engine sends carries a number from this sequence: it
 -- only rises, whichever relay draws it, so a replica can drop a message older

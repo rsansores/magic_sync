@@ -54,13 +54,15 @@ CREATE TABLE sync_backlog (
 
 -- Rows the server sent that this replica could not take, or could not let
 -- go of, until it does: the server is told once (reported_at), quarantines
--- them, and sends them again once a fix is deployed on either side. `sequence`
--- is the message that refused it: a snapshot that ends clears what was
--- refused before it began, which it sent again.
+-- them, and sends them again once a fix is deployed on either side. `epoch`
+-- and `sequence` are the message that refused it, which the server reads
+-- the rejection against: a snapshot that ends clears what was refused before
+-- it began, which it sent again.
 CREATE TABLE sync_rejections (
     table_name  TEXT    NOT NULL,
     row_key     TEXT    NOT NULL,
     reason      TEXT    NOT NULL,
+    epoch       TEXT    NOT NULL,
     sequence    INTEGER NOT NULL,
     rejected_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     reported_at TEXT,

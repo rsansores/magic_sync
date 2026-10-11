@@ -313,6 +313,9 @@ type ForeignKey = (Relation, Relation, Vec<String>, Vec<String>);
 /// schema and name.
 type CatalogForeignKey = (String, String, String, String, Vec<String>, Vec<String>);
 
+/// The horizon [`Engine::held`] answers for a row the replica refused.
+const REFUSED: i64 = -1;
+
 /// Rows a pass loads, encodes and records at a time: what it holds in
 /// memory however much it sends.
 pub(crate) const RECORD_CHUNK: usize = 2_000;
@@ -1065,6 +1068,7 @@ impl Engine {
              provisioned AS (INSERT INTO sync.notes (kind, replica_id, partition_id) \
                              SELECT 'resync', a.id, a.partition FROM arrived a WHERE {}), \
              forgotten AS (DELETE FROM sync.held h USING gone g WHERE h.replica_id = g.replica_id), \
+             untaken AS (DELETE FROM sync.gone t USING gone g WHERE t.replica_id = g.replica_id), \
              dropped AS (DELETE FROM sync.outbox o USING gone g WHERE o.replica_id = g.replica_id), \
              unchained AS (DELETE FROM sync.chains c USING gone g WHERE c.replica_id = g.replica_id), \
              came AS (INSERT INTO sync.replicas AS r (replica_id, live, partition_id) \
@@ -1170,7 +1174,9 @@ impl Engine {
     }
 
     /// Who holds which of `keys` (`None`: every key), among `replicas`
-    /// when given, and the horizon each was last sent from.
+    /// when given, and the horizon each was last sent from — [`REFUSED`]
+    /// for a row the replica refused, which it holds for what takes rows
+    /// back, and lacks for what sends them.
     async fn held(
         &self,
         conn: &mut Conn,
@@ -1178,9 +1184,11 @@ impl Engine {
         keys: Option<&[String]>,
         replicas: Option<&[Uuid]>,
     ) -> Result<BTreeMap<(Uuid, String), i64>, Error> {
-        let mut sql = "SELECT replica_id, row_key, horizon::text::bigint FROM sync.held \
-                       WHERE relation = $1"
-            .to_owned();
+        let mut sql = format!(
+            "SELECT replica_id, row_key, \
+                    CASE WHEN refused IS NULL THEN horizon::text::bigint ELSE {REFUSED} END \
+               FROM sync.held WHERE relation = $1"
+        );
         if keys.is_some() {
             sql.push_str(" AND row_key = ANY($2)");
         }
@@ -1235,16 +1243,17 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether `holder` must be sent its row: it lacks it, or holds a version
-    /// sent from before the latest change `notes` has for it — a change whose
-    /// transaction the send's horizon is past is already in what it holds.
+    /// Whether `holder` must be sent its row: it lacks it, or refused it, or
+    /// holds a version sent from before the latest change `notes` has for it
+    /// — a change whose transaction the send's horizon is past is already in
+    /// what it holds.
     fn owed(
         horizons: &BTreeMap<(Uuid, String), i64>,
         notes: Option<&BTreeMap<String, i64>>,
         holder: &(Uuid, String),
     ) -> bool {
         match horizons.get(holder) {
-            None => true,
+            None | Some(&REFUSED) => true,
             Some(horizon) => notes
                 .and_then(|n| n.get(&holder.1))
                 .is_some_and(|xid| xid >= horizon),
@@ -1479,8 +1488,9 @@ impl Engine {
         .await?)
     }
 
-    /// Sends along every parent a sent row points at that its replica lacks,
-    /// children first so a parent's own parents follow.
+    /// Sends along every parent a sent row points at that its replica lacks —
+    /// or refused, so it goes again with what needs it — children first so a
+    /// parent's own parents follow.
     async fn close_references(&self, conn: &mut Conn, delta: &mut Delta) -> Result<(), Error> {
         for &i in self.order.iter().rev() {
             let sent = delta.sent(i);
@@ -1516,7 +1526,8 @@ impl Engine {
                 };
                 for (replica, keys) in &sent {
                     for parent in keys.iter().filter_map(|k| parent_of.get(k)) {
-                        if !held.contains_key(&(*replica, parent.clone()))
+                        let holder = (*replica, parent.clone());
+                        if held.get(&holder).is_none_or(|h| *h == REFUSED)
                             && !delta.has_upsert(*replica, reference.parent, parent)
                         {
                             delta.upsert(*replica, reference.parent, parent.clone());

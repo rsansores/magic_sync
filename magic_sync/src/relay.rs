@@ -342,6 +342,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             // What a snapshot replaces: what it held, and what was on its way.
             for sql in [
                 "DELETE FROM sync.held WHERE replica_id = ANY($1)",
+                "DELETE FROM sync.gone WHERE replica_id = ANY($1)",
                 "DELETE FROM sync.outbox WHERE replica_id = ANY($1)",
             ] {
                 sqlx::query(sql)
@@ -737,7 +738,7 @@ impl Writer<'_> {
         drawn.sort_unstable();
         let mut outbox = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut held = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut gone = (Vec::new(), Vec::new(), Vec::new());
+        let mut gone = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (Ready { replica, mut body }, sequence) in ready.into_iter().zip(drawn) {
             let number = u64::try_from(sequence)
                 .map_err(|_| Error::Misuse(format!("sync.messages drew {sequence}")))?;
@@ -760,6 +761,7 @@ impl Writer<'_> {
                             gone.0.push(replica);
                             gone.1.push(table.table.clone());
                             gone.2.push(key.parts.join("|"));
+                            gone.3.push(sequence);
                         }
                     }
                     if !down.snapshot_id.is_empty() {
@@ -832,6 +834,17 @@ impl Writer<'_> {
         .bind(&gone.2)
         .execute(&mut *conn)
         .await?;
+        sqlx::query(
+            "INSERT INTO sync.gone (replica_id, relation, row_key, sequence) \
+             SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
+             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET sequence = EXCLUDED.sequence",
+        )
+        .bind(&gone.0)
+        .bind(&gone.1)
+        .bind(&gone.2)
+        .bind(&gone.3)
+        .execute(&mut *conn)
+        .await?;
         Ok(())
     }
 }
@@ -844,6 +857,7 @@ async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error
     for sql in [
         "DELETE FROM sync.outbox WHERE replica_id = $1",
         "DELETE FROM sync.held WHERE replica_id = $1",
+        "DELETE FROM sync.gone WHERE replica_id = $1",
     ] {
         sqlx::query(sql).bind(replica).execute(&mut *conn).await?;
     }

@@ -523,6 +523,8 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
                     parts: vec![two.to_string()],
                 }),
                 reason: "a check this build has".into(),
+                epoch: world.epoch().await.to_string(),
+                sequence: world.last_sent(refusing).await,
             }],
             tables: vec![WireTable {
                 table: "from_a_newer_build".into(),

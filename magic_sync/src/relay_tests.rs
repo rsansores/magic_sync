@@ -874,21 +874,33 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
     world.pass(&wire).await;
     wire.delivered();
 
-    let rejection = |table: &str, key: &str| Rejected {
+    let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    let last = world.last_sent(a).await;
+    let rejection = |table: &str, key: &str, epoch: Uuid, sequence: u64| Rejected {
         table: table.to_owned(),
         key: Some(WireKey {
             parts: vec![key.to_owned()],
         }),
         reason: "a check the replica's build has\0 and the server's does not".to_owned(),
+        epoch: epoch.to_string(),
+        sequence,
     };
     let report = Up {
         rejected: vec![
             // Its key as a replica may spell it: the server stores its own.
-            rejection("items", &id.to_string().to_uppercase()),
-            // Rows it was never sent, a key that is none, a table not sent.
-            rejection("items", &Uuid::now_v7().to_string()),
-            rejection("items", "not-a-key"),
-            rejection("readings", &id.to_string()),
+            rejection("items", &id.to_string().to_uppercase(), epoch, last),
+            // A row it does not hold, refused by a message it was sent: a
+            // delete it could not carry out, the row held again, as refused.
+            rejection("items", &Uuid::now_v7().to_string(), epoch, last),
+            // A key that is none, a table not sent, a message of another
+            // epoch, one never sent it.
+            rejection("items", "not-a-key", epoch, last),
+            rejection("readings", &id.to_string(), epoch, last),
+            rejection("items", &id.to_string(), Uuid::now_v7(), last),
+            rejection("items", &id.to_string(), epoch, last + 1_000),
         ],
         ..Up::default()
     };
@@ -896,17 +908,19 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
     crate::filing::file(&mut conn, &world.codecs, &report, a, &())
         .await
         .unwrap();
-    assert_eq!(world.held(a).await, 0, "no longer counted as held");
+    let refused = "SELECT count(*) FROM sync.held WHERE refused IS NOT NULL";
+    assert_eq!(world.count(refused).await, 2, "held, refused");
     let set_aside: Vec<(String, String)> =
         sqlx::query_as("SELECT row_key, cause FROM sync.quarantine")
             .fetch_all(&world.pool)
             .await
             .unwrap();
     assert_eq!(
-        set_aside,
-        [(id.to_string(), "replica".to_owned())],
-        "only what it was sent"
+        set_aside.len(),
+        2,
+        "the row, and the one it could not let go of: {set_aside:?}"
     );
+    assert!(set_aside.contains(&(id.to_string(), "replica".to_owned())));
 
     // The replica's build is fixed; the retry sends it to that replica alone.
     retry_quarantine(&mut conn).await.unwrap();
@@ -922,8 +936,13 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
         "set aside until it says it took it"
     );
     world.acknowledge(a, world.last_sent(a).await).await;
-    assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
-    assert_eq!(world.held(a).await, 1);
+    let still: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.quarantine WHERE row_key = $1")
+        .bind(id.to_string())
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(still, 0, "out of the quarantine");
+    assert_eq!(world.count(refused).await, 0, "taken, and let go of");
 }
 
 /// An acknowledgement past every message the server records sending a
@@ -1296,6 +1315,14 @@ impl World {
         self.provisioned[&replica].clone()
     }
 
+    /// The server's epoch.
+    async fn epoch(&self) -> Uuid {
+        sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
     /// The last message sent to `replica`.
     async fn last_sent(&self, replica: Uuid) -> u64 {
         sqlx::query_scalar::<_, i64>("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
@@ -1498,7 +1525,7 @@ impl World {
             let mut moved = passed.done + passed.sent > 0;
             for (replica, model) in models.iter_mut() {
                 while let Some(bytes) = wire.next(*replica) {
-                    model.receive(&bytes, &Rules::ANY);
+                    model.receive(&bytes, &REFUSING);
                     wire.acknowledge(*replica);
                     moved = true;
                 }
@@ -1526,7 +1553,9 @@ impl World {
             .collect()
     }
 
-    /// Each replica holds what the engine records, and what it should.
+    /// Each replica holds what the engine records — what it took as taken,
+    /// what it refused as refused — and what it should, but for what it
+    /// refused.
     async fn assert_converged(&self, models: &BTreeMap<Uuid, Model>) {
         let should: BTreeSet<String> =
             sqlx::query_scalar("SELECT name FROM fixture.items WHERE retired_at IS NULL")
@@ -1536,26 +1565,218 @@ impl World {
                 .into_iter()
                 .collect();
         for (replica, model) in models {
+            let recorded: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT row_key, refused IS NOT NULL FROM sync.held WHERE replica_id = $1",
+            )
+            .bind(replica)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap();
+            let as_recorded = |refused: bool| -> BTreeSet<String> {
+                recorded
+                    .iter()
+                    .filter(|(_, r)| *r == refused)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            };
+            let rejected: BTreeSet<String> =
+                model.rejections.keys().map(|(_, k)| k.clone()).collect();
+            let taken: BTreeSet<String> = model
+                .rows
+                .keys()
+                .map(|(_, k)| k.clone())
+                .filter(|k| !rejected.contains(k))
+                .collect();
             assert_eq!(
-                items_of(model),
-                should,
-                "{replica} holds other than it should"
+                as_recorded(false),
+                taken,
+                "{replica}: recorded taken other than it is"
             );
-            let recorded: BTreeSet<String> =
-                sqlx::query_scalar("SELECT row_key FROM sync.held WHERE replica_id = $1")
-                    .bind(replica)
-                    .fetch_all(&self.pool)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .collect();
-            let held: BTreeSet<String> = model.rows.keys().map(|(_, k)| k.clone()).collect();
             assert_eq!(
-                recorded, held,
-                "{replica} is recorded holding other than it holds"
+                as_recorded(true),
+                rejected,
+                "{replica}: recorded refused other than it is"
             );
+            if rejected.is_empty() {
+                assert_eq!(
+                    items_of(model),
+                    should,
+                    "{replica} holds other than it should"
+                );
+            }
         }
     }
+}
+
+/// What the replicas of these tests refuse: a row named "refused".
+const REFUSING: Rules = Rules {
+    refuses: |_, bytes| ItemRow::decode(bytes).is_ok_and(|row| row.name == "refused"),
+    parents: |_, _| Vec::new(),
+};
+
+impl World {
+    /// Every message `replica` was sent, taken by its model as `rules` say.
+    fn deliver(&self, wire: &Wire, replica: Uuid, model: &mut Model, rules: &Rules) {
+        while let Some(bytes) = wire.next(replica) {
+            model.receive(&bytes, rules);
+            wire.acknowledge(replica);
+        }
+    }
+
+    /// What `model` of `replica` has to say, filed.
+    async fn say(&self, replica: Uuid, model: &mut Model) {
+        if let Some(up) = model.up() {
+            let mut conn = self.pool.acquire().await.unwrap();
+            crate::filing::file(&mut conn, &self.codecs, &up, replica, &())
+                .await
+                .unwrap();
+            model.delivered(&up);
+        }
+    }
+
+    async fn rename(&self, id: Uuid, name: &str) {
+        self.exec(
+            "UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2",
+            id,
+            name,
+        )
+        .await;
+    }
+
+    async fn refused(&self) -> i64 {
+        self.count("SELECT count(*) FROM sync.held WHERE refused IS NOT NULL")
+            .await
+    }
+}
+
+/// A rejection that reaches the server after a newer version of its row was
+/// recorded is of a version that no longer matters: the row stays held, and
+/// the newer one arrives.
+#[sqlx::test(migrations = false)]
+async fn a_stale_rejection_after_a_newer_delivery_changes_nothing(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(11);
+    let mut models = world.models();
+    let x = world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let mut model = models.remove(&a).unwrap();
+    world.rename(x, "refused").await;
+    world.pass(&wire).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    world.rename(x, "two").await;
+    world.pass(&wire).await;
+    world.say(a, &mut model).await;
+    assert_eq!(world.refused().await, 0, "a newer version went since");
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    world.say(a, &mut model).await;
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["two"]));
+}
+
+/// A replica that refuses a new version of a row it holds keeps the old
+/// one: the server counts it held for what takes rows back, so when the row
+/// leaves the replica's scope, the delete still goes.
+#[sqlx::test(migrations = false)]
+async fn a_refused_version_of_a_held_row_is_still_taken_back(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(12);
+    let mut models = world.models();
+    let x = world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    world.rename(x, "refused").await;
+    let mut model = models.remove(&a).unwrap();
+    world.pass(&wire).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    world.say(a, &mut model).await;
+    assert_eq!(world.refused().await, 1);
+    assert_eq!(items_of(&model), names(&["one"]), "it keeps what it had");
+    world
+        .exec(
+            "DELETE FROM fixture.items WHERE id = $1 AND partition_id = $2 AND $3 <> ''",
+            x,
+            "x",
+        )
+        .await;
+    world.pass(&wire).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    world.say(a, &mut model).await;
+    assert!(
+        model.rows.is_empty(),
+        "the delete went: {:?}",
+        items_of(&model)
+    );
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    world.assert_converged(&models).await;
+}
+
+/// A delete the replica cannot carry out — a row of its own points at the
+/// row — leaves the row held, refused and quarantined; once the replica can
+/// let go, the retry sends the delete again.
+#[sqlx::test(migrations = false)]
+async fn a_refused_delete_is_sent_again_after_a_fix(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(13);
+    let mut models = world.models();
+    let x = world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let row = ("items".to_owned(), x.to_string());
+    models.get_mut(&a).unwrap().pinned.insert(row.clone());
+    world
+        .exec(
+            "DELETE FROM fixture.items WHERE id = $1 AND partition_id = $2 AND $3 <> ''",
+            x,
+            "x",
+        )
+        .await;
+    world.settle(&wire, &mut models).await;
+    assert_eq!(world.refused().await, 1, "held again, refused");
+    assert_eq!(items_of(&models[&a]), names(&["one"]));
+    world.assert_converged(&models).await;
+
+    models.get_mut(&a).unwrap().pinned.remove(&row);
+    retry_quarantine(&mut world.pool.acquire().await.unwrap())
+        .await
+        .unwrap();
+    world.settle(&wire, &mut models).await;
+    assert!(models[&a].rows.is_empty());
+    assert_eq!(world.refused().await, 0);
+    assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
+    world.assert_converged(&models).await;
+}
+
+/// A snapshot that sends again a row the replica holds, in a version it
+/// refuses, names it all the same: its end does not sweep the old copy, the
+/// rejection stands, and the server records the row refused.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_does_not_sweep_a_row_it_carried_and_the_replica_refused(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(14);
+    let mut models = world.models();
+    let x = world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    world.rename(x, "refused").await;
+    sqlx::query("INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', $1)")
+        .bind(a)
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let mut model = models.remove(&a).unwrap();
+    world.pass(&wire).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    assert_eq!(items_of(&model), names(&["one"]), "named, not swept");
+    assert_eq!(model.rejections.len(), 1, "the rejection stands");
+    world.say(a, &mut model).await;
+    assert_eq!(world.refused().await, 1);
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    world.assert_converged(&models).await;
 }
 
 /// A server database restored from a copy older than what its replicas
@@ -1571,25 +1792,25 @@ async fn a_server_restored_from_an_older_copy_provisions_its_replicas_again(pool
     let mut models = world.models();
     world.item("one").await;
     world.settle(&wire, &mut models).await;
-    let mut conn = world.pool.acquire().await.unwrap();
-    crate::testkit::back_up(&mut conn, &["fixture", "sync"]).await;
-    let before: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap();
+    crate::testkit::back_up(
+        &mut world.pool.acquire().await.unwrap(),
+        &["fixture", "sync"],
+    )
+    .await;
+    let before = world.epoch().await;
     for n in 0..5 {
         world.item(&format!("lost {n}")).await;
         world.settle(&wire, &mut models).await;
     }
-    crate::testkit::restore(&mut conn, &["fixture", "sync"]).await;
+    crate::testkit::restore(
+        &mut world.pool.acquire().await.unwrap(),
+        &["fixture", "sync"],
+    )
+    .await;
     world.item("after").await;
     world.settle(&wire, &mut models).await;
 
-    let after: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap();
-    assert_ne!(before, after, "a new epoch");
+    assert_ne!(before, world.epoch().await, "a new epoch");
     world.assert_converged(&models).await;
     assert_eq!(
         items_of(&models[&world.replicas[0]]),

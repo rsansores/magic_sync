@@ -211,13 +211,15 @@ is its `EndSnapshot` alone.
   snapshot in progress, if any: the replica forgets what that one named. The
   messages after it follow it, as any do (4.1).
 - While applying a `Down` of the snapshot in progress, the replica **must**
-  remember the key of every row it carried, per table.
+  remember the key of every row it carried, per table — the ones it refused
+  as well: a refused row keeps whatever the replica had of it.
 - On `EndSnapshot`, the replica **must** let go of every row of the named
   tables that the snapshot did not name (delete, or retire as in 4.3),
   children before parents: **in reverse** of the order the tables are
-  listed. The rejections it recorded for those tables before the snapshot
-  began are forgotten: the snapshot sent again what it should hold. Then the
-  snapshot is no longer in progress.
+  listed. A row it refused was named, so it is never swept. The rejections
+  it recorded for those tables before the snapshot began are forgotten — the
+  snapshot sent again what it should hold — and the ones it recorded since
+  stand. Then the snapshot is no longer in progress.
 - A message that follows the last applied and names a snapshot other than
   the one in progress — one that ended, or was superseded — is one no
   server sends: malformed (4.0).
@@ -283,25 +285,37 @@ written for it since that message is on its way.
 
 A row the replica could not take, or could not let go of (4.1), is a
 **rejection**: the table, the key — **required**, in the form of section 3:
-read off the row, or from `keys[i]` if the row did not even decode — and why.
-A row whose key cannot be told is logged and not reported.
+read off the row, or from `keys[i]` if the row did not even decode — why,
+and the `(epoch, sequence)` of the message that carried the row, or its
+delete. A row whose key cannot be told is logged and not reported.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.
-- It **must** report each rejection to the server in an `Up` (`rejected`), and
-  should do so promptly.
+- It **must** report each rejection to the server in an `Up` (`rejected`),
+  **no later than** the `Up` that says it applied the message that refused
+  it (5.2): the server counts the rows a message carried as held once it
+  hears the message was applied.
 - It **must** keep the rejection until it takes the row (a later message
   carries the row and it applies) or lets go of it (a delete, or a snapshot
   that does not name it): a digest (section 8) leaves rejected rows out, as
-  the server leaves out the rows it set aside for the replica.
+  the server leaves out the rows recorded refused. It reports only the
+  rejections of the epoch it follows; a snapshot of a new epoch clears the
+  others.
 
-On a rejection of a row it records sending the replica, the server stops
-counting the row as held and sets it aside for that replica. The key is read
-as its table's key (section 3) whatever its spelling. A rejection of anything
-else — a table the server does not send, no key or one that is not the
-table's, a row the replica was never sent — is malformed and left out. It sends it again when the relay restarts or on a timer,
-which is after a deploy on either side has had the chance to fix the cause.
-Nobody repairs the row by hand.
+On a rejection of the last message that carried the row, the server
+records the row **refused**: still held for every decision that takes rows
+back — a delete still goes when the row leaves the replica's scope, and a
+refused delete is sent again — and not held for progress, or for digests.
+The row is set aside for that replica, and sent again, or its delete, when
+the relay restarts or on a timer, which is after a deploy on either side
+has had the chance to fix the cause; it is taken once the replica applies a
+later message that carries it. A rejection of a delete re-records the row
+the server took back. A rejection of a message older than the last one that
+carried the row, or of another epoch, names a version that no longer
+matters, and is left out. The key is read as its table's key (section 3)
+whatever its spelling. A rejection of anything else — a table the server
+does not send, no key or one that is not the table's, a message never sent
+the replica — is malformed and left out. Nobody repairs the row by hand.
 
 ---
 
@@ -485,7 +499,9 @@ A replica implementation is complete when:
       `EndSnapshot` included — and sweeps on its end, in reverse table order;
 - [ ] it leaves as it was and records, in the same transaction, a row it
       cannot take or let go of;
-- [ ] it reports rejections, and keeps them until it takes the row;
+- [ ] it reports rejections, each with the message that refused it, before
+      it says it applied that message, and keeps them until it takes the
+      row or lets it go;
 - [ ] it acknowledges the transport only after committing;
 - [ ] it reports the last applied `(epoch, sequence)` to the server;
 - [ ] it notes its own writes in the writing transaction, uploads them as they

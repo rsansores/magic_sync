@@ -163,6 +163,13 @@ pub struct Rejected {
     pub key: ::core::option::Option<Key>,
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
+    /// The message whose row, or delete, the replica refused: the server
+    /// ignores a rejection of a message older than the last one that carried
+    /// the row, or of another epoch.
+    #[prost(string, tag = "4")]
+    pub epoch: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub sequence: u64,
 }
 /// What a replica holds of one table: how many rows, and a fingerprint of
 /// their keys. Rows it retired, or rejected, are left out.

@@ -356,9 +356,16 @@ fn parents(table: &str, bytes: &[u8]) -> Vec<Row> {
         .collect()
 }
 
-/// The replicas of the walk: their foreign keys, and nothing they refuse.
+/// A name the replicas' build cannot take: the bug a deploy on their side,
+/// or a fix of the data, cures.
+const REFUSED: &str = "refused";
+
+/// The replicas of the walk: their foreign keys, and the rows they refuse.
 const RULES: Rules = Rules {
-    refuses: |_, _| false,
+    refuses: |_, bytes| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .is_ok_and(|row| row.get("name").and_then(|n| n.as_str()) == Some(REFUSED))
+    },
     parents,
 };
 
@@ -452,8 +459,9 @@ impl World {
     /// Answers whether anything moved.
     async fn round(&mut self, mut storm: Option<&mut Walk>) -> bool {
         let mut chance = |n: usize| storm.as_deref_mut().is_some_and(|w| w.below(n) == 0);
-        if !chance(1) {
-            // The backoffs ran out: out of a storm, nothing waits for a clock.
+        if !chance(1) || chance(2) {
+            // The backoffs ran out: time passes between rounds, and out of
+            // a storm nothing waits for a clock.
             sqlx::query("UPDATE sync.replicas SET retry_after = now()")
                 .execute(&mut *self.conn)
                 .await
@@ -591,21 +599,16 @@ impl World {
         );
     }
 
-    /// The engine records `replica` holding exactly what it holds.
+    /// The engine records `replica` holding exactly what it holds — what it
+    /// took as taken, what it refused as refused.
     async fn assert_recorded(&mut self, replica: Uuid) {
-        let recorded: BTreeSet<(String, String)> =
-            sqlx::query_as("SELECT relation, row_key FROM sync.held WHERE replica_id = $1")
-                .bind(replica)
-                .fetch_all(&mut *self.conn)
-                .await
-                .expect("held")
-                .into_iter()
-                .collect();
-        let holds: BTreeSet<(String, String)> = self
-            .replicas
-            .get(&replica)
-            .map(|m| m.rows.keys().cloned().collect())
-            .unwrap_or_default();
+        let recorded: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT relation, row_key, refused IS NOT NULL FROM sync.held WHERE replica_id = $1",
+        )
+        .bind(replica)
+        .fetch_all(&mut *self.conn)
+        .await
+        .expect("held");
         let live: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM t_replicas WHERE id = $1 AND live)")
                 .bind(replica)
@@ -619,13 +622,33 @@ impl World {
             );
             return;
         }
-        assert!(
-            recorded == holds,
-            "{replica}: recorded other than held:\n  recorded, not held {:?}\n  held, not recorded {:?}\n  last steps: {:#?}",
-            recorded.difference(&holds).collect::<Vec<_>>(),
-            holds.difference(&recorded).collect::<Vec<_>>(),
-            self.last_steps(),
-        );
+        let model = self.replicas.get(&replica).cloned().unwrap_or_default();
+        let held: BTreeSet<Row> = model
+            .rows
+            .keys()
+            .filter(|row| !model.rejections.contains_key(*row))
+            .cloned()
+            .collect();
+        let refused: BTreeSet<Row> = model.rejections.keys().cloned().collect();
+        let as_recorded = |refused: bool| -> BTreeSet<Row> {
+            recorded
+                .iter()
+                .filter(|r| r.2 == refused)
+                .map(|(t, k, _)| (t.clone(), k.clone()))
+                .collect()
+        };
+        for (what, recorded, holds) in [
+            ("taken", as_recorded(false), &held),
+            ("refused", as_recorded(true), &refused),
+        ] {
+            assert!(
+                &recorded == holds,
+                "{replica}: recorded {what} other than it is:\n  recorded, not so {:?}\n  so, not recorded {:?}\n  last steps: {:#?}",
+                recorded.difference(holds).collect::<Vec<_>>(),
+                holds.difference(&recorded).collect::<Vec<_>>(),
+                self.last_steps(),
+            );
+        }
     }
 
     fn last_steps(&self) -> &[String] {
@@ -802,6 +825,25 @@ macro_rules! write {
 
 const RETIRE: &str = "retired_at = CASE WHEN retired_at IS NULL THEN now() END";
 
+/// The fix, deployed: what this build could not encode, and what the
+/// replicas' could not take, is data both take now.
+async fn cure(conn: &mut Conn) {
+    for (table, name) in [
+        ("t_kinds", POISON),
+        ("t_sizes", POISON),
+        ("t_customers", REFUSED),
+        ("t_products", REFUSED),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE fixture.{table} SET name = 'cured' WHERE name = $1"
+        ))
+        .bind(name)
+        .execute(&mut *conn)
+        .await
+        .expect("the fix");
+    }
+}
+
 /// One write of an office, or one thing that happens to a replica, picked at
 /// random among those the schema allows.
 async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
@@ -958,14 +1000,11 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         64 => write!(conn, "UPDATE fixture.t_kinds SET name = $2 WHERE id = $1", kind, POISON),
         65 => write!(conn, "UPDATE fixture.t_sizes SET name = $2 WHERE code = $1", size, POISON),
         66 => write!(conn, "INSERT INTO fixture.t_kinds (id, partition_id, name) VALUES ($1, $2, $3)", new, partition, POISON),
+        // Rows the replicas' build refuses: a parent, and rows that follow it.
+        67 => write!(conn, "UPDATE fixture.t_customers SET name = $2 WHERE id = $1", customer, REFUSED),
+        68 => write!(conn, "UPDATE fixture.t_products SET name = $2 WHERE id = $1", product, REFUSED),
         _ => {
-            for table in ["t_kinds", "t_sizes"] {
-                sqlx::query(&format!("UPDATE fixture.{table} SET name = 'cured' WHERE name = $1"))
-                    .bind(POISON)
-                    .execute(&mut *conn)
-                    .await
-                    .expect("the fix");
-            }
+            cure(conn).await;
             return Step::Cured;
         }
     };
@@ -1081,15 +1120,7 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
         if settles || last {
             if last {
                 *world.wire.faults.lock().unwrap() = Faults::default();
-                for table in ["t_kinds", "t_sizes"] {
-                    sqlx::query(&format!(
-                        "UPDATE fixture.{table} SET name = 'cured' WHERE name = $1"
-                    ))
-                    .bind(POISON)
-                    .execute(&mut *world.conn)
-                    .await
-                    .expect("the fix");
-                }
+                cure(&mut world.conn).await;
                 world.settle().await;
                 world.retry_quarantine().await;
             }

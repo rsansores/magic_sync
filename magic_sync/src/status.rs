@@ -765,7 +765,7 @@ impl Engine {
                          FROM sync.held h CROSS JOIN sync.epoch e \
                          LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
                          LEFT JOIN p ON p.row_key = h.row_key \
-                        WHERE h.relation = $1 AND h.replica_id = ANY($2)) \
+                        WHERE h.relation = $1 AND h.replica_id = ANY($2) AND h.refused IS NULL) \
                  SELECT coalesce(w.replica_id, h.replica_id), \
                         count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
                         count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed), \
@@ -1257,7 +1257,8 @@ impl Engine {
                  SELECT h.relation, h.replica_id, count(*) AS in_flight, 0 AS quarantined, 0 AS unfiled \
                    FROM sync.held h CROSS JOIN sync.epoch e \
                    LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-                  WHERE h.replica_id = ANY($1) AND NOT {CONFIRMED} GROUP BY 1, 2 \
+                  WHERE h.replica_id = ANY($1) AND h.refused IS NULL AND NOT {CONFIRMED} \
+                  GROUP BY 1, 2 \
                  UNION ALL \
                  SELECT relation, replica_id, 0, count(*), 0 FROM sync.quarantine \
                   WHERE replica_id = ANY($2) GROUP BY 1, 2 \

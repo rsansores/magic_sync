@@ -956,6 +956,35 @@ async fn a_snapshot_forgets_the_rejections_from_before_it(pool: SqlitePool) {
     assert!(w.rejected().await.is_empty());
 }
 
+/// A snapshot names every row it carried, the ones the replica refused as
+/// well: one it held keeps its old copy through the sweep, and its
+/// rejection stands, reported with the message that refused it.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_keeps_a_row_it_carried_and_the_replica_refused(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "old")])]))
+        .await;
+    let s = Uuid::now_v7().to_string();
+    let broken = (key(&[&a.to_string()]), vec![0xff, 0xff]);
+    w.receive(&begin(2, &s, vec![upserts("items", vec![broken])]))
+        .await;
+    w.receive(&end(3, &s, &["items"])).await;
+    assert_eq!(w.items().await, ["old"], "not swept");
+    assert_eq!(
+        w.rejected().await,
+        [format!("items {a}")],
+        "the rejection stands"
+    );
+    let up = w.up(0, false).await.expect("the refusal");
+    assert_eq!(up.rejected.len(), 1);
+    assert_eq!(
+        (up.rejected[0].epoch.as_str(), up.rejected[0].sequence),
+        (EPOCH, BASE + 2),
+        "named by the message that refused it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tables written on both sides, and records.
 
