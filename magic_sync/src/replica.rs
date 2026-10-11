@@ -673,6 +673,14 @@ async fn act<P: Sync + 'static>(
             Ok(Received::Filed)
         }
         Body::Down(down) => {
+            if let Some(table) = down.tables.iter().find(|t| t.keys.len() != t.upserts.len()) {
+                return Ok(malformed(format!(
+                    "`{}`: {} rows and {} keys beside them",
+                    table.table,
+                    table.upserts.len(),
+                    table.keys.len()
+                )));
+            }
             let place = Place {
                 epoch: &down.epoch,
                 sequence: down.sequence,
@@ -870,22 +878,13 @@ async fn apply<P: Sync + 'static>(
     let naming = !message.snapshot_id.is_empty();
     let mut taken = Vec::new();
     for (entry, table) in message.tables.iter().enumerate() {
-        if table.keys.len() != table.upserts.len() {
-            tracing::error!(
-                table = table.table,
-                "sync: {} rows and {} keys beside them — a row that does not decode cannot be named",
-                table.upserts.len(),
-                table.keys.len()
-            );
-        }
         let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
             let why = if codec_of(codecs, &table.table).is_some() {
                 "a table the server does not send"
             } else {
                 "a table this replica does not mirror"
             };
-            let keys: Vec<String> = table.keys.iter().map(|k| k.parts.join("|")).collect();
-            reject(conn, &table.table, &keys, why, sequence).await?;
+            reject(conn, &table.table, &foreign_keys(table), why, sequence).await?;
             continue;
         };
         let mut held = Vec::new();
@@ -918,6 +917,37 @@ async fn apply<P: Sync + 'static>(
         });
     }
     Ok(taken)
+}
+
+/// Text the replica keeps of what a server said, at most: a reason, the
+/// name and a key of a table it does not know. A rejection always fits a
+/// message up, so one never holds back the replica's confirmation.
+#[cfg(feature = "sqlite")]
+const TEXT_CAP: usize = 512;
+
+/// The keys of rows of a table this build does not take, as the server
+/// spelled them, to report: none when the name or a key is longer than any
+/// table's — what no server sends is logged, not kept.
+#[cfg(feature = "sqlite")]
+fn foreign_keys(table: &Table) -> Vec<String> {
+    let keys: Vec<String> = table.keys.iter().map(|k| k.parts.join("|")).collect();
+    if table.table.len() > TEXT_CAP || keys.iter().any(|k| k.len() > TEXT_CAP) {
+        tracing::error!(
+            "sync: rows of a table named or keyed longer than {TEXT_CAP} bytes — not kept"
+        );
+        return Vec::new();
+    }
+    keys
+}
+
+/// `text`, cut to [`TEXT_CAP`] bytes at a character.
+#[cfg(feature = "sqlite")]
+fn capped(text: &str) -> &str {
+    let mut end = text.len().min(TEXT_CAP);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The rows of `table` at `positions`, taken: the ones the replica cannot
@@ -1150,7 +1180,7 @@ async fn reject(
     )
     .bind(table)
     .bind(json(keys))
-    .bind(why)
+    .bind(capped(why))
     .bind(sequence)
     .execute(&mut *conn)
     .await?;
@@ -1186,7 +1216,9 @@ async fn end_snapshot<P: Sync + 'static>(
     let began: i64 = sqlx::query_scalar("SELECT snapshot_began FROM sync_applied WHERE id = 1")
         .fetch_one(&mut *conn)
         .await?;
-    for table in message.tables.iter().rev() {
+    let mut seen = HashSet::new();
+    let tables: Vec<&String> = message.tables.iter().filter(|t| seen.insert(*t)).collect();
+    for table in tables.into_iter().rev() {
         let Some(codec) = codec_of(codecs, table).filter(|c| c.sent_down()) else {
             tracing::error!(
                 table,
@@ -1484,8 +1516,10 @@ pub(crate) struct Outgoing {
     pub(crate) up: Up,
     /// The notes its rows carry.
     notes: Vec<i64>,
-    /// Its rejections, each as refused by the message numbered so.
-    rejected: Vec<(String, String, i64)>,
+    /// Its rejections, each as refused by the message numbered so, and
+    /// whether the replica keeps it once reported — of a table it holds from
+    /// the server, which a snapshot clears — or forgets it then.
+    rejected: Vec<(String, String, i64, bool)>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -1570,7 +1604,8 @@ pub(crate) async fn outbox<P: Sync + 'static>(
                 .as_ref()
                 .map(|k| k.parts.join("|"))
                 .unwrap_or_default();
-            rejected.push((row.table.clone(), key, sequence));
+            let kept = codec_of(codecs, &row.table).is_some_and(Codec::sent_down);
+            rejected.push((row.table.clone(), key, sequence, kept));
             up.rejected.push(row);
         }
         let applied: Option<(String, i64, i64, bool, bool)> = sqlx::query_as(
@@ -1875,8 +1910,9 @@ async fn unreported(
 /// The transport took `outgoing`: its notes — the ones still under its
 /// number, the server's answer may have come first — wait for the server's
 /// [`Filed`](envelope::Filed), its rejections are reported (unless refused
-/// again since), and the server of its epoch knows what was applied. Run it
-/// in one transaction.
+/// again since; those of a table the replica does not hold from the server,
+/// which no snapshot clears, forgotten), and the server of its epoch knows
+/// what was applied. Run it in one transaction.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
     if let Some(number) = outgoing.up.uploads.first() {
@@ -1890,11 +1926,17 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
         .execute(&mut *conn)
         .await?;
     }
-    for (table, key, sequence) in &outgoing.rejected {
+    for (table, key, sequence, kept) in &outgoing.rejected {
+        let told = if *kept {
+            format!(
+                "UPDATE sync_rejections SET reported_at = {}",
+                crate::dialect::NOW
+            )
+        } else {
+            "DELETE FROM sync_rejections".to_owned()
+        };
         sqlx::query(&format!(
-            "UPDATE sync_rejections SET reported_at = {} \
-              WHERE table_name = $1 AND row_key = $2 AND sequence = $3",
-            crate::dialect::NOW
+            "{told} WHERE table_name = $1 AND row_key = $2 AND sequence = $3"
         ))
         .bind(table)
         .bind(key)

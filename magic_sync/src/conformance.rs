@@ -273,6 +273,17 @@ pub fn malformed() -> Vec<(&'static str, Vec<u8>)> {
             "follows_a_later_one",
             message(1, Some(down(101, 102, "", EPOCH))),
         ),
+        ("keys_not_one_per_row", {
+            let mut down = down(101, 100, "", EPOCH);
+            if let Body::Down(d) = &mut down {
+                d.tables.push(crate::envelope::Table {
+                    table: "items".to_owned(),
+                    upserts: vec![Vec::new()],
+                    ..crate::envelope::Table::default()
+                });
+            }
+            message(1, Some(down))
+        }),
         (
             "follows_nothing_and_begins_nothing",
             message(1, Some(down(101, 0, "", EPOCH))),

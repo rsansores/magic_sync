@@ -143,8 +143,8 @@ snapshot (4.2), which follows nothing. The replica keeps the
 
 - `sequence` 0 or above 2^63 − 1, an `epoch` that is not a UUID, a
   `previous` at or past `sequence`, or a `previous` of 0 on a message that
-  begins no snapshot: no server numbers a message so. The message is
-  malformed (4.0).
+  begins no snapshot: no server numbers a message so; nor sends a table
+  whose `keys` are not one per upsert. The message is malformed (4.0).
 - the same `epoch` and a `sequence` **at or below** the last one: the message
   changes nothing. The replica **must not** apply it, and **must**
   acknowledge it to the transport: it is a redelivery, or the server's
@@ -318,7 +318,12 @@ delete. A row whose key cannot be told is logged and not reported.
   that does not name it): a digest (section 8) leaves rejected rows out, as
   the server leaves out the rows recorded refused. It reports only the
   rejections of the epoch it follows; a snapshot of a new epoch clears the
-  others.
+  others. A rejection of a table it does not hold from the server, which no
+  snapshot clears, it **may** forget once reported.
+- It keeps what the server said within bounds: a reason **may** be cut (to
+  512 bytes), and rows of a table it does not know, named or keyed longer
+  than that, are logged rather than kept — no server sends such a table. So
+  any rejection fits a message up, and never holds back the confirmation.
 
 On a rejection of the last message that carried the row, the server
 records the row **refused**: still held for every decision that takes rows

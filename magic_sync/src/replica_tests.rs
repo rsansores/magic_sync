@@ -15,6 +15,7 @@ use crate::run::replica::{Replica, Settings};
 use crate::testkit::ItemRow;
 use chrono::{TimeZone, Utc};
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 
 const TABLES: &str = "
 CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT);
@@ -961,7 +962,93 @@ async fn a_table_this_build_does_not_mirror_is_rejected_row_by_row(pool: SqliteP
         vec![upserts("newer", vec![item(a, "a"), item(b, "b")])],
     ))
     .await;
-    assert_eq!(w.rejected().await.len(), 2);
+    assert_eq!(
+        w.rejected().await,
+        BTreeSet::from([format!("newer {a}"), format!("newer {b}")])
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    let up = w.up(0, false).await.expect("the rejections");
+    assert_eq!(up.rejected.len(), 2);
+    assert_eq!(up.sequence, BASE + 1, "confirmed once reported");
+    assert!(
+        w.rejected().await.is_empty(),
+        "no snapshot clears a table this build does not hold: forgotten once told"
+    );
+}
+
+/// What a server says is kept within bounds, whatever it says: a reason is
+/// cut, a table this build does not know named or keyed longer than any
+/// table is not kept, and a rejection is told however long its reason was.
+#[sqlx::test(migrations = false)]
+async fn what_a_server_says_is_kept_within_bounds(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec(&format!(
+        "CREATE TRIGGER wordy BEFORE INSERT ON items BEGIN SELECT RAISE(ABORT, '{}'); END",
+        "é".repeat(5000)
+    ))
+    .await
+    .unwrap();
+    let [a, b] = ids();
+    let long = "t".repeat(10_000);
+    let mut keyed = upserts("unknown", vec![item(b, "b")]);
+    keyed.keys[0].parts[0] = "k".repeat(10_000);
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts("items", vec![item(a, "a")]),
+            upserts(&long, vec![item(b, "b")]),
+            keyed,
+        ],
+    ))
+    .await;
+    assert_eq!(w.rejected().await, [format!("items {a}")]);
+    let longest = w
+        .count("SELECT max(length(CAST(reason AS BLOB))) FROM sync_rejections")
+        .await;
+    assert!((500..=512).contains(&longest), "{longest}");
+    let up = w.up(0, false).await.expect("the rejection");
+    assert_eq!(
+        (up.rejected.len(), up.sequence),
+        (1, BASE + 1),
+        "told, and the message confirmed"
+    );
+}
+
+/// Shapes no server sends cost nothing: rows with keys not one per row are
+/// a malformed message, applied not at all; a snapshot's end that names a
+/// table again and again sweeps it once.
+#[sqlx::test(migrations = false)]
+async fn shapes_no_server_sends_cost_nothing(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    let mut unkeyed = upserts("items", vec![item(a, "a"), item(b, "b")]);
+    unkeyed.keys.pop();
+    let received = w.receive(&down(1, "", vec![unkeyed])).await;
+    assert!(matches!(received, Received::Malformed(_)), "{received:?}");
+    assert!(w.items().await.is_empty());
+    assert_eq!(
+        w.count("SELECT sequence FROM sync_applied").await,
+        i64::try_from(BASE).unwrap(),
+        "not applied: the next one is a gap"
+    );
+
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(1, &s, vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    let tables = vec!["items"; 200_000];
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        w.receive(&end(2, &s, &tables)).await,
+        Received::SnapshotEnded
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(w.items().await, ["a"]);
 }
 
 /// A row a trigger refuses — as a bug in this build would — is the only one
