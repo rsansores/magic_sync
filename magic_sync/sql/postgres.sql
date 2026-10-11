@@ -64,9 +64,7 @@ COMMENT ON COLUMN sync.notes.kind IS
 COMMENT ON COLUMN sync.notes.row_key IS
     'The changed row''s primary key, its parts joined by |, in key order.';
 COMMENT ON COLUMN sync.notes.previous IS
-    'For a row: the columns it points at other mirrored rows with, as they were before an '
-    'update or a delete, so a parent it no longer points at can be let go — and nothing else '
-    'of the row. For a member: the member row.';
+    'For a member: the member row.';
 COMMENT ON COLUMN sync.notes.id IS
     'Rises with every note. Writers of one row take turns on its lock, so the notes of a row '
     'rise in the order their changes committed: a version of the row sent while its newest '
@@ -80,6 +78,24 @@ COMMENT ON COLUMN sync.notes.parked_at IS
     'the relay starts — after a deploy — and on a timer.';
 COMMENT ON COLUMN sync.notes.attempts IS
     'Passes that failed on this note.';
+
+-- What a row pointed at before it changed, one row per mirrored row, kept
+-- with the note of the row's key as it was: a replica holding that version
+-- still points there until the note is planned. By the row pointed at, so
+-- what still points at a row is found however many notes wait.
+CREATE TABLE sync.pointed (
+    note     BIGINT NOT NULL REFERENCES sync.notes (id) ON DELETE CASCADE,
+    relation TEXT   NOT NULL,
+    row_key  TEXT   NOT NULL,
+    PRIMARY KEY (note, relation, row_key)
+);
+
+CREATE INDEX pointed_row ON sync.pointed (relation, row_key);
+
+COMMENT ON TABLE sync.pointed IS
+    'The mirrored rows a row pointed at before an update or a delete, by the note of its key '
+    'as it was: a parent it no longer points at is let go of, and only once no replica holds '
+    'a version that points there. Gone once the note is done.';
 
 -- What each replica holds, as the engine sent it: the other half of every
 -- decision the planner takes.
@@ -308,22 +324,30 @@ $$;
 
 -- Arguments: the table's name as the engine knows it, its partition column
 -- ('' for none), the number of key columns and the key's columns in key
--- order, the number of columns kept of the row as it was and those columns
--- (what it points at), then the columns the replicas own. An update that
--- changes only those is no change here.
+-- order, the number of mirrored tables it points at and, for each, that
+-- table's name as the engine knows it, the number of columns that point
+-- there and those columns, in that table's key order; then the columns the
+-- replicas own. An update that changes only those is no change here.
 CREATE FUNCTION sync.note_row() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
     v_keys    INTEGER := TG_ARGV[2]::INTEGER;
     v_key     TEXT[]  := TG_ARGV[3:2 + v_keys];
-    v_kept    INTEGER := TG_ARGV[3 + v_keys]::INTEGER;
-    v_pointed TEXT[]  := TG_ARGV[4 + v_keys:3 + v_keys + v_kept];
-    v_owned   TEXT[]  := coalesce(TG_ARGV[4 + v_keys + v_kept:], '{}');
+    v_refs    INTEGER := TG_ARGV[3 + v_keys]::INTEGER;
+    v_at      INTEGER := 4 + v_keys;
+    v_owned   TEXT[];
+    v_columns INTEGER;
     v_new     JSONB;
     v_old     JSONB;
     v_new_key TEXT;
     v_old_key TEXT;
-    v_previous JSONB;
+    v_note    BIGINT;
+    v_parent  TEXT;
+    v_parts   INTEGER;
 BEGIN
+    FOR i IN 1..v_refs LOOP
+        v_at := v_at + 2 + TG_ARGV[v_at + 1]::INTEGER;
+    END LOOP;
+    v_owned := coalesce(TG_ARGV[v_at:], '{}');
     IF TG_OP <> 'DELETE' THEN
         v_new := to_jsonb(NEW);
         SELECT string_agg(v_new ->> k, '|' ORDER BY n) INTO v_new_key
@@ -338,22 +362,32 @@ BEGIN
         END IF;
         SELECT string_agg(v_old ->> k, '|' ORDER BY n) INTO v_old_key
           FROM unnest(v_key) WITH ORDINALITY AS a(k, n);
-        SELECT coalesce(jsonb_object_agg(k, v_old -> k), '{}') INTO v_previous
-          FROM unnest(v_pointed) AS a(k);
     END IF;
     IF v_new_key IS NOT NULL THEN
-        INSERT INTO sync.notes (kind, relation, row_key, partition_id, previous)
+        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
         VALUES ('row', TG_ARGV[0], v_new_key,
-                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_new ->> TG_ARGV[1])::UUID END,
-                v_previous);
+                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_new ->> TG_ARGV[1])::UUID END)
+        RETURNING id INTO v_note;
     END IF;
     -- A row deleted, or whose key changed: the old key is gone.
     IF v_old_key IS DISTINCT FROM v_new_key AND v_old_key IS NOT NULL THEN
-        INSERT INTO sync.notes (kind, relation, row_key, partition_id, previous)
+        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
         VALUES ('row', TG_ARGV[0], v_old_key,
-                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_old ->> TG_ARGV[1])::UUID END,
-                v_previous);
+                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_old ->> TG_ARGV[1])::UUID END)
+        RETURNING id INTO v_note;
     END IF;
+    -- What the version before pointed at, with the note of its key.
+    v_at := 4 + v_keys;
+    FOR i IN 1..CASE WHEN v_old IS NULL THEN 0 ELSE v_refs END LOOP
+        v_columns := TG_ARGV[v_at + 1]::INTEGER;
+        SELECT string_agg(v_old ->> c, '|' ORDER BY n), count(v_old ->> c) INTO v_parent, v_parts
+          FROM unnest(TG_ARGV[v_at + 2:v_at + 1 + v_columns]) WITH ORDINALITY AS a(c, n);
+        IF v_parts = v_columns THEN
+            INSERT INTO sync.pointed (note, relation, row_key) VALUES (v_note, TG_ARGV[v_at], v_parent)
+            ON CONFLICT DO NOTHING;
+        END IF;
+        v_at := v_at + 2 + v_columns;
+    END LOOP;
     RETURN NULL;
 END;
 $$;

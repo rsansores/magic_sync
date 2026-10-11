@@ -207,6 +207,9 @@ impl World {
 
     /// The first half of a pass: planned and recorded, nothing sent.
     async fn record(&self, relay: &Relay<'_, ()>) -> Outcome {
+        let mut tx = self.pool.begin().await.expect("a transaction");
+        relay.engine.observe(&mut tx).await.expect("observed");
+        tx.commit().await.expect("commit");
         let mut tx = self.pool.begin_with(SNAPSHOT).await.expect("a transaction");
         let outcome = relay.record(&mut tx).await.expect("recorded");
         tx.commit().await.expect("commit");

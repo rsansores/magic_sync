@@ -248,7 +248,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let unsent = self.engine.unsent(&delta);
         outcome.quarantined = unsent.len();
         quarantine(conn, &unsent).await?;
-        settle(conn).await?;
+        self.engine.settle(conn).await?;
         let replicas: Vec<Uuid> = self.engine.touched(conn).await?.into_iter().collect();
         let done: Vec<i64> = notes.iter().map(|n| n.id).chain(covered).collect();
         crate::plan::mark_done(conn, &done).await?;
@@ -868,7 +868,7 @@ impl Writer {
         sqlx::query(
             "WITH u AS (SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
                             AS u(r, t, k, s)), \
-                  n AS (SELECT t, k, (SELECT max(id) FROM sync.notes n \
+                  n AS MATERIALIZED (SELECT t, k, (SELECT max(id) FROM sync.notes n \
                                        WHERE n.kind = 'row' AND n.relation = r.t AND n.row_key = r.k) AS noted \
                           FROM (SELECT DISTINCT t, k FROM u) AS r) \
              INSERT INTO sync.held (replica_id, relation, row_key, noted, sequence) \
@@ -978,23 +978,6 @@ async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error
     .execute(&mut *conn)
     .await?;
     resync(conn, replica).await?;
-    Ok(())
-}
-
-/// A row tried again that the plan no longer sends a replica — deleted,
-/// retired, no longer its — is owed to it by nobody: it leaves that
-/// replica's quarantine, unless it failed again.
-async fn settle(conn: &mut Conn) -> Result<(), Error> {
-    sqlx::query(
-        "DELETE FROM sync.quarantine q USING sync_changed c \
-          WHERE q.relation = c.relation AND q.row_key = c.row_key \
-            AND NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = q.replica_id \
-                               AND k.rel = c.rel AND k.row_key = c.row_key AND k.sends) \
-            AND NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
-                               AND b.rel = c.rel AND b.row_key = c.row_key)",
-    )
-    .execute(&mut *conn)
-    .await?;
     Ok(())
 }
 

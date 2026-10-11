@@ -57,6 +57,9 @@ async fn drain(pool: &crate::DbPool, engine: &Engine) -> Drained {
     };
     loop {
         let started = Instant::now();
+        let mut tx = pool.begin().await.expect("a transaction");
+        engine.observe(&mut tx).await.expect("observed");
+        tx.commit().await.expect("commit");
         let mut tx = pool
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
             .await

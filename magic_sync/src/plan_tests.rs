@@ -614,6 +614,7 @@ async fn world(pool: crate::DbPool) -> World {
     let engine = Engine::install(&mut tx, &tables, REPLICAS)
         .await
         .expect("engine");
+    engine.observe(&mut tx).await.expect("observed");
     tx.commit().await.expect("installed");
     World {
         pool,
@@ -694,8 +695,15 @@ impl World {
         .fetch_one(&mut *tx)
         .await
         .expect("drawn");
+        let held: BTreeSet<(Uuid, String, String)> =
+            sqlx::query_as("SELECT replica_id, relation, row_key FROM sync.held")
+                .fetch_all(&mut *tx)
+                .await
+                .expect("held")
+                .into_iter()
+                .collect();
         let outcome = relay.record(&mut tx).await.expect("recorded");
-        assert_minimal(&mut tx, drawn, &self.history).await;
+        assert_minimal(&mut tx, drawn, &held, &self.history).await;
         if chance(12) {
             self.history
                 .push("the relay lost its lock while recording".to_owned());
@@ -748,6 +756,7 @@ impl World {
                     .iter()
                     .map(|(row, _)| model.rows.get(row).cloned())
                     .collect();
+                let rejected = model.rejections.clone();
                 if model.receive(&bytes, &RULES) == Received::Applied {
                     for ((row, bytes), held) in carried.iter().zip(held) {
                         assert!(
@@ -758,6 +767,32 @@ impl World {
                     }
                 }
                 moved = true;
+                // A row it could not let go of because a row it holds
+                // points at it is the replica covering for the server —
+                // unless it refused that row's version that points
+                // elsewhere, which the server cannot know it kept.
+                for (row, rejection) in &model.rejections {
+                    if rejection.reason != "pointed at"
+                        || rejected
+                            .get(row)
+                            .is_some_and(|r| r.sequence == rejection.sequence)
+                        || model.pinned.contains(row)
+                    {
+                        continue;
+                    }
+                    let pointing: Vec<&Row> = model
+                        .rows
+                        .iter()
+                        .filter(|((t, _), bytes)| parents(t, bytes).contains(row))
+                        .map(|(r, _)| r)
+                        .filter(|r| !model.rejections.contains_key(*r))
+                        .collect();
+                    assert!(
+                        pointing.is_empty(),
+                        "{replica} was told to let go of {row:?}, which {pointing:?} it holds points at; last steps: {:#?}",
+                        &self.history[self.history.len().saturating_sub(8)..]
+                    );
+                }
                 let orphans = model.orphans(&RULES);
                 assert!(
                     orphans.is_empty(),
@@ -1148,21 +1183,19 @@ impl Oracle {
     }
 }
 
-/// A pass that planned every pending note sends each replica only rows it
-/// should hold, and takes back only rows it should not: what `tx` — the
-/// pass, recorded and not committed — wrote to the outboxes past the
-/// message `drawn`, against what should be held as the pass read the rows.
-async fn assert_minimal(tx: &mut Conn, drawn: i64, history: &[String]) {
+/// A pass sends each replica only rows it should hold, or held already —
+/// a change not planned yet may still point at it there — and takes back
+/// only rows it should not hold: what `tx` — the pass, recorded and not
+/// committed — wrote to the outboxes past the message `drawn`, against what
+/// should be held as the pass read the rows, and `held`, what the replicas
+/// held before it.
+async fn assert_minimal(
+    tx: &mut Conn,
+    drawn: i64,
+    held: &BTreeSet<(Uuid, String, String)>,
+    history: &[String],
+) {
     use prost::Message as _;
-    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
-        .fetch_one(&mut *tx)
-        .await
-        .expect("waiting");
-    if waiting > 0 {
-        // The batch split what was written: the replicas hold what the
-        // rows were before the rest, which the pass did not plan.
-        return;
-    }
     let written: Vec<(Uuid, Vec<u8>)> =
         sqlx::query_as("SELECT replica_id, message FROM sync.outbox WHERE sequence > $1")
             .bind(drawn)
@@ -1189,8 +1222,8 @@ async fn assert_minimal(tx: &mut Conn, drawn: i64, history: &[String]) {
             for key in &table.keys {
                 let row = (table.table.clone(), key.parts.join("|"));
                 assert!(
-                    should.contains(&row),
-                    "{replica} was sent {row:?}, which it should not hold; last steps: {:#?}",
+                    should.contains(&row) || held.contains(&(replica, row.0.clone(), row.1.clone())),
+                    "{replica} was sent {row:?}, which it should not hold, nor held; last steps: {:#?}",
                     &history[history.len().saturating_sub(8)..]
                 );
             }
@@ -1979,7 +2012,6 @@ async fn a_note_for_a_table_no_row_declares_is_refused_not_dropped(pool: crate::
     let change = Change::Row {
         table: "t_gone".to_owned(),
         key: Uuid::now_v7().to_string(),
-        previous: None,
         retry: false,
     };
     let mut tx = world
@@ -2124,13 +2156,14 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
     .execute(&mut *conn)
     .await
     .expect("writes");
-    let notes: Vec<(String, String, Option<Uuid>, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT relation, row_key, partition_id, previous FROM sync.notes ORDER BY id",
+    let notes: Vec<(String, String, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT n.relation, n.row_key, n.partition_id, p.relation || ' ' || p.row_key \
+           FROM sync.notes n LEFT JOIN sync.pointed p ON p.note = n.id ORDER BY n.id",
     )
     .fetch_all(&mut *conn)
     .await
     .expect("notes");
-    let pointed = serde_json::json!({ "kind_id": kind.to_string() });
+    let pointed = Some(format!("t_kinds {kind}"));
     assert_eq!(
         notes,
         vec![
@@ -2139,29 +2172,14 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
                 "t_counters".into(),
                 counter.to_string(),
                 Some(a),
-                Some(pointed.clone())
+                pointed.clone()
             ),
             // Named as the engine knows it, not by the partition it landed in.
-            (
-                "t_logs".into(),
-                format!("{log}|{a}"),
-                Some(a),
-                Some(serde_json::json!({}))
-            ),
+            ("t_logs".into(), format!("{log}|{a}"), Some(a), None),
             // A key that changed: the new one where it is now, the old one
-            // where it was; of the row as it was, only what it pointed at.
-            (
-                "t_counters".into(),
-                log.to_string(),
-                Some(b),
-                Some(pointed.clone())
-            ),
-            (
-                "t_counters".into(),
-                counter.to_string(),
-                Some(a),
-                Some(pointed)
-            ),
+            // where it was, with what the row as it was pointed at.
+            ("t_counters".into(), log.to_string(), Some(b), None),
+            ("t_counters".into(), counter.to_string(), Some(a), pointed),
         ]
     );
 }
@@ -2835,4 +2853,54 @@ async fn a_database_moved_to_another_cluster_keeps_sending_what_changes(pool: cr
         .execute(&mut admin)
         .await
         .expect("the moved database dropped");
+}
+
+/// A replica that stops being live after the relay looked at the replicas,
+/// and is live again before it looks next, misses nothing it was sent in
+/// between: a pass sends to the replicas as the relay last saw them.
+#[sqlx::test(migrations = false)]
+async fn a_replica_live_again_before_it_was_seen_gone_misses_nothing(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[1];
+    let product = Uuid::now_v7();
+    sqlx::query("INSERT INTO fixture.t_products (id, partition_id, name) VALUES ($1, $2, 'p')")
+        .bind(product)
+        .bind(partition)
+        .execute(&mut *world.conn)
+        .await
+        .expect("a product");
+    world.settle().await;
+    let replica = live_in(&mut world.conn, partition).await[0];
+    let mut tx = world.conn.begin().await.expect("a transaction");
+    world.engine.observe(&mut tx).await.expect("observed");
+    tx.commit().await.expect("commit");
+    for sql in [
+        "UPDATE fixture.t_replicas SET live = false WHERE id = $1",
+        "UPDATE fixture.t_products SET name = 'q' WHERE partition_id = (SELECT partition_id FROM fixture.t_replicas WHERE id = $1)",
+    ] {
+        sqlx::query(sql)
+            .bind(replica)
+            .execute(&mut *world.conn)
+            .await
+            .expect("a write");
+    }
+    let relay = relay(&world.engine, &world.codecs, world.batch);
+    let mut tx = world
+        .conn
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("a transaction");
+    relay.record(&mut tx).await.expect("recorded");
+    tx.commit().await.expect("commit");
+    relay
+        .publish(&mut world.conn, &world.wire)
+        .await
+        .expect("published");
+    sqlx::query("UPDATE fixture.t_replicas SET live = true WHERE id = $1")
+        .bind(replica)
+        .execute(&mut *world.conn)
+        .await
+        .expect("live again");
+    world.settle().await;
+    world.assert_holdings(0, 0).await;
 }
