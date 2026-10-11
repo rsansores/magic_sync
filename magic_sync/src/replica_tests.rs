@@ -3700,6 +3700,48 @@ async fn five_hundred_rows_that_each_roll_the_message_back_are_all_refused(pool:
     );
 }
 
+/// A row held retired for its edits, that the database then refuses to let
+/// go of once they are filed, is not stuck without a word: it is rejected,
+/// for the server to hear of and the operator to see.
+#[sqlx::test(migrations = false)]
+async fn a_row_the_database_will_not_let_go_of_once_filed_is_rejected(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [id] = ids();
+    let row = Task {
+        id,
+        title: "held".into(),
+        done: false,
+        updated_at: at(0),
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("tasks", vec![(key(&[&id.to_string()]), json(&row))])],
+    ))
+    .await;
+    w.exec(
+        "UPDATE tasks SET done = 1;
+         CREATE TRIGGER stays BEFORE DELETE ON tasks BEGIN SELECT RAISE(ABORT, 'it stays'); END;",
+    )
+    .await
+    .unwrap();
+    let up = w.up(0, false).await.expect("the edit");
+    w.receive(&down(2, "", vec![deletes("tasks", vec![key(&[&id.to_string()])])]))
+        .await;
+    assert!(w.rejected().await.is_empty(), "held retired for its edit");
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads,
+        })
+        .encoded(),
+    )
+    .await;
+    assert_eq!(w.rejected().await, [format!("tasks {id}")]);
+    let up = w.up(0, false).await.expect("the rejection goes up");
+    assert_eq!(up.rejected.len(), 1);
+    assert_eq!(up.rejected[0].sequence, BASE + 2);
+}
+
 /// A full disk while a message is applied row by row — after a refusal
 /// rolled it back — still fails the message, whole, rather than rejecting
 /// the row it happened on.

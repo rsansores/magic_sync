@@ -1205,9 +1205,10 @@ async fn let_go_together<P: Sync + 'static>(
     Ok(())
 }
 
-/// A row the replica could not let go of: rejected, when the message
-/// numbered `sequence` let go of it; logged, when the replica let go of it
-/// once the server filed its edits.
+/// A row the replica could not let go of: rejected, as refused by the message
+/// numbered `sequence` — the one that let go of it, or, when the replica let
+/// go of it once the server filed its edits, the last it applied; logged
+/// only when it has applied none.
 #[cfg(feature = "sqlite")]
 async fn kept(
     conn: &mut Conn,
@@ -1362,6 +1363,9 @@ async fn filed<P: Sync + 'static>(
     )
     .fetch_all(&mut *conn)
     .await?;
+    let applied: Option<i64> = sqlx::query_scalar("SELECT sequence FROM sync_applied WHERE id = 1")
+        .fetch_optional(&mut *conn)
+        .await?;
     for codec in codecs {
         let keys: Vec<Key> = done
             .iter()
@@ -1371,7 +1375,7 @@ async fn filed<P: Sync + 'static>(
                 codec.key(&parts).ok()
             })
             .collect();
-        let_go(conn, codec, &keys, None, care).await?;
+        let_go(conn, codec, &keys, applied, care).await?;
     }
     Ok(())
 }
