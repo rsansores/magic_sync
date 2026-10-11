@@ -159,6 +159,7 @@ CREATE TABLE sync.chains (
     replica_id        UUID        PRIMARY KEY,
     last_sequence     BIGINT,
     snapshot_sequence BIGINT,
+    snapshot_end      BIGINT,
     dropped           TEXT,
     dropped_at        TIMESTAMPTZ
 );
@@ -168,6 +169,9 @@ COMMENT ON COLUMN sync.chains.last_sequence IS
     'provisioned or the epoch began.';
 COMMENT ON COLUMN sync.chains.snapshot_sequence IS
     'The first message of the last snapshot written to its outbox, in this epoch.';
+COMMENT ON COLUMN sync.chains.snapshot_end IS
+    'The message that ended that snapshot: a row it refused to let go of at the sweep is held '
+    'again, refused.';
 COMMENT ON COLUMN sync.chains.dropped IS
     'Why its outbox was last dropped and it provisioned again, an alarm: it outgrew its bound, '
     'or the transport refused its next message for good again and again.';

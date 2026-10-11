@@ -356,6 +356,10 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 ours: envelope::PROTOCOL,
             });
         }
+        if up.protocol == 0 {
+            tracing::error!(%replica, "sync: an upload that names no protocol — dropped");
+            return Ok(Vec::new());
+        }
         let filed = match self.file(replica, &up).await {
             Ok(Some(filed)) => filed,
             Ok(None) => {

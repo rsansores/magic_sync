@@ -892,11 +892,10 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
         rejected: vec![
             // Its key as a replica may spell it: the server stores its own.
             rejection("items", &id.to_string().to_uppercase(), epoch, last),
-            // A row it does not hold, refused by a message it was sent: a
-            // delete it could not carry out, the row held again, as refused.
+            // A row that message neither carried nor took back, a key that
+            // is none, a table not sent, a message of another epoch, one
+            // never sent it.
             rejection("items", &Uuid::now_v7().to_string(), epoch, last),
-            // A key that is none, a table not sent, a message of another
-            // epoch, one never sent it.
             rejection("items", "not-a-key", epoch, last),
             rejection("readings", &id.to_string(), epoch, last),
             rejection("items", &id.to_string(), Uuid::now_v7(), last),
@@ -904,27 +903,24 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
         ],
         ..Up::default()
     };
-    let mut conn = world.pool.acquire().await.unwrap();
-    crate::filing::file(&mut conn, &world.codecs, &report, a, &())
-        .await
-        .unwrap();
+    crate::testkit::file(&world.pool, &world.codecs, &report, a, &()).await;
     let refused = "SELECT count(*) FROM sync.held WHERE refused IS NOT NULL";
-    assert_eq!(world.count(refused).await, 2, "held, refused");
+    assert_eq!(world.count(refused).await, 1, "held, refused");
     let set_aside: Vec<(String, String)> =
         sqlx::query_as("SELECT row_key, cause FROM sync.quarantine")
             .fetch_all(&world.pool)
             .await
             .unwrap();
     assert_eq!(
-        set_aside.len(),
-        2,
-        "the row, and the one it could not let go of: {set_aside:?}"
+        set_aside,
+        [(id.to_string(), "replica".to_owned())],
+        "only what that message carried"
     );
-    assert!(set_aside.contains(&(id.to_string(), "replica".to_owned())));
 
     // The replica's build is fixed; the retry sends it to that replica alone.
-    retry_quarantine(&mut conn).await.unwrap();
-    drop(conn);
+    retry_quarantine(&mut world.pool.acquire().await.unwrap())
+        .await
+        .unwrap();
     world.pass(&wire).await;
 
     let delivered = wire.delivered();
@@ -942,7 +938,7 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
         .await
         .unwrap();
     assert_eq!(still, 0, "out of the quarantine");
-    assert_eq!(world.count(refused).await, 0, "taken, and let go of");
+    assert_eq!(world.count(refused).await, 0, "taken");
 }
 
 /// An acknowledgement past every message the server records sending a
@@ -1017,10 +1013,7 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
     let file = |up: Up| {
         let world = &world;
         async move {
-            let mut conn = world.pool.acquire().await.unwrap();
-            crate::filing::file(&mut conn, &world.codecs, &up, a, &())
-                .await
-                .unwrap();
+            crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
         }
     };
 
@@ -1035,8 +1028,7 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
         "messages still on their way: not compared"
     );
 
-    // A digest of a table it is not sent, or of one twice, is no report.
-    file(digests_of(&[("readings", &[one])], last)).await;
+    // Digests of one table twice are no report.
     file(digests_of(
         &[("items", &[one, two]), ("items", &[one])],
         last,
@@ -1044,7 +1036,9 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
     .await;
     assert_eq!(world.count(resyncs).await, 0, "malformed: not compared");
 
-    file(digests_of(&[("items", &[one])], last)).await;
+    // A digest of a table the server does not send is the replica's own
+    // business, and the others are compared all the same.
+    file(digests_of(&[("readings", &[one]), ("items", &[one])], last)).await;
     assert_eq!(world.count(resyncs).await, 1, "provisioned again");
     file(digests_of(&[("items", &[one])], last)).await;
     assert_eq!(world.count(resyncs).await, 1, "once, while one is pending");
@@ -1343,10 +1337,7 @@ impl World {
             sequence,
             ..envelope::Up::default()
         };
-        let mut conn = self.pool.acquire().await.unwrap();
-        crate::filing::file(&mut conn, &self.codecs, &ack, replica, &())
-            .await
-            .unwrap();
+        crate::testkit::file(&self.pool, &self.codecs, &ack, replica, &()).await;
     }
 
     async fn overview(&self, scope: Scope<'_>) -> crate::status::Overview {
@@ -1530,10 +1521,7 @@ impl World {
                     moved = true;
                 }
                 if let Some(up) = model.up() {
-                    let mut conn = self.pool.acquire().await.unwrap();
-                    crate::filing::file(&mut conn, &self.codecs, &up, *replica, &())
-                        .await
-                        .unwrap();
+                    crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &()).await;
                     model.delivered(&up);
                     moved = true;
                 }
@@ -1626,10 +1614,7 @@ impl World {
     /// What `model` of `replica` has to say, filed.
     async fn say(&self, replica: Uuid, model: &mut Model) {
         if let Some(up) = model.up() {
-            let mut conn = self.pool.acquire().await.unwrap();
-            crate::filing::file(&mut conn, &self.codecs, &up, replica, &())
-                .await
-                .unwrap();
+            crate::testkit::file(&self.pool, &self.codecs, &up, replica, &()).await;
             model.delivered(&up);
         }
     }
@@ -1856,6 +1841,89 @@ async fn a_message_lost_on_the_way_is_found_by_the_next(pool: crate::DbPool) {
     world.settle(&wire, &mut models).await;
     world.assert_converged(&models).await;
     assert_eq!(items_of(&models[&a]), names(&["lost", "next"]));
+}
+
+/// A row of a table keyed by its replica is its sender's, whatever it says:
+/// one that names another replica is malformed, left out — neither filed
+/// nor kept — while the sender's own is filed.
+#[sqlx::test(migrations = false)]
+async fn an_uploaded_row_of_another_replica_is_left_out(pool: crate::DbPool) {
+    use crate::conformance::Reading;
+    use crate::envelope::{Table as WireTable, Up};
+    let world = world(pool).await;
+    let [a, b] = world.replicas;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.readings (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         value BIGINT NOT NULL, at BIGINT NOT NULL, PRIMARY KEY (replica_id, id))",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let codecs = vec![Codec::<()>::json::<Reading>(None)];
+    let row = |replica: Uuid| {
+        let reading = Reading {
+            replica_id: replica,
+            id: Uuid::now_v7(),
+            value: 1,
+            at: 1,
+        };
+        let table = Table::of::<Reading>();
+        crate::wire::json_encode("readings", &table.columns, &reading).unwrap()
+    };
+    let upload = Up {
+        tables: vec![WireTable {
+            table: "readings".to_owned(),
+            upserts: vec![row(a), row(b)],
+            ..WireTable::default()
+        }],
+        protocol: envelope::PROTOCOL,
+        ..Up::default()
+    };
+    crate::testkit::file(&world.pool, &codecs, &upload, a, &()).await;
+    let filed: Vec<Uuid> = sqlx::query_scalar("SELECT replica_id FROM fixture.readings")
+        .fetch_all(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(filed, [a]);
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+}
+
+/// What an upload kept in the inbox said of its moment — what the replica
+/// refused, applied, held — was filed when it came: filed again, only its
+/// rows are.
+#[sqlx::test(migrations = false)]
+async fn a_kept_upload_filed_again_files_only_its_rows(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Rejected, Up};
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let id = world.item("one").await;
+    world.pass(&Fake::default()).await;
+    let said = Up {
+        rejected: vec![Rejected {
+            table: "items".to_owned(),
+            key: Some(WireKey {
+                parts: vec![id.to_string()],
+            }),
+            reason: "then".to_owned(),
+            epoch: world.epoch().await.to_string(),
+            sequence: world.last_sent(a).await,
+        }],
+        protocol: envelope::PROTOCOL,
+        ..Up::default()
+    };
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::keep_whole(&mut tx, a, &said.encode_to_vec(), "a bug")
+        .await
+        .unwrap();
+    let kept = crate::filing::inbox(&mut tx, 0, i64::MAX, 10)
+        .await
+        .unwrap();
+    crate::filing::refile(&mut tx, &world.codecs, &kept[0], &())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
 
 #[path = "status_tests.rs"]

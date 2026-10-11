@@ -553,9 +553,11 @@ impl World {
             let Some(up) = self.replicas[&replica].up() else {
                 continue;
             };
-            crate::filing::file(&mut self.conn, &self.codecs, &up, replica, &())
+            let mut tx = self.conn.begin().await.expect("a transaction");
+            crate::filing::file(&mut tx, &self.codecs, &up, replica, &())
                 .await
                 .expect("filed");
+            tx.commit().await.expect("filed");
             moved = true;
             if storm.as_deref_mut().is_some_and(|w| w.below(10) == 0) {
                 // Filed, and the uplink's answer lost: it says it again.

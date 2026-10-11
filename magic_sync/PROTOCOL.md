@@ -356,12 +356,15 @@ For a table the replica writes and the server mirrors:
    server files the same rows idempotently.
 
 The server files an upload under **the replica it came from** (the transport
-says which), whatever the rows themselves claim. A row the server cannot file,
-or a delete its database refuses, is kept on the server, not lost, and filed
-later; so is a whole upload whose filing fails for a reason a resend cannot
-cure. Either still counts as filed for `Filed`. Deletes of a table not keyed
-by the replica, and keys that are not the table's, are malformed and left
-out.
+says which), whatever the rows themselves claim: a row of a table keyed by
+its replica that names another replica there is malformed, and left out. A
+row the server cannot file, or a delete its database refuses, is kept on the
+server, not lost, and filed later; so are an upload's rows whose filing fails
+as a whole for a reason a resend cannot cure. Either still counts as filed
+for `Filed`. What the upload says of the replica — rejections, the last
+applied message, a gap, digests, the backlog — is filed apart from its rows,
+so neither holds back the other. Deletes of a table not keyed by the replica,
+and keys that are not the table's, are malformed and left out.
 
 A replica **may** say what it wrote and the server has not filed yet, in
 `Up.backlog`: per table, rows not sent yet (`unsent`), rows sent and not
@@ -414,8 +417,9 @@ recorded for it (the same epoch and last sequence). If they differ, it
 provisions the replica again from scratch (4.2). Digests that differ again
 within a day of the provisioning they caused are a bug no provisioning cures:
 the server logs them and does not act on them. A digest of a table the server
-does not send the replica, or two digests of one table, are malformed: none
-of that `Up`'s digests is compared. A replica that skips digests loses only
+does not send the replica — a later build's, or one it no longer sends — is
+skipped. Two digests of one table are malformed: none of that `Up`'s digests
+is compared. A replica that skips digests loses only
 this safety net.
 
 ---

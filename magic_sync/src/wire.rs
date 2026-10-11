@@ -112,7 +112,9 @@ impl std::fmt::Debug for MapError {
 impl<P: Sync + 'static> Codec<P> {
     /// A table that travels as `M`, a protobuf message of the host's: `to`
     /// and `from` map a row to its message and back, and `place` stamps a
-    /// row a replica uploads. A mapping that fails is the row's: a row that
+    /// row a replica uploads. A row of a table keyed by its replica
+    /// (`origin`) must name its sender there once placed: one that names
+    /// another is malformed, and left out. A mapping that fails is the row's: a row that
     /// does not encode is set aside, one that does not decode refused.
     pub fn new<R, M>(
         to: fn(R) -> Result<M, MapError>,
@@ -142,7 +144,8 @@ impl<P: Sync + 'static> Codec<P> {
     /// the field's serde writes it — but an `i64` field as its decimal text,
     /// which a JSON number would round past 2^53 for a replica that reads
     /// numbers as doubles. A field serde names otherwise than itself does not
-    /// encode. `place` stamps a row a replica uploads.
+    /// encode. `place` stamps a row a replica uploads; one of a table keyed
+    /// by its replica must name its sender, as with [`Codec::new`].
     pub fn json<R>(place: Option<Place<R, P>>) -> Self
     where
         R: Row + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned,
@@ -178,6 +181,10 @@ impl<P: Sync + 'static> Codec<P> {
         Self {
             ops: Box::new(Typed {
                 owned: table.replica_owned(),
+                #[cfg(feature = "postgres")]
+                origin: table
+                    .origin
+                    .and_then(|origin| table.key.iter().position(|k| *k == origin)),
                 encode,
                 decode,
                 place,
@@ -412,6 +419,10 @@ type Decode<R> = Box<dyn Fn(&[u8]) -> Result<R, Error> + Send + Sync>;
 struct Typed<R, P> {
     /// The columns the replicas own.
     owned: Vec<&'static str>,
+    /// Where the replica that wrote a row sits in its key, for a table keyed
+    /// by it.
+    #[cfg(feature = "postgres")]
+    origin: Option<usize>,
     encode: Encode<R>,
     decode: Decode<R>,
     /// Stamps a row a replica uploads: the server's alone.
@@ -650,6 +661,21 @@ where
                 for (_, row) in &mut rows {
                     place(row, sender, known);
                 }
+            }
+            // A row keyed by its replica is the sender's, whatever `place`
+            // did: one that names another is no row this sender may write.
+            if let Some(part) = self.origin {
+                rows.retain(|(_, row)| {
+                    let own = row.key().get(part) == Some(&KeyPart::Uuid(sender));
+                    if !own {
+                        tracing::error!(
+                            %sender,
+                            table = R::TABLE,
+                            "upload: a row of another replica — malformed, left out"
+                        );
+                    }
+                    own
+                });
             }
             let (written, refused) = self.guarded(conn, rows, how).await?;
             rejected.extend(refused);

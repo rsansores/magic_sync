@@ -24,10 +24,8 @@ pub const ENVELOPE_ROOM: usize = 4096;
 mod sync;
 
 pub(crate) use sync::to_replica::Body;
-#[cfg(any(feature = "sqlite", test))]
-pub(crate) use sync::Digest;
 pub(crate) use sync::{
-    Backlog, Down, EndSnapshot, Filed, Key, Rejected, Table, TableBacklog, ToReplica, Up,
+    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, TableBacklog, ToReplica, Up,
 };
 
 #[cfg(any(feature = "postgres", test))]

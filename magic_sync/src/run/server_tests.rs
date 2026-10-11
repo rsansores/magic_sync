@@ -359,6 +359,7 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
         let ack = crate::envelope::Up {
             epoch: epoch.to_string(),
             sequence: last as u64,
+            protocol: crate::envelope::PROTOCOL,
             ..crate::envelope::Up::default()
         };
         fixed.receive(replica, &ack.encode_to_vec()).await.unwrap();
@@ -722,11 +723,13 @@ async fn the_running_server_provisions_again_a_replica_silent_on_what_it_was_sen
 
 /// Whatever a replica sends up — bytes that are no message, keys that are
 /// none, sequences no message has, tables nobody mirrors, text with NUL in
-/// it — the server answers `Ok` or an error worth a resend, and what it keeps
-/// for the replica stays bounded by what it sent it: quarantined rows are
-/// rows it sent, no note but one provisioning per replica, an inbox no
-/// larger than the rows and deletes that came, nothing kept whole, and no
-/// acknowledgement past the last message sent.
+/// it, from replicas it holds rows for or one it never heard of, with the
+/// relay running in between — the server answers `Ok` or an error worth a
+/// resend, answers an upload that names no protocol with nothing, and what
+/// it keeps for the replica stays bounded by what it sent it: quarantined
+/// rows are rows of a table it sends, no note but one provisioning per
+/// replica, an inbox no larger than the rows and deletes that came, nothing
+/// kept whole, and no acknowledgement past the last message sent.
 #[sqlx::test(migrations = false)]
 async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) {
     use crate::envelope::{Backlog, Digest, Key, Rejected, TableBacklog, Up};
@@ -810,8 +813,13 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         u64::MAX,
     ];
     let mut came = 0i64;
+    let stranger = Uuid::now_v7();
     for step in 0..300 {
-        let sender = [a, b][walk.below(2)];
+        let sender = [a, b, stranger][walk.below(3)];
+        if step % 20 == 19 {
+            server.pass_now().await.unwrap();
+        }
+        let answers = wire.0.lock().unwrap().len();
         let bytes = if step % 10 == 0 {
             (0..walk.below(64)).map(|_| walk.below(256) as u8).collect()
         } else {
@@ -888,6 +896,13 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                 "step {step}: an error that is no reason to resend: {e}"
             ),
         }
+        if Up::decode(bytes.as_slice()).is_ok_and(|up| up.protocol == 0) {
+            assert_eq!(
+                wire.0.lock().unwrap().len(),
+                answers,
+                "step {step}: an upload that names no protocol is answered"
+            );
+        }
 
         let quarantined: Vec<(Uuid, String, String)> =
             sqlx::query_as("SELECT replica_id, relation, row_key FROM sync.quarantine")
@@ -896,10 +911,10 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                 .unwrap();
         for (replica, table, key) in quarantined {
             assert!(
-                [a, b].contains(&replica)
+                [a, b, stranger].contains(&replica)
                     && table == "items"
-                    && items.iter().any(|i| i.to_string() == key),
-                "step {step}: quarantined what was never sent: {replica} {table} {key:?}"
+                    && Uuid::parse_str(&key).is_ok_and(|k| k.to_string() == key),
+                "step {step}: quarantined what is no row it is sent: {replica} {table} {key:?}"
             );
         }
         assert_eq!(

@@ -154,8 +154,9 @@ struct Writer<'d> {
     /// A replica provisioned is absent until its snapshot's first message,
     /// which follows nothing.
     last: BTreeMap<Uuid, i64>,
-    /// Per replica provisioned, its snapshot's first message.
+    /// Per replica provisioned, its snapshot's first message, and its last.
     began: BTreeMap<Uuid, i64>,
+    ended: BTreeMap<Uuid, i64>,
     written: usize,
     upserts: usize,
     deletes: usize,
@@ -374,6 +375,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 .map(|(r, s)| (*r, *s))
                 .collect(),
             began: BTreeMap::new(),
+            ended: BTreeMap::new(),
             written: 0,
             upserts: 0,
             deletes: 0,
@@ -428,19 +430,20 @@ impl<P: Sync + 'static> Relay<'_, P> {
         writer.flush(conn, true).await?;
         let (replicas, lasts): (Vec<Uuid>, Vec<i64>) =
             writer.last.iter().map(|(r, s)| (*r, *s)).unzip();
-        let began: Vec<Option<i64>> = replicas
-            .iter()
-            .map(|r| writer.began.get(r).copied())
-            .collect();
+        let of = |map: &BTreeMap<Uuid, i64>| -> Vec<Option<i64>> {
+            replicas.iter().map(|r| map.get(r).copied()).collect()
+        };
         sqlx::query(
-            "INSERT INTO sync.chains AS c (replica_id, last_sequence, snapshot_sequence) \
-             SELECT * FROM unnest($1::uuid[], $2::bigint[], $3::bigint[]) \
+            "INSERT INTO sync.chains AS c (replica_id, last_sequence, snapshot_sequence, snapshot_end) \
+             SELECT * FROM unnest($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[]) \
              ON CONFLICT (replica_id) DO UPDATE SET last_sequence = EXCLUDED.last_sequence, \
-               snapshot_sequence = coalesce(EXCLUDED.snapshot_sequence, c.snapshot_sequence)",
+               snapshot_sequence = coalesce(EXCLUDED.snapshot_sequence, c.snapshot_sequence), \
+               snapshot_end = coalesce(EXCLUDED.snapshot_end, c.snapshot_end)",
         )
         .bind(&replicas)
         .bind(&lasts)
-        .bind(&began)
+        .bind(of(&writer.began))
+        .bind(of(&writer.ended))
         .execute(&mut *conn)
         .await?;
         Ok(Ok((writer.written, writer.upserts, writer.deletes)))
@@ -772,6 +775,7 @@ impl Writer<'_> {
                     (end.sequence, end.epoch, end.previous) =
                         (number, self.epoch.clone(), previous);
                     self.began.entry(replica).or_insert(sequence);
+                    self.ended.insert(replica, sequence);
                 }
                 Body::Filed(_) => {}
             }
@@ -864,7 +868,7 @@ async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error
     sqlx::query(
         "INSERT INTO sync.chains (replica_id, dropped, dropped_at) VALUES ($1, $2, now()) \
          ON CONFLICT (replica_id) DO UPDATE SET last_sequence = NULL, snapshot_sequence = NULL, \
-           dropped = EXCLUDED.dropped, dropped_at = now()",
+           snapshot_end = NULL, dropped = EXCLUDED.dropped, dropped_at = now()",
     )
     .bind(replica)
     .bind(stored(why))

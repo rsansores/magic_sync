@@ -50,9 +50,7 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
         sequence: last as u64,
         ..Up::default()
     };
-    crate::filing::file(&mut conn, &world.codecs, &ack, a, &())
-        .await
-        .unwrap();
+    crate::testkit::file(&world.pool, &world.codecs, &ack, a, &()).await;
 
     world.exec("UPDATE fixture.items SET name = 'one, renamed' WHERE id = $1 AND partition_id = $2 AND $3 <> ''", one, "x").await;
     world.exec("UPDATE fixture.items SET retired_at = now() WHERE id = $1 AND partition_id = $2 AND $3 <> ''", two, "x").await;
@@ -374,10 +372,7 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
             backlog: Some(envelope::Backlog { tables }),
             ..envelope::Up::default()
         };
-        let mut conn = world.pool.acquire().await.unwrap();
-        crate::filing::file(&mut conn, &world.codecs, &up, a, &())
-            .await
-            .unwrap();
+        crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
     };
     say(vec![envelope::TableBacklog {
         table: "sales".into(),
@@ -508,10 +503,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
         let pool = world.pool.clone();
         let codecs = &world.codecs;
         async move {
-            let mut conn = pool.acquire().await.unwrap();
-            crate::filing::file(&mut conn, codecs, &up, from, &())
-                .await
-                .unwrap();
+            crate::testkit::file(&pool, codecs, &up, from, &()).await;
         }
     };
     say(

@@ -89,6 +89,8 @@ struct Standing {
     last: Option<i64>,
     /// The first message of the last snapshot written for it.
     snapshot: Option<i64>,
+    /// And the one that ended it.
+    snapshot_end: Option<i64>,
     drifted_at: Option<DateTime<Utc>>,
 }
 
@@ -97,10 +99,11 @@ struct Standing {
 /// of it (`known`), whatever the rows say. What it cannot file — a table this
 /// server does not mirror, a row that does not decode, a row or a delete the
 /// database refuses for its data — is kept as it came in the server's inbox,
-/// to be filed again once a fix is deployed. An error is the storage's, or an
-/// upload of a later protocol than this build speaks; a failure of anything
-/// else is permanent, and the caller keeps the upload whole
-/// ([`Server::receive`](crate::Server::receive) does).
+/// to be filed again once a fix is deployed; rows whose filing fails as a
+/// whole are kept whole. What the upload says of the replica — what it
+/// refused, applied, missed, holds and has not sent — is filed apart from
+/// its rows, so neither holds back the other. An error is the storage's, or
+/// an upload of a later protocol than this build speaks.
 pub(crate) async fn file<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -108,18 +111,6 @@ pub(crate) async fn file<P: Sync + 'static>(
     sender: Uuid,
     known: &P,
 ) -> Result<Vec<Filed>, Error> {
-    let (filed, unfiled) = file_parts(conn, codecs, upload, sender, known).await?;
-    keep(conn, sender, &unfiled, None).await?;
-    Ok(filed)
-}
-
-async fn file_parts<P: Sync + 'static>(
-    conn: &mut Conn,
-    codecs: &[Codec<P>],
-    upload: &Up,
-    sender: Uuid,
-    known: &P,
-) -> Result<(Vec<Filed>, Vec<Unfiled>), Error> {
     if upload.protocol > envelope::PROTOCOL {
         return Err(Error::Protocol {
             theirs: upload.protocol,
@@ -127,6 +118,50 @@ async fn file_parts<P: Sync + 'static>(
         });
     }
     let standing = standing(conn, sender).await?;
+    crate::row::savepoint(conn).await?;
+    let filed = file_rows(conn, codecs, upload, sender, known).await;
+    let filed = match crate::row::released(conn, filed).await? {
+        Ok(filed) => filed,
+        Err(e) => {
+            let rows = Up {
+                tables: upload.tables.clone(),
+                protocol: upload.protocol,
+                ..Up::default()
+            };
+            use prost::Message as _;
+            keep_whole(conn, sender, &rows.encode_to_vec(), &e.to_string()).await?;
+            Vec::new()
+        }
+    };
+    crate::row::savepoint(conn).await?;
+    let said = said(conn, codecs, sender, &standing, upload).await;
+    if let Err(e) = crate::row::released(conn, said).await? {
+        tracing::error!(%sender, "sync: what a replica said of itself could not be filed — left out: {e}");
+    }
+    Ok(filed)
+}
+
+/// The rows of `upload` filed; what of them could not be is kept in the
+/// inbox.
+async fn file_rows<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    upload: &Up,
+    sender: Uuid,
+    known: &P,
+) -> Result<Vec<Filed>, Error> {
+    let (filed, unfiled) = file_tables(conn, codecs, upload, sender, known).await?;
+    keep(conn, sender, &unfiled, None).await?;
+    Ok(filed)
+}
+
+async fn file_tables<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    upload: &Up,
+    sender: Uuid,
+    known: &P,
+) -> Result<(Vec<Filed>, Vec<Unfiled>), Error> {
     let mut filed = Vec::new();
     let mut unfiled = Vec::new();
     for table in &upload.tables {
@@ -191,17 +226,28 @@ async fn file_parts<P: Sync + 'static>(
             gone,
         });
     }
-    // What it refused first: a row it applied a message of and refused is
-    // not held, and stays in quarantine.
-    rejected(conn, codecs, sender, &standing, &upload.rejected).await?;
-    if acknowledge(conn, sender, &standing, &upload.epoch, upload.sequence).await? {
-        gap(conn, sender, &standing, upload).await?;
-        compare(conn, codecs, sender, &standing, upload).await?;
+    Ok((filed, unfiled))
+}
+
+/// What `upload` says of its sender: what it refused — first, before what
+/// it applied, which counts as held what it did not refuse — what it
+/// applied, what it missed, what it holds, and what it has not sent.
+async fn said<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    sender: Uuid,
+    standing: &Standing,
+    upload: &Up,
+) -> Result<(), Error> {
+    rejected(conn, codecs, sender, standing, &upload.rejected).await?;
+    if acknowledge(conn, sender, standing, &upload.epoch, upload.sequence).await? {
+        gap(conn, sender, standing, upload).await?;
+        compare(conn, codecs, sender, standing, upload).await?;
     }
     if let Some(told) = &upload.backlog {
         backlog(conn, sender, told).await?;
     }
-    Ok((filed, unfiled))
+    Ok(())
 }
 
 /// What the server records of a sender.
@@ -209,6 +255,7 @@ async fn file_parts<P: Sync + 'static>(
 struct Recorded {
     last: Option<i64>,
     snapshot: Option<i64>,
+    snapshot_end: Option<i64>,
     drifted_at: Option<DateTime<Utc>>,
 }
 
@@ -222,7 +269,8 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
     .fetch_one(&mut *conn)
     .await?;
     let recorded: Recorded = sqlx::query_as(
-        "SELECT c.last_sequence AS last, c.snapshot_sequence AS snapshot, r.drifted_at \
+        "SELECT c.last_sequence AS last, c.snapshot_sequence AS snapshot, \
+                c.snapshot_end, r.drifted_at \
            FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
           WHERE r.replica_id = $1 FOR UPDATE OF r",
     )
@@ -235,6 +283,7 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
         drawn,
         last: recorded.last,
         snapshot: recorded.snapshot,
+        snapshot_end: recorded.snapshot_end,
         drifted_at: recorded.drifted_at,
     })
 }
@@ -336,29 +385,8 @@ async fn rejected<P: Sync + 'static>(
             tracing::debug!(%replica, table = row.table, key, "upload: a rejection from before its last provisioning — left out");
             continue;
         }
-        // The row as the message left it: held, taken back by it — then the
-        // replica could not let it go — or, after a snapshot that began
-        // before it, swept by its end.
-        let refused = sqlx::query(
-            "WITH taken AS (DELETE FROM sync.gone \
-                             WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence = $4 \
-                             RETURNING 1), \
-                  older AS (SELECT 1 FROM sync.gone \
-                             WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence <> $4) \
-             INSERT INTO sync.held AS h (replica_id, relation, row_key, horizon, sequence, refused) \
-             SELECT $1, $2, $3, '0'::xid8, $4, $4 \
-              WHERE EXISTS (SELECT 1 FROM taken) OR NOT EXISTS (SELECT 1 FROM older) \
-             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET refused = EXCLUDED.refused \
-              WHERE h.sequence <= EXCLUDED.refused",
-        )
-        .bind(replica)
-        .bind(codec.table.name)
-        .bind(&key)
-        .bind(sequence)
-        .execute(&mut *conn)
-        .await?;
-        if refused.rows_affected() == 0 {
-            tracing::debug!(%replica, table = row.table, key, "upload: a rejection of a version sent again since — left out");
+        if !refuse(conn, replica, standing, codec.table.name, &key, sequence).await? {
+            tracing::debug!(%replica, table = row.table, key, "upload: a rejection of a version that no longer matters — left out");
             continue;
         }
         let reason = stored(&format!("rejected by the replica: {}", row.reason));
@@ -383,6 +411,61 @@ async fn rejected<P: Sync + 'static>(
         );
     }
     Ok(())
+}
+
+/// Records `key` of `table` refused by `replica`'s message `sequence`, as
+/// that message left the row: held — unless a later message carried it
+/// since — or taken back by it, which the replica could not carry out, or
+/// swept by the end of its snapshot, which it could not either. Answers
+/// whether it was; any other row the message did not concern.
+async fn refuse(
+    conn: &mut Conn,
+    replica: Uuid,
+    standing: &Standing,
+    table: &str,
+    key: &str,
+    sequence: i64,
+) -> Result<bool, Error> {
+    let held: Option<i64> = sqlx::query_scalar(
+        "SELECT sequence FROM sync.held \
+          WHERE replica_id = $1 AND relation = $2 AND row_key = $3 FOR UPDATE",
+    )
+    .bind(replica)
+    .bind(table)
+    .bind(key)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match held {
+        Some(carried) if carried > sequence => return Ok(false),
+        Some(_) => {}
+        None => {
+            let taken = sqlx::query(
+                "DELETE FROM sync.gone \
+                  WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence = $4",
+            )
+            .bind(replica)
+            .bind(table)
+            .bind(key)
+            .bind(sequence)
+            .execute(&mut *conn)
+            .await?;
+            if taken.rows_affected() == 0 && standing.snapshot_end != Some(sequence) {
+                return Ok(false);
+            }
+        }
+    }
+    sqlx::query(
+        "INSERT INTO sync.held AS h (replica_id, relation, row_key, horizon, sequence, refused) \
+         VALUES ($1, $2, $3, '0'::xid8, $4, $4) \
+         ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET refused = EXCLUDED.refused",
+    )
+    .bind(replica)
+    .bind(table)
+    .bind(key)
+    .bind(sequence)
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
 }
 
 /// Records that `replica` applied every message up to `sequence` from the
@@ -492,7 +575,7 @@ async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) ->
     for sql in [
         "DELETE FROM sync.outbox",
         "DELETE FROM sync.gone",
-        "UPDATE sync.chains SET last_sequence = NULL, snapshot_sequence = NULL",
+        "UPDATE sync.chains SET last_sequence = NULL, snapshot_sequence = NULL, snapshot_end = NULL",
     ] {
         sqlx::query(sql).execute(&mut *conn).await?;
     }
@@ -552,12 +635,18 @@ async fn compare<P: Sync + 'static>(
     }
     let mut tables = std::collections::BTreeSet::new();
     for digest in &upload.digests {
-        let sent = codec_of(codecs, &digest.table).is_some_and(Codec::sent_down);
-        if !sent || !tables.insert(digest.table.as_str()) {
-            tracing::error!(%replica, table = stored(&digest.table), "upload: digests of a table this server does not send, or of one twice — malformed, not compared");
+        if !tables.insert(digest.table.as_str()) {
+            tracing::error!(%replica, table = stored(&digest.table), "upload: digests of one table twice — malformed, not compared");
             return Ok(Vec::new());
         }
     }
+    // A table this server does not send — of a later build's, or one it no
+    // longer sends — is the replica's own to hold: not compared.
+    let digests: Vec<&envelope::Digest> = upload
+        .digests
+        .iter()
+        .filter(|d| codec_of(codecs, &d.table).is_some_and(Codec::sent_down))
+        .collect();
     let settled = Uuid::parse_str(&upload.epoch).ok() == Some(standing.epoch)
         && standing.last.is_some()
         && i64::try_from(upload.sequence).ok() == standing.last;
@@ -566,7 +655,7 @@ async fn compare<P: Sync + 'static>(
         return Ok(Vec::new());
     }
     let mut differ = Vec::new();
-    for digest in &upload.digests {
+    for digest in digests {
         let keys: Vec<String> = sqlx::query_scalar(
             "SELECT row_key FROM sync.held \
               WHERE replica_id = $1 AND relation = $2 AND refused IS NULL",
@@ -745,9 +834,9 @@ pub(crate) async fn newest(conn: &mut Conn) -> Result<i64, Error> {
 /// Files `kept` again, in the caller's transaction, under its replica and
 /// what the server knows of it now; answers whether all of it was filed. It
 /// leaves the inbox, and what still cannot be filed is kept again with its
-/// age. Only what it carried is filed: what it said of its moment — the
-/// message it had applied, what it held, what it had not sent — is out of
-/// date by now.
+/// age. Only the rows it carried are filed: what it said of its moment —
+/// what it refused, applied, missed, held, had not sent — is out of date by
+/// now, and was filed when it came.
 pub(crate) async fn refile<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -755,16 +844,21 @@ pub(crate) async fn refile<P: Sync + 'static>(
     known: &P,
 ) -> Result<bool, Error> {
     use prost::Message as _;
-    let mut up = Up::decode(kept.upload.as_slice()).map_err(|e| Error::Malformed {
+    let up = Up::decode(kept.upload.as_slice()).map_err(|e| Error::Malformed {
         table: "sync.inbox".to_owned(),
         reason: e.to_string(),
     })?;
-    (up.epoch, up.sequence, up.digests, up.backlog) = (String::new(), 0, Vec::new(), None);
+    if up.protocol > envelope::PROTOCOL {
+        return Err(Error::Protocol {
+            theirs: up.protocol,
+            ours: envelope::PROTOCOL,
+        });
+    }
     sqlx::query("DELETE FROM sync.inbox WHERE id = $1")
         .bind(kept.id)
         .execute(&mut *conn)
         .await?;
-    let (_, unfiled) = file_parts(conn, codecs, &up, kept.replica_id, known).await?;
+    let (_, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known).await?;
     keep(conn, kept.replica_id, &unfiled, Some(kept)).await?;
     Ok(unfiled.is_empty())
 }

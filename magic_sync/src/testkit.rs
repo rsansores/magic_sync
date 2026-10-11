@@ -214,3 +214,20 @@ async fn tables(conn: &mut crate::Conn, schemas: &[&str]) -> Vec<(String, String
     .await
     .expect("the tables")
 }
+
+/// `up` from `sender` filed as the server files it: in a transaction of its
+/// own.
+#[cfg(feature = "postgres")]
+pub async fn file<P: Sync + 'static>(
+    pool: &crate::DbPool,
+    codecs: &[crate::wire::Codec<P>],
+    up: &crate::envelope::Up,
+    sender: Uuid,
+    known: &P,
+) {
+    let mut tx = pool.begin().await.expect("a transaction");
+    crate::filing::file(&mut tx, codecs, up, sender, known)
+        .await
+        .expect("filed");
+    tx.commit().await.expect("committed");
+}
