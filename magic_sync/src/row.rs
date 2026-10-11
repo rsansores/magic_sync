@@ -1,6 +1,6 @@
 //! A table declared once, as the struct that is its row.
 //!
-//! A struct derives [`Row`](crate::Row) with fields that are exactly its
+//! A struct derives [`Row`] with fields that are exactly its
 //! table's columns, and says where the table lives ([`Mirror`]) and which
 //! replicas hold which of its rows; the derive's documentation lists every
 //! attribute. The engine checks the declaration against the database when it

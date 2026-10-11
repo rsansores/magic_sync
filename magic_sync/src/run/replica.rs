@@ -32,9 +32,8 @@ impl Identity for Uuid {
 
 /// Where a replica's messages up go.
 pub trait Uplink: Send + Sync + 'static {
-    /// Sends `message`, an encoded [`Up`](crate::envelope::Up) from
-    /// `replica`, on `lane`. An error means it was not taken, and it goes
-    /// again.
+    /// Sends `message`, one message up, encoded, from `replica`, on `lane`.
+    /// An error means it was not taken, and it goes again.
     fn send(
         &self,
         replica: Uuid,

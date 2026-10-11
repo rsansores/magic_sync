@@ -205,10 +205,11 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
 /// added or changes how it travels; [`check`] refuses a database whose
 /// triggers are not these.
 #[cfg(feature = "sqlite")]
+#[must_use]
 pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
     generated(codecs)
         .into_iter()
-        .map(|t| format!("{};\n", t.sql))
+        .map(|t| t.sql + ";\n")
         .collect()
 }
 
@@ -574,7 +575,6 @@ async fn apply<P: Sync + 'static>(
             } else {
                 "a table this replica does not mirror"
             };
-            tracing::warn!(table = table.table, "sync: {why} — rejected");
             let keys: Vec<String> = table.keys.iter().map(|k| k.parts.join("|")).collect();
             reject(conn, &table.table, &keys, why, sequence).await?;
             continue;
@@ -627,11 +627,6 @@ async fn let_go<P: Sync + 'static>(
 ) -> Result<crate::row::Retired, Error> {
     let retired = codec.retire(conn, keys).await?;
     for (key, why) in &retired.refused {
-        tracing::error!(
-            table = codec.table.name,
-            ?key,
-            "sync: a row this replica cannot let go of — rejected: {why}"
-        );
         reject(conn, codec.table.name, &[key_text(key)], why, sequence).await?;
     }
     let gone: Vec<String> = keys
@@ -660,6 +655,12 @@ async fn reject(
     why: &str,
     sequence: i64,
 ) -> Result<(), Error> {
+    tracing::error!(
+        table,
+        ?keys,
+        sequence,
+        "sync: rows this replica cannot take or let go of — rejected, for the server to hear of: {why}"
+    );
     sqlx::query(
         "INSERT INTO sync_rejections (table_name, row_key, reason, sequence) \
          SELECT $1, value, $3, $4 FROM json_each($2) WHERE true \

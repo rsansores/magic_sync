@@ -15,7 +15,7 @@ type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
 /// Files a row a replica sent under that replica, whatever the row said: it
 /// is handed the row, the replica's id, and what the server knows of it
-/// (`P`, the host's: see [`Senders`](crate::run::server::Senders)).
+/// (`P`, the host's: the server's `Senders` says what it is).
 pub type Place<R, P> = fn(&mut R, Uuid, &P);
 
 /// One mirrored table: how its rows turn into bytes and back, and how each
@@ -85,6 +85,7 @@ pub struct MapError(String);
 
 impl MapError {
     /// A mapping that failed for `reason`.
+    #[must_use]
     pub fn new(reason: impl std::fmt::Display) -> Self {
         MapError(reason.to_string())
     }
@@ -501,10 +502,6 @@ where
             match row {
                 Ok(row) => decoded.push((at, row)),
                 Err(e) => {
-                    tracing::error!(
-                        table = R::TABLE,
-                        "a row that does not decode — skipped: {e}"
-                    );
                     failed.push(Refused {
                         at,
                         #[cfg(feature = "sqlite")]
@@ -532,8 +529,8 @@ where
 
     /// Writes `rows`, and when the database refuses them for their data (a
     /// duplicate, a dangling reference) writes them one by one, leaving out
-    /// and logging each it refuses — a message must not be refused forever
-    /// for one row. Answers the keys written, and the places of the rows
+    /// each it refuses — a message must not be refused forever for one row;
+    /// the caller says what becomes of it. Answers the keys written, and the places of the rows
     /// refused with why.
     async fn guarded(
         &self,
@@ -556,22 +553,16 @@ where
         let mut written = Vec::new();
         let mut refused = Vec::new();
         for (at, one) in rows {
+            #[cfg(feature = "sqlite")]
             let key = one.key();
             match self.attempt(conn, vec![one], how).await? {
                 Ok(keys) => written.extend(keys),
-                Err(e) => {
-                    tracing::error!(
-                        table = R::TABLE,
-                        ?key,
-                        "a row the database refuses — skipped: {e}"
-                    );
-                    refused.push(Refused {
-                        at,
-                        #[cfg(feature = "sqlite")]
-                        key: Some(key),
-                        reason: e.to_string(),
-                    });
-                }
+                Err(e) => refused.push(Refused {
+                    at,
+                    #[cfg(feature = "sqlite")]
+                    key: Some(key),
+                    reason: e.to_string(),
+                }),
             }
         }
         Ok((written, refused))

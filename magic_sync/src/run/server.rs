@@ -87,7 +87,8 @@ pub struct Settings {
     /// How long a replica a send failed to waits before it is tried again.
     pub replica_backoff: Backoff,
     /// How long a replica may leave a message unconfirmed, with nothing sent
-    /// to it since, before it is provisioned again ([`relay::heal`]).
+    /// to it since, before it is provisioned again: the messages may never
+    /// have reached it.
     pub unconfirmed_after: Duration,
     /// How often a process that is not the relay asks for the lock.
     pub standby: Duration,

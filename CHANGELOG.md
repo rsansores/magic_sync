@@ -5,10 +5,13 @@
 The first release: the engine extracted from the system it was built in.
 
 - `#[derive(Row)]` / `#[derive(Columns)]` (`magic_sync_derive`): one struct is
-  one table; every convention is a declaration.
+  one table; every convention is a declaration. A misuse is a compile error
+  pointing at what says it; a table that is not its row is refused when the
+  server or a replica starts.
 - Codecs: `Codec::json` (an object of the row's columns, 64-bit integers as
   text) and `Codec::new` (a protobuf message of your own).
-- `Server` and `Replica` runners, built on public step functions.
+- `Server` and `Replica` runners: what a host builds, runs and hands what
+  arrives. The steps they are built on are the engine's own.
 - `Server::install`, `replica::install` and `replica::check` for the engine's
   schema and triggers; a schema version both sides check. On the server the
   schema is installed or upgraded in one transaction, one process at a time,

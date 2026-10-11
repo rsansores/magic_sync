@@ -1,7 +1,7 @@
 //! `#[derive(Row)]` and `#[derive(Columns)]` for [magic_sync]: one struct is
 //! one table, column for column, and says how it travels. Use them through
-//! `magic_sync`, which re-exports both; the example and every attribute are
-//! documented on [`magic_sync::Row`].
+//! `magic_sync`, which re-exports both; every attribute is documented there,
+//! on [`magic_sync::Row`].
 //!
 //! Everything the derive is told is checked where it is written: a key that
 //! is not a field, a column named twice, an attribute a table of its kind
@@ -18,7 +18,7 @@ use syn::meta::ParseNestedMeta;
 use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Ident, LitStr, Type};
 
-/// One struct is one table. See `magic_sync::Row`.
+/// Written by `magic_sync_derive`.
 #[proc_macro_derive(Row, attributes(row))]
 pub fn derive_row(input: Tokens) -> Tokens {
     let input = parse_macro_input!(input as DeriveInput);
@@ -27,8 +27,7 @@ pub fn derive_row(input: Tokens) -> Tokens {
         .into()
 }
 
-/// A part of a row that a row flattens in (`#[sqlx(flatten)]`). See
-/// `magic_sync::Columns`.
+/// Written by `magic_sync_derive`.
 #[proc_macro_derive(Columns, attributes(row))]
 pub fn derive_columns(input: Tokens) -> Tokens {
     let input = parse_macro_input!(input as DeriveInput);
@@ -116,6 +115,14 @@ fn identifier(text: &str, at: Span) -> syn::Result<String> {
         ));
     }
     Ok(text.to_owned())
+}
+
+/// `value` as the generated code's `Option`.
+fn option(value: Option<impl ToTokens>) -> TokenStream {
+    match value {
+        Some(value) => quote!(::core::option::Option::Some(#value)),
+        None => quote!(::core::option::Option::None),
+    }
 }
 
 /// `name` quoted as SQL quotes an identifier.
@@ -375,11 +382,12 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
         } else {
             quote!(::core::option::Option::None)
         };
-        let version = match flags.version {
-            Some(_) => quote_spanned! {ty.span()=>
+        let version = if flags.version.is_some() {
+            quote_spanned! {ty.span()=>
                 ::core::option::Option::Some(<#ty as #krate::row::Version>::KIND)
-            },
-            None => quote!(::core::option::Option::None),
+            }
+        } else {
+            quote!(::core::option::Option::None)
         };
         let generated = flags.generated.is_some();
         let replica_owned = flags.replica_owned.is_some();
@@ -417,13 +425,7 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
                 format!("one column at most is #[row({what})]"),
             ));
         }
-        let here = match marked.first() {
-            Some(column) => {
-                let name = &column.name;
-                quote!(::core::option::Option::Some(#name))
-            }
-            None => quote!(::core::option::Option::None),
-        };
+        let here = option(marked.first().map(|column| &column.name));
         let parts = flattened
             .iter()
             .map(|part| quote!(<#part as #private::Columns>::#which));
@@ -679,10 +681,6 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         }));
     }
 
-    let option = |value: Option<String>| match value {
-        Some(v) => quote!(::core::option::Option::Some(#v)),
-        None => quote!(::core::option::Option::None),
-    };
     let active = option(active);
     let retired = option(retired);
     let origin = option(args.origin.as_ref().map(LitStr::value));

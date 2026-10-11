@@ -65,8 +65,104 @@ mod testkit;
 pub mod wire;
 
 pub use error::Error;
-pub use magic_sync_derive::{Columns, Row};
 pub use row::{Columns, Row};
+
+/// One struct is one table, column for column, and says how it travels:
+/// implements [`Row`](trait@Row). The same struct serves both sides.
+///
+/// ```
+/// use chrono::{DateTime, Utc};
+/// use uuid::Uuid;
+///
+/// /// Written at the head office, held by every register; a register keeps
+/// /// one a receipt of its own still points at, retired.
+/// #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+/// #[row(table = "products", schema = "shop", mirror = "catalog", sync = "broadcast", retired = "retired_at")]
+/// pub struct Product {
+///     pub id: Uuid,
+///     pub name: String,
+///     pub price_cents: i64,
+///     #[row(version)]
+///     pub updated_at: DateTime<Utc>,
+/// }
+///
+/// /// Written by a register, filed at the head office under the register
+/// /// that sent it.
+/// #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+/// #[row(table = "receipts", schema = "shop", mirror = "record", key = "register_id, id", origin = "register_id")]
+/// pub struct Receipt {
+///     pub register_id: Uuid,
+///     pub id: Uuid,
+///     pub product_id: Uuid,
+///     pub total_cents: i64,
+///     #[row(created)]
+///     pub created_at: DateTime<Utc>,
+/// }
+/// ```
+///
+/// On the struct, `#[row(…)]` takes:
+///
+/// | key | means |
+/// |---|---|
+/// | `table` | the table's name (required) |
+/// | `schema` | its PostgreSQL schema; `public` when left out |
+/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server), `both` (each side its own columns) or `server` (it never travels) — required |
+/// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names), `follows(col)` (wherever the row `col` points at goes) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
+/// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]) |
+/// | `active` | for `catalog` and `both`, the relation the rows replicas hold are read through on the server — `view` or `schema.view`, a view that leaves out the rows no replica should hold |
+/// | `retired` | for `catalog` and `both`, the column a replica sets on a row it lets go of but must keep, because a row of its own points at it |
+/// | `origin` | for `record` and `both`, the uuid key column naming the replica a row belongs to: a replica deletes only its own rows |
+/// | `unmirrored` | columns one side's table has that the row leaves out: `unmirrored = "archived_at, notes"` |
+/// | `crate` | the path to this crate, when a host reaches it through another: `crate = "platform::sync"` |
+///
+/// On a field:
+///
+/// | flag | means |
+/// |---|---|
+/// | `#[row(version)]` | the column whose value only moves forward: an older copy never overwrites a newer one. An integer or a `chrono` instant ([`row::Version`]), never NULL, and in a `both` table the server's |
+/// | `#[row(created)]` | written once, when the row is created; never by an update |
+/// | `#[row(replica_owned)]` | in a `both` table, a column only replicas write: it goes up, the rest come down |
+/// | `#[row(generated)]` | computed by the database: read, never written |
+///
+/// Fields follow `sqlx::FromRow`: `#[sqlx(rename = "…")]` names the column,
+/// `#[sqlx(try_from = "…")]` is the type the column decodes into,
+/// `#[sqlx(skip)]` is no column, and `#[sqlx(flatten)]` brings in the columns
+/// of a part that derives [`Columns`](macro@Columns). `#[sqlx(json)]` and a
+/// struct-level `#[sqlx(rename_all)]` are refused rather than
+/// half-understood. A nullable column is a field written as `Option<…>`.
+///
+/// Every name is the database's own, as written — the engine quotes each —
+/// and at most the 63 bytes PostgreSQL keeps of one. Whatever the derive
+/// cannot honour is a compile error pointing at what says it; whatever the
+/// database disagrees with — a column on one side only, a nullability, a
+/// type its field does not decode, another primary key — is refused when the
+/// server or a replica starts.
+pub use magic_sync_derive::Row;
+
+/// A part of a row, flattened into it with `#[sqlx(flatten)]`: its columns
+/// are the row's. Its fields take the same flags as a row's; on the struct,
+/// only `#[row(crate = "…")]`.
+///
+/// ```
+/// use chrono::{DateTime, Utc};
+///
+/// /// When a row was created, for every table that keeps it.
+/// #[derive(sqlx::FromRow, Clone, magic_sync::Columns)]
+/// pub struct Stamps {
+///     #[row(created)]
+///     pub created_at: DateTime<Utc>,
+/// }
+///
+/// #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+/// #[row(table = "notes", mirror = "record")]
+/// pub struct Note {
+///     pub id: uuid::Uuid,
+///     pub text: String,
+///     #[sqlx(flatten)]
+///     pub stamps: Stamps,
+/// }
+/// ```
+pub use magic_sync_derive::Columns;
 #[cfg(feature = "sqlite")]
 pub use run::replica::Replica;
 #[cfg(feature = "postgres")]
@@ -75,9 +171,12 @@ pub use run::server::Server;
 // The derive's generated code names this crate, and sqlx through it.
 extern crate self as magic_sync;
 
-/// A connection of this side's database — `&mut *tx` inside a transaction:
-/// a `PgConnection` on the server, a `SqliteConnection` on a replica.
-pub type Conn = <Db as sqlx::Database>::Connection;
+/// A connection of this side's database: `&mut *tx` inside a transaction.
+#[cfg(feature = "postgres")]
+pub type Conn = sqlx::PgConnection;
+/// A connection of this side's database: `&mut *tx` inside a transaction.
+#[cfg(feature = "sqlite")]
+pub type Conn = sqlx::SqliteConnection;
 
 /// The version of the engine's schema, on both sides: the engine refuses to
 /// run against a database that installed another.
