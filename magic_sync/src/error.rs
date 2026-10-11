@@ -1,7 +1,9 @@
-/// What the engine can fail with.
+/// What the engine can fail with. [`Error::is_transient`] says whether the
+/// same work may succeed as it is once the infrastructure is back.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// The database failed, or refused a statement.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     /// A declaration the schema cannot honour, or a call the engine cannot
@@ -12,18 +14,40 @@ pub enum Error {
     /// that does not decode, a message that breaks the protocol. Set aside
     /// rather than retried: the same bytes fail the same way.
     #[error("`{table}`: {reason}")]
-    Malformed { table: String, reason: String },
-    /// The transport refused or could not take a message.
+    Malformed {
+        /// The table it was of; empty for a message rather than a row.
+        table: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// The transport refused or could not take a message: what a host's
+    /// transport or uplink answers.
     #[error("{reason}")]
-    Transport { reason: String, transient: bool },
+    Transport {
+        /// Why, as the transport says it.
+        reason: String,
+        /// Whether a retry may get it through (the network, the broker away)
+        /// rather than never (a message the transport will never take).
+        transient: bool,
+    },
     /// The host failed at something the engine asked of it: who a replica is,
     /// a transaction to file in.
     #[error("{reason}")]
-    Host { reason: String, transient: bool },
+    Host {
+        /// Why, as the host says it.
+        reason: String,
+        /// Whether the same question may be answered once the host is back.
+        transient: bool,
+    },
     /// A message of a later protocol than this build speaks. It is not acted
     /// on and not acknowledged: it waits for this side to be updated.
     #[error("a message of protocol {theirs}, and this build speaks {ours}")]
-    Protocol { theirs: u32, ours: u32 },
+    Protocol {
+        /// The protocol the message speaks.
+        theirs: u32,
+        /// The protocol this build speaks ([`PROTOCOL`](crate::envelope::PROTOCOL)).
+        ours: u32,
+    },
 }
 
 impl Error {
@@ -35,6 +59,7 @@ impl Error {
     /// The transient side is the listed one, because it is the short, closed
     /// set: an error nobody listed is set aside and shows, rather than
     /// retried for ever.
+    #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
             Error::Database(e) => is_transient_sqlx(e),
@@ -93,7 +118,7 @@ fn is_transient_code(code: &str) -> bool {
 /// memory, read-only, interrupted, an I/O error, a full disk, a file it
 /// cannot open — each the machine's, not the rows'. The primary result code
 /// is the extended one's low byte.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn is_transient_code(code: &str) -> bool {
     const BUSY: i32 = 5;
     const LOCKED: i32 = 6;
@@ -127,14 +152,14 @@ mod tests {
         assert!(!Error::Database(sqlx::Error::RowNotFound).is_transient());
         // The server's own failures: an I/O error, a statement whose fate
         // is unknown, a broken connection protocol.
-        #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+        #[cfg(feature = "postgres")]
         for code in ["58030", "58000", "40003", "08P01", "08007"] {
             assert!(is_transient_code(code), "{code}");
         }
-        #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+        #[cfg(feature = "postgres")]
         assert!(!is_transient_code("23505"), "a duplicate is the rows'");
         // A busy or locked database is the machine's; a refused row is not.
-        #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+        #[cfg(feature = "sqlite")]
         {
             assert!(is_transient_code("5"));
             assert!(is_transient_code("517"));

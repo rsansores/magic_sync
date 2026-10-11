@@ -1,0 +1,5 @@
+error: #[row(version)] orders a row's versions: it cannot be NULL
+ --> tests/derive/fail/version_nullable.rs:5:11
+  |
+5 |     #[row(version)]
+  |           ^^^^^^^

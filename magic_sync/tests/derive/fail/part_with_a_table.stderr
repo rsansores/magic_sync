@@ -1,0 +1,5 @@
+error: #[derive(Columns)] is a part a row flattens in: only `crate` applies to it
+ --> tests/derive/fail/part_with_a_table.rs:2:7
+  |
+2 | #[row(table = "stamps")]
+  |       ^^^^^

@@ -12,7 +12,8 @@
 //! [`CONTRACT`], and carries that number.
 
 use crate::plan::{parse_key, Engine};
-use crate::replica::UpProgress;
+
+pub use crate::replica::UpProgress;
 use crate::Error;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use sqlx::{Connection, Database, TransactionManager};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
-type Conn = crate::row::Conn;
+use crate::Conn;
 
 /// The version of the JSON the answers serialize as. A field added does not
 /// change it; a field removed or renamed, or a meaning changed, does — and a
@@ -32,8 +33,11 @@ pub const CONTRACT: u32 = 1;
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum Scope<'a> {
+    /// These replicas: the ones a caller may see.
     Replicas(&'a [Uuid]),
+    /// Every replica of one partition.
     Partition(Uuid),
+    /// Every replica.
     All,
 }
 
@@ -43,7 +47,9 @@ pub enum Scope<'a> {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Progress {
+    /// The contract this answer serializes as: [`CONTRACT`].
     pub contract: u32,
+    /// Each replica of the scope.
     pub replicas: Vec<ReplicaProgress>,
 }
 
@@ -52,7 +58,9 @@ pub struct Progress {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct ReplicaProgress {
+    /// The replica.
     pub replica: Uuid,
+    /// Each table the server sends down, parents first.
     pub tables: Vec<TableProgress>,
 }
 
@@ -65,6 +73,7 @@ pub struct ReplicaProgress {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct TableProgress {
+    /// The table.
     pub table: String,
     /// Rows its rules say it should hold. For a table that only travels with
     /// others, what the engine decided to send it.
@@ -83,6 +92,7 @@ pub struct TableProgress {
 
 impl TableProgress {
     /// Rows it holds as they should be.
+    #[must_use]
     pub fn up_to_date(&self) -> i64 {
         self.holds - self.outdated
     }
@@ -94,7 +104,9 @@ impl TableProgress {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct RowProgress {
+    /// The contract this answer serializes as: [`CONTRACT`].
     pub contract: u32,
+    /// Each replica of the scope the row is something to.
     pub places: Vec<RowPlace>,
 }
 
@@ -103,7 +115,9 @@ pub struct RowProgress {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct RowPlace {
+    /// The replica.
     pub replica: Uuid,
+    /// What the row is to it.
     pub state: RowState,
 }
 
@@ -155,9 +169,13 @@ pub enum ReplicaState {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct ReplicaCounts {
+    /// Replicas [`ReplicaState::AwaitingFix`].
     pub awaiting_fix: i64,
+    /// Replicas [`ReplicaState::Unreachable`].
     pub unreachable: i64,
+    /// Replicas [`ReplicaState::CatchingUp`].
     pub catching_up: i64,
+    /// Replicas [`ReplicaState::Synced`].
     pub synced: i64,
 }
 
@@ -180,7 +198,9 @@ impl ReplicaCounts {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct ReplicaOverview {
+    /// The replica.
     pub replica: Uuid,
+    /// Where it stands, in one word.
     pub state: ReplicaState,
     /// Changes noted and not yet planned that may concern it.
     pub pending: i64,
@@ -194,13 +214,15 @@ pub struct ReplicaOverview {
     pub quarantined: i64,
     /// Rows it sent that wait in the inbox until a fix.
     pub unfiled: i64,
-    /// Sends to it that failed in a row, and the last one's error.
+    /// Sends to it that failed in a row.
     pub failures: i32,
+    /// The last failed send's error.
     pub last_error: Option<String>,
     /// When it is tried again, while it waits out a failure.
     pub retry_at: Option<DateTime<Utc>>,
-    /// When it was last sent a message, and when it last said it applied one.
+    /// When it was last sent a message.
     pub sent_at: Option<DateTime<Utc>>,
+    /// When it last said it applied one.
     pub applied_at: Option<DateTime<Utc>>,
     /// While it has messages it has not said it applied: since when it has
     /// not moved — the first one it did not confirm, or its last confirmation
@@ -216,7 +238,9 @@ pub struct ReplicaOverview {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Backlog {
+    /// Each table with something on its way.
     pub tables: Vec<UpProgress>,
+    /// When the replica said so.
     pub at: DateTime<Utc>,
 }
 
@@ -227,6 +251,7 @@ pub struct Backlog {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct TableOverview {
+    /// The table.
     pub table: String,
     /// Every figure below is zero.
     pub synced: bool,
@@ -257,14 +282,18 @@ pub struct Health {
     /// is the network's to settle, and listed in `failing`; nor is a
     /// backlog, unless it stops draining, which the host says when.
     pub healthy: bool,
-    /// Changes noted and not yet planned, and when the oldest the planner is
-    /// due to get to was noted: one owed to a replica out of reach waits for
-    /// it, and is not counted there.
+    /// Changes noted and not yet planned.
     pub pending: i64,
+    /// When the oldest change the planner is due to get to was noted: one
+    /// owed to a replica out of reach waits for it, and is not counted here.
     pub oldest: Option<DateTime<Utc>>,
+    /// Changes the planner set aside until a fix.
     pub parked: Listed<Parked>,
+    /// Rows set aside for a replica until a fix.
     pub quarantine: Listed<Quarantined>,
+    /// What replicas sent that waits in the inbox until a fix.
     pub inbox: Listed<Unfiled>,
+    /// Replicas sends keep failing to.
     pub failing: Listed<Failing>,
 }
 
@@ -273,7 +302,9 @@ pub struct Health {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Listed<T> {
+    /// How many there are in all.
     pub total: i64,
+    /// The first of them, up to the limit the read was given.
     pub first: Vec<T>,
 }
 
@@ -308,13 +339,21 @@ pub enum NoteKind {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Parked {
+    /// The note's number.
     pub id: i64,
+    /// What it asks for.
     pub kind: NoteKind,
+    /// The table it is of, for a row or a group.
     pub table: Option<String>,
+    /// The row's key, for a row.
     pub key: Option<String>,
+    /// The replica it is about, or owed to alone.
     pub replica: Option<Uuid>,
+    /// How many times it was planned and failed.
     pub attempts: i32,
+    /// Why it failed last.
     pub last_error: Option<String>,
+    /// When it was set aside.
     pub parked_at: Option<DateTime<Utc>>,
 }
 
@@ -323,12 +362,19 @@ pub struct Parked {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Quarantined {
+    /// The replica it is set aside for.
     pub replica: Uuid,
+    /// Its table.
     pub table: String,
+    /// Its key.
     pub key: String,
+    /// Why it could not go, or could not be taken.
     pub reason: String,
+    /// When it was first set aside.
     pub first_at: DateTime<Utc>,
+    /// When it last failed.
     pub last_at: DateTime<Utc>,
+    /// How many times it failed.
     pub attempts: i32,
 }
 
@@ -338,13 +384,19 @@ pub struct Quarantined {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Unfiled {
+    /// Its number in the inbox.
     pub id: i64,
+    /// The replica that sent it.
     pub replica: Uuid,
     /// Empty for a whole upload kept as it came.
     pub table: String,
+    /// Why it could not be filed.
     pub reason: String,
+    /// When it first could not be filed.
     pub first_at: DateTime<Utc>,
+    /// When filing it last failed.
     pub last_at: DateTime<Utc>,
+    /// How many times filing it failed.
     pub attempts: i32,
 }
 
@@ -353,9 +405,13 @@ pub struct Unfiled {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Failing {
+    /// The replica.
     pub replica: Uuid,
+    /// Sends to it that failed in a row.
     pub failures: i32,
+    /// The last failed send's error.
     pub last_error: Option<String>,
+    /// When it is tried again.
     pub retry_at: Option<DateTime<Utc>>,
 }
 
@@ -367,13 +423,18 @@ pub struct Failing {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Overview {
+    /// The contract this answer serializes as: [`CONTRACT`].
     pub contract: u32,
     /// The server's time when the answer was read: every time in it is the
     /// server's, and how long ago one was is measured from this.
     pub now: DateTime<Utc>,
+    /// What the engine waits on.
     pub health: Health,
+    /// How many replicas are in each state.
     pub states: ReplicaCounts,
+    /// The replicas that need attention most, worst first.
     pub replicas: Listed<ReplicaOverview>,
+    /// Each table the server sends down, parents first.
     pub tables: Vec<TableOverview>,
 }
 
@@ -382,13 +443,15 @@ pub struct Overview {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Listing {
+    /// The contract this answer serializes as: [`CONTRACT`].
     pub contract: u32,
     /// The server's time when the answer was read.
     pub now: DateTime<Utc>,
-    /// The state the page was asked for (`None`: every state), and where in
-    /// the list it begins.
+    /// The state the page was asked for (`None`: every state).
     pub state: Option<ReplicaState>,
+    /// Where in the list the page begins.
     pub offset: u32,
+    /// The page.
     pub replicas: Listed<ReplicaOverview>,
 }
 

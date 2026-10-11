@@ -1,0 +1,5 @@
+error: a #[row(version)] column moves with every write; a #[row(created)] one never moves
+ --> tests/derive/fail/version_and_created.rs:5:20
+  |
+5 |     #[row(version, created)]
+  |                    ^^^^^^^

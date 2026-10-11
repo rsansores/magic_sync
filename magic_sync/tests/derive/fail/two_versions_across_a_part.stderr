@@ -1,0 +1,13 @@
+error[E0080]: evaluation panicked: one column at most is #[row(version)], here or in a part flattened in
+ --> tests/derive/fail/two_versions_across_a_part.rs:7:32
+  |
+7 | #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+  |                                ^^^^^^^^^^^^^^^ evaluation of `<Thing as magic_sync::Columns>::VERSION` failed here
+
+note: erroneous constant encountered
+ --> tests/derive/fail/two_versions_across_a_part.rs:7:32
+  |
+7 | #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+  |                                ^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the derive macro `magic_sync::Row` (in Nightly builds, run with -Z macro-backtrace for more info)

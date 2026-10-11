@@ -1,0 +1,5 @@
+error: #[row(replica_owned)] splits a table written on both sides: needs `mirror = "both"`
+ --> tests/derive/fail/replica_owned_off_both.rs:5:11
+  |
+5 |     #[row(replica_owned)]
+  |           ^^^^^^^^^^^^^

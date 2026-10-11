@@ -35,25 +35,26 @@
 
 use crate::envelope::{self, Body, Down, EndSnapshot, Limits};
 use crate::plan::{pending, Delta, Engine, Loaded, Note, Unsent};
-use crate::row::Conn;
 use crate::wire::Codec;
+use crate::Conn;
 use crate::Error;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Where messages go: `message` is a [`ToReplica`](envelope::ToReplica),
-/// encoded, for `replica`. `id` names the message — `{epoch}-{sequence}`,
-/// one of its own for every message the engine sends — for a transport that
-/// deduplicates a send it retries itself. A pass sent again after a relay
-/// died before recording it is numbered anew, and goes again.
+/// Where the server's messages go: the host's transport. `message` is one
+/// message, encoded, for `replica`. `id` names the message, one of its own
+/// for every message the engine sends, for a transport that deduplicates a
+/// send it retries itself; a pass sent again after a relay died before
+/// recording it is numbered anew, and goes again.
 ///
 /// An error is transient when a retry may get it through (the network, the
 /// broker away) and permanent when the transport will never take this message;
 /// the engine already keeps every message within [`Limits`]. Either way the
 /// replica waits out a backoff and is sent what it is owed again.
 pub trait Transport: Sync {
+    /// Sends `message` to `replica`, or says why it could not.
     fn send(
         &self,
         replica: Uuid,
@@ -63,18 +64,18 @@ pub trait Transport: Sync {
 }
 
 /// The relay's settings.
-pub struct Relay<'a, P> {
-    pub engine: &'a Engine,
-    pub codecs: &'a [Codec<P>],
-    pub limits: Limits,
+pub(crate) struct Relay<'a, P> {
+    pub(crate) engine: &'a Engine,
+    pub(crate) codecs: &'a [Codec<P>],
+    pub(crate) limits: Limits,
     /// Notes per pass, and how many a replica left out may be owed alone
     /// before it is provisioned again instead.
-    pub batch: i64,
+    pub(crate) batch: i64,
     /// How long one send may take before its replica counts as unreachable.
-    pub timeout: Duration,
+    pub(crate) timeout: Duration,
     /// How long a replica a send failed to waits: the first, doubling with
     /// every failure in a row up to the second.
-    pub backoff: (Duration, Duration),
+    pub(crate) backoff: crate::run::Backoff,
 }
 
 /// Notes planned together, and what they owe.
@@ -99,7 +100,7 @@ struct Outgoing {
 }
 
 /// A pass planned and numbered, waiting to be published.
-pub struct Prepared {
+pub(crate) struct Prepared {
     groups: Vec<Group>,
     parked: Vec<(i64, String)>,
     /// The installation the numbers are from.
@@ -107,7 +108,7 @@ pub struct Prepared {
 }
 
 /// A pass published, waiting to be recorded.
-pub struct Sent {
+pub(crate) struct Sent {
     groups: Vec<Group>,
     parked: Vec<(i64, String)>,
     /// Replicas a send failed to, with why.
@@ -121,15 +122,15 @@ pub struct Sent {
 
 /// What a pass did.
 #[derive(Debug, Default)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     /// Notes done.
-    pub done: usize,
+    pub(crate) done: usize,
     /// Notes the planner set aside.
-    pub parked: Vec<(i64, String)>,
+    pub(crate) parked: Vec<(i64, String)>,
     /// Rows quarantined for a replica.
-    pub quarantined: usize,
+    pub(crate) quarantined: usize,
     /// Replicas a send failed to, with why.
-    pub failing: Vec<(Uuid, String)>,
+    pub(crate) failing: Vec<(Uuid, String)>,
 }
 
 impl<P: Sync + 'static> Relay<'_, P> {
@@ -137,7 +138,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
     /// sends; `None` when there are none. `conn` must be in a transaction
     /// that may draw from a sequence: a plan that fails is rolled back to a
     /// savepoint, so the next can run.
-    pub async fn prepare(&self, conn: &mut Conn) -> Result<Option<Prepared>, Error> {
+    pub(crate) async fn prepare(&self, conn: &mut Conn) -> Result<Option<Prepared>, Error> {
         let notes = pending(conn, self.batch).await?;
         if notes.is_empty() {
             return Ok(None);
@@ -335,7 +336,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
     /// is left out of what is recorded, in this group and every later one of
     /// the pass: a message of a later group must not reach it before what an
     /// earlier one owed it.
-    pub async fn publish<T: Transport>(&self, transport: &T, prepared: Prepared) -> Sent {
+    pub(crate) async fn publish<T: Transport>(&self, transport: &T, prepared: Prepared) -> Sent {
         let mut sent = Sent {
             groups: Vec::new(),
             parked: prepared.parked,
@@ -405,7 +406,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
     /// Records the pass, in the caller's transaction: what each replica now
     /// holds, the notes done, the notes parked, the rows quarantined, the
     /// replicas that failed and what they are still owed.
-    pub async fn record(&self, conn: &mut Conn, sent: Sent) -> Result<Outcome, Error> {
+    pub(crate) async fn record(&self, conn: &mut Conn, sent: Sent) -> Result<Outcome, Error> {
         // Every replica row this pass writes, locked first and in one order:
         // filing an upload locks its sender's first too, so the two wait for
         // each other rather than deadlock, and a filing never reads a pass
@@ -544,8 +545,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
         .bind(&replicas)
         .bind(&lasts)
         .bind(&whys)
-        .bind(self.backoff.0.as_secs_f64())
-        .bind(self.backoff.1.as_secs_f64())
+        .bind(self.backoff.first.as_secs_f64())
+        .bind(self.backoff.max.as_secs_f64())
         .execute(&mut *conn)
         .await?;
         Ok(outcome)
@@ -685,7 +686,7 @@ async fn settle(conn: &mut Conn, engine: &Engine, group: &Group) -> Result<(), E
 /// Lets the parked notes be planned again; answers how many. For when the
 /// relay starts — after a deploy, which may have fixed what they failed on —
 /// and on a timer.
-pub async fn unpark(conn: &mut Conn) -> Result<u64, Error> {
+pub(crate) async fn unpark(conn: &mut Conn) -> Result<u64, Error> {
     let done = sqlx::query("UPDATE sync.notes SET parked_at = NULL WHERE parked_at IS NOT NULL")
         .execute(&mut *conn)
         .await?;
@@ -695,7 +696,7 @@ pub async fn unpark(conn: &mut Conn) -> Result<u64, Error> {
 /// Notes every quarantined row again for its replica, unless such a note is
 /// already pending; answers how many. When it gets there, it leaves the
 /// quarantine.
-pub async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
+pub(crate) async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
     let done = sqlx::query(
         "INSERT INTO sync.notes (kind, relation, row_key, scope) \
          SELECT 'row', q.relation, q.row_key, q.replica_id FROM sync.quarantine q \
@@ -715,7 +716,7 @@ pub async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
 /// While it stays silent, the next time waits twice as long as the last, up
 /// to 32 times `after`, so a replica that is merely away is not sent
 /// everything over and over. Answers how many.
-pub async fn heal(conn: &mut Conn, engine: &Engine, after: Duration) -> Result<u64, Error> {
+pub(crate) async fn heal(conn: &mut Conn, engine: &Engine, after: Duration) -> Result<u64, Error> {
     let healed = sqlx::query(&format!(
         "INSERT INTO sync.notes (kind, replica_id, scope) \
          SELECT 'resync', r.replica_id, r.replica_id FROM sync.replicas r \

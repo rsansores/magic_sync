@@ -10,8 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post, put};
 use axum::Router;
-use magic_sync::relay::Transport;
-use magic_sync::run::server::{Anyone, Settings};
+use magic_sync::run::server::{Anyone, Settings, Transport};
 use magic_sync::status::{Listing, Overview, Progress, ReplicaState, RowProgress, Scope};
 use magic_sync::{Error, Server};
 use serde::{Deserialize, Serialize};
@@ -102,6 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // No migrations of its own: the engine sets up what the database lacks.
     let queues = Queues::default();
+    let mut settings = Settings::default();
+    settings.idle = Duration::from_millis(200);
+    // A fix deployed (a register restarted without its bug) gets through
+    // within seconds, not the hour a real server waits.
+    settings.retry_every = Duration::from_secs(10);
     let server = Arc::new(
         Server::install(
             pool.clone(),
@@ -109,13 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             REGISTERS,
             queues.clone(),
             Anyone(pool.clone()),
-            Settings {
-                idle: Duration::from_millis(200),
-                // A fix deployed (a register restarted without its bug) gets
-                // through within seconds, not the hour a real server waits.
-                retry_every: Duration::from_secs(10),
-                ..Settings::default()
-            },
+            settings,
         )
         .await?,
     );

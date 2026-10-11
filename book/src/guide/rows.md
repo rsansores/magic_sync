@@ -94,18 +94,17 @@ Fields follow `sqlx::FromRow`: `#[sqlx(rename = "…")]` names the column,
 
 ## Keeping the struct and the table together
 
-> **You write**, if your migrations build the tables, a list of the rows that
-> travel, given the migrator your tests use:
+> **What happens:** every time the server or a replica starts, the engine
+> holds each table against its row on that database — column for column,
+> type for type, nullability for nullability, and the primary key — and
+> refuses to start on one that differs, naming every difference. A column
+> added on one side only, or to the struct only, never runs. The columns a
+> row leaves out on purpose (`retired`, `unmirrored`) are not compared.
 
-```rust
-magic_sync::mirrored! {
-    migrator = "crate::MIGRATOR";
-    shop::Product,
-    shop::Receipt,
-}
-```
+A test of yours that builds the server, or a replica, over the database your
+migrations build is all it takes to see it before a deploy.
 
-> **What happens:** it defines `TABLES` and `tables()`, and a test holding
-> every listed row against the table that migrator builds, column for column,
-> type for type, nullability for nullability. A column added on one side only
-> fails it.
+The derive checks the rest where you write it: a key that is not a field, a
+column named twice, an attribute a table of its kind cannot have (a `sync`
+rule on a record, a version owned by a replica), a key or version of a type
+the engine cannot read — each is a compile error pointing at what says it.

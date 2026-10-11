@@ -1,0 +1,5 @@
+error: a row is one table: it takes no generic parameters
+ --> tests/derive/fail/generic_row.rs:3:17
+  |
+3 | pub struct Thing<T> {
+  |                 ^^^

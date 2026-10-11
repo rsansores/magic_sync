@@ -1,0 +1,5 @@
+error: the key column `slot` is not a field of the row
+ --> tests/derive/fail/key_not_a_field.rs:2:51
+  |
+2 | #[row(table = "things", mirror = "catalog", key = "id, slot")]
+  |                                                   ^^^^^^^^^^

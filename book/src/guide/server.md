@@ -10,25 +10,27 @@ something up.
 > **You write:**
 
 ```rust
-pub const REGISTERS: magic_sync::plan::Replicas = magic_sync::plan::Replicas {
-    relation: "shop.registers",   // a table or view with an `id` column
-    table: "registers",           // its name, as foreign keys name it
-    live: "active",               // which of them receive anything
-    partition: None,
-};
+use magic_sync::plan::Replicas;
+
+pub const REGISTERS: Replicas = Replicas::new(
+    "shop.registers",   // a table or view with an `id` column
+    "registers",        // its name, as foreign keys name it
+    "active",           // which of them receive anything
+);
 ```
 
-`partition` names a column that splits rows and replicas into groups no row
-crosses — one per customer of a multi-customer system, say: a `broadcast` row
-reaches every live replica *of its partition*. The shop has one company, so
-none.
+`Replicas::partitioned_by("company_id")` names a column that splits rows and
+replicas into groups no row crosses — one per customer of a multi-customer
+system, say: a `broadcast` row reaches every live replica *of its partition*.
+The shop has one company, so none.
 
 ## How bytes reach a replica: the transport
 
 > **You write** one method: send these bytes to that replica.
 
 ```rust
-use magic_sync::{relay::Transport, Error};
+use magic_sync::run::server::Transport;
+use magic_sync::Error;
 
 #[derive(Clone, Default)]
 struct Queues(Arc<Mutex<HashMap<Uuid, VecDeque<Vec<u8>>>>>);
@@ -110,7 +112,15 @@ key, how often it retries and prunes, how long a send may take and how long
 a replica it failed to waits, how long a replica may leave what it was sent
 unconfirmed before it is provisioned again, and `role` — a role every
 transaction of the engine's own assumes, when your connecting role has less
-than it needs.
+than it needs. Change what you need of the defaults:
+
+```rust
+use magic_sync::envelope::Limits;
+
+let mut settings = Settings::default();
+settings.limits = Limits::new(200, 256 * 1024)?;   // what your transport takes
+settings.role = Some("sync_engine".to_owned());
+```
 
 ## What replicas send up
 

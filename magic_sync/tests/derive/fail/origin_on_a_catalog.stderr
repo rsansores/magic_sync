@@ -1,0 +1,5 @@
+error: only a table a replica writes (`record` or `both`) has an `origin`
+ --> tests/derive/fail/origin_on_a_catalog.rs:2:78
+  |
+2 | #[row(table = "things", mirror = "catalog", key = "replica_id, id", origin = "replica_id")]
+  |                                                                              ^^^^^^^^^^^^

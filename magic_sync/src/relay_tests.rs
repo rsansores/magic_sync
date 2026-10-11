@@ -7,6 +7,7 @@ use crate::plan::Replicas;
 use crate::row::Table;
 use crate::status::{ReplicaState, RowState, Scope};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
+use crate::wire::MapError;
 use prost::Message as _;
 use sqlx::Connection as _;
 use std::sync::Mutex;
@@ -149,7 +150,7 @@ impl World {
             },
             batch: 100,
             timeout: std::time::Duration::from_secs(5),
-            backoff: (
+            backoff: crate::run::Backoff::new(
                 std::time::Duration::from_secs(2),
                 std::time::Duration::from_secs(900),
             ),
@@ -1429,7 +1430,7 @@ struct Tag {
     name: String,
 }
 
-fn tag_to_wire(tag: Tag) -> Result<ItemRow, magic_map::MappingError> {
+fn tag_to_wire(tag: Tag) -> Result<ItemRow, MapError> {
     to_wire(Item {
         id: tag.id,
         partition_id: tag.partition_id,
@@ -1437,7 +1438,7 @@ fn tag_to_wire(tag: Tag) -> Result<ItemRow, magic_map::MappingError> {
     })
 }
 
-fn tag_from_wire(row: ItemRow) -> Result<Tag, magic_map::MappingError> {
+fn tag_from_wire(row: ItemRow) -> Result<Tag, MapError> {
     let item = from_wire(row)?;
     Ok(Tag {
         id: item.id,

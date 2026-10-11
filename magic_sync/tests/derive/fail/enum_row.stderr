@@ -1,0 +1,5 @@
+error: a row is a struct, one field per column
+ --> tests/derive/fail/enum_row.rs:3:10
+  |
+3 | pub enum Thing {
+  |          ^^^^^

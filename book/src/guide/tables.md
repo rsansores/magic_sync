@@ -70,8 +70,12 @@ exists is never noted.
 > **You write**, if you do have migrations, the engine's schema in one of them
 > — it is [`magic_sync::POSTGRES_SCHEMA`], one SQL script — and the triggers in
 > the migration that creates the tables, as you would their indexes. You do not
-> write them by hand: `Engine::triggers` prints them, from the same
+> write them by hand: [`Engine::triggers`] prints them, from the same
 > declarations the server starts from, one `CREATE TRIGGER` per line:
+
+```rust
+println!("{}", Engine::triggers(&mut *pool.acquire().await?, &codecs(), REGISTERS).await?);
+```
 
 ```sql
 -- after CREATE TABLE shop.products …
@@ -128,7 +132,7 @@ paste it into the migration that creates the tables, and again when a table
 is added or changes how it travels:
 
 ```rust
-println!("{}", magic_sync::replica::triggers(codecs()));
+println!("{}", magic_sync::replica::triggers(&codecs()));
 ```
 
 The triggers note every insert, update and delete of a table that goes up
@@ -140,6 +144,7 @@ a database whose triggers are not exactly these; a test of yours runs it too,
 over the database your migrations build.
 
 [`magic_sync::POSTGRES_SCHEMA`]: https://docs.rs/magic_sync/latest/magic_sync/constant.POSTGRES_SCHEMA.html
+[`Engine::triggers`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.triggers
 [`magic_sync::SQLITE_SCHEMA`]: https://docs.rs/magic_sync/latest/magic_sync/constant.SQLITE_SCHEMA.html
 [`magic_sync::replica::install`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.install.html
 [`magic_sync::replica::check`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.check.html

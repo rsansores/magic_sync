@@ -1,0 +1,5 @@
+error: expected `table`, `schema`, `mirror`, `sync`, `key`, `active`, `retired`, `origin`, `unmirrored` or `crate`
+ --> tests/derive/fail/unknown_key.rs:2:7
+  |
+2 | #[row(tabel = "things", mirror = "catalog")]
+  |       ^^^^^

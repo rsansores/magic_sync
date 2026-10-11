@@ -1,0 +1,19 @@
+error[E0277]: `std::string::String` cannot be a key column
+ --> tests/derive/fail/key_of_a_type_no_key_has.rs:4:13
+  |
+4 |     pub id: String,
+  |             ^^^^^^ a key column is a `Uuid`, an `i64`, an `i32` or an `i16`
+  |
+  = help: the trait `KeyValue` is not implemented for `std::string::String`
+  = note: a newtype around one of them implements `magic_sync::row::KeyValue` as its inner type does
+help: the following other types implement trait `KeyValue`
+ --> src/row.rs
+  |
+  | impl KeyValue for i64 {
+  | ^^^^^^^^^^^^^^^^^^^^^ `i64`
+...
+  | impl KeyValue for i32 {
+  | ^^^^^^^^^^^^^^^^^^^^^ `i32`
+...
+  | impl KeyValue for i16 {
+  | ^^^^^^^^^^^^^^^^^^^^^ `i16`

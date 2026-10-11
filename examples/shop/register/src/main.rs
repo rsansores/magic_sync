@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     // No migrations of its own: the engine sets up what the database lacks,
     // including the trigger that notes every receipt written.
-    replica::install(&mut *pool.acquire().await?, codecs()).await?;
+    replica::install(&mut *pool.acquire().await?, &codecs()).await?;
     // `--refuse <product>`: this build has a bug that refuses one product, to
     // see a row set aside until a fix. Started again without it, the fix is
     // deployed, and the head office's next retry gets the product through.
@@ -135,6 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let online = Arc::new(AtomicBool::new(true));
     let client = reqwest::Client::new();
+    let mut settings = Settings::default();
+    settings.idle = Duration::from_millis(300);
     let replica = Arc::new(Replica::new(
         pool.clone(),
         codecs(),
@@ -144,10 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server: server.clone(),
             online: online.clone(),
         },
-        Settings {
-            idle: Duration::from_millis(300),
-            ..Settings::default()
-        },
+        settings,
     )
     .await?);
     let up = replica.clone();

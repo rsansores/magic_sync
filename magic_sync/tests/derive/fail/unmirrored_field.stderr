@@ -1,0 +1,5 @@
+error: `label` is a field of the row: a column the row leaves out is not one of its fields
+ --> tests/derive/fail/unmirrored_field.rs:2:58
+  |
+2 | #[row(table = "things", mirror = "catalog", unmirrored = "label")]
+  |                                                          ^^^^^^^

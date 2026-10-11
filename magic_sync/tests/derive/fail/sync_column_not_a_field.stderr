@@ -1,0 +1,5 @@
+error: sync = "assigned(store_id)": `store_id` is not a field of the row
+ --> tests/derive/fail/sync_column_not_a_field.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "assigned(store_id)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^

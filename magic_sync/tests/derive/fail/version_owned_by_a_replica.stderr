@@ -1,0 +1,5 @@
+error: the version of a table written on both sides is the server's: a #[row(version)] column cannot be #[row(replica_owned)]
+ --> tests/derive/fail/version_owned_by_a_replica.rs:5:20
+  |
+5 |     #[row(version, replica_owned)]
+  |                    ^^^^^^^^^^^^^

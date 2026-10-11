@@ -6,9 +6,9 @@
 //! acknowledging it to the transport only once that returned `Ok`.
 
 use crate::replica::{self, Lane, Outbox, Received};
-use crate::row::Conn;
+use crate::run::Backoff;
 use crate::wire::Codec;
-use crate::Error;
+use crate::{Conn, Error};
 use sqlx::SqlitePool;
 use std::future::Future;
 use std::time::Duration;
@@ -16,7 +16,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-/// Which replica this is.
+/// Which replica this is: a `Uuid` the replica knows from the start, or the
+/// host's own answer when it learns it later (from a provisioning step, say).
 pub trait Identity: Send + Sync + 'static {
     /// The replica's id; `None` while it does not know it yet, and nothing
     /// goes up until it does.
@@ -42,8 +43,10 @@ pub trait Uplink: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
-/// How a replica runs.
+/// How a replica runs: a host changes what it needs of a
+/// `Settings::default()`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Settings {
     /// How much one message up carries.
     pub outbox: Outbox,
@@ -52,8 +55,8 @@ pub struct Settings {
     pub lanes: Vec<Lane>,
     /// How long the upward loop waits when there is nothing to say.
     pub idle: Duration,
-    /// How long it waits after a failure, doubling up to the second.
-    pub backoff: (Duration, Duration),
+    /// How long a lane waits after a failure.
+    pub backoff: Backoff,
     /// When the first digests go, after the replica starts: once it settled.
     pub digests_first: Duration,
     /// How often digests go after that.
@@ -64,22 +67,51 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             outbox: Outbox::default(),
-            lanes: vec![Lane {
-                name: "main",
-                tables: &[],
-            }],
+            lanes: vec![Lane::new("main", &[])],
             idle: Duration::from_secs(1),
-            backoff: (Duration::from_secs(1), Duration::from_secs(60)),
+            backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
             digests_first: Duration::from_secs(5 * 60),
             digests_every: Duration::from_secs(60 * 60),
         }
     }
 }
 
-/// A replica's side of sync, for the host to run.
+/// A replica's side of sync, for the host to run: built once, run in a task
+/// of its own, and handed every message the server sends.
+///
+/// ```no_run
+/// use magic_sync::run::replica::{Settings, Uplink};
+/// use magic_sync::wire::Codec;
+/// use magic_sync::{replica, Error, Replica};
+/// use std::sync::Arc;
+/// use uuid::Uuid;
+///
+/// /// The host's way to the server.
+/// struct Http;
+///
+/// impl Uplink for Http {
+///     async fn send(&self, me: Uuid, _lane: &'static str, message: Vec<u8>) -> Result<(), Error> {
+///         // POST `message` to the server, as `me`
+///         Ok(())
+///     }
+/// }
+///
+/// # async fn start(pool: sqlx::SqlitePool, codecs: impl Fn() -> Vec<Codec<()>>, me: Uuid, message: Vec<u8>) -> Result<(), Error> {
+/// // No migrations of its own: the engine sets up its part of the database.
+/// replica::install(&mut *pool.acquire().await?, &codecs()).await?;
+///
+/// let replica = Arc::new(Replica::new(pool, codecs(), me, Http, Settings::default()).await?);
+/// let up = replica.clone();
+/// tokio::spawn(async move { up.run(std::future::pending()).await });
+///
+/// // Every message from the server, in order; acknowledged only once applied.
+/// replica.receive(&message).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     pool: SqlitePool,
-    codecs: &'static [Codec<P>],
+    codecs: Vec<Codec<P>>,
     identity: I,
     uplink: U,
     settings: Settings,
@@ -89,19 +121,28 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
 
 impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// A replica over a database the engine can run against
-    /// ([`replica::check`]), with settings it can send up with
-    /// ([`replica::check_settings`]). What an earlier run set aside, because
-    /// it could not go up as it was, is offered again: this build may send it.
+    /// ([`replica::check`]): `codecs` are the tables that travel, parents
+    /// first, as the server lists them; `identity` says which replica this
+    /// is; `uplink` how a message reaches the server. Refused, too, when the
+    /// settings cannot send up: no lane, a table on two lanes or on none.
+    /// What an earlier run set aside, because it could not go up as it was,
+    /// is offered again: this build may send it.
     pub async fn new(
         pool: SqlitePool,
-        codecs: &'static [Codec<P>],
+        codecs: Vec<Codec<P>>,
         identity: I,
         uplink: U,
         settings: Settings,
     ) -> Result<Self, Error> {
-        replica::check_settings(codecs, &settings.lanes, &settings.outbox)?;
+        replica::check_settings(&codecs, &settings.lanes)?;
+        settings.backoff.check("backoff")?;
+        if settings.idle.is_zero() {
+            return Err(Error::Misuse(
+                "`idle` is zero: the replica would spin".into(),
+            ));
+        }
         let mut conn = pool.acquire().await?;
-        replica::check(&mut conn, codecs).await?;
+        replica::check(&mut conn, &codecs).await?;
         let offered = replica::retry_set_aside(&mut conn).await?;
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");
@@ -123,7 +164,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// this build).
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let received = replica::receive(&mut tx, self.codecs, bytes).await?;
+        let received = replica::receive(&mut tx, &self.codecs, bytes).await?;
         tx.commit().await?;
         if matches!(received, Received::Applied(_) | Received::SnapshotEnded) {
             // The server counts nothing as held until it hears of it.
@@ -143,11 +184,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// while the others go on; one with more to say goes again at once.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
-        let (min, max) = self.settings.backoff;
+        let first = self.settings.backoff.first;
         let lanes = self.settings.lanes.len();
         let start = Instant::now();
         let mut due = vec![start; lanes];
-        let mut backoff = vec![min; lanes];
+        let mut backoff = vec![first; lanes];
         let mut digests_at = start + self.settings.digests_first;
         loop {
             for lane in 0..lanes {
@@ -158,7 +199,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 let digests = lane == 0 && now >= digests_at;
                 due[lane] = match self.send_lane(lane, digests).await {
                     Ok(went) => {
-                        backoff[lane] = min;
+                        backoff[lane] = first;
                         if digests {
                             digests_at = now + self.settings.digests_every;
                         }
@@ -174,7 +215,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                             "sync: what this replica has to say did not go up, and goes again: {e}"
                         );
                         let wait = backoff[lane];
-                        backoff[lane] = (wait * 2).min(max);
+                        backoff[lane] = self.settings.backoff.after(wait);
                         now + wait
                     }
                 };
@@ -186,7 +227,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 () = self.wake.notified() => {
                     let now = Instant::now();
                     for (due, backoff) in due.iter_mut().zip(&backoff) {
-                        if *backoff == min {
+                        if *backoff == first {
                             *due = now;
                         }
                     }
@@ -200,14 +241,14 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// numbered in one transaction, handed to the uplink with none open,
     /// recorded in another. Answers whether one went. A message the uplink
     /// refuses for good has its rows set aside rather than offered for ever.
-    pub async fn send_lane(&self, lane: usize, digests: bool) -> Result<bool, Error> {
+    pub(crate) async fn send_lane(&self, lane: usize, digests: bool) -> Result<bool, Error> {
         let Some(id) = self.identity.id(&mut *self.pool.acquire().await?).await? else {
             return Ok(false);
         };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outgoing = replica::outbox(
             &mut tx,
-            self.codecs,
+            &self.codecs,
             &self.settings.lanes,
             lane,
             &self.settings.outbox,

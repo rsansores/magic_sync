@@ -5,7 +5,7 @@
 //! applied by the sqlite side's suite. The two sides never build together;
 //! the golden file is what holds each to the other.
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 use crate::row::Row;
 use crate::testkit::{from_wire, to_wire, Item, ItemRow};
 use crate::wire::Codec;
@@ -89,22 +89,19 @@ pub struct Event {
 }
 
 /// Every table of the suite, parents first.
-pub fn codecs() -> &'static [Codec<()>] {
-    static CODECS: std::sync::OnceLock<Vec<Codec<()>>> = std::sync::OnceLock::new();
-    CODECS.get_or_init(|| {
-        vec![
-            Codec::new::<Item, ItemRow>(to_wire, from_wire, None),
-            Codec::json::<Shelf>(None),
-            Codec::json::<Price>(None),
-            Codec::json::<Task>(None),
-            Codec::json::<Reading>(None),
-            Codec::json::<Event>(None),
-        ]
-    })
+pub fn codecs() -> Vec<Codec<()>> {
+    vec![
+        Codec::new::<Item, ItemRow>(to_wire, from_wire, None),
+        Codec::json::<Shelf>(None),
+        Codec::json::<Price>(None),
+        Codec::json::<Task>(None),
+        Codec::json::<Reading>(None),
+        Codec::json::<Event>(None),
+    ]
 }
 
 /// A row of a JSON table, as the server sends it.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub fn json<R: Row + Serialize>(row: &R) -> Vec<u8> {
     let table = crate::row::Table::of::<R>();
     crate::wire::json_encode(R::TABLE, &table.columns, row).expect("a fixture row encodes")
@@ -113,9 +110,9 @@ pub fn json<R: Row + Serialize>(row: &R) -> Vec<u8> {
 /// Where the golden messages are kept.
 pub const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/to_replica.txt");
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
 /// The golden messages, as `(step, bytes)`, in the order they were sent:
 /// one line each, the step's name and the message in hex.
+#[cfg(feature = "sqlite")]
 pub fn golden(text: &str) -> Vec<(String, Vec<u8>)> {
     text.lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -131,12 +128,12 @@ pub fn golden(text: &str) -> Vec<(String, Vec<u8>)> {
 }
 
 /// What went up: who sent it, on which lane.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub type Sent = (Uuid, &'static str, crate::envelope::Up);
 
 /// An uplink that keeps what it is given, refusing — for a while or for
 /// good — while told to.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 #[derive(Clone, Default)]
 pub struct Uplinked {
     pub sent: std::sync::Arc<std::sync::Mutex<Vec<Sent>>>,
@@ -146,7 +143,7 @@ pub struct Uplinked {
     pub refused_lanes: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 impl crate::run::replica::Uplink for Uplinked {
     async fn send(
         &self,
@@ -170,7 +167,7 @@ impl crate::run::replica::Uplink for Uplinked {
     }
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 impl Uplinked {
     /// What went up since last asked.
     pub fn taken(&self) -> Vec<(&'static str, crate::envelope::Up)> {
@@ -188,7 +185,7 @@ impl Uplinked {
 /// message it sends that replica kept. What varies from run to run — the
 /// installation's epoch, the snapshot ids a pass draws — is pinned, so the
 /// same build sends the same bytes.
-#[cfg(all(test, feature = "postgres", not(feature = "sqlite")))]
+#[cfg(all(test, feature = "postgres"))]
 mod server {
     use super::*;
     use crate::envelope::{Body, Limits, ToReplica};
@@ -285,7 +282,8 @@ mod server {
             .execute(&mut *conn)
             .await
             .unwrap();
-        let tables: Vec<&crate::row::Table> = codecs()
+        let codecs = codecs();
+        let tables: Vec<&crate::row::Table> = codecs
             .iter()
             .filter(|c| c.sent_down())
             .map(|c| &c.table)
@@ -302,14 +300,14 @@ mod server {
         tx.commit().await.unwrap();
         let relay = Relay {
             engine: &engine,
-            codecs: codecs(),
+            codecs: &codecs,
             limits: Limits {
                 rows: 100,
                 bytes: 1 << 20,
             },
             batch: 100,
             timeout: std::time::Duration::from_secs(5),
-            backoff: (
+            backoff: crate::run::Backoff::new(
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(60),
             ),

@@ -97,10 +97,8 @@ archived.
 Give rows and replicas a partition column, and name it:
 
 ```rust
-pub const REGISTERS: Replicas = Replicas {
-    relation: "shop.registers", table: "registers", live: "active",
-    partition: Some("company_id"),
-};
+pub const REGISTERS: Replicas =
+    Replicas::new("shop.registers", "registers", "active").partitioned_by("company_id");
 ```
 
 Every table that goes down carries `company_id`; a `broadcast` product reaches

@@ -11,7 +11,7 @@ that arrives, and run its upward loop in a task of its own.
 use magic_sync::run::replica::Settings;
 use magic_sync::{replica, Replica};
 
-replica::install(&mut *pool.acquire().await?, codecs()).await?;   // no migrations of your own
+replica::install(&mut *pool.acquire().await?, &codecs()).await?;   // no migrations of your own
 
 let replica = Arc::new(Replica::new(pool.clone(), codecs(), me, Http { … }, Settings::default()).await?);
 let up = replica.clone();
@@ -51,7 +51,7 @@ products arrived:
 
 ```rust
 if let Received::Applied(tables) = replica.receive(&message).await? {
-    for (table, keys) in tables { /* … */ }
+    for applied in tables { /* applied.table, applied.keys */ }
 }
 ```
 
@@ -91,13 +91,11 @@ A replica that writes a table often — positions, readings — can give it a la
 of its own, so it never waits behind the rest, nor the rest behind it:
 
 ```rust
-Settings {
-    lanes: vec![
-        Lane { name: "main", tables: &[] },                   // everything else, and what the engine says
-        Lane { name: "telemetry", tables: &["positions"] },
-    ],
-    ..Settings::default()
-}
+let mut settings = Settings::default();
+settings.lanes = vec![
+    Lane::new("main", &[]),                  // everything else, and what the engine says
+    Lane::new("telemetry", &["positions"]),
+];
 ```
 
 Your uplink gets the lane's name and sends each on its own stream.

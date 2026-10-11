@@ -1045,7 +1045,7 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
     let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
     assert!(why.contains("is missing"), "{why}");
 
-    let triggers = Engine::triggers(&mut conn, &tables, REPLICAS)
+    let triggers = Engine::triggers(&mut conn, &codecs, REPLICAS)
         .await
         .expect("the triggers");
     sqlx::raw_sql(&triggers)

@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: #[row(replica_owned)] in a part flattened in splits a table written on both sides: the row needs `mirror = "both"`
+  --> tests/derive/fail/replica_owned_in_a_part_off_both.rs:12:16
+   |
+12 |     pub state: State,
+   |                ^^^^^ evaluation of `_` failed here

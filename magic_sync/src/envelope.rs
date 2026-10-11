@@ -1,7 +1,12 @@
-//! What the engine sends a replica and a replica sends back, as protobuf
-//! messages. A host carries them as bytes on whatever transport it has: one
-//! [`ToReplica`] down, one [`Up`] up. A row inside one is its table's own
-//! message, encoded by the table's codec.
+//! What the engine sends a replica and a replica sends back. A host carries
+//! them as bytes on whatever transport it has, and never looks inside: the
+//! messages are protobuf, as `proto/sync.proto` declares them for a replica
+//! in another language, and the
+//! [replica protocol](https://github.com/rsansores/magic_sync/blob/main/magic_sync/PROTOCOL.md)
+//! says what they mean. What a host sets is how large one may be:
+//! [`Limits`].
+
+use crate::Error;
 
 /// The version of the protocol these messages speak. A side that receives a
 /// message of a later version than its own does not act on it: it waits to be
@@ -18,14 +23,17 @@ pub const ENVELOPE_ROOM: usize = 4096;
 #[rustfmt::skip]
 mod sync;
 
-pub use sync::to_replica::Body;
-pub use sync::{
-    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, TableBacklog, ToReplica, Up,
+pub(crate) use sync::to_replica::Body;
+#[cfg(any(feature = "sqlite", test))]
+pub(crate) use sync::Digest;
+pub(crate) use sync::{
+    Backlog, Down, EndSnapshot, Filed, Key, Rejected, Table, TableBacklog, ToReplica, Up,
 };
 
+#[cfg(any(feature = "postgres", test))]
 impl Body {
     /// As the bytes a transport carries.
-    pub fn encoded(self) -> Vec<u8> {
+    pub(crate) fn encoded(self) -> Vec<u8> {
         use prost::Message as _;
         ToReplica {
             protocol: PROTOCOL,
@@ -37,7 +45,7 @@ impl Body {
 
 /// A fingerprint of a set of keys, as text: the same on every side and every
 /// build (FNV-1a over the keys sorted, each ended by a newline).
-pub fn fingerprint(keys: impl IntoIterator<Item = String>) -> u64 {
+pub(crate) fn fingerprint(keys: impl IntoIterator<Item = String>) -> u64 {
     let mut keys: Vec<String> = keys.into_iter().collect();
     keys.sort_unstable();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -50,16 +58,43 @@ pub fn fingerprint(keys: impl IntoIterator<Item = String>) -> u64 {
     hash
 }
 
-/// How large a message the transport takes.
-#[derive(Clone, Copy, Debug)]
+/// How large a message the transport takes: the engine never hands it a
+/// larger one. A row too large for any message is set aside rather than
+/// sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    pub rows: usize,
-    pub bytes: usize,
+    pub(crate) rows: usize,
+    pub(crate) bytes: usize,
 }
 
 impl Limits {
+    /// At most `rows` rows and `bytes` bytes a message. Refused unless a
+    /// message can carry a row: `rows` at least one, and `bytes` more than
+    /// [`ENVELOPE_ROOM`].
+    pub fn new(rows: usize, bytes: usize) -> Result<Self, Error> {
+        if rows == 0 || bytes <= ENVELOPE_ROOM {
+            return Err(Error::Misuse(format!(
+                "a message carries a row at least, in more than {ENVELOPE_ROOM} bytes: \
+                 {rows} rows in {bytes} bytes cannot"
+            )));
+        }
+        Ok(Limits { rows, bytes })
+    }
+
+    /// Rows a message carries, at most.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Bytes a message takes, at most.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// The largest row a message can carry.
-    pub fn largest_row(&self) -> usize {
+    pub(crate) fn largest_row(&self) -> usize {
         self.bytes.saturating_sub(ENVELOPE_ROOM)
     }
 }
@@ -69,7 +104,8 @@ impl Limits {
 /// can carry goes alone. Each row keeps its key beside it, and every byte the
 /// rows add to a message counts — their framing and their tables' included —
 /// so a message never outgrows the limit by more than [`ENVELOPE_ROOM`] holds.
-pub fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
+#[cfg(feature = "postgres")]
+pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
     use prost::Message as _;
     let budget = limits.largest_row();
     let mut messages: Vec<Vec<Table>> = Vec::new();
@@ -129,13 +165,13 @@ pub fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
 
 /// What `len` bytes weigh as one field of a message: its tag, its length,
 /// and themselves.
-pub fn framed(len: usize) -> usize {
+pub(crate) fn framed(len: usize) -> usize {
     1 + prost::length_delimiter_len(len) + len
 }
 
 /// What a table's part weighs in a message before it holds anything: its
 /// name, and its own tag and length (at most five bytes of length).
-pub fn opened(table: &str) -> usize {
+pub(crate) fn opened(table: &str) -> usize {
     framed(table.len()) + 6
 }
 
@@ -143,6 +179,7 @@ pub fn opened(table: &str) -> usize {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres")]
     fn rows(table: &str, sizes: &[usize]) -> Table {
         Table {
             table: table.to_owned(),
@@ -156,6 +193,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn a_message_ends_at_either_limit_and_keeps_the_order() {
         // A row of four bytes weighs 6 and its key 5; `parents` opens with 15.
@@ -187,6 +225,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn each_row_keeps_its_key_across_messages() {
         let packed = pack(
@@ -210,6 +249,7 @@ mod tests {
         assert_eq!(keys, vec![vec!["0", "1"], vec!["2"]]);
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn a_row_past_the_byte_limit_goes_alone() {
         let packed = pack(
@@ -227,6 +267,7 @@ mod tests {
     /// Whatever the rows, keys and tables, every message as the transport
     /// carries it — numbered, with its snapshot and epoch — fits the limit,
     /// unless it is one row that alone does not.
+    #[cfg(feature = "postgres")]
     #[test]
     fn every_message_packed_fits_the_limit_framing_and_all() {
         let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;

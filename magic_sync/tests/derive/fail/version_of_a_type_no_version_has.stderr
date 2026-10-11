@@ -1,0 +1,19 @@
+error[E0277]: `std::string::String` cannot be a #[row(version)] column
+ --> tests/derive/fail/version_of_a_type_no_version_has.rs:6:19
+  |
+6 |     pub revision: String,
+  |                   ^^^^^^ a version is an integer or a `chrono` instant
+  |
+  = help: the trait `magic_sync::row::Version` is not implemented for `std::string::String`
+  = note: a newtype around one of them implements `magic_sync::row::Version` as its inner type does
+help: the following other types implement trait `magic_sync::row::Version`
+ --> src/row.rs
+  |
+  | impl Version for i16 {
+  | ^^^^^^^^^^^^^^^^^^^^ `i16`
+...
+  | impl Version for i32 {
+  | ^^^^^^^^^^^^^^^^^^^^ `i32`
+...
+  | impl Version for i64 {
+  | ^^^^^^^^^^^^^^^^^^^^ `i64`

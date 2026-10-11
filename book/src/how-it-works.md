@@ -79,9 +79,9 @@ A table is declared once, as the Rust struct that is its row, implementing
 | `Both` | both, column by column | the columns the replicas own (`Column::replica_owned`) go up; the rest go down |
 | `ServerOnly` | the server | nowhere |
 
-### Which replicas hold which rows? (`Sync`, for tables that go down)
+### Which replicas hold which rows? (`sync`, for tables that go down)
 
-| `Sync` | A replica holds a row when |
+| `sync` | A replica holds a row when |
 |---|---|
 | `Broadcast` | the row is in the replica's partition |
 | `Assigned(column)` | `column` names the replica |
@@ -182,7 +182,7 @@ never does.
 
 For the notes it read, the planner computes, per replica:
 
-1. **The changed rows**: who should hold each one now (by its table's `Sync`
+1. **The changed rows**: who should hold each one now (by its table's `sync`
    rule) against who holds it (`sync.held`). New holders get it, holders that
    should not hold it any more lose it.
 2. **Parents**: every row being sent brings along each row it points at that
@@ -463,7 +463,7 @@ They rest on:
 ## 8. What is the host's, and what is the engine's
 
 The host writes its tables, a struct per table, the codec list, where the
-replicas are, how bytes travel each way (a [`relay::Transport`] and a
+replicas are, how bytes travel each way (a [`run::server::Transport`] and a
 [`run::replica::Uplink`]), and, when it needs to, what it knows about a
 sender ([`run::server::Senders`]). [Build your own](guide/tables.md) walks
 through each.
@@ -473,7 +473,8 @@ passes and their backoff, retrying what was set aside, pruning, the alarms,
 filing uploads and answering them; on a replica, applying each message in one
 transaction, and the upward loop. The step functions they are built on —
 `Relay::prepare`/`publish`/`record`, `replica::apply`, `replica::outbox` and
-the rest — stay public, for a host that needs to drive the engine itself.
+the rest — are the engine's own: a host drives the engine through the
+runners.
 
 ---
 
@@ -481,16 +482,16 @@ the rest — stay public, for a host that needs to drive the engine itself.
 
 | Module | What it holds |
 |---|---|
-| [`row`] | a table's declaration (`Row`, `Mirror`, `Sync`, `Column`), and the writes both sides make: upsert with the version guard, insert-first-wins, retire |
+| [`row`] | a table's declaration (`Row`, `Mirror`, the key and version types), the check of a table against its row, and the writes both sides make: upsert with the version guard, insert-first-wins, retire |
 | [`wire`] | the codec: a table's rows encoded as its own message, and applied by the rules its row declares |
-| [`envelope`] | the messages between server and replica, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
+| [`envelope`] | the messages between server and replica, their limits, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
 | [`plan`] | the planner and the notes (server) |
-| [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, provisioning a silent replica again (server) |
+| [`relay`] | one pass (prepare, publish, record), parking, quarantine, provisioning a silent replica again (server) |
 | [`filing`] | what a replica sends up, filed: its rows, its rejections, its acknowledgement, its digests, its backlog; the inbox (server) |
 | [`status`] | what the engine answers about itself: the overview, health, progress, where a row is (server) |
 | [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica) |
 | [`dialect`] | the few things PostgreSQL and SQLite spell differently |
-| [`run`] | the runners: [`Server`] (the relay under its lock, retries, filing and answering uploads) and [`Replica`] (receiving, and the way up) |
+| [`run`] | the runners: [`Server`] (the relay under its lock, retries, filing and answering uploads, and the transport it sends through) and [`Replica`] (receiving, and the way up) |
 
 | File | What it is |
 |---|---|
@@ -530,22 +531,22 @@ through `DATABASE_URL`; each test gets a database of its own) and
 
 [`row::Row`]: https://docs.rs/magic_sync/latest/magic_sync/row/trait.Row.html
 [`wire::Codec`]: https://docs.rs/magic_sync/latest/magic_sync/wire/struct.Codec.html
-[`envelope::Down`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Down.html
-[`envelope::EndSnapshot`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.EndSnapshot.html
-[`envelope::ToReplica`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.ToReplica.html
-[`envelope::Up`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Up.html
-[`replica::apply`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.apply.html
-[`filing::file`]: https://docs.rs/magic_sync/latest/magic_sync/filing/fn.file.html
+[`envelope::Down`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`envelope::EndSnapshot`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`envelope::ToReplica`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`envelope::Up`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`replica::apply`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/replica.rs
+[`filing::file`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/filing.rs
 [`Error::is_transient`]: https://docs.rs/magic_sync/latest/magic_sync/enum.Error.html#method.is_transient
 [`plan::Engine::overview`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.overview
 [`plan::Engine::health`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.health
 [`plan::Engine::progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.progress
 [`plan::Engine::listing`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.listing
 [`plan::Engine::row_progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.row_progress
-[`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.new
+[`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html#method.new
 [`plan::Replicas`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Replicas.html
 [`replica::progress`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.progress.html
-[`relay::Transport`]: https://docs.rs/magic_sync/latest/magic_sync/relay/trait.Transport.html
+[`run::server::Transport`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Transport.html
 [`run::replica::Uplink`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/trait.Uplink.html
 [`run::server::Senders`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Senders.html
 [`run`]: https://docs.rs/magic_sync/latest/magic_sync/run/index.html
@@ -553,10 +554,10 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`wire`]: https://docs.rs/magic_sync/latest/magic_sync/wire/index.html
 [`envelope`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/index.html
 [`plan`]: https://docs.rs/magic_sync/latest/magic_sync/plan/index.html
-[`relay`]: https://docs.rs/magic_sync/latest/magic_sync/relay/index.html
-[`filing`]: https://docs.rs/magic_sync/latest/magic_sync/filing/index.html
+[`relay`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/relay.rs
+[`filing`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/filing.rs
 [`status`]: https://docs.rs/magic_sync/latest/magic_sync/status/index.html
 [`replica`]: https://docs.rs/magic_sync/latest/magic_sync/replica/index.html
-[`dialect`]: https://docs.rs/magic_sync/latest/magic_sync/dialect/index.html
+[`dialect`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/dialect.rs
 [`Server`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html
 [`Replica`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/struct.Replica.html

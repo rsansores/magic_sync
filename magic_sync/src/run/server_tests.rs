@@ -6,6 +6,7 @@ use super::*;
 use crate::envelope::{self, Body, Table as WireTable, ToReplica};
 use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
+use crate::wire::MapError;
 use prost::Message as _;
 use std::sync::{Arc, Mutex};
 
@@ -103,7 +104,7 @@ struct LogRow {
     value: String,
 }
 
-fn log_to_wire(log: Log) -> Result<LogRow, magic_map::MappingError> {
+fn log_to_wire(log: Log) -> Result<LogRow, MapError> {
     Ok(LogRow {
         replica_id: log.replica_id.to_string(),
         id: log.id.to_string(),
@@ -111,23 +112,20 @@ fn log_to_wire(log: Log) -> Result<LogRow, magic_map::MappingError> {
     })
 }
 
-fn log_from_wire(row: LogRow) -> Result<Log, magic_map::MappingError> {
-    let uuid = |field, text: &str| {
-        Uuid::parse_str(text).map_err(|_| magic_map::MappingError::InvalidUuid { field })
-    };
+fn log_from_wire(row: LogRow) -> Result<Log, MapError> {
     Ok(Log {
-        replica_id: uuid("replica_id", &row.replica_id)?,
-        id: uuid("id", &row.id)?,
+        replica_id: row.replica_id.parse()?,
+        id: row.id.parse()?,
         value: row.value,
     })
 }
 
-fn codecs() -> &'static [Codec<()>] {
-    Box::leak(Box::new([
+fn codecs() -> Vec<Codec<()>> {
+    vec![
         Codec::new::<Item, ItemRow>(to_wire, from_wire, None),
         Codec::new::<Reading, ReadingRow>(reading_to_wire, reading_from_wire, None),
         Codec::new::<Log, LogRow>(log_to_wire, log_from_wire, None),
-    ]))
+    ]
 }
 
 fn settings() -> Settings {
@@ -153,7 +151,8 @@ async fn world(pool: &PgPool) -> (Uuid, [Uuid; 2]) {
             .await
             .unwrap();
     }
-    let tables: Vec<&Table> = codecs().iter().map(|c| &c.table).collect();
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.unwrap();
     Engine::install(&mut tx, &tables, REPLICAS).await.unwrap();
     tx.commit().await.unwrap();

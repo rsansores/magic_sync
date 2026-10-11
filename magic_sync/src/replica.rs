@@ -1,23 +1,26 @@
 //! A replica's side: what the server sends, applied table by table through
-//! the codecs, and what the replica wrote, gathered to go up. Every function
-//! works in the caller's transaction and names no table — the codecs do.
+//! the codecs, and what the replica wrote, gathered to go up — run by the
+//! [`Replica`](crate::Replica). What a host does here itself is set up the
+//! database ([`install`], or [`triggers`] and [`check`] for one with
+//! migrations), say how its writes go up ([`Lane`], [`Outbox`]), and ask how
+//! far along they are ([`progress`]).
 
 use crate::envelope;
 use crate::wire::Codec;
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 use {
+    crate::dialect::{ident, literal},
     crate::envelope::Up,
     crate::envelope::{framed, opened, Body, Down, EndSnapshot, Limits, Table, ToReplica},
-    crate::row::Conn,
-    crate::row::{key_text, Key},
-    crate::Error,
+    crate::row::{key_text, Key, KeyKind},
+    crate::{Conn, Error},
     prost::Message as _,
     std::collections::{HashMap, HashSet},
     uuid::Uuid,
 };
 
 /// The codec of `table`, when this build mirrors it.
-pub fn codec_of<'a, P>(codecs: &'a [Codec<P>], table: &str) -> Option<&'a Codec<P>> {
+pub(crate) fn codec_of<'a, P>(codecs: &'a [Codec<P>], table: &str) -> Option<&'a Codec<P>> {
     codecs.iter().find(|c| c.table.name == table)
 }
 
@@ -46,26 +49,14 @@ pub(crate) fn keys_of<P: Sync + 'static>(
 
 /// The engine's migrations, in order: the `n`th brings a replica database
 /// from version `n` to `n + 1`.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 const MIGRATIONS: [&str; crate::SCHEMA_VERSION as usize] = [crate::SQLITE_SCHEMA];
 
 /// A trigger the engine needs on a replica database.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 struct Trigger {
     name: String,
     sql: String,
-}
-
-/// `name` as SQL quotes an identifier.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-fn ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// `text` as an SQL string literal.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// The triggers every mirrored table needs, as the engine writes them:
@@ -83,9 +74,9 @@ fn literal(text: &str) -> String {
 ///
 /// A write the engine makes while it applies what the server sent is noted
 /// by none and refused by none.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
-    use crate::row::{KeyPart, Mirror};
+    use crate::row::Mirror;
     const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
     let mut out = Vec::new();
     for codec in codecs {
@@ -102,7 +93,7 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
                 .iter()
                 .map(|c| {
                     let value = format!("{row}.{}", ident(c.name));
-                    if KeyPart::is_int(c) {
+                    if c.key == Some(KeyKind::Integer) {
                         format!("CAST({value} AS TEXT)")
                     } else {
                         let hex = format!("hex({value})");
@@ -119,7 +110,7 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
             .iter()
             .map(|c| {
                 let value = format!("NEW.{}", ident(c.name));
-                if KeyPart::is_int(c) {
+                if c.key == Some(KeyKind::Integer) {
                     format!("typeof({value}) = 'integer'")
                 } else {
                     format!("(typeof({value}) = 'blob' AND length({value}) = 16)")
@@ -147,24 +138,20 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
             key("OLD"),
             key("NEW")
         );
-        let refuse = |event: &str, when: &str, why: String| {
-            Trigger {
+        let refuse = |event: &str, when: &str, why: String| Trigger {
             name: format!("sync_refuse_{table}_{}", event.to_lowercase()),
             sql: format!(
-                "CREATE TRIGGER sync_refuse_{table}_{} BEFORE {event} ON {on}{when} BEGIN SELECT RAISE(ABORT, {}); END",
-                event.to_lowercase(),
+                "CREATE TRIGGER {} BEFORE {event} ON {on}{when} BEGIN SELECT RAISE(ABORT, {}); END",
+                ident(&format!("sync_refuse_{table}_{}", event.to_lowercase())),
                 literal(&why)
             ),
-        }
         };
-        let noting = |event: &str, of: &str, when: &str, body: String| {
-            Trigger {
+        let noting = |event: &str, of: &str, when: &str, body: String| Trigger {
             name: format!("sync_note_{table}_{}", event.to_lowercase()),
             sql: format!(
-                "CREATE TRIGGER sync_note_{table}_{} AFTER {event}{of} ON {on}{when} BEGIN {body}END",
-                event.to_lowercase()
+                "CREATE TRIGGER {} AFTER {event}{of} ON {on}{when} BEGIN {body}END",
+                ident(&format!("sync_note_{table}_{}", event.to_lowercase()))
             ),
-        }
         };
         match codec.table.mirror {
             Mirror::Catalog => {
@@ -175,7 +162,7 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
             }
             Mirror::Record => {
                 out.push(noting("INSERT", "", "", format!("{guard}{}", note("NEW"))));
-                if codec.table.version.is_some() {
+                if codec.table.columns.iter().any(|c| c.version.is_some()) {
                     let body = format!("{guard}{}{gone}", note("NEW"));
                     out.push(noting("UPDATE", "", "", body));
                 } else {
@@ -217,7 +204,7 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
 /// [`SQLITE_SCHEMA`](crate::SQLITE_SCHEMA), and again whenever a table is
 /// added or changes how it travels; [`check`] refuses a database whose
 /// triggers are not these.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
     generated(codecs)
         .into_iter()
@@ -226,7 +213,7 @@ pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
 }
 
 /// The version of the engine's tables a database holds: 0 when none.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
     let versioned: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_version')",
@@ -243,15 +230,18 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 }
 
 /// Refuses a replica database the engine cannot run against: another
-/// version of its tables; triggers that are not the ones [`triggers`] writes
-/// — one missing, one that differs, or one left from a table that no longer
-/// travels; or commits that are not durable (`synchronous` below `FULL`),
-/// since a message is acknowledged once its commit returns. [`Replica::new`]
+/// version of its tables; a table that is not its row, column for column —
+/// one missing or extra, nullable on one side only, of a type its field does
+/// not decode, keyed otherwise — with every difference named; triggers that
+/// are not the ones [`triggers`] writes — one missing, one that differs, or
+/// one left from a table that no longer travels; or commits that are not
+/// durable (`synchronous` below `FULL`), since a message is acknowledged
+/// once its commit returns. [`Replica::new`]
 /// runs it; a host with migrations also runs it in a test, over the database
 /// its migrations build.
 ///
 /// [`Replica::new`]: crate::Replica::new
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     let version = schema_version(conn).await?;
     if version != crate::SCHEMA_VERSION {
@@ -260,6 +250,8 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
             crate::SCHEMA_VERSION
         )));
     }
+    let tables: Vec<&crate::row::Table> = codecs.iter().map(|c| &c.table).collect();
+    crate::row::parity(conn, &tables).await?;
     let live: HashMap<String, String> =
         sqlx::query_as("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
             .fetch_all(&mut *conn)
@@ -314,7 +306,7 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
 /// trigger [`triggers`] writes, in place of the engine's own it had. Then
 /// [`check`]s it. For a host with no migrations of its own; run it before
 /// anything writes, on a connection with no transaction open. Idempotent.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
     let version = schema_version(&mut tx).await?;
@@ -351,18 +343,25 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
 // ---------------------------------------------------------------------------
 // What the server sends.
 
-/// Per table, the keys a message left the replica holding.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub type Applied = Vec<(String, Vec<Key>)>;
+/// What a message left the replica holding, of one table.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Applied {
+    /// The table.
+    pub table: String,
+    /// The keys of its rows the message carried that the replica now holds.
+    pub keys: Vec<Key>,
+}
 
 /// What a message from the server did. Every one of these is acknowledged to
 /// the transport once the transaction it was acted on in commits.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Received {
     /// Rows applied: per table, the keys the replica now holds.
-    Applied(Applied),
+    Applied(Vec<Applied>),
     /// A snapshot ended, and what it did not name went.
     SnapshotEnded,
     /// Uploads the server filed: their notes are done.
@@ -388,8 +387,8 @@ pub enum Received {
 /// ([`Error::Protocol`]) and waits for it to be updated. Nothing a message
 /// carries is an error: a row it cannot take is rejected, a message it
 /// cannot read is [`Received::Malformed`].
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub async fn receive<P: Sync + 'static>(
+#[cfg(feature = "sqlite")]
+pub(crate) async fn receive<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     bytes: &[u8],
@@ -421,13 +420,13 @@ pub async fn receive<P: Sync + 'static>(
     Ok(received)
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn malformed(why: String) -> Received {
     tracing::error!("sync: a message this build can do nothing with — dropped: {why}");
     Received::Malformed(why)
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn act<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -461,7 +460,7 @@ async fn act<P: Sync + 'static>(
 /// A message of another epoch is of a server installed again, which knows
 /// nothing it was told: the replica forgets the snapshot it was following,
 /// and says again its backlog and its rejections.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn numbered(
     conn: &mut Conn,
     epoch: &str,
@@ -513,7 +512,7 @@ async fn numbered(
 
 /// `keys` as one JSON array, for a statement to read through `json_each`
 /// with one bind however many there are.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn json<T: serde::Serialize>(keys: &[T]) -> String {
     serde_json::to_string(keys).expect("strings and numbers serialize")
 }
@@ -521,7 +520,7 @@ fn json<T: serde::Serialize>(keys: &[T]) -> String {
 /// The text of a key that came on the wire: parsed by its table's codec and
 /// written back in the one form keys are compared in. `None`, logged, when it
 /// does not parse.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn wire_key<P: Sync + 'static>(codec: &Codec<P>, key: Option<&envelope::Key>) -> Option<String> {
     let Some(key) = key else {
         tracing::error!(
@@ -547,13 +546,13 @@ fn wire_key<P: Sync + 'static>(codec: &Codec<P>, key: Option<&envelope::Key>) ->
 /// for [`outbox`] to report, rather than holding back the queue behind it; a
 /// storage failure is the error. A row the replica takes or lets go of is no
 /// longer one to report.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn apply<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     message: &Down,
     sequence: i64,
-) -> Result<Applied, Error> {
+) -> Result<Vec<Applied>, Error> {
     let naming = if message.snapshot_id.is_empty() {
         false
     } else {
@@ -609,14 +608,17 @@ async fn apply<P: Sync + 'static>(
         }
         let deletes = keys_of(codec, &table.deletes);
         let_go(conn, codec, &deletes, sequence).await?;
-        taken.push((table.table.clone(), applied.held));
+        taken.push(Applied {
+            table: table.table.clone(),
+            keys: applied.held,
+        });
     }
     Ok(taken)
 }
 
 /// Lets go of the rows of `keys`: the ones the database refuses to let go
 /// are rejected, the rest are no longer ones to report.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn let_go<P: Sync + 'static>(
     conn: &mut Conn,
     codec: &Codec<P>,
@@ -650,7 +652,7 @@ async fn let_go<P: Sync + 'static>(
 
 /// Notes rows the replica could not take, or let go of, for the server to
 /// hear of: refused by the message numbered `sequence`.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn reject(
     conn: &mut Conn,
     table: &str,
@@ -674,7 +676,7 @@ async fn reject(
 }
 
 /// Rows no longer ones to report: taken, or let go of.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn cleared(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Error> {
     sqlx::query(
         "DELETE FROM sync_rejections WHERE table_name = $1 \
@@ -689,7 +691,7 @@ async fn cleared(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Er
 
 /// The state of the snapshot `id`: `None` when never seen, `Some(None)` while
 /// in progress, `Some(Some(sequence))` once it ended or was superseded.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn snapshot(conn: &mut Conn, id: &str) -> Result<Option<Option<i64>>, Error> {
     Ok(
         sqlx::query_scalar("SELECT ended FROM sync_snapshots WHERE snapshot_id = $1")
@@ -701,7 +703,7 @@ async fn snapshot(conn: &mut Conn, id: &str) -> Result<Option<Option<i64>>, Erro
 
 /// Begins the snapshot `id` with the message numbered `sequence`: the one in
 /// progress, if any, is superseded, and what it named forgotten.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn begin(conn: &mut Conn, id: &str, sequence: i64) -> Result<(), Error> {
     sqlx::query("UPDATE sync_snapshots SET ended = $1 WHERE ended IS NULL")
         .bind(sequence)
@@ -729,7 +731,7 @@ async fn begin(conn: &mut Conn, id: &str, sequence: i64) -> Result<(), Error> {
 /// rows it carries: it does in the snapshot in progress, and in one never
 /// seen, which it begins — whatever the snapshot id says, the message's
 /// sequence orders it. One that ended names nothing; its rows still apply.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn names(conn: &mut Conn, id: &str, sequence: i64) -> Result<bool, Error> {
     match snapshot(conn, id).await? {
         Some(None) => Ok(true),
@@ -747,7 +749,7 @@ async fn names(conn: &mut Conn, id: &str, sequence: i64) -> Result<bool, Error> 
 /// tables goes. The end of one that ended or was superseded does nothing.
 /// What was rejected in those tables before it began is forgotten: it sent
 /// again what the replica should hold.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn end_snapshot<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -818,7 +820,7 @@ async fn end_snapshot<P: Sync + 'static>(
 
 /// The server filed these uploads: the notes they carried are done. A
 /// number no upload has is ignored.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Error> {
     let uploads: Vec<i64> = message
         .uploads
@@ -840,10 +842,15 @@ async fn filed(conn: &mut Conn, message: &envelope::Filed) -> Result<(), Error> 
 /// filed, and rows that cannot go as they are.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
 pub struct UpProgress {
+    /// The table.
     pub table: String,
+    /// Rows written and not sent yet.
     pub unsent: i64,
+    /// Rows sent that the server has not said it filed.
     pub unfiled: i64,
+    /// Rows that cannot go up as they are, until a build that can send them.
     #[serde(default)]
     pub set_aside: i64,
 }
@@ -860,7 +867,7 @@ impl From<&envelope::TableBacklog> for UpProgress {
 }
 
 /// [`UpProgress`] for every table with something on its way.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
     Ok(sqlx::query_as(
         "SELECT relation AS \"table\", \
@@ -878,7 +885,7 @@ pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
 /// starts, or when the last time is `backlog_every` ago — and, while it is
 /// not empty, every `backlog_every` even unchanged. A clock set back since
 /// it was last told counts as that long ago.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn backlog_due(
     conn: &mut Conn,
     now: Vec<UpProgress>,
@@ -907,7 +914,7 @@ async fn backlog_due(
     Ok(due.then(|| backlog_of(now)))
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn backlog_of(progress: Vec<UpProgress>) -> envelope::Backlog {
     let count = |n: i64| u64::try_from(n).unwrap_or_default();
     envelope::Backlog {
@@ -926,30 +933,46 @@ fn backlog_of(progress: Vec<UpProgress>) -> envelope::Backlog {
 /// Which of a replica's writes one stream of uploads carries. A replica may
 /// keep a table that writes often (positions, events) on a lane of its own,
 /// so it never waits behind the rest, nor the rest behind it.
+#[cfg(feature = "sqlite")]
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Lane {
-    /// The transport's name for it.
+    /// The uplink's name for it.
     pub name: &'static str,
     /// The tables it carries; every table no other lane names when empty.
     pub tables: &'static [&'static str],
 }
 
-/// What a replica sends up in one message, and how much.
+#[cfg(feature = "sqlite")]
+impl Lane {
+    /// The lane `name`, carrying `tables` — or, when empty, every table no
+    /// other lane names.
+    #[must_use]
+    pub const fn new(name: &'static str, tables: &'static [&'static str]) -> Self {
+        Lane { name, tables }
+    }
+}
+
+/// What a replica sends up in one message, and how much: a host changes
+/// what it needs of an `Outbox::default()`.
+#[cfg(feature = "sqlite")]
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Outbox {
-    /// How large a message the transport takes: rows per message, and bytes.
+    /// How large a message the uplink takes: rows per message, and bytes.
     pub limits: envelope::Limits,
     /// How long an upload the server has not answered waits before it goes
     /// again.
     pub resend_after: std::time::Duration,
     /// Rejections per message, at most.
-    pub rejections: usize,
+    pub rejections: std::num::NonZeroUsize,
     /// How often, at most, the replica tells the server its backlog while it
     /// grows — and how often it says it again, unchanged, while it is not
     /// empty; it says at once when it empties, or starts.
     pub backlog_every: std::time::Duration,
 }
 
+#[cfg(feature = "sqlite")]
 impl Default for Outbox {
     fn default() -> Self {
         Outbox {
@@ -958,33 +981,23 @@ impl Default for Outbox {
                 bytes: 1 << 20,
             },
             resend_after: std::time::Duration::from_secs(600),
-            rejections: 500,
+            rejections: std::num::NonZeroUsize::new(500).expect("not zero"),
             backlog_every: std::time::Duration::from_secs(60),
         }
     }
 }
 
-/// Refuses lanes and limits a replica cannot send up with: no lane, a table
-/// on two lanes or on none, a lane naming a table that does not go up, two
-/// lanes for every other table, or a message too small for anything.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub fn check_settings<P: Sync + 'static>(
+/// Refuses lanes a replica cannot send up with: no lane, a table on two
+/// lanes or on none, a lane naming a table that does not go up, or two lanes
+/// for every other table.
+#[cfg(feature = "sqlite")]
+pub(crate) fn check_settings<P: Sync + 'static>(
     codecs: &[Codec<P>],
     lanes: &[Lane],
-    outbox: &Outbox,
 ) -> Result<(), Error> {
     let misuse = |why: String| Err(Error::Misuse(why));
     if lanes.is_empty() {
         return misuse("a replica needs a lane to send up on".into());
-    }
-    if outbox.limits.rows == 0
-        || outbox.limits.bytes <= envelope::ENVELOPE_ROOM
-        || outbox.rejections == 0
-    {
-        return misuse(format!(
-            "an outbox carries a row and a rejection at least, in more than {} bytes",
-            envelope::ENVELOPE_ROOM
-        ));
     }
     if lanes.iter().filter(|l| l.tables.is_empty()).count() > 1 {
         return misuse("one lane at most carries every table no other lane names".into());
@@ -1010,26 +1023,26 @@ pub fn check_settings<P: Sync + 'static>(
 }
 
 /// A message on its way up, and what to record once the transport took it.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 #[derive(Debug)]
-pub struct Outgoing {
-    pub lane: &'static str,
-    pub up: Up,
+pub(crate) struct Outgoing {
+    pub(crate) lane: &'static str,
+    pub(crate) up: Up,
     /// The notes its rows carry.
     notes: Vec<i64>,
     /// Its rejections, each as refused by the message numbered so.
     rejected: Vec<(String, String, i64)>,
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 impl Outgoing {
     /// As the bytes a transport carries.
-    pub fn bytes(&self) -> Vec<u8> {
+    pub(crate) fn bytes(&self) -> Vec<u8> {
         self.up.encode_to_vec()
     }
 
     /// How many of the replica's writes it carries.
-    pub fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         self.notes.len()
     }
 }
@@ -1049,8 +1062,8 @@ impl Outgoing {
 /// key it cannot read, a row that does not encode or is larger than a
 /// message — is set aside, and counted in the backlog, until
 /// [`retry_set_aside`].
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub async fn outbox<P: Sync + 'static>(
+#[cfg(feature = "sqlite")]
+pub(crate) async fn outbox<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     lanes: &[Lane],
@@ -1058,7 +1071,7 @@ pub async fn outbox<P: Sync + 'static>(
     settings: &Outbox,
     digests: bool,
 ) -> Result<Option<Outgoing>, Error> {
-    check_settings(codecs, lanes, settings)?;
+    check_settings(codecs, lanes)?;
     let Some(this) = lanes.get(lane) else {
         return Err(Error::Misuse(format!("no lane {lane} of {}", lanes.len())));
     };
@@ -1086,9 +1099,9 @@ pub async fn outbox<P: Sync + 'static>(
         // One over the cap says whether this message reports them all: the
         // server must hear of a refusal before the message it refused is
         // confirmed, or it would take the refused row for applied.
-        let pending = unreported(conn, settings.rejections + 1).await?;
-        let mut all_reported = pending.len() <= settings.rejections;
-        for (row, sequence) in pending.into_iter().take(settings.rejections) {
+        let pending = unreported(conn, settings.rejections.get() + 1).await?;
+        let mut all_reported = pending.len() <= settings.rejections.get();
+        for (row, sequence) in pending.into_iter().take(settings.rejections.get()) {
             let weight = framed(row.encoded_len());
             if weight > budget {
                 all_reported = false;
@@ -1145,7 +1158,7 @@ pub async fn outbox<P: Sync + 'static>(
 }
 
 /// A note of a row the replica wrote.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 #[derive(sqlx::FromRow)]
 struct Note {
     id: i64,
@@ -1157,7 +1170,7 @@ struct Note {
 /// never sent, and the ones sent longer than `resend_after` ago — or, by a
 /// clock set back since, in the future — that the server never said it
 /// filed.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn unsent(
     conn: &mut Conn,
     lanes: &[Lane],
@@ -1193,11 +1206,11 @@ async fn unsent(
 }
 
 /// Keys of one table, each with the notes of it.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 type Keyed = Vec<(Key, Vec<i64>)>;
 
 /// Notes made into a message's tables.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 struct Gathered {
     tables: Vec<Table>,
     /// The notes the tables carry.
@@ -1211,7 +1224,7 @@ struct Gathered {
 /// history a replica let go of before it went up is not the server's to
 /// delete, and its note is done here. What does not fit waits for the next
 /// message; a note that cannot go as it is is set aside.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn gather<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -1344,7 +1357,7 @@ async fn gather<P: Sync + 'static>(
     Ok(Gathered { tables, carried })
 }
 
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 fn wire_of(key: &Key) -> envelope::Key {
     envelope::Key {
         parts: key.iter().map(ToString::to_string).collect(),
@@ -1353,7 +1366,7 @@ fn wire_of(key: &Key) -> envelope::Key {
 
 /// The rejections the server has not heard of, oldest first, up to `limit`,
 /// each with the message that refused it.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn unreported(
     conn: &mut Conn,
     limit: usize,
@@ -1384,8 +1397,8 @@ async fn unreported(
 /// [`Filed`](envelope::Filed), its rejections are reported (unless refused
 /// again since), and the server of its epoch knows what was applied. Run it
 /// in one transaction.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
+#[cfg(feature = "sqlite")]
+pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
     if let Some(number) = outgoing.up.uploads.first() {
         sqlx::query(&format!(
             "UPDATE sync_notes SET upload = $1, sent_at = {} \
@@ -1434,8 +1447,12 @@ pub async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error
 
 /// The transport refused `outgoing` for good: its rows are set aside, with
 /// why, until [`retry_set_aside`]. Everything else it carried goes again.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub async fn set_aside(conn: &mut Conn, outgoing: &Outgoing, why: &str) -> Result<(), Error> {
+#[cfg(feature = "sqlite")]
+pub(crate) async fn set_aside(
+    conn: &mut Conn,
+    outgoing: &Outgoing,
+    why: &str,
+) -> Result<(), Error> {
     sqlx::query(
         "UPDATE sync_notes SET set_aside = $1 WHERE id IN (SELECT value FROM json_each($2))",
     )
@@ -1448,8 +1465,8 @@ pub async fn set_aside(conn: &mut Conn, outgoing: &Outgoing, why: &str) -> Resul
 
 /// Offers every write set aside to go up again: what this build could not
 /// send, a new one may.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-pub async fn retry_set_aside(conn: &mut Conn) -> Result<u64, Error> {
+#[cfg(feature = "sqlite")]
+pub(crate) async fn retry_set_aside(conn: &mut Conn) -> Result<u64, Error> {
     Ok(
         sqlx::query("UPDATE sync_notes SET set_aside = NULL WHERE set_aside IS NOT NULL")
             .execute(&mut *conn)
@@ -1461,7 +1478,7 @@ pub async fn retry_set_aside(conn: &mut Conn) -> Result<u64, Error> {
 /// What this replica holds of each table the server sends down, for the
 /// server to compare with what it records: rows it retired, or rejected,
 /// left out.
-#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[cfg(feature = "sqlite")]
 async fn digests<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -1491,6 +1508,6 @@ async fn digests<P: Sync + 'static>(
     Ok(digests)
 }
 
-#[cfg(all(test, feature = "sqlite", not(feature = "postgres")))]
+#[cfg(all(test, feature = "sqlite"))]
 #[path = "replica_tests.rs"]
 mod tests;

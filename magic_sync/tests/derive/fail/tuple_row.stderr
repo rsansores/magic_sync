@@ -1,0 +1,5 @@
+error: a row is a struct with named fields, one per column
+ --> tests/derive/fail/tuple_row.rs:3:12
+  |
+3 | pub struct Thing(uuid::Uuid);
+  |            ^^^^^

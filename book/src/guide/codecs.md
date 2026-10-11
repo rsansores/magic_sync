@@ -9,14 +9,11 @@ table itself.
 ```rust
 use magic_sync::wire::Codec;
 
-pub fn codecs() -> &'static [Codec<()>] {
-    static CODECS: std::sync::OnceLock<Vec<Codec<()>>> = std::sync::OnceLock::new();
-    CODECS.get_or_init(|| {
-        vec![
-            Codec::json::<Product>(None),
-            Codec::json::<Receipt>(Some(place_receipt)),
-        ]
-    })
+pub fn codecs() -> Vec<Codec<()>> {
+    vec![
+        Codec::json::<Product>(None),
+        Codec::json::<Receipt>(Some(place_receipt)),
+    ]
 }
 
 /// A receipt is filed under the register that sent it, whatever it says.
@@ -41,7 +38,14 @@ Codec::new::<Product, ProductRow>(product_to_wire, product_from_wire, None)
 ```
 
 where `ProductRow` is a [`prost`] message and the two functions map the row to
-it and back (a [`magic_map`] declaration each, if you like).
+it and back, failing with a `magic_sync::wire::MapError` — which any error
+converts into with `?`, so a [`magic_map`] mapping, say, is one line:
+
+```rust
+fn product_to_wire(p: Product) -> Result<ProductRow, MapError> {
+    Ok(p.try_map_into()?)
+}
+```
 
 ## What the server knows about a sender: `P` and `place`
 

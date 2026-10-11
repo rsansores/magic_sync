@@ -1,7 +1,7 @@
 //! A table for the engine's own tests: one row type, its message, and a codec
 //! whose encoding has a bug that refuses one value, on either backend.
 
-use magic_map::MappingError;
+use crate::wire::MapError;
 use std::cell::Cell;
 use uuid::Uuid;
 
@@ -35,11 +35,9 @@ thread_local! {
     pub static BUGGY: Cell<bool> = const { Cell::new(true) };
 }
 
-pub fn to_wire(item: Item) -> Result<ItemRow, MappingError> {
+pub fn to_wire(item: Item) -> Result<ItemRow, MapError> {
     if item.name == "poison" && BUGGY.get() {
-        return Err(MappingError::Custom(
-            "a value this build cannot encode".into(),
-        ));
+        return Err(MapError::new("a value this build cannot encode"));
     }
     Ok(ItemRow {
         id: item.id.to_string(),
@@ -48,21 +46,19 @@ pub fn to_wire(item: Item) -> Result<ItemRow, MappingError> {
     })
 }
 
-pub fn from_wire(row: ItemRow) -> Result<Item, MappingError> {
-    let uuid =
-        |field, text: &str| Uuid::parse_str(text).map_err(|_| MappingError::InvalidUuid { field });
+pub fn from_wire(row: ItemRow) -> Result<Item, MapError> {
     Ok(Item {
-        id: uuid("id", &row.id)?,
-        partition_id: uuid("partition_id", &row.partition_id)?,
+        id: row.id.parse()?,
+        partition_id: row.partition_id.parse()?,
         name: row.name,
     })
 }
 
 /// A deterministic walk: the same seed replays the same failure.
-#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+#[cfg(feature = "postgres")]
 pub struct Walk(pub u64);
 
-#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+#[cfg(feature = "postgres")]
 impl Walk {
     pub fn next(&mut self) -> u64 {
         // Xorshift stays at zero from zero: that seed walks from another.
@@ -92,7 +88,7 @@ impl Walk {
 }
 
 /// A record: written on a replica, filed on the server.
-#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+#[cfg(feature = "postgres")]
 pub mod records {
     use super::*;
 
@@ -115,7 +111,7 @@ pub mod records {
         pub value: String,
     }
 
-    pub fn reading_to_wire(reading: Reading) -> Result<ReadingRow, MappingError> {
+    pub fn reading_to_wire(reading: Reading) -> Result<ReadingRow, MapError> {
         Ok(ReadingRow {
             id: reading.id.to_string(),
             replica_id: reading.replica_id.to_string(),
@@ -124,18 +120,13 @@ pub mod records {
     }
 
     /// The server's decoding has the bug that refuses "poison", while `BUGGY`.
-    pub fn reading_from_wire(row: ReadingRow) -> Result<Reading, MappingError> {
+    pub fn reading_from_wire(row: ReadingRow) -> Result<Reading, MapError> {
         if row.value == "poison" && BUGGY.get() {
-            return Err(MappingError::Custom(
-                "a value this build cannot decode".into(),
-            ));
+            return Err(MapError::new("a value this build cannot decode"));
         }
-        let uuid = |field, text: &str| {
-            Uuid::parse_str(text).map_err(|_| MappingError::InvalidUuid { field })
-        };
         Ok(Reading {
-            id: uuid("id", &row.id)?,
-            replica_id: uuid("replica_id", &row.replica_id)?,
+            id: row.id.parse()?,
+            replica_id: row.replica_id.parse()?,
             value: row.value,
         })
     }

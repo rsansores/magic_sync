@@ -1,0 +1,5 @@
+error: `a_table_whose_name_is_longer_than_postgresql_keeps_of_a_name_at_all` is longer than the 63 bytes PostgreSQL keeps of a name
+ --> tests/derive/fail/name_too_long.rs:2:15
+  |
+2 | #[row(table = "a_table_whose_name_is_longer_than_postgresql_keeps_of_a_name_at_all", mirror = "catalog")]
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,144 +1,164 @@
 //! `#[derive(Row)]` and `#[derive(Columns)]` for [magic_sync]: one struct is
-//! one table, column for column, and says how it travels.
+//! one table, column for column, and says how it travels. Use them through
+//! `magic_sync`, which re-exports both; the example and every attribute are
+//! documented on [`magic_sync::Row`].
 //!
-//! ```ignore
-//! #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
-//! #[row(table = "products", schema = "shop", mirror = "catalog", sync = "broadcast")]
-//! pub struct Product {
-//!     pub id: Uuid,
-//!     pub company_id: Uuid,
-//!     pub name: String,
-//!     #[row(version)]
-//!     pub updated_at: DateTime<Utc>,
-//! }
-//! ```
-//!
-//! On the struct:
-//!
-//! | key | means |
-//! |---|---|
-//! | `table` | the table's name (required) |
-//! | `schema` | its PostgreSQL schema (`public` when left out) |
-//! | `mirror` | `catalog`, `record`, `both` or `server` (required) |
-//! | `sync` | `broadcast`, `assigned(col)`, `follows(col)` or `grouped(members = t, assigned = t)`; left out, a row travels only when a row that travels points at it |
-//! | `key` | the primary key's columns, when it is not `id` |
-//! | `active` | the relation the rows replicas hold are read through (a view leaving rows out) |
-//! | `retired` | the column a replica sets on a row it lets go of but must keep |
-//! | `origin` | the key column naming the replica a record belongs to |
-//! | `unmirrored` | columns one side's table has that the row leaves out |
-//! | `crate` | the path to `magic_sync`, when it is re-exported |
-//!
-//! On a field: `#[row(version)]` (a column whose value only moves forward),
-//! `#[row(created)]` (written once), `#[row(replica_owned)]` (in a `both`
-//! table, a column only replicas write), `#[row(generated)]` (computed by the
-//! database: read, never written).
-//!
-//! Fields follow `sqlx::FromRow`: `#[sqlx(rename = "…")]` names the column,
-//! `#[sqlx(try_from = "…")]` is the type the column decodes into,
-//! `#[sqlx(skip)]` is no column, and `#[sqlx(flatten)]` contributes the nested
-//! struct's columns, which that struct declares with `#[derive(Columns)]`.
-//! `#[sqlx(json)]` and a struct-level `#[sqlx(rename_all)]` are refused rather
-//! than half-understood.
+//! Everything the derive is told is checked where it is written: a key that
+//! is not a field, a column named twice, an attribute a table of its kind
+//! cannot have, a key or version of a type the engine cannot read — each is a
+//! compile error pointing at the token that says it.
 //!
 //! [magic_sync]: https://docs.rs/magic_sync
+//! [`magic_sync::Row`]: https://docs.rs/magic_sync/latest/magic_sync/derive.Row.html
 
 use proc_macro::TokenStream as Tokens;
-use proc_macro2::TokenStream;
-use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, LitStr, Type};
+use proc_macro2::{Span, TokenStream};
+use quote::{quote, quote_spanned, ToTokens};
+use syn::meta::ParseNestedMeta;
+use syn::spanned::Spanned;
+use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Ident, LitStr, Type};
 
-/// One struct is one table. See the crate's documentation.
+/// One struct is one table. See `magic_sync::Row`.
 #[proc_macro_derive(Row, attributes(row))]
 pub fn derive_row(input: Tokens) -> Tokens {
     let input = parse_macro_input!(input as DeriveInput);
-    row(input)
+    row(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
-/// A part of a row that a row flattens in (`#[sqlx(flatten)]`).
+/// A part of a row that a row flattens in (`#[sqlx(flatten)]`). See
+/// `magic_sync::Columns`.
 #[proc_macro_derive(Columns, attributes(row))]
 pub fn derive_columns(input: Tokens) -> Tokens {
     let input = parse_macro_input!(input as DeriveInput);
-    columns_only(input)
+    columns_only(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
+/// The keys `#[row(…)]` takes on a struct that derives `Row`.
+const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `retired`, \
+                        `origin`, `unmirrored` or `crate`";
+
+/// PostgreSQL keeps the first 63 bytes of a longer name, and would answer
+/// for a table or column the row does not name.
+const LONGEST_NAME: usize = 63;
+
 #[derive(Default)]
 struct Args {
-    table: Option<String>,
-    key: Option<String>,
-    schema: Option<String>,
-    mirror: Option<String>,
+    table: Option<LitStr>,
+    key: Option<LitStr>,
+    schema: Option<LitStr>,
+    mirror: Option<LitStr>,
     sync: Option<LitStr>,
-    active: Option<String>,
-    retired: Option<String>,
-    origin: Option<String>,
-    unmirrored: Vec<String>,
-    krate: Option<syn::Path>,
+    active: Option<LitStr>,
+    retired: Option<LitStr>,
+    origin: Option<LitStr>,
+    unmirrored: Option<LitStr>,
+    krate: Option<LitStr>,
 }
 
-fn parse_args(input: &DeriveInput) -> syn::Result<Args> {
+/// The struct's `#[row(…)]` keys. `only_crate`: a part a row flattens in,
+/// which takes `crate` and nothing else.
+fn parse_args(input: &DeriveInput, only_crate: bool) -> syn::Result<Args> {
     let mut args = Args::default();
     for attr in input.attrs.iter().filter(|a| a.path().is_ident("row")) {
         attr.parse_nested_meta(|meta| {
-            let value: LitStr = meta.value()?.parse()?;
-            let text = || Some(value.value());
-            if meta.path.is_ident("table") {
-                args.table = text();
-            } else if meta.path.is_ident("key") {
-                args.key = text();
-            } else if meta.path.is_ident("schema") {
-                args.schema = text();
-            } else if meta.path.is_ident("mirror") {
-                args.mirror = text();
-            } else if meta.path.is_ident("sync") {
-                args.sync = Some(value.clone());
-            } else if meta.path.is_ident("active") {
-                args.active = text();
-            } else if meta.path.is_ident("retired") {
-                args.retired = text();
-            } else if meta.path.is_ident("origin") {
-                args.origin = text();
-            } else if meta.path.is_ident("unmirrored") {
-                args.unmirrored = value
-                    .value()
-                    .split(',')
-                    .map(|c| c.trim().to_owned())
-                    .filter(|c| !c.is_empty())
-                    .collect();
-            } else if meta.path.is_ident("crate") {
-                args.krate = Some(value.parse()?);
-            } else {
-                return Err(meta.error(
-                    "expected `table`, `schema`, `mirror`, `sync`, `key`, `active`, `retired`, \
-                     `origin`, `unmirrored` or `crate`",
-                ));
-            }
-            Ok(())
+            let slot = match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                Some("crate") => &mut args.krate,
+                Some(_) if only_crate => return Err(meta.error(
+                    "#[derive(Columns)] is a part a row flattens in: only `crate` applies to it",
+                )),
+                Some("table") => &mut args.table,
+                Some("key") => &mut args.key,
+                Some("schema") => &mut args.schema,
+                Some("mirror") => &mut args.mirror,
+                Some("sync") => &mut args.sync,
+                Some("active") => &mut args.active,
+                Some("retired") => &mut args.retired,
+                Some("origin") => &mut args.origin,
+                Some("unmirrored") => &mut args.unmirrored,
+                _ => return Err(meta.error(format!("expected {ROW_KEYS}"))),
+            };
+            once(slot, &meta)
         })?;
     }
     Ok(args)
 }
 
-fn krate(args: &Args) -> syn::Path {
-    args.krate
-        .clone()
-        .unwrap_or_else(|| syn::parse_quote!(::magic_sync))
+/// Sets `slot` to the literal `meta` carries, refusing it a second time.
+fn once(slot: &mut Option<LitStr>, meta: &ParseNestedMeta) -> syn::Result<()> {
+    let name = meta.path.to_token_stream().to_string();
+    if slot.is_some() {
+        return Err(meta.error(format!("`{name}` is given twice")));
+    }
+    let value = meta
+        .value()
+        .map_err(|_| meta.error(format!("`{name}` takes a value: `{name} = \"…\"`")))?;
+    *slot = Some(value.parse()?);
+    Ok(())
 }
 
-/// Read off the type as written: an alias to `Option` reads as NOT NULL.
+/// A name the engine writes into SQL, quoted: refused when no database could
+/// hold it as written.
+fn identifier(text: &str, at: Span) -> syn::Result<String> {
+    if text.is_empty() {
+        return Err(syn::Error::new(at, "an empty name"));
+    }
+    if text.contains('\0') {
+        return Err(syn::Error::new(at, "a name cannot hold a NUL character"));
+    }
+    if text.len() > LONGEST_NAME {
+        return Err(syn::Error::new(
+            at,
+            format!("`{text}` is longer than the {LONGEST_NAME} bytes PostgreSQL keeps of a name"),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// `name` quoted as SQL quotes an identifier.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A comma-separated list of names, each checked, none twice.
+fn names(lit: &LitStr) -> syn::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for part in lit.value().split(',') {
+        let name = identifier(part.trim(), lit.span())?;
+        if out.contains(&name) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("`{name}` is listed twice"),
+            ));
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
+fn krate(args: &Args) -> syn::Result<syn::Path> {
+    match &args.krate {
+        Some(lit) => lit.parse(),
+        None => Ok(syn::parse_quote!(::magic_sync)),
+    }
+}
+
+/// Read off the type as written: an alias to `Option` reads as NOT NULL,
+/// which the engine's check of the table against its row then refuses.
 fn is_option(ty: &Type) -> bool {
-    matches!(ty, Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Option"))
+    matches!(ty, Type::Path(p) if p.qself.is_none()
+        && p.path.segments.last().is_some_and(|s| s.ident == "Option"))
 }
 
-/// The `#[sqlx(…)]` keys on a field.
+/// The `#[sqlx(…)]` keys on a field that name or shape its column.
 #[derive(Default)]
 struct SqlxField {
     skip: bool,
     flatten: bool,
-    rename: Option<String>,
+    rename: Option<LitStr>,
     try_from: Option<Type>,
 }
 
@@ -151,11 +171,11 @@ fn sqlx_field(field: &Field) -> syn::Result<SqlxField> {
             } else if meta.path.is_ident("flatten") {
                 out.flatten = true;
             } else if meta.path.is_ident("rename") {
-                out.rename = Some(meta.value()?.parse::<LitStr>()?.value());
+                out.rename = Some(meta.value()?.parse()?);
             } else if meta.path.is_ident("try_from") {
                 out.try_from = Some(meta.value()?.parse::<LitStr>()?.parse()?);
             } else if meta.path.is_ident("json") {
-                return Err(meta.error("#[derive(Row)] does not support #[sqlx(json)] yet"));
+                return Err(meta.error("#[derive(Row)] does not support #[sqlx(json)]"));
             } else if meta.input.peek(syn::Token![=]) {
                 let _: syn::Expr = meta.value()?.parse()?;
             } else if meta.input.peek(syn::token::Paren) {
@@ -167,79 +187,112 @@ fn sqlx_field(field: &Field) -> syn::Result<SqlxField> {
     Ok(out)
 }
 
-/// The `#[row(…)]` keys on a field.
+/// The `#[row(…)]` flags on a field, each where it is written.
 #[derive(Default)]
 struct RowField {
-    generated: bool,
-    replica_owned: bool,
-    version: bool,
-    created: bool,
+    generated: Option<Span>,
+    replica_owned: Option<Span>,
+    version: Option<Span>,
+    created: Option<Span>,
+}
+
+impl RowField {
+    fn any(&self) -> Option<Span> {
+        self.generated
+            .or(self.replica_owned)
+            .or(self.version)
+            .or(self.created)
+    }
 }
 
 fn row_field(field: &Field) -> syn::Result<RowField> {
     let mut out = RowField::default();
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("row")) {
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("generated") {
-                out.generated = true;
-            } else if meta.path.is_ident("replica_owned") {
-                out.replica_owned = true;
-            } else if meta.path.is_ident("version") {
-                out.version = true;
-            } else if meta.path.is_ident("created") {
-                out.created = true;
-            } else {
-                return Err(
-                    meta.error("expected `version`, `created`, `replica_owned` or `generated`")
-                );
+            let flag = match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                Some("generated") => &mut out.generated,
+                Some("replica_owned") => &mut out.replica_owned,
+                Some("version") => &mut out.version,
+                Some("created") => &mut out.created,
+                _ => {
+                    return Err(
+                        meta.error("expected `version`, `created`, `replica_owned` or `generated`")
+                    )
+                }
+            };
+            let name = meta.path.to_token_stream().to_string();
+            if flag.is_some() {
+                return Err(meta.error(format!("`{name}` is given twice")));
             }
+            if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
+                return Err(meta.error(format!("`{name}` takes no value")));
+            }
+            *flag = Some(meta.path.span());
             Ok(())
         })?;
+    }
+    let refuse = |at: Option<Span>, why: &str| match at {
+        Some(at) => Err(syn::Error::new(at, why)),
+        None => Ok(()),
+    };
+    if out.generated.is_some() {
+        refuse(
+            out.version.or(out.created).or(out.replica_owned),
+            "a #[row(generated)] column is computed by the database: nothing writes it",
+        )?;
+    }
+    if out.version.is_some() {
+        refuse(
+            out.created,
+            "a #[row(version)] column moves with every write; a #[row(created)] one never moves",
+        )?;
+        refuse(
+            out.replica_owned,
+            "the version of a table written on both sides is the server's: \
+             a #[row(version)] column cannot be #[row(replica_owned)]",
+        )?;
     }
     Ok(out)
 }
 
-/// The type inside an `Option`, or the type itself.
-fn unwrapped(ty: &Type) -> &Type {
-    if let Type::Path(p) = ty {
-        if let Some(last) = p.path.segments.last() {
-            if last.ident == "Option" {
-                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                        return inner;
-                    }
-                }
-            }
-        }
-    }
-    ty
+/// A column a struct declares directly.
+struct Direct {
+    name: String,
+    /// Where the name is written: its `rename`, or the field.
+    at: Span,
+    ident: Ident,
+    ty: Type,
+    nullable: bool,
+    flags: RowField,
 }
 
-/// How a column travels on the wire: a proto scalar for the numbers and
-/// booleans, text for everything else (ids, instants, decimals, enums).
-fn wire(ty: &Type) -> TokenStream {
-    let name = match unwrapped(ty) {
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default(),
-        _ => String::new(),
+/// What `#[derive(Columns)]` and `#[derive(Row)]` share: the columns, and the
+/// `Columns` impl that lists and binds them.
+struct Declared {
+    tokens: TokenStream,
+    direct: Vec<Direct>,
+    flattened: Vec<Type>,
+}
+
+fn refuse_shape(input: &DeriveInput) -> syn::Result<&syn::FieldsNamed> {
+    if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &input.generics,
+            "a row is one table: it takes no generic parameters",
+        ));
+    }
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "a row is a struct, one field per column",
+        ));
     };
-    match name.as_str() {
-        "i16" => quote!(Int16),
-        "i32" => quote!(Int32),
-        "i64" => quote!(Int64),
-        "bool" => quote!(Bool),
-        "f32" => quote!(Float),
-        "f64" => quote!(Double),
-        "Value" => quote!(Json),
-        _ => quote!(String),
-    }
-}
-
-fn refuse_rename_all(input: &DeriveInput) -> syn::Result<()> {
+    let Fields::Named(fields) = &data.fields else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "a row is a struct with named fields, one per column",
+        ));
+    };
     for attr in input.attrs.iter().filter(|a| a.path().is_ident("sqlx")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename_all") {
@@ -249,41 +302,29 @@ fn refuse_rename_all(input: &DeriveInput) -> syn::Result<()> {
             }
             if meta.input.peek(syn::Token![=]) {
                 let _: syn::Expr = meta.value()?.parse()?;
+            } else if meta.input.peek(syn::token::Paren) {
+                meta.parse_nested_meta(|_| Ok(()))?;
             }
             Ok(())
         })?;
     }
-    Ok(())
+    Ok(fields)
 }
 
-/// A column a struct declares directly.
-struct Direct {
-    name: String,
-    ident: syn::Ident,
-    nullable: bool,
-    flags: RowField,
-}
-
-fn columns_impl(input: &DeriveInput, krate: &syn::Path) -> syn::Result<(TokenStream, Vec<Direct>)> {
-    let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new_spanned(&input.ident, "needs a struct"));
-    };
-    let Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new_spanned(&input.ident, "needs named fields"));
-    };
-
-    refuse_rename_all(input)?;
+/// `key`: the row's key columns, whose kind the engine reads off their type.
+fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Result<Declared> {
+    let fields = refuse_shape(input)?;
+    let private = quote!(#krate::__private);
     let mut push = Vec::new();
     let mut bind = Vec::new();
-    let mut direct = Vec::new();
+    let mut direct: Vec<Direct> = Vec::new();
     let mut flattened: Vec<Type> = Vec::new();
     for field in &fields.named {
         let sqlx = sqlx_field(field)?;
         let flags = row_field(field)?;
-        let marked = flags.generated || flags.replica_owned || flags.version || flags.created;
-        if marked && (sqlx.skip || sqlx.flatten) {
-            return Err(syn::Error::new_spanned(
-                field,
+        if let Some(at) = flags.any().filter(|_| sqlx.skip || sqlx.flatten) {
+            return Err(syn::Error::new(
+                at,
                 "a #[row(…)] field names a column; a skipped or flattened field is none",
             ));
         }
@@ -291,241 +332,405 @@ fn columns_impl(input: &DeriveInput, krate: &syn::Path) -> syn::Result<(TokenStr
             continue;
         }
         let ty = &field.ty;
-        let ident = field.ident.as_ref().expect("named field");
+        let ident = field.ident.clone().expect("a named field");
         if sqlx.flatten {
+            push.push(quote_spanned! {ty.span()=>
+                <#ty as #private::Columns>::columns(out);
+            });
+            bind.push(quote_spanned! {ty.span()=>
+                <#ty as #private::Columns>::push_binds(self.#ident, sep);
+            });
             flattened.push(ty.clone());
-            push.push(quote!(<#ty as #krate::row::Columns>::columns(out);));
-            bind.push(quote!(#krate::row::Columns::push_binds(self.#ident, sep);));
             continue;
         }
-        if !flags.generated {
-            bind.push(quote!(sep.push_bind(self.#ident);));
+        let field_name = ident.to_string().trim_start_matches("r#").to_owned();
+        let (name, at) = match &sqlx.rename {
+            Some(lit) => (identifier(&lit.value(), lit.span())?, lit.span()),
+            None => (identifier(&field_name, ident.span())?, ident.span()),
+        };
+        if let Some(earlier) = direct.iter().find(|d| d.name == name) {
+            return Err(syn::Error::new(
+                at,
+                format!(
+                    "the column `{name}` is already the field `{}`",
+                    earlier.ident
+                ),
+            ));
         }
-        let name = sqlx
-            .rename
-            .unwrap_or_else(|| ident.to_string().trim_start_matches("r#").to_owned());
         let nullable = is_option(ty);
-        if flags.version && nullable {
-            return Err(syn::Error::new_spanned(
-                field,
+        if let Some(version) = flags.version.filter(|_| nullable) {
+            return Err(syn::Error::new(
+                version,
                 "#[row(version)] orders a row's versions: it cannot be NULL",
             ));
         }
+        if flags.generated.is_none() {
+            bind.push(quote!(sep.push_bind(self.#ident);));
+        }
         let decoded = sqlx.try_from.as_ref().unwrap_or(ty);
-        let wire = wire(ty);
-        let field_name = ident.to_string().trim_start_matches("r#").to_owned();
-        let generated = flags.generated;
-        let replica_owned = flags.replica_owned;
-        push.push(quote!(out.push(#krate::row::Column {
-            name: #name,
-            field: #field_name,
-            nullable: #nullable,
-            generated: #generated,
-            replica_owned: #replica_owned,
-            wire: #krate::row::Wire::#wire,
-            compatible: |info| <#decoded as #krate::__sqlx::Type<#krate::Db>>::compatible(info),
-        });));
+        let key = if key.contains(&name) {
+            quote_spanned! {ty.span()=>
+                ::core::option::Option::Some(<#ty as #krate::row::KeyValue>::KIND)
+            }
+        } else {
+            quote!(::core::option::Option::None)
+        };
+        let version = match flags.version {
+            Some(_) => quote_spanned! {ty.span()=>
+                ::core::option::Option::Some(<#ty as #krate::row::Version>::KIND)
+            },
+            None => quote!(::core::option::Option::None),
+        };
+        let generated = flags.generated.is_some();
+        let replica_owned = flags.replica_owned.is_some();
+        push.push(quote! {
+            out.push(#private::Column {
+                name: #name,
+                field: #field_name,
+                nullable: #nullable,
+                generated: #generated,
+                replica_owned: #replica_owned,
+                key: #key,
+                version: #version,
+                int64: #private::is_int64::<#ty>(),
+                compatible: |info| {
+                    <#decoded as #private::sqlx::Type<#private::Db>>::compatible(info)
+                },
+            });
+        });
         direct.push(Direct {
             name,
-            ident: ident.clone(),
+            at,
+            ident,
+            ty: ty.clone(),
             nullable,
             flags,
         });
     }
 
-    // A marked column here, or else the first flattened part's.
-    let role =
-        |pick: fn(&RowField) -> bool, which: TokenStream, what: &str| -> syn::Result<TokenStream> {
-            let marked: Vec<&Direct> = direct.iter().filter(|d| pick(&d.flags)).collect();
-            if let [_, second, ..] = marked.as_slice() {
-                return Err(syn::Error::new_spanned(
-                    &second.ident,
-                    format!("one column at most is #[row({what})]"),
-                ));
+    // The one column marked so, here or in a part flattened in.
+    let role = |pick: fn(&RowField) -> Option<Span>, which: TokenStream, what: &str| {
+        let marked: Vec<&Direct> = direct.iter().filter(|d| pick(&d.flags).is_some()).collect();
+        if let [_, second, ..] = marked.as_slice() {
+            return Err(syn::Error::new(
+                pick(&second.flags).unwrap_or(second.at),
+                format!("one column at most is #[row({what})]"),
+            ));
+        }
+        let here = match marked.first() {
+            Some(column) => {
+                let name = &column.name;
+                quote!(::core::option::Option::Some(#name))
             }
-            let mut value = match marked.first() {
-                Some(column) => {
-                    let name = &column.name;
-                    quote!(Some(#name))
-                }
-                None => quote!(None),
-            };
-            for part in flattened.iter().rev() {
-                value = quote!(match #value {
-                    Some(column) => Some(column),
-                    None => <#part as #krate::row::Columns>::#which,
-                });
-            }
-            Ok(value)
+            None => quote!(::core::option::Option::None),
         };
-    let version = role(|f| f.version, quote!(VERSION_COLUMN), "version")?;
-    let created = role(|f| f.created, quote!(CREATED_COLUMN), "created")?;
-
-    let ident = &input.ident;
-    Ok((
-        quote! {
-            impl #krate::row::Columns for #ident {
-                const VERSION_COLUMN: Option<&'static str> = #version;
-                const CREATED_COLUMN: Option<&'static str> = #created;
-
-                fn columns(out: &mut Vec<#krate::row::Column>) {
-                    #(#push)*
+        let parts = flattened
+            .iter()
+            .map(|part| quote!(<#part as #private::Columns>::#which));
+        let refusal =
+            format!("one column at most is #[row({what})], here or in a part flattened in");
+        Ok(quote! {
+            {
+                let found = [#here, #(#parts),*];
+                if #private::count(&found) > 1 {
+                    ::core::panic!(#refusal)
                 }
-
-                fn push_binds<'args>(
-                    self,
-                    sep: &mut #krate::__sqlx::query_builder::Separated<'_, 'args, #krate::Db, &'static str>,
-                ) {
-                    #(#bind)*
-                }
+                #private::first(&found)
             }
-        },
-        direct,
-    ))
-}
+        })
+    };
+    let version = role(|f| f.version, quote!(VERSION), "version")?;
+    let created = role(|f| f.created, quote!(CREATED), "created")?;
+    let owned_here = direct.iter().any(|d| d.flags.replica_owned.is_some());
+    let owned_parts = flattened
+        .iter()
+        .map(|part| quote!(|| <#part as #private::Columns>::REPLICA_OWNED));
 
-fn columns_only(input: DeriveInput) -> syn::Result<TokenStream> {
-    let args = parse_args(&input)?;
-    if args.table.is_some()
-        || args.key.is_some()
-        || args.schema.is_some()
-        || args.mirror.is_some()
-        || args.sync.is_some()
-    {
-        return Err(syn::Error::new_spanned(
-            &input.ident,
-            "#[derive(Columns)] is a part a row flattens in: only `crate` applies to it",
-        ));
-    }
-    Ok(columns_impl(&input, &krate(&args))?.0)
-}
-
-fn plain(s: &str) -> bool {
-    s.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
-fn row(input: DeriveInput) -> syn::Result<TokenStream> {
-    let args = parse_args(&input)?;
     let ident = &input.ident;
-    let error = |what: String| syn::Error::new_spanned(ident, what);
-    let table = args
-        .table
-        .clone()
-        .ok_or_else(|| error("#[row] needs `table`".into()))?;
-    let schema = args.schema.clone().unwrap_or_else(|| "public".to_owned());
-    let mirror = args
-        .mirror
-        .clone()
-        .ok_or_else(|| error("#[row] needs `mirror`".into()))?;
-    if !plain(&table) || !plain(&schema) {
-        return Err(error(
-            "`table` and `schema` are plain snake_case names".into(),
-        ));
-    }
-    let variant = match mirror.as_str() {
-        "catalog" => quote!(Catalog),
-        "record" => quote!(Record),
-        "both" => quote!(Both),
-        "server" => quote!(ServerOnly),
-        other => {
-            return Err(error(format!(
-                "mirror = \"{other}\": expected \"catalog\", \"record\", \"both\" or \"server\""
-            )))
+    let tokens = quote! {
+        // The roles are settled where the struct is declared, not where a
+        // row of it is first used.
+        const _: () = {
+            let _ = <#ident as #private::Columns>::VERSION;
+            let _ = <#ident as #private::Columns>::CREATED;
+        };
+
+        impl #private::Columns for #ident {
+            const VERSION: ::core::option::Option<&'static ::core::primitive::str> = #version;
+            const CREATED: ::core::option::Option<&'static ::core::primitive::str> = #created;
+            const REPLICA_OWNED: ::core::primitive::bool = #owned_here #(#owned_parts)*;
+
+            fn columns(out: &mut ::std::vec::Vec<#private::Column>) {
+                #(#push)*
+            }
+
+            fn push_binds<'args>(
+                self,
+                sep: &mut #private::sqlx::query_builder::Separated<'_, 'args, #private::Db, &'static ::core::primitive::str>,
+            ) {
+                #(#bind)*
+            }
         }
     };
-    let krate = krate(&args);
-    let sync = sync_strategy(args.sync.as_ref(), &mirror, &krate)?;
-    let (columns, direct) = columns_impl(&input, &krate)?;
+    Ok(Declared {
+        tokens,
+        direct,
+        flattened,
+    })
+}
 
-    if mirror != "both" {
-        if let Some(owned) = direct.iter().find(|d| d.flags.replica_owned) {
-            return Err(syn::Error::new_spanned(
-                &owned.ident,
+fn columns_only(input: &DeriveInput) -> syn::Result<TokenStream> {
+    let args = parse_args(input, true)?;
+    Ok(declared(input, &krate(&args)?, &[])?.tokens)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mirror {
+    Catalog,
+    Record,
+    Both,
+    Server,
+}
+
+impl Mirror {
+    fn parse(lit: &LitStr) -> syn::Result<Self> {
+        Ok(match lit.value().as_str() {
+            "catalog" => Mirror::Catalog,
+            "record" => Mirror::Record,
+            "both" => Mirror::Both,
+            "server" => Mirror::Server,
+            other => {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!(
+                        "mirror = \"{other}\": expected \"catalog\", \"record\", \"both\" or \"server\""
+                    ),
+                ))
+            }
+        })
+    }
+
+    fn variant(self) -> TokenStream {
+        match self {
+            Mirror::Catalog => quote!(Catalog),
+            Mirror::Record => quote!(Record),
+            Mirror::Both => quote!(Both),
+            Mirror::Server => quote!(ServerOnly),
+        }
+    }
+
+    /// Whether the server sends the table's rows down.
+    fn sent_down(self) -> bool {
+        matches!(self, Mirror::Catalog | Mirror::Both)
+    }
+}
+
+/// Refuses `lit`, given on a table that is not sent down.
+fn only_sent_down(lit: Option<&LitStr>, mirror: Mirror, what: &str) -> syn::Result<()> {
+    match lit {
+        Some(lit) if !mirror.sent_down() => Err(syn::Error::new_spanned(
+            lit,
+            format!("only a table the server sends down (`catalog` or `both`) has {what}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
+    let args = parse_args(input, false)?;
+    let krate = krate(&args)?;
+    let private = quote!(#krate::__private);
+    let ident = &input.ident;
+    let missing = |what: &str| {
+        syn::Error::new(
+            Span::call_site(),
+            format!("#[derive(Row)] needs #[row({what} = \"…\")]"),
+        )
+    };
+    let table_lit = args.table.as_ref().ok_or_else(|| missing("table"))?;
+    let table = identifier(&table_lit.value(), table_lit.span())?;
+    let schema = match &args.schema {
+        Some(lit) => identifier(&lit.value(), lit.span())?,
+        None => "public".to_owned(),
+    };
+    let mirror = Mirror::parse(args.mirror.as_ref().ok_or_else(|| missing("mirror"))?)?;
+    let key = match &args.key {
+        Some(lit) => names(lit)?,
+        None => vec!["id".to_owned()],
+    };
+    let Declared {
+        tokens: columns,
+        direct,
+        flattened,
+    } = declared(input, &krate, &key)?;
+    let column = |name: &str| direct.iter().find(|d| d.name == name);
+
+    if mirror != Mirror::Both {
+        if let Some(at) = direct.iter().find_map(|d| d.flags.replica_owned) {
+            return Err(syn::Error::new(
+                at,
                 "#[row(replica_owned)] splits a table written on both sides: needs `mirror = \"both\"`",
             ));
         }
     }
-    let key: Vec<String> = args
-        .key
-        .as_deref()
-        .unwrap_or("id")
-        .split(',')
-        .map(|k| k.trim().to_owned())
-        .collect();
-    let mut key_idents = Vec::new();
-    for k in &key {
-        let Some(column) = direct.iter().find(|d| &d.name == k) else {
-            return Err(error(format!("key column `{k}` is not a field of the row")));
+    let route = route(args.sync.as_ref(), mirror, &direct, &private)?;
+    only_sent_down(args.active.as_ref(), mirror, "an `active` relation")?;
+    only_sent_down(args.retired.as_ref(), mirror, "a `retired` column")?;
+
+    let key_at = args.key.as_ref().map_or(ident.span(), LitStr::span);
+    let mut key_columns = Vec::new();
+    for name in &key {
+        let Some(column) = column(name) else {
+            let why = if flattened.is_empty() {
+                format!("the key column `{name}` is not a field of the row")
+            } else {
+                format!("the key column `{name}` is not a field of the row itself: a key is not flattened in")
+            };
+            return Err(syn::Error::new(key_at, why));
         };
         if column.nullable {
-            return Err(syn::Error::new_spanned(
-                &column.ident,
-                "a key column cannot be NULL",
+            return Err(syn::Error::new(column.at, "a key column cannot be NULL"));
+        }
+        if let Some(at) = column.flags.any() {
+            return Err(syn::Error::new(
+                at,
+                "a key column is the row's identity: it is not generated, owned by a replica, \
+                 a version or a creation time",
             ));
         }
-        key_idents.push(column.ident.clone());
-    }
-    if let Some(origin) = &args.origin {
-        if !key.contains(origin) {
-            return Err(error(format!(
-                "origin = \"{origin}\": the replica a record belongs to is a key column"
-            )));
-        }
+        key_columns.push(column);
     }
 
-    let option = |value: &Option<String>| match value {
-        Some(v) => quote!(Some(#v)),
-        None => quote!(None),
+    let mut checks = Vec::new();
+    if let Some(lit) = &args.origin {
+        let origin = identifier(&lit.value(), lit.span())?;
+        if !matches!(mirror, Mirror::Record | Mirror::Both) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                "only a table a replica writes (`record` or `both`) has an `origin`",
+            ));
+        }
+        let Some(column) = key_columns.iter().find(|c| c.name == origin) else {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("origin = \"{origin}\": the replica a record belongs to is a key column"),
+            ));
+        };
+        let ty = &column.ty;
+        let refusal = format!("origin = \"{origin}\": the replica a record belongs to is a uuid");
+        checks.push(quote_spanned! {lit.span()=>
+            const _: () = ::core::assert!(
+                ::core::matches!(<#ty as #krate::row::KeyValue>::KIND, #krate::row::KeyKind::Uuid),
+                #refusal,
+            );
+        });
+    }
+    let leaves_out = |lit: &LitStr, name: &str| {
+        match column(name) {
+        Some(_) => Err(syn::Error::new_spanned(
+            lit,
+            format!("`{name}` is a field of the row: a column the row leaves out is not one of its fields"),
+        )),
+        None => Ok(()),
+    }
     };
-    let active = option(&args.active);
-    let retired = option(&args.retired);
-    let origin = option(&args.origin);
-    let unmirrored = &args.unmirrored;
+    let retired = match &args.retired {
+        Some(lit) => Some(identifier(&lit.value(), lit.span())?),
+        None => None,
+    };
+    let unmirrored = match &args.unmirrored {
+        Some(lit) => {
+            let names = names(lit)?;
+            for name in &names {
+                leaves_out(lit, name)?;
+                if retired.as_ref() == Some(name) {
+                    return Err(syn::Error::new_spanned(
+                        lit,
+                        format!("`{name}` is the retired column already"),
+                    ));
+                }
+            }
+            names
+        }
+        None => Vec::new(),
+    };
+    let active = match &args.active {
+        Some(lit) => {
+            let text = lit.value();
+            let parts = match text.split_once('.') {
+                Some((schema, name)) => vec![schema, name],
+                None => vec![text.as_str()],
+            };
+            let quoted: Vec<String> = parts
+                .into_iter()
+                .map(|p| identifier(p, lit.span()).map(|p| quoted(&p)))
+                .collect::<syn::Result<_>>()?;
+            Some(quoted.join("."))
+        }
+        None => None,
+    };
+    if mirror != Mirror::Both {
+        let refusal = "#[row(replica_owned)] in a part flattened in splits a table written on \
+                       both sides: the row needs `mirror = \"both\"`";
+        checks.extend(flattened.iter().map(|part| {
+            quote_spanned! {part.span()=>
+                const _: () = ::core::assert!(!<#part as #private::Columns>::REPLICA_OWNED, #refusal);
+            }
+        }));
+    }
+
+    let option = |value: Option<String>| match value {
+        Some(v) => quote!(::core::option::Option::Some(#v)),
+        None => quote!(::core::option::Option::None),
+    };
+    let active = option(active);
+    let retired = option(retired);
+    let origin = option(args.origin.as_ref().map(LitStr::value));
+    let variant = mirror.variant();
+    let (quoted_schema, quoted_table) = (quoted(&schema), quoted(&table));
+    let key_parts = key_columns.iter().map(|c| {
+        let (ident, ty) = (&c.ident, &c.ty);
+        quote_spanned! {ty.span()=>
+            <#ty as #krate::row::KeyValue>::key_part(&self.#ident)
+        }
+    });
 
     Ok(quote! {
         #columns
 
-        impl #krate::row::Row for #ident {
-            const TABLE: &'static str = #table;
-            const KEY: &'static [&'static str] = &[#(#key),*];
-            const QUALIFIED: &'static str = #krate::qualified!(#schema, #table);
-            const SCHEMA: &'static str = #schema;
+        impl #private::Row for #ident {
+            const TABLE: &'static ::core::primitive::str = #table;
+            const SCHEMA: &'static ::core::primitive::str = #schema;
+            const KEY: &'static [&'static ::core::primitive::str] = &[#(#key),*];
             const MIRROR: #krate::row::Mirror = #krate::row::Mirror::#variant;
-            const SYNC: #krate::row::Sync = #sync;
-            const ACTIVE: Option<&'static str> = #active;
-            const RETIRED: Option<&'static str> = #retired;
-            const UNMIRRORED: &'static [&'static str] = &[#(#unmirrored),*];
-            const ORIGIN: Option<&'static str> = #origin;
-            const VERSION: Option<&'static str> = <Self as #krate::row::Columns>::VERSION_COLUMN;
-            const CREATED: Option<&'static str> = <Self as #krate::row::Columns>::CREATED_COLUMN;
-
-            fn key_repr(&self) -> String {
-                let mut repr = String::new();
-                #(repr.push_str(&format!("{:?}\u{1f}", self.#key_idents));)*
-                repr
-            }
+            const QUALIFIED: &'static ::core::primitive::str = #krate::__qualified!(#quoted_schema, #quoted_table);
+            const ROUTE: #private::Route = #route;
+            const ACTIVE: ::core::option::Option<&'static ::core::primitive::str> = #active;
+            const RETIRED: ::core::option::Option<&'static ::core::primitive::str> = #retired;
+            const UNMIRRORED: &'static [&'static ::core::primitive::str] = &[#(#unmirrored),*];
+            const ORIGIN: ::core::option::Option<&'static ::core::primitive::str> = #origin;
 
             fn key(&self) -> #krate::row::Key {
-                vec![#(#krate::row::KeyValue::key_part(self.#key_idents)),*]
+                ::std::vec![#(#key_parts),*]
             }
         }
+
+        #(#checks)*
     })
 }
 
-/// `sync = "…"`: how a table's rows find the replicas that hold them.
-fn sync_strategy(
+/// `sync = "…"`: how a table's rows find the replicas that hold them. The
+/// columns it names are the row's own.
+fn route(
     sync: Option<&LitStr>,
-    mirror: &str,
-    krate: &syn::Path,
+    mirror: Mirror,
+    direct: &[Direct],
+    private: &TokenStream,
 ) -> syn::Result<TokenStream> {
     let Some(lit) = sync else {
-        return Ok(quote!(#krate::row::Sync::Referenced));
+        return Ok(quote!(#private::Route::Referenced));
     };
-    if mirror == "record" || mirror == "server" {
+    if !mirror.sent_down() {
         return Err(syn::Error::new_spanned(
             lit,
             "only a table the server sends down (`catalog` or `both`) takes a `sync` strategy",
@@ -544,43 +749,45 @@ fn sync_strategy(
     };
     let column = |inner: Option<&str>| -> syn::Result<String> {
         let arg = inner.map(str::trim).unwrap_or_default();
-        if plain(arg) {
-            Ok(arg.to_owned())
-        } else {
-            Err(bad("expected one column name"))
+        if arg.is_empty() || arg.contains(',') || arg.contains('=') {
+            return Err(bad("expected one column name"));
         }
+        let name = identifier(arg, lit.span())?;
+        if !direct.iter().any(|d| d.name == name) {
+            return Err(bad(&format!("`{name}` is not a field of the row")));
+        }
+        Ok(name)
     };
     Ok(match name {
-        "broadcast" if inner.is_none() => quote!(#krate::row::Sync::Broadcast),
+        "broadcast" if inner.is_none() => quote!(#private::Route::Broadcast),
         "assigned" => {
             let column = column(inner)?;
-            quote!(#krate::row::Sync::Assigned(#column))
+            quote!(#private::Route::Assigned(#column))
         }
         "follows" => {
             let column = column(inner)?;
-            quote!(#krate::row::Sync::Follows(#column))
+            quote!(#private::Route::Follows(#column))
         }
         "grouped" => {
             let mut members = None;
             let mut assigned = None;
             for part in inner.unwrap_or_default().split(',') {
-                let (key, value) = part
-                    .split_once('=')
-                    .ok_or_else(|| bad("expected `members = …, assigned = …`"))?;
-                let value = value.trim();
-                if !plain(value) {
-                    return Err(bad("a group table is a plain snake_case name"));
-                }
-                match key.trim() {
-                    "members" => members = Some(value.to_owned()),
-                    "assigned" => assigned = Some(value.to_owned()),
-                    _ => return Err(bad("expected `members = …, assigned = …`")),
+                let expected = || bad("expected `members = …, assigned = …`");
+                let (key, value) = part.split_once('=').ok_or_else(expected)?;
+                let value = identifier(value.trim(), lit.span())?;
+                let slot = match key.trim() {
+                    "members" => &mut members,
+                    "assigned" => &mut assigned,
+                    _ => return Err(expected()),
+                };
+                if slot.replace(value).is_some() {
+                    return Err(bad(&format!("`{}` is given twice", key.trim())));
                 }
             }
             let (Some(members), Some(assigned)) = (members, assigned) else {
                 return Err(bad("expected `members = …, assigned = …`"));
             };
-            quote!(#krate::row::Sync::Grouped {
+            quote!(#private::Route::Grouped {
                 members: #members,
                 assigned: #assigned,
             })

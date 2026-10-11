@@ -7,18 +7,23 @@
 //! What the host knows and the engine does not — who a replica is, and the
 //! transaction its uploads are filed in — it says through [`Senders`].
 
-use crate::envelope::{self, Body, Filed, Limits, Up};
+use crate::envelope::{self, Body, Limits, Up};
 use crate::filing;
 use crate::plan::{Engine, Replicas};
-use crate::relay::{self, Relay, Transport};
+use crate::relay::{self, Relay};
 use crate::row::Table;
+use crate::run::Backoff;
 use crate::wire::Codec;
 use crate::Error;
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
+
+pub use crate::filing::Filed;
+pub use crate::relay::Transport;
 
 /// What the host knows about the replicas that send something up.
 pub trait Senders: Send + Sync + 'static {
@@ -41,7 +46,8 @@ pub trait Senders: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Transaction<'static, Postgres>, Error>> + Send;
 }
 
-/// Every replica files as it is, in a plain transaction.
+/// [`Senders`] for a host that knows nothing about its replicas: every one
+/// is known, and its uploads are filed in a plain transaction of the pool.
 pub struct Anyone(pub PgPool);
 
 impl Senders for Anyone {
@@ -57,13 +63,16 @@ impl Senders for Anyone {
 }
 
 /// How the server runs. The defaults suit a server of a few hundred replicas
-/// on a transport that takes a megabyte per message.
+/// on a transport that takes half a megabyte per message; a host changes
+/// what it needs of a `Settings::default()`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Settings {
     /// How large a message the transport takes.
     pub limits: Limits,
-    /// Notes planned per pass.
-    pub batch: i64,
+    /// Notes planned per pass, and how many a replica left out of passes may
+    /// be owed before it is provisioned again instead.
+    pub batch: NonZeroU32,
     /// The advisory lock only the running relay holds.
     pub lock_key: i64,
     /// The role every transaction of the engine's own assumes, when the
@@ -71,13 +80,12 @@ pub struct Settings {
     pub role: Option<String>,
     /// How long the relay waits when nothing is pending.
     pub idle: Duration,
-    /// How long it waits after a failure, doubling up to the second.
-    pub backoff: (Duration, Duration),
+    /// How long it waits after a failed pass.
+    pub backoff: Backoff,
     /// How long one send may take before its replica counts as unreachable.
     pub send_timeout: Duration,
-    /// How long a replica a send failed to waits before it is tried again,
-    /// doubling with every failure in a row up to the second.
-    pub replica_backoff: (Duration, Duration),
+    /// How long a replica a send failed to waits before it is tried again.
+    pub replica_backoff: Backoff,
     /// How long a replica may leave a message unconfirmed, with nothing sent
     /// to it since, before it is provisioned again ([`relay::heal`]).
     pub unconfirmed_after: Duration,
@@ -101,14 +109,14 @@ impl Default for Settings {
                 rows: 500,
                 bytes: 512 * 1024,
             },
-            batch: 500,
+            batch: NonZeroU32::new(500).expect("not zero"),
             // "SYNCENGN"
             lock_key: 0x5359_4e43_454e_474e,
             role: None,
             idle: Duration::from_secs(1),
-            backoff: (Duration::from_secs(1), Duration::from_secs(60)),
+            backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
             send_timeout: Duration::from_secs(30),
-            replica_backoff: (Duration::from_secs(2), Duration::from_secs(15 * 60)),
+            replica_backoff: Backoff::new(Duration::from_secs(2), Duration::from_secs(15 * 60)),
             unconfirmed_after: Duration::from_secs(60 * 60),
             standby: Duration::from_secs(30),
             retry_every: Duration::from_secs(60 * 60),
@@ -119,27 +127,92 @@ impl Default for Settings {
     }
 }
 
-/// The server's side of sync, for the host to run.
+impl Settings {
+    /// Refuses settings the server cannot run with.
+    fn check(&self) -> Result<(), Error> {
+        self.backoff.check("backoff")?;
+        self.replica_backoff.check("replica_backoff")?;
+        let zero = [
+            ("idle", self.idle),
+            ("send_timeout", self.send_timeout),
+            ("standby", self.standby),
+            ("retry_every", self.retry_every),
+            ("watch_every", self.watch_every),
+        ];
+        if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
+            return Err(Error::Misuse(format!(
+                "`{what}` is zero: the server would spin"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The server's side of sync, for the host to run: built once, run in a task
+/// of its own, and handed every message a replica sends up.
+///
+/// ```no_run
+/// use magic_sync::plan::Replicas;
+/// use magic_sync::run::server::{Anyone, Settings, Transport};
+/// use magic_sync::wire::Codec;
+/// use magic_sync::{Error, Server};
+/// use std::sync::Arc;
+/// use uuid::Uuid;
+///
+/// /// The host's way to its replicas.
+/// struct Queues;
+///
+/// impl Transport for Queues {
+///     async fn send(&self, register: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
+///         // hand `message` to `register`'s queue
+///         Ok(())
+///     }
+/// }
+///
+/// # async fn start(pool: sqlx::PgPool, codecs: Vec<Codec<()>>, upload: (Uuid, Vec<u8>)) -> Result<(), Error> {
+/// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers", "active");
+///
+/// let server = Arc::new(
+///     Server::new(pool.clone(), codecs, REGISTERS, Queues, Anyone(pool), Settings::default())
+///         .await?,
+/// );
+/// let relay = server.clone();
+/// tokio::spawn(async move { relay.run(std::future::pending()).await });
+///
+/// // Every message a register sends up, from whichever register sent it.
+/// let (register, bytes) = upload;
+/// server.receive(register, &bytes).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Server<S: Senders, T: Transport> {
     pool: PgPool,
     engine: Engine,
-    codecs: &'static [Codec<S::Known>],
+    codecs: Vec<Codec<S::Known>>,
     transport: T,
     senders: S,
     settings: Settings,
 }
 
 impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
-    /// Builds the engine from the schema: refused when a declaration cannot
-    /// be honoured ([`Engine::new`]).
+    /// The server over a database its migrations set up: `codecs` are the
+    /// tables that travel, parents first; `replicas` where it finds the
+    /// replicas; `transport` how a message reaches one; `senders` what the
+    /// host knows of a replica that sends something up.
+    ///
+    /// Refused when the database is not what the engine needs — its schema
+    /// at another version, a table that is not its row column for column, a
+    /// trigger missing or different from what [`Engine::triggers`] prints —
+    /// or a declaration the schema cannot honour, or the settings cannot run.
     pub async fn new(
         pool: PgPool,
-        codecs: &'static [Codec<S::Known>],
+        codecs: Vec<Codec<S::Known>>,
         replicas: Replicas,
         transport: T,
         senders: S,
         settings: Settings,
     ) -> Result<Self, Error> {
+        settings.check()?;
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::new(&mut tx, &tables, replicas).await?;
@@ -149,18 +222,23 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         ))
     }
 
-    /// [`Server::new`], having first installed what the database lacks
-    /// ([`Engine::install`]): for a host with no migrations of its own. Run it
-    /// before anything writes a mirrored table, on a pool whose connections
-    /// may create triggers.
+    /// [`Server::new`], having first brought the database to what it needs,
+    /// for a host with no migrations of its own: in one transaction, and one
+    /// process at a time, the engine's schema installed or upgraded and every
+    /// trigger missing or different written (any of the engine's on a table
+    /// no longer declared dropped). A table mirrored for the first time that
+    /// already has rows is sent whole. Run it before anything writes a
+    /// mirrored table — a write before its trigger is never noted — on a
+    /// pool whose connections may create triggers.
     pub async fn install(
         pool: PgPool,
-        codecs: &'static [Codec<S::Known>],
+        codecs: Vec<Codec<S::Known>>,
         replicas: Replicas,
         transport: T,
         senders: S,
         settings: Settings,
     ) -> Result<Self, Error> {
+        settings.check()?;
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::install(&mut tx, &tables, replicas).await?;
@@ -173,7 +251,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     fn with(
         pool: PgPool,
         engine: Engine,
-        codecs: &'static [Codec<S::Known>],
+        codecs: Vec<Codec<S::Known>>,
         transport: T,
         senders: S,
         settings: Settings,
@@ -188,12 +266,14 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
         }
     }
 
-    /// The engine, for what a host asks of it: progress, where a row is.
+    /// The engine, for what a host asks of it: how far along the replicas
+    /// are, where a row is ([`status`](crate::status)).
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
 
-    /// A transaction of the engine's own, for the host to ask it things in.
+    /// A transaction as the engine's own begin — assuming the settings'
+    /// `role` — for the host to ask the engine things in.
     pub async fn begin(&self) -> Result<Transaction<'static, Postgres>, Error> {
         begin(&self.pool, "BEGIN", self.settings.role.as_deref()).await
     }
@@ -253,7 +333,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
             }
         };
         if let Some(last) = up.uploads.iter().max() {
-            let answer = Body::Filed(Filed {
+            let answer = Body::Filed(envelope::Filed {
                 uploads: up.uploads.clone(),
             });
             let id = format!("filed-{replica}-{last}");
@@ -275,7 +355,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
             return Ok(None);
         };
         let mut tx = self.senders.filing(&known).await?;
-        let filed = filing::file(&mut tx, self.codecs, up, replica, &known).await?;
+        let filed = filing::file(&mut tx, &self.codecs, up, replica, &known).await?;
         tx.commit().await?;
         Ok(Some(filed))
     }
@@ -295,9 +375,9 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     async fn pass(&self, lock: &mut Lock) -> Result<usize, Error> {
         let relay = Relay {
             engine: &self.engine,
-            codecs: self.codecs,
+            codecs: &self.codecs,
             limits: self.settings.limits,
-            batch: self.settings.batch,
+            batch: i64::from(self.settings.batch.get()),
             timeout: self.settings.send_timeout,
             backoff: self.settings.replica_backoff,
         };
@@ -339,8 +419,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// The relay, for as long as this process holds `lock`.
     async fn lead(&self, mut lock: Lock) {
         tracing::info!("sync: this process runs the relay");
-        let (min, max) = self.settings.backoff;
-        let mut backoff = min;
+        let mut backoff = self.settings.backoff.first;
         // Due now: taking the lock is usually a deploy, which may have fixed
         // what was set aside. A step that failed is due again after the
         // longest backoff, not on every pass.
@@ -357,7 +436,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                         Ok(()) => self.settings.retry_every,
                         Err(e) => {
                             tracing::warn!("sync: trying again what was set aside failed: {e}");
-                            max
+                            self.settings.backoff.max
                         }
                     };
             }
@@ -372,7 +451,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
             }
             match self.pass(&mut lock).await {
                 Ok(done) => {
-                    backoff = min;
+                    backoff = self.settings.backoff.first;
                     if done == 0 {
                         tokio::time::sleep(self.settings.idle).await;
                     }
@@ -380,7 +459,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 Err(e) => {
                     tracing::error!("sync: a pass failed, and runs again: {e}");
                     tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(max);
+                    backoff = self.settings.backoff.after(backoff);
                 }
             }
         }
@@ -416,7 +495,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
                 &mut *self.begin().await?,
                 after,
                 through,
-                self.settings.batch,
+                i64::from(self.settings.batch.get()),
             )
             .await?;
             let Some(last) = kept.last() else {
@@ -451,7 +530,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
             return Ok(false);
         };
         let mut tx = self.senders.filing(&known).await?;
-        let all = filing::refile(&mut tx, self.codecs, kept, &known).await?;
+        let all = filing::refile(&mut tx, &self.codecs, kept, &known).await?;
         tx.commit().await?;
         Ok(all)
     }

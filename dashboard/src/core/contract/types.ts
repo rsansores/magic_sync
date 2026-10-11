@@ -25,12 +25,36 @@ export type NoteKind = "row" | "members" | "assigned" | "resync";
  * table: rows noted and not sent yet, rows sent the server has not said it
  * filed, and rows that cannot go as they are.
  */
-export type UpProgress = { table: string, unsent: number, unfiled: number, set_aside: number, };
+export type UpProgress = { 
+/**
+ * The table.
+ */
+table: string, 
+/**
+ * Rows written and not sent yet.
+ */
+unsent: number, 
+/**
+ * Rows sent that the server has not said it filed.
+ */
+unfiled: number, 
+/**
+ * Rows that cannot go up as they are, until a build that can send them.
+ */
+set_aside: number, };
 
 /**
  * What a replica wrote and the server has not filed, as of when it said so.
  */
-export type Backlog = { tables: Array<UpProgress>, at: string, };
+export type Backlog = { 
+/**
+ * Each table with something on its way.
+ */
+tables: Array<UpProgress>, 
+/**
+ * When the replica said so.
+ */
+at: string, };
 
 /**
  * One replica, from what the engine records about it: nothing here counts
@@ -38,7 +62,15 @@ export type Backlog = { tables: Array<UpProgress>, at: string, };
  * Whether it is synced is exact all the same: a change it lacks is either a
  * note not yet planned, a message it has not confirmed, or set aside.
  */
-export type ReplicaOverview = { replica: string, state: ReplicaState, 
+export type ReplicaOverview = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * Where it stands, in one word.
+ */
+state: ReplicaState, 
 /**
  * Changes noted and not yet planned that may concern it.
  */
@@ -64,17 +96,25 @@ quarantined: number,
  */
 unfiled: number, 
 /**
- * Sends to it that failed in a row, and the last one's error.
+ * Sends to it that failed in a row.
  */
-failures: number, last_error: string | null, 
+failures: number, 
+/**
+ * The last failed send's error.
+ */
+last_error: string | null, 
 /**
  * When it is tried again, while it waits out a failure.
  */
 retry_at: string | null, 
 /**
- * When it was last sent a message, and when it last said it applied one.
+ * When it was last sent a message.
  */
-sent_at: string | null, applied_at: string | null, 
+sent_at: string | null, 
+/**
+ * When it last said it applied one.
+ */
+applied_at: string | null, 
 /**
  * While it has messages it has not said it applied: since when it has
  * not moved — the first one it did not confirm, or its last confirmation
@@ -90,14 +130,34 @@ backlog: Backlog | null, };
 /**
  * How many replicas are in each state.
  */
-export type ReplicaCounts = { awaiting_fix: number, unreachable: number, catching_up: number, synced: number, };
+export type ReplicaCounts = { 
+/**
+ * Replicas [`ReplicaState::AwaitingFix`].
+ */
+awaiting_fix: number, 
+/**
+ * Replicas [`ReplicaState::Unreachable`].
+ */
+unreachable: number, 
+/**
+ * Replicas [`ReplicaState::CatchingUp`].
+ */
+catching_up: number, 
+/**
+ * Replicas [`ReplicaState::Synced`].
+ */
+synced: number, };
 
 /**
  * One table over the replicas of a scope: every figure zero means each of
  * them holds it as it should. It is read without counting what any replica
  * should hold, or which of them a pending change will reach.
  */
-export type TableOverview = { table: string, 
+export type TableOverview = { 
+/**
+ * The table.
+ */
+table: string, 
 /**
  * Every figure below is zero.
  */
@@ -132,32 +192,140 @@ replicas: number, };
 /**
  * The entries of a list a read asked for, and how many there are in all.
  */
-export type Listed<T> = { total: number, first: Array<T>, };
+export type Listed<T> = { 
+/**
+ * How many there are in all.
+ */
+total: number, 
+/**
+ * The first of them, up to the limit the read was given.
+ */
+first: Array<T>, };
 
 /**
  * A change the planner set aside.
  */
-export type Parked = { id: number, kind: NoteKind, table: string | null, key: string | null, replica: string | null, attempts: number, last_error: string | null, parked_at: string | null, };
+export type Parked = { 
+/**
+ * The note's number.
+ */
+id: number, 
+/**
+ * What it asks for.
+ */
+kind: NoteKind, 
+/**
+ * The table it is of, for a row or a group.
+ */
+table: string | null, 
+/**
+ * The row's key, for a row.
+ */
+key: string | null, 
+/**
+ * The replica it is about, or owed to alone.
+ */
+replica: string | null, 
+/**
+ * How many times it was planned and failed.
+ */
+attempts: number, 
+/**
+ * Why it failed last.
+ */
+last_error: string | null, 
+/**
+ * When it was set aside.
+ */
+parked_at: string | null, };
 
 /**
  * A row set aside for one replica.
  */
-export type Quarantined = { replica: string, table: string, key: string, reason: string, first_at: string, last_at: string, attempts: number, };
+export type Quarantined = { 
+/**
+ * The replica it is set aside for.
+ */
+replica: string, 
+/**
+ * Its table.
+ */
+table: string, 
+/**
+ * Its key.
+ */
+key: string, 
+/**
+ * Why it could not go, or could not be taken.
+ */
+reason: string, 
+/**
+ * When it was first set aside.
+ */
+first_at: string, 
+/**
+ * When it last failed.
+ */
+last_at: string, 
+/**
+ * How many times it failed.
+ */
+attempts: number, };
 
 /**
  * What a replica sent that the server could not file: a row, a delete, or a
  * whole upload.
  */
-export type Unfiled = { id: number, replica: string, 
+export type Unfiled = { 
+/**
+ * Its number in the inbox.
+ */
+id: number, 
+/**
+ * The replica that sent it.
+ */
+replica: string, 
 /**
  * Empty for a whole upload kept as it came.
  */
-table: string, reason: string, first_at: string, last_at: string, attempts: number, };
+table: string, 
+/**
+ * Why it could not be filed.
+ */
+reason: string, 
+/**
+ * When it first could not be filed.
+ */
+first_at: string, 
+/**
+ * When filing it last failed.
+ */
+last_at: string, 
+/**
+ * How many times filing it failed.
+ */
+attempts: number, };
 
 /**
  * A replica sends to keep failing to.
  */
-export type Failing = { replica: string, failures: number, last_error: string | null, retry_at: string | null, };
+export type Failing = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * Sends to it that failed in a row.
+ */
+failures: number, 
+/**
+ * The last failed send's error.
+ */
+last_error: string | null, 
+/**
+ * When it is tried again.
+ */
+retry_at: string | null, };
 
 /**
  * What the engine is waiting on, over a scope: each entry is either the
@@ -172,11 +340,30 @@ export type Health = {
  */
 healthy: boolean, 
 /**
- * Changes noted and not yet planned, and when the oldest the planner is
- * due to get to was noted: one owed to a replica out of reach waits for
- * it, and is not counted there.
+ * Changes noted and not yet planned.
  */
-pending: number, oldest: string | null, parked: Listed<Parked>, quarantine: Listed<Quarantined>, inbox: Listed<Unfiled>, failing: Listed<Failing>, };
+pending: number, 
+/**
+ * When the oldest change the planner is due to get to was noted: one
+ * owed to a replica out of reach waits for it, and is not counted here.
+ */
+oldest: string | null, 
+/**
+ * Changes the planner set aside until a fix.
+ */
+parked: Listed<Parked>, 
+/**
+ * Rows set aside for a replica until a fix.
+ */
+quarantine: Listed<Quarantined>, 
+/**
+ * What replicas sent that waits in the inbox until a fix.
+ */
+inbox: Listed<Unfiled>, 
+/**
+ * Replicas sends keep failing to.
+ */
+failing: Listed<Failing>, };
 
 /**
  * [`Engine::overview`]: everything a dashboard shows first, in one read.
@@ -184,26 +371,57 @@ pending: number, oldest: string | null, parked: Listed<Parked>, quarantine: List
  * state, and listed worst first up to the limit; [`Engine::listing`] pages
  * through the rest.
  */
-export type Overview = { contract: number, 
+export type Overview = { 
+/**
+ * The contract this answer serializes as: [`CONTRACT`].
+ */
+contract: number, 
 /**
  * The server's time when the answer was read: every time in it is the
  * server's, and how long ago one was is measured from this.
  */
-now: string, health: Health, states: ReplicaCounts, replicas: Listed<ReplicaOverview>, tables: Array<TableOverview>, };
+now: string, 
+/**
+ * What the engine waits on.
+ */
+health: Health, 
+/**
+ * How many replicas are in each state.
+ */
+states: ReplicaCounts, 
+/**
+ * The replicas that need attention most, worst first.
+ */
+replicas: Listed<ReplicaOverview>, 
+/**
+ * Each table the server sends down, parents first.
+ */
+tables: Array<TableOverview>, };
 
 /**
  * [`Engine::listing`]: one page of the replicas, worst first.
  */
-export type Listing = { contract: number, 
+export type Listing = { 
+/**
+ * The contract this answer serializes as: [`CONTRACT`].
+ */
+contract: number, 
 /**
  * The server's time when the answer was read.
  */
 now: string, 
 /**
- * The state the page was asked for (`None`: every state), and where in
- * the list it begins.
+ * The state the page was asked for (`None`: every state).
  */
-state: ReplicaState | null, offset: number, replicas: Listed<ReplicaOverview>, };
+state: ReplicaState | null, 
+/**
+ * Where in the list the page begins.
+ */
+offset: number, 
+/**
+ * The page.
+ */
+replicas: Listed<ReplicaOverview>, };
 
 /**
  * One table on one replica, counted from what the replica acknowledged
@@ -212,7 +430,11 @@ state: ReplicaState | null, offset: number, replicas: Listed<ReplicaOverview>, }
  * Every row the engine sent it is in exactly one of `holds`, `in_flight`
  * and `to_remove`.
  */
-export type TableProgress = { table: string, 
+export type TableProgress = { 
+/**
+ * The table.
+ */
+table: string, 
 /**
  * Rows its rules say it should hold. For a table that only travels with
  * others, what the engine decided to send it.
@@ -242,21 +464,53 @@ quarantined: number, };
 /**
  * How far one replica is from holding what it should.
  */
-export type ReplicaProgress = { replica: string, tables: Array<TableProgress>, };
+export type ReplicaProgress = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * Each table the server sends down, parents first.
+ */
+tables: Array<TableProgress>, };
 
 /**
  * [`Engine::progress`]: how far each replica of a scope is from holding
  * what it should.
  */
-export type Progress = { contract: number, replicas: Array<ReplicaProgress>, };
+export type Progress = { 
+/**
+ * The contract this answer serializes as: [`CONTRACT`].
+ */
+contract: number, 
+/**
+ * Each replica of the scope.
+ */
+replicas: Array<ReplicaProgress>, };
 
 /**
  * Where one row stands on one replica.
  */
-export type RowPlace = { replica: string, state: RowState, };
+export type RowPlace = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * What the row is to it.
+ */
+state: RowState, };
 
 /**
  * [`Engine::row_progress`]: where one row stands on each replica of a scope
  * that holds it, should, or is owed it.
  */
-export type RowProgress = { contract: number, places: Array<RowPlace>, };
+export type RowProgress = { 
+/**
+ * The contract this answer serializes as: [`CONTRACT`].
+ */
+contract: number, 
+/**
+ * Each replica of the scope the row is something to.
+ */
+places: Array<RowPlace>, };

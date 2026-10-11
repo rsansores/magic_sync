@@ -2,7 +2,7 @@
 //! exactly those.
 //!
 //! Every table the server sends down declares how its rows find replicas
-//! ([`Sync`]); nothing here names a table. From the declarations and the
+//! (its `sync = "…"`); nothing here names a table. From the declarations and the
 //! foreign keys between the mirrored tables the engine builds, once, the query
 //! that answers "who should hold which rows" of each table. Everything it does
 //! is then one operation — compare what should be held with `sync.held`, what
@@ -22,30 +22,67 @@
 //! The notes are read, planned and loaded in one `REPEATABLE READ`
 //! transaction: the plan, the parents it closes over and the rows it encodes
 //! are one snapshot of the database.
+//!
+//! A host meets three things here: [`Replicas`], where the server finds its
+//! replicas; [`Engine`], which prints the triggers the server needs and
+//! answers about its progress; and [`note_resync`], which provisions a
+//! replica again on demand.
 
+use crate::dialect::{ident, literal};
 use crate::envelope;
-use crate::row::{key_text, Column, Key, KeyPart, Mirror, Sync, Table};
+use crate::row::{key_text, Column, Key, KeyPart, Mirror, Route, Table};
 use crate::wire::Codec;
 use crate::Error;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
-/// The rows that are replicas, and which of them are live (have somewhere to
-/// send to). The engine compares them with what it last saw on every pass: a
-/// replica that became live, or moved to another partition, is provisioned
-/// again from scratch; one that stopped being live, or is gone, is forgotten
-/// and sent nothing.
+/// Where the server finds its replicas: the rows that are replicas, and
+/// which of them are live (have somewhere to send to). The engine compares
+/// them with what it last saw on every pass: a replica that became live, or
+/// moved to another partition, is provisioned again from scratch; one that
+/// stopped being live, or is gone, is forgotten and sent nothing.
+///
+/// ```
+/// use magic_sync::plan::Replicas;
+///
+/// pub const REGISTERS: Replicas = Replicas::new("shop.registers", "registers", "active");
+/// pub const DEVICES: Replicas =
+///     Replicas::new("fleet.devices", "devices", "enrolled_at IS NOT NULL").partitioned_by("company_id");
+/// ```
+#[derive(Clone, Copy, Debug)]
 pub struct Replicas {
-    /// The relation listing them, with an `id` column (and the partition's).
-    pub relation: &'static str,
-    /// The table behind it, as a foreign key names it.
-    pub table: &'static str,
-    /// Which of them receive: a condition on the relation's columns.
-    pub live: &'static str,
-    /// The column that splits rows and replicas into partitions no row
-    /// crosses: a broadcast row goes to every live replica of its partition.
-    /// `None`: one partition, every replica.
-    pub partition: Option<&'static str>,
+    pub(crate) relation: &'static str,
+    pub(crate) table: &'static str,
+    pub(crate) live: &'static str,
+    pub(crate) partition: Option<&'static str>,
+}
+
+impl Replicas {
+    /// The replicas are the rows of `relation`, as SQL names it (a table or a
+    /// view, with an `id` uuid column); `table` is the table behind it, as a
+    /// foreign key names it; `live` is an SQL condition on the relation's
+    /// columns saying which of them receive anything. One partition: a
+    /// broadcast row goes to every live replica.
+    #[must_use]
+    pub const fn new(relation: &'static str, table: &'static str, live: &'static str) -> Self {
+        Replicas {
+            relation,
+            table,
+            live,
+            partition: None,
+        }
+    }
+
+    /// The replicas, split into partitions no row crosses by the uuid
+    /// `column` — the relation's, and every partitioned table's: a broadcast
+    /// row goes to every live replica of its partition.
+    #[must_use]
+    pub const fn partitioned_by(self, column: &'static str) -> Self {
+        Replicas {
+            partition: Some(column),
+            ..self
+        }
+    }
 }
 
 /// A foreign key from one mirrored table to another, as the child's columns
@@ -90,7 +127,7 @@ pub(crate) struct Plan {
     /// What the rows replicas should hold are read from.
     active: String,
     pub(crate) key: Vec<Column>,
-    sync: Sync,
+    route: Route,
     references: Vec<Reference>,
     group: Option<Group>,
     /// The columns the replicas own: a write of only these is no change here.
@@ -99,15 +136,15 @@ pub(crate) struct Plan {
 
 /// The rows to send to, and take back from, each replica.
 #[derive(Default, Debug)]
-pub struct Delta {
-    pub upserts: BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>,
-    pub deletes: BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>,
+pub(crate) struct Delta {
+    pub(crate) upserts: BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>,
+    pub(crate) deletes: BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>,
     /// Replicas being provisioned: what they held is forgotten and what they
     /// should hold sent whole, then everything else swept on their side.
-    pub snapshots: BTreeSet<Uuid>,
+    pub(crate) snapshots: BTreeSet<Uuid>,
     /// The xmin of the snapshot the plan read: every transaction before it had
     /// finished, so what it noted is in the rows sent.
-    pub horizon: i64,
+    pub(crate) horizon: i64,
     /// What was planned, for [`Engine::load`] to plan it again around a row
     /// that cannot go.
     changes: Vec<Change>,
@@ -190,14 +227,14 @@ impl Delta {
 
     /// Only what `replica` is owed: what a note planned for that replica alone
     /// asks.
-    pub fn keep_only(&mut self, replica: Uuid) {
+    pub(crate) fn keep_only(&mut self, replica: Uuid) {
         self.only = Some(replica);
         self.restrict();
     }
 
     /// Everything `replica` is owed, left out: it was not sent, so it is not
     /// recorded.
-    pub fn forget(&mut self, replica: Uuid) {
+    pub(crate) fn forget(&mut self, replica: Uuid) {
         self.left_out.insert(replica);
         self.restrict();
     }
@@ -218,7 +255,7 @@ impl Delta {
     }
 
     /// Every row this delta sends `replica`, as its table and key.
-    pub fn upserted(&self, replica: Uuid) -> Vec<(usize, String)> {
+    pub(crate) fn upserted(&self, replica: Uuid) -> Vec<(usize, String)> {
         self.upserts
             .get(&replica)
             .into_iter()
@@ -245,15 +282,15 @@ impl Delta {
 /// A pending note: what changed, and the one replica it is still owed to
 /// when a send to that replica failed.
 #[derive(Clone, Debug)]
-pub struct Note {
-    pub id: i64,
-    pub change: Change,
-    pub scope: Option<Uuid>,
+pub(crate) struct Note {
+    pub(crate) id: i64,
+    pub(crate) change: Change,
+    pub(crate) scope: Option<Uuid>,
 }
 
 /// What changed, as the outbox noted it.
 #[derive(Clone, Debug)]
-pub enum Change {
+pub(crate) enum Change {
     /// A row of a mirrored table, by its key, and the columns it pointed at
     /// other mirrored rows with, as they were before an update or a delete.
     Row {
@@ -277,21 +314,21 @@ pub enum Change {
 
 /// Every row a plan sends, encoded once: by table index and key text.
 #[derive(Default)]
-pub struct Loaded {
+pub(crate) struct Loaded {
     rows: HashMap<(usize, String), Vec<u8>>,
     /// Rows that could not go, per replica they were to go to — that do not
     /// encode, or point at a row that could not go where the replica lacks
     /// it: left out of the delta, neither sent nor recorded as held.
-    pub failed: Vec<Unsent>,
+    pub(crate) failed: Vec<Unsent>,
 }
 
 /// A row the engine could not send a replica, and why.
 #[derive(Debug)]
-pub struct Unsent {
-    pub replica: Uuid,
-    pub table: &'static str,
-    pub key: String,
-    pub reason: String,
+pub(crate) struct Unsent {
+    pub(crate) replica: Uuid,
+    pub(crate) table: &'static str,
+    pub(crate) key: String,
+    pub(crate) reason: String,
 }
 
 /// A foreign key as the catalogue reads it: the child, the parent, then the
@@ -314,7 +351,10 @@ const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 /// writing its version.
 const MIGRATIONS: [&str; crate::SCHEMA_VERSION as usize] = [crate::POSTGRES_SCHEMA];
 
-/// The engine, built once from the codecs and the schema.
+/// The server's engine, built once from the codecs and the schema by the
+/// [`Server`](crate::Server), which hands it out for what a host asks of it:
+/// the triggers it needs ([`Engine::triggers`]), and how far along every
+/// replica is ([`status`](crate::status)).
 pub struct Engine {
     pub(crate) plans: Vec<Plan>,
     by_name: HashMap<&'static str, usize>,
@@ -323,17 +363,7 @@ pub struct Engine {
     pub(crate) replicas: Replicas,
 }
 
-type Conn = crate::row::Conn;
-
-/// A name as SQL quotes it, whatever it is spelled with.
-fn ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// A string as an SQL literal.
-fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
-}
+use crate::Conn;
 
 /// The key text of the row aliased `alias`, its `columns` joined by `|`.
 fn key_sql(alias: &str, columns: &[impl AsRef<str>]) -> String {
@@ -353,7 +383,7 @@ fn key_in(alias: &str, columns: &[impl AsRef<str>], types: &[Column], param: &st
         return format!(
             "{alias}.{} IN (SELECT unnest({param}::text[])::{})",
             ident(column.as_ref()),
-            KeyPart::sql_type(typed)
+            KeyPart::sql_type(typed.key)
         );
     }
     let row: Vec<String> = columns
@@ -367,7 +397,7 @@ fn key_in(alias: &str, columns: &[impl AsRef<str>], types: &[Column], param: &st
             format!(
                 "split_part(k, '|', {})::{}",
                 i + 1,
-                KeyPart::sql_type(typed)
+                KeyPart::sql_type(typed.key)
             )
         })
         .collect();
@@ -395,7 +425,7 @@ pub(crate) fn parse_key(columns: &[Column], text: &str) -> Result<Key, Error> {
         .iter()
         .zip(parts)
         .map(|(column, part)| {
-            KeyPart::parse(column, part)
+            KeyPart::parse(column.key, part)
                 .ok_or_else(|| Error::Misuse(format!("`{part}` is not a key of `{}`", column.name)))
         })
         .collect()
@@ -560,16 +590,18 @@ async fn version(conn: &mut Conn) -> Result<Option<i32>, Error> {
 
 impl Engine {
     /// Reads the foreign keys between the mirrored tables and each grouped
-    /// table's group tables from the catalog, and checks that every trigger
-    /// the engine needs is there as [`Engine::triggers`] writes it. Fails on
-    /// a declaration the schema cannot honour — a `follows` column that is not
-    /// a key, a group table that does not have the columns a group needs, a
-    /// cycle — and on a trigger missing or different.
-    pub async fn new(
+    /// table's group tables from the catalog, and checks that every table is
+    /// its row column for column and that every trigger the engine needs is
+    /// there as [`Engine::triggers`] writes it. Fails on a declaration the
+    /// schema cannot honour — a table that differs from its row, a `follows`
+    /// column that is not a key, a group table that does not have the columns
+    /// a group needs, a cycle — and on a trigger missing or different.
+    pub(crate) async fn new(
         conn: &mut Conn,
         tables: &[&Table],
         replicas: Replicas,
     ) -> Result<Self, Error> {
+        crate::row::parity(conn, tables).await?;
         let engine = Self::read(conn, tables, replicas).await?;
         let live = live_triggers(conn).await?;
         let mut wrong = Vec::new();
@@ -614,12 +646,13 @@ impl Engine {
     /// [`POSTGRES_SCHEMA`](crate::POSTGRES_SCHEMA) in one and writes each
     /// table's triggers in the migration that creates it, as it does its
     /// indexes; [`Engine::new`] refuses to start while one is missing.
-    pub async fn install(
+    pub(crate) async fn install(
         conn: &mut Conn,
         tables: &[&Table],
         replicas: Replicas,
     ) -> Result<Self, Error> {
         migrate(conn).await?;
+        crate::row::parity(conn, tables).await?;
         let engine = Self::read(conn, tables, replicas).await?;
         let live = live_triggers(conn).await?;
         for stray in engine.strays(&live) {
@@ -673,17 +706,33 @@ impl Engine {
         Ok(engine)
     }
 
-    /// The statements that create every trigger the engine needs, one per
-    /// line: what a host with migrations writes in the migration that creates
-    /// the tables, and what [`Engine::install`] runs. A mirrored table notes
-    /// every write that changes a column it does not leave to the replicas,
-    /// and refuses a truncate; a group table notes every write.
-    pub async fn triggers(
+    /// The statements that create every trigger the server needs for
+    /// `codecs`, one per line, read off the database `conn` is on: what a
+    /// host with migrations writes in the migration that creates the tables —
+    /// after [`POSTGRES_SCHEMA`](crate::POSTGRES_SCHEMA) — and what
+    /// [`Server::install`](crate::Server::install) runs. A mirrored table
+    /// notes every write that changes a column it does not leave to the
+    /// replicas, and refuses a truncate; a group table notes every write.
+    /// [`Server::new`](crate::Server::new) refuses to start while one is
+    /// missing or differs.
+    ///
+    /// ```no_run
+    /// # async fn print(pool: sqlx::PgPool, codecs: Vec<magic_sync::wire::Codec<()>>) -> Result<(), magic_sync::Error> {
+    /// use magic_sync::plan::{Engine, Replicas};
+    ///
+    /// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers", "active");
+    /// let mut conn = pool.acquire().await?;
+    /// println!("{}", Engine::triggers(&mut conn, &codecs, REGISTERS).await?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn triggers<P: std::marker::Sync + 'static>(
         conn: &mut Conn,
-        tables: &[&Table],
+        codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        let engine = Self::read(conn, tables, replicas).await?;
+        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine
             .triggers_needed()
             .iter()
@@ -726,7 +775,7 @@ impl Engine {
                 function: "refuse_truncate",
                 args: Vec::new(),
             });
-            if let (Some(g), Sync::Grouped { members, assigned }) = (&plan.group, plan.sync) {
+            if let (Some(g), Route::Grouped { members, assigned }) = (&plan.group, plan.route) {
                 groups.insert(
                     g.members.clone(),
                     (members.to_owned(), g.group[0].0.clone(), "members"),
@@ -871,7 +920,7 @@ impl Engine {
                 active: t.active.map_or_else(|| relation.sql(), str::to_owned),
                 relation,
                 key,
-                sync: t.sync,
+                route: t.route,
                 references: Vec::new(),
                 group: None,
                 owned: t
@@ -926,8 +975,8 @@ impl Engine {
         }
 
         for plan in &mut plans {
-            match plan.sync {
-                Sync::Follows(column) => {
+            match plan.route {
+                Route::Follows(column) => {
                     if !plan
                         .references
                         .iter()
@@ -939,7 +988,7 @@ impl Engine {
                         )));
                     }
                 }
-                Sync::Grouped { members, assigned } => {
+                Route::Grouped { members, assigned } => {
                     plan.group = Some(group_of(
                         &foreign_keys,
                         plan,
@@ -964,9 +1013,9 @@ impl Engine {
                     *s == plan.relation.schema && *t == plan.relation.name && c == column
                 })
             };
-            let missing = match plan.sync {
-                Sync::Broadcast => replicas.partition.filter(|p| !has(p)),
-                Sync::Assigned(column) if !has(column) => Some(column),
+            let missing = match plan.route {
+                Route::Broadcast => replicas.partition.filter(|p| !has(p)),
+                Route::Assigned(column) if !has(column) => Some(column),
                 _ => None,
             };
             if let Some(column) = missing {
@@ -989,7 +1038,7 @@ impl Engine {
         self.by_name.get(table).copied()
     }
 
-    pub fn table(&self, index: usize) -> &'static str {
+    pub(crate) fn table(&self, index: usize) -> &'static str {
         self.plans[index].table
     }
 
@@ -1011,7 +1060,7 @@ impl Engine {
     /// no longer live, or gone, is forgotten — nothing is recorded as held by
     /// it, and nothing is sent it until it is live again. The relay runs it
     /// before every pass.
-    pub async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
+    pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
         sqlx::query(&format!(
             "WITH now AS (SELECT s.id, s.partition FROM {}), \
              seen AS (SELECT replica_id, partition_id FROM sync.replicas WHERE live), \
@@ -1054,18 +1103,18 @@ impl Engine {
         let replicas = self.replicas_sql();
         let same_partition = self.same_partition();
         let view = &plan.active;
-        Some(match plan.sync {
-            Sync::Referenced | Sync::Follows(_) => return None,
-            Sync::Broadcast => format!(
+        Some(match plan.route {
+            Route::Referenced | Route::Follows(_) => return None,
+            Route::Broadcast => format!(
                 "SELECT s.id AS replica_id, {key} AS key FROM {view} t \
                  JOIN {replicas} ON {same_partition} WHERE {filter}"
             ),
-            Sync::Assigned(column) => format!(
+            Route::Assigned(column) => format!(
                 "SELECT s.id AS replica_id, {key} AS key FROM {view} t \
                  JOIN {replicas} ON s.id = t.{} WHERE {filter}",
                 ident(column)
             ),
-            Sync::Grouped { .. } => {
+            Route::Grouped { .. } => {
                 let g = plan.group.as_ref()?;
                 let member_row: Vec<String> = g
                     .member_row
@@ -1235,7 +1284,7 @@ impl Engine {
 
     /// What a batch of changes asks of every replica, read in the caller's
     /// `REPEATABLE READ` transaction.
-    pub async fn plan(&self, conn: &mut Conn, changes: &[Change]) -> Result<Delta, Error> {
+    pub(crate) async fn plan(&self, conn: &mut Conn, changes: &[Change]) -> Result<Delta, Error> {
         let delta = Delta {
             changes: changes.to_vec(),
             ..Delta::default()
@@ -1329,7 +1378,7 @@ impl Engine {
         }
         let mut touched: BTreeMap<usize, BTreeMap<String, i64>> = BTreeMap::new();
         for (i, notes) in &rows {
-            if matches!(self.plans[*i].sync, Sync::Follows(_)) {
+            if matches!(self.plans[*i].route, Route::Follows(_)) {
                 touched.insert(*i, notes.clone());
                 continue;
             }
@@ -1383,8 +1432,8 @@ impl Engine {
             .iter()
             .enumerate()
             .filter_map(|(i, p)| {
-                let declared = match p.sync {
-                    Sync::Grouped { members, assigned } => [members, assigned],
+                let declared = match p.route {
+                    Route::Grouped { members, assigned } => [members, assigned],
                     _ => return None,
                 };
                 p.group
@@ -1789,8 +1838,8 @@ impl Engine {
         let mut kept = BTreeSet::new();
         for (c, plan) in self.plans.iter().enumerate() {
             // A follower goes where its parent goes: it never keeps it.
-            let follows = match plan.sync {
-                Sync::Follows(column) => Some(column),
+            let follows = match plan.route {
+                Route::Follows(column) => Some(column),
                 _ => None,
             };
             for reference in plan
@@ -1842,7 +1891,7 @@ impl Engine {
         touched: &BTreeMap<usize, BTreeMap<String, i64>>,
     ) -> Result<(), Error> {
         for &c in &self.order {
-            let Sync::Follows(column) = self.plans[c].sync else {
+            let Route::Follows(column) = self.plans[c].route else {
                 continue;
             };
             let reference = self.plans[c]
@@ -1992,7 +2041,7 @@ impl Engine {
     /// A replica holding an older version of one has it taken back, with
     /// what points at it, rather than keep a version the engine no longer
     /// knows the contents of; each comes back once a fix lets it through.
-    pub async fn load<P: std::marker::Sync + 'static>(
+    pub(crate) async fn load<P: std::marker::Sync + 'static>(
         &self,
         conn: &mut Conn,
         codecs: &[Codec<P>],
@@ -2089,7 +2138,12 @@ impl Engine {
 
     /// One replica's rows from what [`Engine::load`] read: its upserts
     /// parents first, then its deletes children first.
-    pub fn rows(&self, delta: &Delta, loaded: &Loaded, replica: Uuid) -> Vec<envelope::Table> {
+    pub(crate) fn rows(
+        &self,
+        delta: &Delta,
+        loaded: &Loaded,
+        replica: Uuid,
+    ) -> Vec<envelope::Table> {
         let mut out = Vec::new();
         if let Some(tables) = delta.upserts.get(&replica) {
             for &i in &self.order {
@@ -2133,7 +2187,7 @@ impl Engine {
     /// Records what the replicas hold once their messages are out: what was
     /// sent, less what was taken back. A snapshot replaces everything its
     /// replica held.
-    pub async fn record(&self, conn: &mut Conn, delta: &Delta) -> Result<(), Error> {
+    pub(crate) async fn record(&self, conn: &mut Conn, delta: &Delta) -> Result<(), Error> {
         let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
         if !snapshots.is_empty() {
             sqlx::query("DELETE FROM sync.held WHERE replica_id = ANY($1)")
@@ -2195,12 +2249,12 @@ impl Engine {
     }
 
     /// The tables every snapshot names, parents first.
-    pub fn snapshot_tables(&self) -> Vec<&'static str> {
+    pub(crate) fn snapshot_tables(&self) -> Vec<&'static str> {
         self.order.iter().map(|&i| self.plans[i].table).collect()
     }
 
     /// Every replica the delta touches.
-    pub fn replicas(delta: &Delta) -> BTreeSet<Uuid> {
+    pub(crate) fn replicas(delta: &Delta) -> BTreeSet<Uuid> {
         delta
             .upserts
             .keys()
@@ -2262,7 +2316,7 @@ const READABLE: &str = "((kind = 'row' AND relation IS NOT NULL AND row_key IS N
 /// waiting out a failure, and of a kind this build reads. `conn` is in the
 /// `REPEATABLE READ` transaction the notes are planned and loaded in, so the
 /// rows they are planned against do not move under the plan.
-pub async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Error> {
+pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Error> {
     let isolation: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
         .fetch_one(&mut *conn)
         .await?;
@@ -2318,7 +2372,7 @@ pub async fn note_resync(
 }
 
 /// Marks notes the engine has sent and recorded.
-pub async fn mark_done(conn: &mut Conn, ids: &[i64]) -> Result<(), Error> {
+pub(crate) async fn mark_done(conn: &mut Conn, ids: &[i64]) -> Result<(), Error> {
     sqlx::query("UPDATE sync.notes SET done_at = now() WHERE id = ANY($1)")
         .bind(ids)
         .execute(&mut *conn)
@@ -2327,7 +2381,7 @@ pub async fn mark_done(conn: &mut Conn, ids: &[i64]) -> Result<(), Error> {
 }
 
 /// Deletes the notes done longer ago than `age`; answers how many.
-pub async fn prune(conn: &mut Conn, age: std::time::Duration) -> Result<u64, Error> {
+pub(crate) async fn prune(conn: &mut Conn, age: std::time::Duration) -> Result<u64, Error> {
     let done =
         sqlx::query("DELETE FROM sync.notes WHERE done_at < now() - make_interval(secs => $1)")
             .bind(age.as_secs_f64())

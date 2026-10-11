@@ -1,0 +1,5 @@
+error: `version` takes no value
+ --> tests/derive/fail/flag_with_a_value.rs:5:11
+  |
+5 |     #[row(version = "at")]
+  |           ^^^^^^^

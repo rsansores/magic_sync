@@ -14,17 +14,24 @@
 use crate::envelope::{self, Up};
 use crate::relay::{resync, stored};
 use crate::replica::{codec_of, keys_of, UpProgress};
-use crate::row::{key_text, Conn, Key, Mirror};
+use crate::row::{key_text, Key};
 use crate::wire::Codec;
+use crate::Conn;
 use crate::Error;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-/// One table of an upload, as the server filed it.
+/// One table of an upload, as the server filed it: what
+/// [`Server::receive`](crate::Server::receive) answers, for the host to act
+/// on what its replicas wrote.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Filed {
+    /// The table.
     pub table: String,
+    /// The keys of the rows the upload wrote.
     pub written: Vec<Key>,
+    /// The keys of the rows the replica deleted, and the server with it.
     pub gone: Vec<Key>,
 }
 
@@ -89,7 +96,7 @@ struct Standing {
 /// upload of a later protocol than this build speaks; a failure of anything
 /// else is permanent, and the caller keeps the upload whole
 /// ([`Server::receive`](crate::Server::receive) does).
-pub async fn file<P: Sync + 'static>(
+pub(crate) async fn file<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     upload: &Up,
@@ -261,11 +268,6 @@ async fn delete_guarded<P: Sync + 'static>(
     }
 }
 
-/// Whether a table travels down, and so is held, rejected and digested.
-fn sent_down<P>(codec: &Codec<P>) -> bool {
-    matches!(codec.table.mirror, Mirror::Catalog | Mirror::Both)
-}
-
 /// Rows `replica` reported it could not take: no longer counted as held, and
 /// quarantined, so a retry after a fix sends them again. Only a row the
 /// server records sending it: a rejection of anything else — a row it was
@@ -277,7 +279,7 @@ async fn rejected<P: Sync + 'static>(
     rejected: &[envelope::Rejected],
 ) -> Result<(), Error> {
     for row in rejected {
-        let Some(codec) = codec_of(codecs, &row.table).filter(|c| sent_down(c)) else {
+        let Some(codec) = codec_of(codecs, &row.table).filter(|c| c.sent_down()) else {
             tracing::error!(%replica, table = stored(&row.table), "upload: a rejection of a table this server does not send — malformed, left out");
             continue;
         };
@@ -408,7 +410,7 @@ async fn compare<P: Sync + 'static>(
     }
     let mut tables = std::collections::BTreeSet::new();
     for digest in &upload.digests {
-        let sent = codec_of(codecs, &digest.table).is_some_and(|c| sent_down(c));
+        let sent = codec_of(codecs, &digest.table).is_some_and(Codec::sent_down);
         if !sent || !tables.insert(digest.table.as_str()) {
             tracing::error!(%replica, table = stored(&digest.table), "upload: digests of a table this server does not send, or of one twice — malformed, not compared");
             return Ok(Vec::new());

@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: origin = "replica": the replica a record belongs to is a uuid
+ --> tests/derive/fail/origin_not_a_uuid.rs:2:74
+  |
+2 | #[row(table = "things", mirror = "record", key = "replica, id", origin = "replica")]
+  |                                                                          ^^^^^^^^^ evaluation of `_` failed here

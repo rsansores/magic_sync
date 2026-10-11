@@ -21,7 +21,7 @@ CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL, what TEXT NOT NULL);
 
 async fn pool(pool: SqlitePool) -> SqlitePool {
     sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
-    replica::install(&mut pool.acquire().await.unwrap(), codecs())
+    replica::install(&mut pool.acquire().await.unwrap(), &codecs())
         .await
         .unwrap();
     pool
@@ -53,7 +53,7 @@ fn rows(sequence: u64, name: &str) -> Vec<u8> {
 fn settings() -> Settings {
     Settings {
         idle: Duration::from_millis(10),
-        backoff: (Duration::from_millis(10), Duration::from_millis(20)),
+        backoff: crate::run::Backoff::new(Duration::from_millis(10), Duration::from_millis(20)),
         ..Settings::default()
     }
 }

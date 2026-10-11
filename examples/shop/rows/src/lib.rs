@@ -38,12 +38,8 @@ pub struct Receipt {
 
 /// The registers, as the engine finds them on the server.
 #[cfg(feature = "server")]
-pub const REGISTERS: magic_sync::plan::Replicas = magic_sync::plan::Replicas {
-    relation: "shop.registers",
-    table: "registers",
-    live: "active",
-    partition: None,
-};
+pub const REGISTERS: magic_sync::plan::Replicas =
+    magic_sync::plan::Replicas::new("shop.registers", "registers", "active");
 
 /// A receipt is filed under the register that sent it, whatever it says.
 fn place_receipt(receipt: &mut Receipt, register: Uuid, _: &()) {
@@ -51,12 +47,9 @@ fn place_receipt(receipt: &mut Receipt, register: Uuid, _: &()) {
 }
 
 /// Every table that travels, parents first.
-pub fn codecs() -> &'static [Codec<()>] {
-    static CODECS: std::sync::OnceLock<Vec<Codec<()>>> = std::sync::OnceLock::new();
-    CODECS.get_or_init(|| {
-        vec![
-            Codec::json::<Product>(None),
-            Codec::json::<Receipt>(Some(place_receipt)),
-        ]
-    })
+pub fn codecs() -> Vec<Codec<()>> {
+    vec![
+        Codec::json::<Product>(None),
+        Codec::json::<Receipt>(Some(place_receipt)),
+    ]
 }

@@ -48,7 +48,7 @@ async fn world(pool: SqlitePool) -> World {
 
 async fn world_with(pool: SqlitePool, settings: Settings) -> World {
     sqlx::raw_sql(TABLES).execute(&pool).await.expect("tables");
-    install(&mut pool.acquire().await.unwrap(), codecs())
+    install(&mut pool.acquire().await.unwrap(), &codecs())
         .await
         .expect("installed");
     let me = Uuid::now_v7();
@@ -1107,7 +1107,7 @@ async fn a_late_answer_forgets_only_what_its_upload_carried(pool: SqlitePool) {
         || sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')").bind(Uuid::now_v7());
     let send = || async {
         let mut tx = w.pool.begin().await.unwrap();
-        let outgoing = outbox(&mut tx, codecs(), &lanes, 0, &settings, false)
+        let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &settings, false)
             .await
             .unwrap()
             .unwrap();
@@ -1163,7 +1163,7 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
             }
             1 | 2 => {
                 let mut tx = w.pool.begin().await.unwrap();
-                let outgoing = outbox(&mut tx, codecs(), lanes, 0, settings, false)
+                let outgoing = outbox(&mut tx, &codecs(), lanes, 0, settings, false)
                     .await
                     .unwrap();
                 tx.commit().await.unwrap();
@@ -1306,7 +1306,7 @@ async fn a_lane_that_fails_holds_back_no_other(pool: SqlitePool) {
             },
         ],
         idle: std::time::Duration::from_millis(10),
-        backoff: (
+        backoff: crate::run::Backoff::new(
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(20),
         ),
@@ -1360,7 +1360,7 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
         .await;
     let lanes = Settings::default().lanes;
     let mut tx = w.pool.begin().await.unwrap();
-    let outgoing = outbox(&mut tx, codecs(), &lanes, 0, &Outbox::default(), false)
+    let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &Outbox::default(), false)
         .await
         .unwrap()
         .unwrap();
@@ -1386,7 +1386,7 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
 async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool) {
     let settings = Settings {
         outbox: Outbox {
-            rejections: 1,
+            rejections: std::num::NonZeroUsize::MIN,
             ..Outbox::default()
         },
         ..Settings::default()
@@ -1440,7 +1440,7 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         let lanes = lanes.clone();
         async move {
             let mut tx = pool.begin().await.unwrap();
-            let outgoing = outbox(&mut tx, codecs(), &lanes, lane, &settings, false)
+            let outgoing = outbox(&mut tx, &codecs(), &lanes, lane, &settings, false)
                 .await
                 .unwrap();
             if let Some(o) = &outgoing {
@@ -1637,23 +1637,51 @@ async fn every_message_up_fits_whatever_it_carries(pool: SqlitePool) {
 #[sqlx::test(migrations = false)]
 async fn the_suites_tables_are_their_rows(pool: SqlitePool) {
     sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
-    crate::row::assert_parity::<crate::testkit::Item>(&pool).await;
-    crate::row::assert_parity::<Shelf>(&pool).await;
-    crate::row::assert_parity::<Price>(&pool).await;
-    crate::row::assert_parity::<Task>(&pool).await;
-    crate::row::assert_parity::<Reading>(&pool).await;
-    crate::row::assert_parity::<Event>(&pool).await;
+    let codecs = codecs();
+    let tables: Vec<&crate::row::Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut conn = pool.acquire().await.unwrap();
+    crate::row::parity(&mut conn, &tables)
+        .await
+        .expect("every table its row");
 }
 
-/// A table that is not its row fails the check that holds them together.
+/// A table that is not its row is refused, with every way it is not: a
+/// column the row lacks, a field the table lacks, a nullability, a type, a
+/// primary key.
 #[sqlx::test(migrations = false)]
-#[should_panic(expected = "differs from its row struct")]
-async fn a_table_that_is_not_its_row_fails_parity(pool: SqlitePool) {
-    sqlx::raw_sql("CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL)")
-        .execute(&pool)
+async fn a_table_that_is_not_its_row_is_refused_with_every_difference(pool: SqlitePool) {
+    sqlx::raw_sql(
+        "CREATE TABLE events (id BLOB NOT NULL, what BLOB, extra TEXT, PRIMARY KEY (id, extra))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let table = crate::row::Table::of::<Event>();
+    let mut conn = pool.acquire().await.unwrap();
+    let why = crate::row::parity(&mut conn, &[&table])
+        .await
+        .expect_err("refused")
+        .to_string();
+    for difference in [
+        "`extra` is not a field of the row",
+        "`what` is nullable in the table and no Option in the row",
+        "`what` is BLOB in the table, which its field does not decode",
+        "the primary key is [\"extra\", \"id\"], and the row's key [\"id\"]",
+    ] {
+        assert!(why.contains(difference), "{difference} — in: {why}");
+    }
+    sqlx::raw_sql("DROP TABLE events; CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL)")
+        .execute(&mut *conn)
         .await
         .unwrap();
-    crate::row::assert_parity::<Event>(&pool).await;
+    let why = crate::row::parity(&mut conn, &[&table])
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        why.contains("the field `what` is no column of the table"),
+        "{why}"
+    );
 }
 
 /// Rows by key are the active ones: on a replica, less the retired.
@@ -1724,8 +1752,8 @@ async fn rows_by_key_are_the_ones_not_retired(pool: SqlitePool) {
 async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
     let w = world(pool).await;
     let mut conn = w.pool.acquire().await.unwrap();
-    check(&mut conn, codecs()).await.expect("as installed");
-    let script = triggers(codecs());
+    check(&mut conn, &codecs()).await.expect("as installed");
+    let script = triggers(&codecs());
     assert!(script.contains("sync_note_readings_update"));
 
     let cases = [
@@ -1738,7 +1766,7 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
     ];
     for case in cases {
         sqlx::raw_sql(case).execute(&mut *conn).await.unwrap();
-        let refused = check(&mut conn, codecs()).await;
+        let refused = check(&mut conn, &codecs()).await;
         assert!(refused.is_err(), "{case}");
         if case.contains("by_hand") {
             sqlx::raw_sql("DROP TRIGGER by_hand")
@@ -1746,14 +1774,14 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
                 .await
                 .unwrap();
         }
-        install(&mut conn, codecs()).await.expect("put right");
+        install(&mut conn, &codecs()).await.expect("put right");
     }
     sqlx::raw_sql("PRAGMA synchronous = OFF")
         .execute(&mut *conn)
         .await
         .unwrap();
     assert!(
-        check(&mut conn, codecs()).await.is_err(),
+        check(&mut conn, &codecs()).await.is_err(),
         "commits not durable"
     );
 }
@@ -1768,7 +1796,7 @@ async fn an_install_that_fails_leaves_nothing_half_done(pool: SqlitePool) {
         .execute(&mut *conn)
         .await
         .unwrap();
-    assert!(install(&mut conn, codecs()).await.is_err());
+    assert!(install(&mut conn, &codecs()).await.is_err());
     let left: i64 =
         sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name LIKE 'sync%'")
             .fetch_one(&mut *conn)
@@ -1789,23 +1817,12 @@ fn lanes_that_would_strand_a_write_are_refused() {
         &[lane("a", &["events"])],
     ];
     for lanes in refused {
-        assert!(
-            check_settings(codecs(), lanes, &Outbox::default()).is_err(),
-            "{lanes:?}"
-        );
+        assert!(check_settings(&codecs(), lanes).is_err(), "{lanes:?}");
     }
     let fine = [lane("main", &[]), lane("fast", &["readings"])];
-    check_settings(codecs(), &fine, &Outbox::default()).unwrap();
+    check_settings(&codecs(), &fine).unwrap();
     let every_table_named = [lane("a", &["tasks", "readings"]), lane("b", &["events"])];
-    check_settings(codecs(), &every_table_named, &Outbox::default()).unwrap();
-    let tiny = Outbox {
-        limits: Limits {
-            rows: 10,
-            bytes: 10,
-        },
-        ..Outbox::default()
-    };
-    assert!(check_settings(codecs(), &fine, &tiny).is_err());
+    check_settings(&codecs(), &every_table_named).unwrap();
 }
 
 /// A table that travels as JSON keeps a 64-bit integer exact for a replica
@@ -1846,15 +1863,15 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
         Settings::default(),
     ));
     let mut conn = w.pool.acquire().await.unwrap();
-    spawnable(receive(&mut conn, codecs(), &[]));
+    spawnable(receive(&mut conn, &codecs(), &[]));
     let settings = Outbox::default();
     spawnable(outbox(
         &mut conn,
-        codecs(),
+        &codecs(),
         &Settings::default().lanes,
         0,
         &settings,
         true,
     ));
-    spawnable(install(&mut conn, codecs()));
+    spawnable(install(&mut conn, &codecs()));
 }
