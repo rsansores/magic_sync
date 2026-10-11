@@ -24,7 +24,9 @@ The words **must**, **must not** and **should** mean what they mean in RFCs.
   on which one, but it requires what section 2 lists.
 
 A replica never decides what it should hold. It applies what it is sent,
-reports what it could not apply, and reports what it holds.
+reports what it could not apply, and reports what it holds. It follows one
+server installation: two that send it messages each take the other's for a
+new epoch, and provision it again and again.
 
 ---
 

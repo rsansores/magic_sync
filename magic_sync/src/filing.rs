@@ -268,6 +268,12 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
     )
     .fetch_one(&mut *conn)
     .await?;
+    // A sender the relay never saw has a row all the same, so two filings
+    // of it lock one row, and run one after the other.
+    sqlx::query("INSERT INTO sync.replicas (replica_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(sender)
+        .execute(&mut *conn)
+        .await?;
     let recorded: Recorded = sqlx::query_as(
         "SELECT c.last_sequence AS last, c.snapshot_sequence AS snapshot, \
                 c.snapshot_end, r.drifted_at \
