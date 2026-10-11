@@ -1011,6 +1011,155 @@ async fn what_a_trigger_refuses_is_the_only_thing_rejected(pool: SqlitePool) {
     );
 }
 
+/// A row whose refusal rolls back the whole transaction — a trigger's
+/// `RAISE(ROLLBACK)` — never fails the message for ever: the message is
+/// applied again, row by row, without it, and it is rejected; so is a
+/// delete, or a sweep, refused so.
+#[sqlx::test(migrations = false)]
+async fn a_row_that_rolls_back_the_whole_message_is_rejected_and_the_rest_taken(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [good, poison, kept, gone, swept, stays] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "items",
+            vec![item(kept, "kept"), item(gone, "gone"), item(swept, "swept")],
+        )],
+    ))
+    .await;
+    w.exec(
+        "CREATE TRIGGER a_bug BEFORE INSERT ON items WHEN NEW.name = 'poison' \
+         BEGIN SELECT RAISE(ROLLBACK, 'this build cannot take it'); END; \
+         CREATE TRIGGER another BEFORE DELETE ON items WHEN OLD.name IN ('kept', 'swept') \
+         BEGIN SELECT RAISE(ROLLBACK, 'this build cannot let it go'); END;",
+    )
+    .await
+    .unwrap();
+    let received = w
+        .receive(&down(
+            2,
+            "",
+            vec![
+                upserts("items", vec![item(good, "good"), item(poison, "poison")]),
+                deletes(
+                    "items",
+                    vec![key(&[&kept.to_string()]), key(&[&gone.to_string()])],
+                ),
+            ],
+        ))
+        .await;
+    let Received::Applied(applied) = received else {
+        panic!("{received:?}");
+    };
+    assert_eq!(applied[0].keys, [vec![crate::row::KeyPart::Uuid(good)]]);
+    assert_eq!(w.items().await, ["good", "kept", "swept"]);
+    let mut rejected = vec![format!("items {kept}"), format!("items {poison}")];
+    rejected.sort();
+    assert_eq!(w.rejected().await, rejected);
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(
+        3,
+        &s,
+        vec![upserts("items", vec![item(stays, "stays")])],
+    ))
+    .await;
+    assert!(matches!(
+        w.receive(&end(4, &s, &["items"])).await,
+        Received::SnapshotEnded
+    ));
+    assert_eq!(w.items().await, ["kept", "stays", "swept"]);
+    let mut rejected = vec![format!("items {kept}"), format!("items {swept}")];
+    rejected.sort();
+    assert_eq!(w.rejected().await, rejected, "the sweep's, since it began");
+    let reasons = w.texts("SELECT reason FROM sync_rejections").await;
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r.ends_with("this build cannot let it go")),
+        "{reasons:?}"
+    );
+    assert_eq!(
+        w.count("SELECT sequence FROM sync_applied").await,
+        i64::try_from(BASE + 4).unwrap()
+    );
+}
+
+/// A failure of the replica's own storage — the disk full in the middle of
+/// a message — fails the message, whole: nothing of it applied, nothing
+/// rejected, and it is taken when it comes again.
+#[sqlx::test(migrations = false)]
+async fn a_disk_full_while_applying_leaves_the_message_to_come_again(pool: SqlitePool) {
+    let w = world(pool).await;
+    let pages: i64 = w.count("PRAGMA page_count").await;
+    let options = (*w.pool.connect_options())
+        .clone()
+        .pragma("max_page_count", (pages + 2).to_string());
+    let full = SqlitePool::connect_with(options).await.unwrap();
+    let cramped = Replica::new(full, codecs(), w.me, w.uplink.clone(), Settings::default())
+        .await
+        .unwrap();
+    let rows: Vec<(WireKey, Vec<u8>)> = (0..2000)
+        .map(|n| item(Uuid::now_v7(), &format!("{n:0>200}")))
+        .collect();
+    let message = down(1, "", vec![upserts("items", rows)]);
+    match cramped.receive(&message).await {
+        Err(e) => assert!(e.is_transient(), "{e}"),
+        Ok(received) => panic!("applied on a full disk: {received:?}"),
+    }
+    assert_eq!(w.count("SELECT count(*) FROM items").await, 0);
+    assert!(w.rejected().await.is_empty());
+    assert_eq!(
+        w.count("SELECT sequence FROM sync_applied").await,
+        i64::try_from(BASE).unwrap()
+    );
+    w.receive(&message).await;
+    assert_eq!(w.count("SELECT count(*) FROM items").await, 2000);
+}
+
+/// A message larger than one statement binds is written in as many as it
+/// takes, never as rows a statement refused: rows, and deletes, past
+/// SQLite's limit of variables.
+#[sqlx::test(migrations = false)]
+async fn a_message_past_a_statements_variables_is_taken_whole(pool: SqlitePool) {
+    let w = world(pool).await;
+    let ids: Vec<Uuid> = (0..crate::dialect::MAX_BINDS + 10)
+        .map(|_| Uuid::now_v7())
+        .collect();
+    let rows = ids.iter().map(|id| item(*id, "n")).collect();
+    w.receive(&down(1, "", vec![upserts("items", rows)])).await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM items").await,
+        i64::try_from(ids.len()).unwrap()
+    );
+    // Keyed by two columns: half as many keys a statement.
+    let aisle = Uuid::now_v7();
+    let shelves: Vec<(WireKey, Vec<u8>)> = (0..crate::dialect::MAX_BINDS / 2 + 10)
+        .map(|slot| {
+            let shelf = Shelf {
+                aisle,
+                slot: i64::try_from(slot).unwrap(),
+                label: String::new(),
+                revision: 1,
+            };
+            (key(&[&aisle.to_string(), &slot.to_string()]), json(&shelf))
+        })
+        .collect();
+    let slots: Vec<WireKey> = shelves.iter().map(|(k, _)| k.clone()).collect();
+    w.receive(&down(2, "", vec![upserts("shelves", shelves)]))
+        .await;
+    let gone = ids.iter().map(|id| key(&[&id.to_string()])).collect();
+    w.receive(&down(
+        3,
+        "",
+        vec![deletes("items", gone), deletes("shelves", slots)],
+    ))
+    .await;
+    assert_eq!(w.count("SELECT count(*) FROM items").await, 0);
+    assert_eq!(w.count("SELECT count(*) FROM shelves").await, 0);
+    assert!(w.rejected().await.is_empty());
+}
+
 /// A row a row of the replica's own points at is retired where the table
 /// can retire it, and otherwise rejected — whether the key pointing at it is
 /// checked at once or at commit, the message commits.
@@ -2550,7 +2699,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
         Settings::default(),
     ));
     let mut conn = w.pool.acquire().await.unwrap();
-    spawnable(receive(&mut conn, &codecs(), &[]));
+    spawnable(receive(&mut conn, &codecs(), &[], &Care::default()));
     let settings = Outbox::default();
     spawnable(outbox(
         &mut conn,

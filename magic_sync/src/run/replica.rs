@@ -5,7 +5,7 @@
 //! own, and hands every message the server sends to [`Replica::receive`],
 //! acknowledging it to the transport only once that returned `Ok`.
 
-use crate::replica::{self, Lane, Outbox, Received};
+use crate::replica::{self, Care, Lane, Outbox, Received, Stop};
 use crate::run::Backoff;
 use crate::wire::Codec;
 use crate::{Conn, Error};
@@ -194,10 +194,28 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// ([`Error::Database`]), or it speaks a later protocol than this build
     /// ([`Error::Protocol`]). Nothing of it was applied.
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        replica::settled(&mut tx).await?;
-        let received = replica::receive(&mut tx, &self.codecs, bytes).await?;
-        tx.commit().await?;
+        let mut care = Care::default();
+        let received = loop {
+            let mut conn = self.pool.acquire().await?;
+            let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+            replica::settled(&mut tx).await?;
+            let stop = match replica::receive(&mut tx, &self.codecs, bytes, &care).await {
+                Ok(received) => {
+                    tx.commit().await?;
+                    break received;
+                }
+                Err(stop) => stop,
+            };
+            // The database may have rolled the transaction back under it: a
+            // connection that no longer knows whether it is in one goes.
+            drop(tx);
+            conn.close_on_drop();
+            match stop {
+                Stop::Culprit(culprit) => care.refuse(culprit)?,
+                Stop::Failed(e) if e.is_refusal() && care.heed() => {}
+                Stop::Failed(e) => return Err(e),
+            }
+        };
         if matches!(
             received,
             Received::Applied(_) | Received::SnapshotEnded | Received::Gap

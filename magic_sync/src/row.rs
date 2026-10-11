@@ -705,12 +705,11 @@ pub(crate) async fn savepoint(exec: &mut Conn) -> Result<(), Error> {
 }
 
 /// Closes the savepoint [`savepoint`] opened around the work that answered
-/// `result`: a refusal — any error but a transient one, which retrying would
-/// meet again — comes back as the inner error, rolled back with the
-/// transaction still usable; a transient failure is the outer one. When the
-/// database already rolled the whole transaction back (a trigger's
-/// `RAISE(ROLLBACK)`, a full disk), the refusal is the outer error too: there
-/// is nothing left to go on with.
+/// `result`: a refusal of the rows ([`Error::is_refusal`]) comes back as the
+/// inner error, rolled back with the transaction still usable; any other
+/// failure is the outer one. When the database already rolled the whole
+/// transaction back (a trigger's `RAISE(ROLLBACK)`), the refusal is the
+/// outer error too: there is nothing left to go on with.
 pub(crate) async fn released<T>(
     exec: &mut Conn,
     result: Result<T, Error>,
@@ -722,7 +721,7 @@ pub(crate) async fn released<T>(
                 .await?;
             return Ok(Ok(value));
         }
-        Err(e) if e.is_transient() => return Err(e),
+        Err(e) if !e.is_refusal() => return Err(e),
         Err(e) => e,
     };
     let rolled_back = sqlx::query("ROLLBACK TO SAVEPOINT sync_rows")

@@ -477,22 +477,25 @@ pub enum Received {
 /// failed, or the message speaks a later protocol than this build
 /// ([`Error::Protocol`]) and waits for it to be updated. Nothing a message
 /// carries is an error: a row it cannot take is rejected, a message it
-/// cannot read is [`Received::Malformed`].
+/// cannot read is [`Received::Malformed`] — and a row whose refusal rolled
+/// the whole transaction back stops it with its [`Culprit`], for the caller
+/// to apply the message again, `care`fully, with that row refused.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn receive<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     bytes: &[u8],
-) -> Result<Received, Error> {
+    care: &Care,
+) -> Result<Received, Stop> {
     let message = match ToReplica::decode(bytes) {
         Ok(message) => message,
         Err(e) => return Ok(malformed(format!("bytes that are no message: {e}"))),
     };
     if message.protocol > envelope::PROTOCOL {
-        return Err(Error::Protocol {
+        return Err(Stop::Failed(Error::Protocol {
             theirs: message.protocol,
             ours: envelope::PROTOCOL,
-        });
+        }));
     }
     if message.protocol == 0 {
         return Ok(malformed("a message that names no protocol".to_owned()));
@@ -505,13 +508,150 @@ pub(crate) async fn receive<P: Sync + 'static>(
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
-    let received = act(conn, codecs, body).await;
+    let received = act(conn, codecs, body, care).await;
     let quiet = sqlx::query("DELETE FROM sync_applying")
         .execute(&mut *conn)
         .await;
     let received = received?;
     quiet?;
     Ok(received)
+}
+
+/// Why applying a message stopped short: the replica failed, or a row's
+/// refusal took the whole transaction with it.
+#[cfg(feature = "sqlite")]
+#[derive(Debug)]
+pub(crate) enum Stop {
+    Failed(Error),
+    Culprit(Culprit),
+}
+
+#[cfg(feature = "sqlite")]
+impl From<Error> for Stop {
+    fn from(e: Error) -> Self {
+        Stop::Failed(e)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl From<sqlx::Error> for Stop {
+    fn from(e: sqlx::Error) -> Self {
+        Stop::Failed(e.into())
+    }
+}
+
+/// A row whose refusal rolled back the whole transaction it was applied in
+/// — a trigger's `RAISE(ROLLBACK)`, a constraint declared `ON CONFLICT
+/// ROLLBACK` — so that the message can be applied again without it.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Culprit {
+    table: String,
+    row: Spot,
+    why: String,
+}
+
+/// Where a row is in a message: the upsert at `at` of its `entry`th table,
+/// or a key it lets go of (a delete, a sweep, a let-go once filed).
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Spot {
+    Upsert { entry: usize, at: usize },
+    LetGo(String),
+}
+
+/// How a message is applied: all at once, or — once a refusal rolled a
+/// whole transaction back — `careful`ly, row by row, each in a savepoint of
+/// its own, and the rows that did so refused before they are tried.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Default)]
+pub(crate) struct Care {
+    careful: bool,
+    culprits: Vec<Culprit>,
+}
+
+#[cfg(feature = "sqlite")]
+impl Care {
+    /// After a refusal took the whole transaction with it: row by row from
+    /// now on. Answers whether that is news — a careful run that fails so
+    /// fails for another reason.
+    pub(crate) fn heed(&mut self) -> bool {
+        !std::mem::replace(&mut self.careful, true)
+    }
+
+    /// Refuses `culprit` before it is tried, next time — refused already, it
+    /// is not what failed, and the message stops with an error.
+    pub(crate) fn refuse(&mut self, culprit: Culprit) -> Result<(), Error> {
+        if self.culprits.contains(&culprit) {
+            return Err(Error::Misuse(format!(
+                "a row refused before it was tried rolled the message back again: {culprit:?}"
+            )));
+        }
+        tracing::error!(
+            table = culprit.table,
+            "sync: a row whose refusal rolled back the whole message — applied again without it: {}",
+            culprit.why
+        );
+        self.culprits.push(culprit);
+        Ok(())
+    }
+
+    fn culprit(&self, table: &str, row: &Spot) -> Option<&Culprit> {
+        self.culprits
+            .iter()
+            .find(|c| c.table == table && c.row == *row)
+    }
+}
+
+/// The savepoint one row's work runs in, careful.
+#[cfg(feature = "sqlite")]
+const ROW: &str = "sync_row";
+
+/// Closes the savepoint one row's careful work ran in, as `result` went: a
+/// refusal comes back as the inner error, the transaction going on without
+/// the row; a refusal that took the whole transaction with it stops the
+/// message, naming the row (`table`, `row`).
+#[cfg(feature = "sqlite")]
+async fn row_done<T>(
+    conn: &mut Conn,
+    result: Result<T, Stop>,
+    table: &str,
+    row: Spot,
+) -> Result<Result<T, Error>, Stop> {
+    let refusal = match result {
+        Ok(value) => {
+            sqlx::query(&format!("RELEASE SAVEPOINT {ROW}"))
+                .execute(&mut *conn)
+                .await?;
+            return Ok(Ok(value));
+        }
+        Err(Stop::Failed(e)) if e.is_refusal() => e,
+        Err(stop) => return Err(stop),
+    };
+    if sqlx::query(&format!("ROLLBACK TO SAVEPOINT {ROW}"))
+        .execute(&mut *conn)
+        .await
+        .is_err()
+    {
+        return Err(Stop::Culprit(Culprit {
+            table: table.to_owned(),
+            row,
+            why: refusal.to_string(),
+        }));
+    }
+    sqlx::query(&format!("RELEASE SAVEPOINT {ROW}"))
+        .execute(&mut *conn)
+        .await?;
+    Ok(Err(refusal))
+}
+
+/// Opens the savepoint [`row_done`] closes.
+#[cfg(feature = "sqlite")]
+async fn row_begun(conn: &mut Conn) -> Result<(), Error> {
+    sqlx::query(&format!("SAVEPOINT {ROW}"))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 #[cfg(feature = "sqlite")]
@@ -525,10 +665,11 @@ async fn act<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     body: Body,
-) -> Result<Received, Error> {
+    care: &Care,
+) -> Result<Received, Stop> {
     match body {
         Body::Filed(message) => {
-            filed(conn, codecs, &message).await?;
+            filed(conn, codecs, &message, care).await?;
             Ok(Received::Filed)
         }
         Body::Down(down) => {
@@ -541,7 +682,7 @@ async fn act<P: Sync + 'static>(
             };
             match chained(conn, place).await? {
                 Ok(sequence) => Ok(Received::Applied(
-                    apply(conn, codecs, &down, sequence).await?,
+                    apply(conn, codecs, &down, sequence, care).await?,
                 )),
                 Err(skipped) => Ok(skipped),
             }
@@ -556,7 +697,7 @@ async fn act<P: Sync + 'static>(
             };
             match chained(conn, place).await? {
                 Ok(sequence) => {
-                    end_snapshot(conn, codecs, &end, sequence).await?;
+                    end_snapshot(conn, codecs, &end, sequence, care).await?;
                     Ok(Received::SnapshotEnded)
                 }
                 Err(skipped) => Ok(skipped),
@@ -724,10 +865,11 @@ async fn apply<P: Sync + 'static>(
     codecs: &[Codec<P>],
     message: &Down,
     sequence: i64,
-) -> Result<Vec<Applied>, Error> {
+    care: &Care,
+) -> Result<Vec<Applied>, Stop> {
     let naming = !message.snapshot_id.is_empty();
     let mut taken = Vec::new();
-    for table in &message.tables {
+    for (entry, table) in message.tables.iter().enumerate() {
         if table.keys.len() != table.upserts.len() {
             tracing::error!(
                 table = table.table,
@@ -746,67 +888,162 @@ async fn apply<P: Sync + 'static>(
             reject(conn, &table.table, &keys, why, sequence).await?;
             continue;
         };
-        let applied = codec.apply_down(conn, table.upserts.clone()).await?;
-        let mut refused = Vec::new();
-        for row in &applied.rejected {
-            let key = match &row.key {
-                Some(key) => Some(key_text(key)),
-                None => wire_key(codec, table.keys.get(row.at)),
-            };
-            reject(
-                conn,
-                &table.table,
-                &Vec::from_iter(key.clone()),
-                &row.reason,
-                sequence,
-            )
-            .await?;
-            refused.extend(key);
-        }
-        let held: Vec<String> = applied.held.iter().map(key_text).collect();
-        cleared(conn, &table.table, &held).await?;
-        sqlx::query(
-            "DELETE FROM sync_leaving WHERE relation = $1 \
-               AND row_key IN (SELECT value FROM json_each($2))",
-        )
-        .bind(&table.table)
-        .bind(json(&held))
-        .execute(&mut *conn)
-        .await?;
-        if naming {
-            // Every row it carried, taken or refused: a refused one keeps
-            // what the replica had of it, and its rejection, and is not swept.
-            let named: Vec<&String> = held.iter().chain(refused.iter()).collect();
-            sqlx::query(
-                "INSERT OR IGNORE INTO sync_snapshot_keys (table_name, row_key) \
-                 SELECT $1, value FROM json_each($2)",
-            )
-            .bind(&table.table)
-            .bind(json(&named))
-            .execute(&mut *conn)
-            .await?;
+        let mut held = Vec::new();
+        if care.careful {
+            for at in 0..table.upserts.len() {
+                let row = Spot::Upsert { entry, at };
+                if let Some(culprit) = care.culprit(&table.table, &row) {
+                    let why = culprit.why.clone();
+                    refuse(conn, codec, table, at, &why, naming, sequence).await?;
+                    continue;
+                }
+                row_begun(conn).await?;
+                let took = take(conn, codec, table, &[at], naming, sequence).await;
+                match row_done(conn, took, &table.table, row).await? {
+                    Ok(keys) => held.extend(keys),
+                    Err(e) => {
+                        refuse(conn, codec, table, at, &e.to_string(), naming, sequence).await?;
+                    }
+                }
+            }
+        } else {
+            let every: Vec<usize> = (0..table.upserts.len()).collect();
+            held = take(conn, codec, table, &every, naming, sequence).await?;
         }
         let deletes = keys_of(codec, &table.deletes);
-        let_go(conn, codec, &deletes, sequence).await?;
+        let_go(conn, codec, &deletes, Some(sequence), care).await?;
         taken.push(Applied {
             table: table.table.clone(),
-            keys: applied.held,
+            keys: held,
         });
     }
     Ok(taken)
 }
 
-/// Lets go of the rows of `keys`: the ones the database refuses to let go
-/// are rejected, the rest are no longer ones to report. A row of a table
-/// written on both sides whose edits have not reached the server is held
-/// retired until they have ([`filed`]), so the edits are not lost.
+/// The rows of `table` at `positions`, taken: the ones the replica cannot
+/// take are rejected, the rest are no longer ones to report, nor to let go
+/// once filed; while a snapshot is `naming` them, it names each, taken or
+/// refused. Answers the keys the replica now holds.
+#[cfg(feature = "sqlite")]
+async fn take<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+    table: &Table,
+    positions: &[usize],
+    naming: bool,
+    sequence: i64,
+) -> Result<Vec<Key>, Stop> {
+    let rows = positions.iter().map(|at| table.upserts[*at].clone());
+    let applied = codec.apply_down(conn, rows.collect()).await?;
+    let mut refused = Vec::new();
+    for row in &applied.rejected {
+        let key = match &row.key {
+            Some(key) => Some(key_text(key)),
+            None => wire_key(codec, table.keys.get(positions[row.at])),
+        };
+        reject(
+            conn,
+            &table.table,
+            &Vec::from_iter(key.clone()),
+            &row.reason,
+            sequence,
+        )
+        .await?;
+        refused.extend(key);
+    }
+    let held: Vec<String> = applied.held.iter().map(key_text).collect();
+    cleared(conn, &table.table, &held).await?;
+    sqlx::query(
+        "DELETE FROM sync_leaving WHERE relation = $1 \
+           AND row_key IN (SELECT value FROM json_each($2))",
+    )
+    .bind(&table.table)
+    .bind(json(&held))
+    .execute(&mut *conn)
+    .await?;
+    if naming {
+        named(conn, &table.table, &[held, refused].concat()).await?;
+    }
+    Ok(applied.held)
+}
+
+/// The row of `table` at `at`, refused (`why`) before or as it was tried
+/// alone: rejected, and named by the snapshot in progress.
+#[cfg(feature = "sqlite")]
+async fn refuse<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+    table: &Table,
+    at: usize,
+    why: &str,
+    naming: bool,
+    sequence: i64,
+) -> Result<(), Error> {
+    let key = Vec::from_iter(wire_key(codec, table.keys.get(at)));
+    reject(conn, &table.table, &key, why, sequence).await?;
+    if naming {
+        named(conn, &table.table, &key).await?;
+    }
+    Ok(())
+}
+
+/// Rows of `table` the snapshot in progress names: a refused one keeps what
+/// the replica had of it, and its rejection, and is not swept.
+#[cfg(feature = "sqlite")]
+async fn named(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Error> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO sync_snapshot_keys (table_name, row_key) \
+         SELECT $1, value FROM json_each($2)",
+    )
+    .bind(table)
+    .bind(json(keys))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Lets go of the rows of `keys` ([`let_go_together`]) — carefully, one by
+/// one, once a refusal rolled a whole transaction back: one the database
+/// refuses to let go of alone is refused, and one whose refusal did so is
+/// refused before it is tried.
 #[cfg(feature = "sqlite")]
 async fn let_go<P: Sync + 'static>(
     conn: &mut Conn,
     codec: &Codec<P>,
     keys: &[Key],
-    sequence: i64,
-) -> Result<(), Error> {
+    sequence: Option<i64>,
+    care: &Care,
+) -> Result<(), Stop> {
+    if !care.careful {
+        return let_go_together(conn, codec, keys, sequence).await;
+    }
+    let table = codec.table.name;
+    for key in keys {
+        let row = Spot::LetGo(key_text(key));
+        if let Some(culprit) = care.culprit(table, &row) {
+            kept(conn, table, key, &culprit.why, sequence).await?;
+            continue;
+        }
+        row_begun(conn).await?;
+        let gone = let_go_together(conn, codec, std::slice::from_ref(key), sequence).await;
+        if let Err(e) = row_done(conn, gone, table, row).await? {
+            kept(conn, table, key, &e.to_string(), sequence).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Lets go of the rows of `keys`: the ones the database refuses to let go
+/// are [`kept`], the rest are no longer ones to report. A row of a table
+/// written on both sides whose edits have not reached the server is held
+/// retired until they have ([`filed`]), so the edits are not lost.
+#[cfg(feature = "sqlite")]
+async fn let_go_together<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+    keys: &[Key],
+    sequence: Option<i64>,
+) -> Result<(), Stop> {
     let noted: HashSet<String> = if matches!(codec.table.mirror, crate::row::Mirror::Both) {
         sqlx::query_scalar(
             "SELECT row_key FROM sync_notes WHERE relation = $1 \
@@ -840,7 +1077,7 @@ async fn let_go<P: Sync + 'static>(
     .execute(&mut *conn)
     .await?;
     for (key, why) in &retired.refused {
-        reject(conn, codec.table.name, &[key_text(key)], why, sequence).await?;
+        kept(conn, codec.table.name, key, why, sequence).await?;
     }
     let gone: Vec<String> = keys
         .iter()
@@ -863,6 +1100,28 @@ async fn let_go<P: Sync + 'static>(
         "sync: rows let go of"
     );
     Ok(())
+}
+
+/// A row the replica could not let go of: rejected, when the message
+/// numbered `sequence` let go of it; logged, when the replica let go of it
+/// once the server filed its edits.
+#[cfg(feature = "sqlite")]
+async fn kept(
+    conn: &mut Conn,
+    table: &str,
+    key: &Key,
+    why: &str,
+    sequence: Option<i64>,
+) -> Result<(), Error> {
+    let Some(sequence) = sequence else {
+        tracing::error!(
+            table,
+            key = key_text(key),
+            "sync: a row let go of, whose edits are filed, the database keeps: {why}"
+        );
+        return Ok(());
+    };
+    reject(conn, table, &[key_text(key)], why, sequence).await
 }
 
 /// Notes rows the replica could not take, or let go of, for the server to
@@ -922,7 +1181,8 @@ async fn end_snapshot<P: Sync + 'static>(
     codecs: &[Codec<P>],
     message: &EndSnapshot,
     sequence: i64,
-) -> Result<(), Error> {
+    care: &Care,
+) -> Result<(), Stop> {
     let began: i64 = sqlx::query_scalar("SELECT snapshot_began FROM sync_applied WHERE id = 1")
         .fetch_one(&mut *conn)
         .await?;
@@ -955,7 +1215,7 @@ async fn end_snapshot<P: Sync + 'static>(
             .into_iter()
             .filter(|key| !named.contains(&key_text(key)))
             .collect();
-        let_go(conn, codec, &stale, sequence).await?;
+        let_go(conn, codec, &stale, Some(sequence), care).await?;
     }
     sqlx::query("DELETE FROM sync_snapshot_keys")
         .execute(&mut *conn)
@@ -977,7 +1237,8 @@ async fn filed<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     message: &envelope::Filed,
-) -> Result<(), Error> {
+    care: &Care,
+) -> Result<(), Stop> {
     let uploads: Vec<i64> = message
         .uploads
         .iter()
@@ -1005,17 +1266,7 @@ async fn filed<P: Sync + 'static>(
                 codec.key(&parts).ok()
             })
             .collect();
-        if keys.is_empty() {
-            continue;
-        }
-        let retired = codec.retire(conn, &keys, &[]).await?;
-        for (key, why) in retired.refused {
-            tracing::error!(
-                table = codec.table.name,
-                key = key_text(&key),
-                "sync: a row let go of, whose edits are filed, the database keeps — retired: {why}"
-            );
-        }
+        let_go(conn, codec, &keys, None, care).await?;
     }
     Ok(())
 }

@@ -71,6 +71,37 @@ impl Error {
     }
 }
 
+impl Error {
+    /// Whether the database refused what a statement wrote, rather than
+    /// failed: the same rows are refused the same way, others may pass, and
+    /// the engine leaves the refused ones out rather than stopping on them.
+    /// On the server, anything but a transient failure.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn is_refusal(&self) -> bool {
+        !self.is_transient()
+    }
+
+    /// Whether the database refused what a statement wrote, rather than
+    /// failed: the same rows are refused the same way, others may pass, and
+    /// the engine leaves the refused ones out rather than stopping on them.
+    /// On a replica, a constraint (a trigger's `RAISE` included), a value of
+    /// the wrong type, or one too large — the rows' — and nothing else: a
+    /// statement the engine got wrong (too many variables, say) is not the
+    /// rows' to answer for.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn is_refusal(&self) -> bool {
+        const TOOBIG: i32 = 18;
+        const CONSTRAINT: i32 = 19;
+        const MISMATCH: i32 = 20;
+        let Error::Database(sqlx::Error::Database(db)) = self else {
+            return false;
+        };
+        db.code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, TOOBIG | CONSTRAINT | MISMATCH))
+    }
+}
+
 fn is_transient_sqlx(e: &sqlx::Error) -> bool {
     match e {
         sqlx::Error::Io(_)
@@ -115,10 +146,12 @@ fn is_transient_code(code: &str) -> bool {
 }
 
 /// SQLite: the database busy or locked by another connection, out of
-/// memory, interrupted, an I/O error, a full disk, a file it cannot open, or
-/// read-only for a while — recovering, or locked by another process — each
-/// the machine's, not the rows'. A database read-only for good (a file, a
-/// directory, a database moved) is not: retrying meets it again. The
+/// memory, interrupted, an I/O error, a full disk, a file it cannot open, a
+/// file damaged or no database at all, or read-only for a while —
+/// recovering, or locked by another process — each the machine's, not the
+/// rows': a message must not be taken for applied, nor its rows refused,
+/// while the machine is what fails. A database read-only for good (a file,
+/// a directory, a database moved) is not: retrying meets it again. The
 /// primary result code is the extended one's low byte.
 #[cfg(feature = "sqlite")]
 fn is_transient_code(code: &str) -> bool {
@@ -128,15 +161,17 @@ fn is_transient_code(code: &str) -> bool {
     const READONLY: i32 = 8;
     const INTERRUPT: i32 = 9;
     const IOERR: i32 = 10;
+    const CORRUPT: i32 = 11;
     const FULL: i32 = 13;
     const CANTOPEN: i32 = 14;
+    const NOTADB: i32 = 26;
     const READONLY_RECOVERY: i32 = READONLY | (1 << 8);
     const READONLY_CANTLOCK: i32 = READONLY | (2 << 8);
     const READONLY_ROLLBACK: i32 = READONLY | (3 << 8);
     code.parse::<i32>().is_ok_and(|c| {
         matches!(
             c & 0xff,
-            BUSY | LOCKED | NOMEM | INTERRUPT | IOERR | FULL | CANTOPEN
+            BUSY | LOCKED | NOMEM | INTERRUPT | IOERR | CORRUPT | FULL | CANTOPEN | NOTADB
         ) || matches!(c, READONLY_RECOVERY | READONLY_CANTLOCK | READONLY_ROLLBACK)
     })
 }
@@ -177,6 +212,11 @@ mod tests {
             assert!(is_transient_code("520"));
             assert!(!is_transient_code("8"));
             assert!(!is_transient_code("1032"));
+            // A damaged file, or none, is the machine's: no row is refused
+            // for it, no message dropped.
+            assert!(is_transient_code("11"));
+            assert!(is_transient_code("267"));
+            assert!(is_transient_code("26"));
         }
         assert!(!Error::Transport {
             reason: "message too large".into(),
