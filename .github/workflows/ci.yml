@@ -56,6 +56,26 @@ jobs:
       - run: cargo test --locked -p magic_sync --features postgres
       - run: cargo test --locked -p magic_sync --features sqlite
 
+  # What a host can name, on each side, is what magic_sync/public-api/ lists:
+  # a change to it is made there too, on purpose, and reviewed as one. The
+  # listing is read off rustdoc's JSON, so the nightly is pinned.
+  public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-10
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api@0.52.0
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          for side in postgres sqlite; do
+            cargo +nightly-2026-10-10 public-api -p magic_sync --features "$side" -s > "$RUNNER_TEMP/$side.txt"
+            diff -u "magic_sync/public-api/$side.txt" "$RUNNER_TEMP/$side.txt"
+          done
+
   msrv:
     runs-on: ubuntu-latest
     steps:
