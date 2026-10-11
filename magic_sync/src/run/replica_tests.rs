@@ -49,7 +49,7 @@ fn rows(sequence: u64, previous: u64, name: &str) -> Vec<u8> {
         }],
         sequence,
         previous,
-        snapshot_id: "s".to_owned(),
+        snapshot_id: Uuid::from_u128(5).to_string(),
         epoch: Uuid::nil().to_string(),
         nonce: crate::conformance::nonce_of(sequence),
         previous_nonce: if previous == 0 {

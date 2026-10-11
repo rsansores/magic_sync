@@ -686,7 +686,7 @@ async fn act<P: Sync + 'static>(
             if let Some(table) = down.tables.iter().find(|t| t.keys.len() != t.upserts.len()) {
                 return Ok(malformed(format!(
                     "`{}`: {} rows and {} keys beside them",
-                    table.table,
+                    capped(&table.table),
                     table.upserts.len(),
                     table.keys.len()
                 )));
@@ -775,7 +775,18 @@ async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Receiv
     let Ok(epoch) = Uuid::parse_str(place.epoch).map(|e| e.to_string()) else {
         return Ok(Err(malformed(format!(
             "epoch `{}` is not a uuid",
-            place.epoch
+            capped(place.epoch)
+        ))));
+    };
+    let snapshot = if place.snapshot.is_empty() {
+        Ok(String::new())
+    } else {
+        Uuid::parse_str(place.snapshot).map(|id| id.to_string())
+    };
+    let Ok(snapshot) = snapshot else {
+        return Ok(Err(malformed(format!(
+            "snapshot `{}` is not a uuid",
+            capped(place.snapshot)
         ))));
     };
     let Some(previous) = i64::try_from(place.previous.0)
@@ -800,7 +811,7 @@ async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Receiv
             "message {sequence} follows {previous} of nonce {previous_nonce}"
         ))));
     }
-    if previous == 0 && place.snapshot.is_empty() {
+    if previous == 0 && snapshot.is_empty() {
         return Ok(Err(malformed(
             "a message that follows nothing and begins no snapshot".to_owned(),
         )));
@@ -847,7 +858,7 @@ async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Receiv
         .bind(sequence)
         .bind(nonce)
         .bind(place.mac)
-        .bind(place.snapshot)
+        .bind(&snapshot)
         .execute(&mut *conn)
         .await?;
         return Ok(Ok(sequence));
@@ -871,11 +882,11 @@ async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Receiv
         .await?;
         return Ok(Err(Received::Gap));
     };
-    let named = (!place.snapshot.is_empty() || place.ends).then_some(place.snapshot);
+    let named = (!snapshot.is_empty() || place.ends).then_some(snapshot.as_str());
     if named != snapshot_id.as_deref() {
         return Ok(Err(malformed(format!(
             "message {sequence} of snapshot `{}`, while `{}` is in progress",
-            place.snapshot,
+            snapshot,
             snapshot_id.unwrap_or_default()
         ))));
     }
@@ -1239,10 +1250,12 @@ async fn reject(
     sequence: i64,
 ) -> Result<(), Error> {
     tracing::error!(
-        table,
-        ?keys,
+        table = capped(table),
+        rows = keys.len(),
+        first = capped(keys.first().map_or("", String::as_str)),
         sequence,
-        "sync: rows this replica cannot take or let go of — rejected, for the server to hear of: {why}"
+        "sync: rows this replica cannot take or let go of — rejected, for the server to hear of: {}",
+        capped(why)
     );
     sqlx::query(
         "INSERT INTO sync_rejections (table_name, row_key, reason, epoch, sequence) \

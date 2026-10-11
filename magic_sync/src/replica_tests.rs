@@ -178,9 +178,21 @@ fn begin(n: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
     numbered(BASE + n, 0, snapshot, tables)
 }
 
+/// The snapshot a test calls `name`, as a server would name it: a uuid, the
+/// same for the same name.
+fn snapshot_named(name: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    let spelled = name.bytes().fold(7u128, |sum, byte| {
+        sum.wrapping_mul(31).wrapping_add(u128::from(byte))
+    });
+    Uuid::from_u128(spelled).to_string()
+}
+
 fn numbered(sequence: u64, previous: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
     Body::Down(Down {
-        snapshot_id: snapshot.to_owned(),
+        snapshot_id: snapshot_named(snapshot),
         tables,
         sequence,
         epoch: EPOCH.to_owned(),
@@ -199,7 +211,7 @@ fn end(n: u64, snapshot: &str, tables: &[&str]) -> Vec<u8> {
 
 fn ending(sequence: u64, previous: u64, snapshot: &str, tables: &[&str]) -> Vec<u8> {
     Body::EndSnapshot(EndSnapshot {
-        snapshot_id: snapshot.to_owned(),
+        snapshot_id: snapshot_named(snapshot),
         tables: tables.iter().map(|t| (*t).to_owned()).collect(),
         sequence,
         epoch: EPOCH.to_owned(),
@@ -430,7 +442,7 @@ async fn every_message_of_the_malformed_corpus_is_what_its_line_says(pool: Sqlit
     use crate::conformance::{golden, EPOCH as SERVER, MALFORMED};
     let w = world(pool).await;
     let provisioned = Body::EndSnapshot(EndSnapshot {
-        snapshot_id: "provisioned".to_owned(),
+        snapshot_id: SERVER.to_owned(),
         sequence: 100,
         epoch: SERVER.to_owned(),
         nonce: nonce_of(100),
@@ -795,6 +807,44 @@ async fn a_message_numbered_as_no_server_numbers_one_is_malformed(pool: SqlitePo
     ))
     .await;
     assert_eq!(w.items().await, ["c"]);
+}
+
+/// What a message names is bounded before it is stored or logged: an epoch
+/// or a snapshot that is no uuid is malformed whatever its length, and what
+/// the replica says of it is short.
+#[sqlx::test(migrations = false)]
+async fn an_epoch_or_snapshot_no_server_would_name_is_malformed_and_short(pool: SqlitePool) {
+    let w = world(pool).await;
+    let huge = "x".repeat(1 << 20);
+    let message = |epoch: &str, snapshot: &str, previous: u64| {
+        Body::Down(Down {
+            snapshot_id: snapshot.to_owned(),
+            tables: vec![upserts("items", vec![item(Uuid::now_v7(), "a")])],
+            sequence: BASE + 1,
+            epoch: epoch.to_owned(),
+            previous,
+            nonce: nonce_of(BASE + 1),
+            previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+            mac: vec![0x5e; 16],
+        })
+        .encoded()
+    };
+    for (bytes, what) in [
+        (message(&huge, "", BASE), "epoch"),
+        (message(EPOCH, &huge, 0), "snapshot"),
+        (message(EPOCH, "snapshot", 0), "snapshot"),
+    ] {
+        let Received::Malformed(why) = w.receive(&bytes).await else {
+            panic!("{what}: taken");
+        };
+        assert!(why.len() < 600, "{what}: {} bytes", why.len());
+    }
+    assert!(w.items().await.is_empty());
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_applied WHERE snapshot_id IS NOT NULL")
+            .await,
+        0
+    );
 }
 
 /// A body this build does not know is malformed in its own protocol, and
@@ -3716,7 +3766,10 @@ async fn a_row_the_database_will_not_let_go_of_once_filed_is_rejected(pool: Sqli
     w.receive(&down(
         1,
         "",
-        vec![upserts("tasks", vec![(key(&[&id.to_string()]), json(&row))])],
+        vec![upserts(
+            "tasks",
+            vec![(key(&[&id.to_string()]), json(&row))],
+        )],
     ))
     .await;
     w.exec(
@@ -3726,8 +3779,12 @@ async fn a_row_the_database_will_not_let_go_of_once_filed_is_rejected(pool: Sqli
     .await
     .unwrap();
     let up = w.up(0, false).await.expect("the edit");
-    w.receive(&down(2, "", vec![deletes("tasks", vec![key(&[&id.to_string()])])]))
-        .await;
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes("tasks", vec![key(&[&id.to_string()])])],
+    ))
+    .await;
     assert!(w.rejected().await.is_empty(), "held retired for its edit");
     w.receive(
         &Body::Filed(Filed {

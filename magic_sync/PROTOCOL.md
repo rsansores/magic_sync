@@ -227,6 +227,9 @@ replica should hold in `Down` messages that carry a `snapshot_id`, then an
 `EndSnapshot` naming the tables the snapshot covered. A snapshot of nothing
 is its `EndSnapshot` alone.
 
+The `snapshot_id` is a UUID, as the `epoch` is; a message naming anything else
+is malformed (4.1).
+
 - A snapshot **begins with its first message**, the one whose `previous` is
   0 — the `EndSnapshot` itself, for a snapshot of nothing. It supersedes the
   snapshot in progress, if any: the replica forgets what that one named. The

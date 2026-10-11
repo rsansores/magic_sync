@@ -176,6 +176,9 @@ impl Model {
         let Ok(epoch) = uuid::Uuid::parse_str(&place.epoch).map(|e| e.to_string()) else {
             return Received::Malformed;
         };
+        if !place.snapshot_id.is_empty() && uuid::Uuid::parse_str(&place.snapshot_id).is_err() {
+            return Received::Malformed;
+        }
         let sequence = place.sequence;
         if !(1..=MOST).contains(&sequence)
             || place.previous >= sequence
@@ -540,7 +543,7 @@ mod tests {
     #[test]
     fn the_model_makes_of_every_corpus_line_what_it_says() {
         let provisioned = Body::EndSnapshot(EndSnapshot {
-            snapshot_id: "provisioned".to_owned(),
+            snapshot_id: crate::conformance::EPOCH.to_owned(),
             sequence: 100,
             epoch: EPOCH.to_owned(),
             nonce: nonce_of(100),
