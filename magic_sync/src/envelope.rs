@@ -397,6 +397,18 @@ mod tests {
     }
 
     #[test]
+    fn limits_are_what_they_were_built_with_and_carry_a_row() {
+        let limits = Limits::new(3, ENVELOPE_ROOM + 7).unwrap();
+        assert_eq!((limits.rows(), limits.bytes()), (3, ENVELOPE_ROOM + 7));
+        for (rows, bytes) in [(0, 1 << 20), (1, ENVELOPE_ROOM)] {
+            match Limits::new(rows, bytes) {
+                Err(Error::Misuse(why)) => assert!(why.contains("cannot"), "{why}"),
+                other => panic!("{rows} rows in {bytes} bytes: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn a_fingerprint_is_of_the_set_not_its_order() {
         let set = |keys: &[&str]| fingerprint(keys.iter().map(|k| (*k).to_owned()));
         assert_eq!(set(&["b", "a"]), set(&["a", "b"]));

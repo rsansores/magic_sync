@@ -344,6 +344,15 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             return Ok(Went::default());
         };
         let cap = self.caps[lane].load(Ordering::Relaxed);
+        // Read apart from the write lock: digests read every row it holds.
+        let held = if digests {
+            let mut tx = self.pool.begin().await?;
+            let held = replica::held(&mut tx, &self.codecs).await?;
+            tx.commit().await?;
+            Some(held)
+        } else {
+            None
+        };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outgoing = replica::outbox(
             &mut tx,
@@ -351,7 +360,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             &self.settings.lanes,
             lane,
             &self.settings.outbox,
-            digests,
+            held,
             (cap > 0).then_some(cap),
         )
         .await?;

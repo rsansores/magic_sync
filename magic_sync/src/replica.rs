@@ -1540,16 +1540,16 @@ impl Outgoing {
 /// message within the outbox's limits: `None` when it has nothing. Rows it
 /// wrote (as they are now), on every lane; on the first lane — the main one
 /// — also the rows it could not take, the last message it applied when the
-/// server has not heard of it, the backlog when it is due, and, when
-/// `digests` is set, what it holds. Run it in a transaction begun with
+/// server has not heard of it, the backlog when it is due, and the
+/// `digests` of what it holds, when given ([`held`]). Run it in a transaction begun with
 /// `BEGIN IMMEDIATE`, and commit before the message goes: it reads all of
 /// that as of one moment, and draws the upload's number. Hand the message
 /// to the transport, then to [`delivered`] — or, when the transport refuses
 /// it for good, ask again with a `cap` on the rows and rejections it
 /// carries, halving it until the one it refuses is alone: then to
-/// [`refused`]. The digests go only with the last message applied, which
-/// goes only once every refusal of it is told, and only when they fit;
-/// otherwise they wait.
+/// [`refused`]. The digests go only with the last message applied they were
+/// read with, which goes only once every refusal of it is told, and only
+/// when they fit; otherwise they wait.
 ///
 /// Every byte counts against the transport's limit: what the message is
 /// built with exactly, and what it takes by the end — its upload's number,
@@ -1557,8 +1557,8 @@ impl Outgoing {
 ///
 /// A row that cannot go as it is — of a table this build does not send up, a
 /// key it cannot read, a row that does not encode or is larger than a
-/// message with nothing else in it — is set aside, and counted in the backlog, until
-/// [`retry_set_aside`].
+/// message with nothing else in it — is set aside, and counted in the
+/// backlog, until [`retry_set_aside`].
 #[cfg(feature = "sqlite")]
 pub(crate) async fn outbox<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1566,7 +1566,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     lanes: &[Lane],
     lane: usize,
     settings: &Outbox,
-    digests: bool,
+    digests: Option<Held>,
     cap: Option<usize>,
 ) -> Result<Option<Outgoing>, Error> {
     let Some(this) = lanes.get(lane) else {
@@ -1635,11 +1635,11 @@ pub(crate) async fn outbox<P: Sync + 'static>(
             // server reads what it missed against it), and otherwise when
             // the server has not heard of it.
             if all_reported {
-                if digests {
-                    let held = self::digests(conn, codecs).await?;
-                    let weight: usize = held.iter().map(|d| framed(d.encoded_len())).sum();
+                let read = Some((epoch.clone(), sequence));
+                if let Some(held) = digests.filter(|held| held.applied == read) {
+                    let weight: usize = held.digests.iter().map(|d| framed(d.encoded_len())).sum();
                     if up.encoded_len() + reserved + weight <= limit {
-                        up.digests = held;
+                        up.digests = held.digests;
                     }
                 }
                 news = sequence > acknowledged;
@@ -2055,13 +2055,26 @@ pub(crate) async fn retry_set_aside(conn: &mut Conn) -> Result<u64, Error> {
 }
 
 /// What this replica holds of each table the server sends down, for the
-/// server to compare with what it records: rows it retired, or rejected,
-/// left out.
+/// server to compare with what it records — rows it retired, or rejected,
+/// left out — and the last message it applied, which they are read against.
 #[cfg(feature = "sqlite")]
-async fn digests<P: Sync + 'static>(
+#[derive(Debug)]
+pub(crate) struct Held {
+    applied: Option<(String, i64)>,
+    digests: Vec<envelope::Digest>,
+}
+
+/// What this replica [`Held`], read in one transaction of the caller's — a
+/// reading one, which writes wait for no longer than it takes (in WAL, not
+/// at all): it reads every row the server sends.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn held<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
-) -> Result<Vec<envelope::Digest>, Error> {
+) -> Result<Held, Error> {
+    let applied = sqlx::query_as("SELECT epoch, sequence FROM sync_applied WHERE id = 1")
+        .fetch_optional(&mut *conn)
+        .await?;
     let mut digests = Vec::new();
     for codec in codecs.iter().filter(|c| c.sent_down()) {
         let rejected: HashSet<String> =
@@ -2084,7 +2097,7 @@ async fn digests<P: Sync + 'static>(
             fingerprint: envelope::fingerprint(keys),
         });
     }
-    Ok(digests)
+    Ok(Held { applied, digests })
 }
 
 #[cfg(all(test, feature = "sqlite"))]

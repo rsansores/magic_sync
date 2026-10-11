@@ -1757,7 +1757,7 @@ async fn a_late_answer_forgets_only_what_its_upload_carried(pool: SqlitePool) {
         || sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')").bind(Uuid::now_v7());
     let send = || async {
         let mut tx = w.pool.begin().await.unwrap();
-        let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &settings, false, None)
+        let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &settings, None, None)
             .await
             .unwrap()
             .unwrap();
@@ -1852,7 +1852,7 @@ async fn an_answer_that_overtakes_the_send_or_is_not_ours_is_read_right(pool: Sq
         &lanes,
         0,
         &Outbox::default(),
-        false,
+        None,
         None,
     )
     .await
@@ -1938,7 +1938,7 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
             }
             2 | 3 => {
                 let mut tx = w.pool.begin().await.unwrap();
-                let outgoing = outbox(&mut tx, &codecs(), lanes, 0, settings, false, None)
+                let outgoing = outbox(&mut tx, &codecs(), lanes, 0, settings, None, None)
                     .await
                     .unwrap();
                 tx.commit().await.unwrap();
@@ -2266,6 +2266,64 @@ async fn digests_wait_for_the_confirmation_they_are_read_against(pool: SqlitePoo
     assert!(!last.digests.is_empty());
 }
 
+/// Digests read before a message was applied are not sent with it: they
+/// wait to be read again, against what the replica now holds.
+#[sqlx::test(migrations = false)]
+async fn digests_go_only_with_the_message_they_were_read_against(pool: SqlitePool) {
+    let w = world(pool).await;
+    let mut conn = w.pool.acquire().await.unwrap();
+    let stale = held(&mut conn, &codecs()).await.unwrap();
+    drop(conn);
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![item(Uuid::now_v7(), "a")])],
+    ))
+    .await;
+    let lanes = Settings::default().lanes;
+    let mut tx = w.pool.begin().await.unwrap();
+    let up = outbox(
+        &mut tx,
+        &codecs(),
+        &lanes,
+        0,
+        &Outbox::default(),
+        Some(stale),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .up;
+    tx.rollback().await.unwrap();
+    assert!(up.digests.is_empty());
+    assert_eq!(up.sequence, BASE + 1);
+    let mut conn = w.pool.acquire().await.unwrap();
+    let fresh = held(&mut conn, &codecs()).await.unwrap();
+    let mut tx = w.pool.begin().await.unwrap();
+    let up = outbox(
+        &mut tx,
+        &codecs(),
+        &lanes,
+        0,
+        &Outbox::default(),
+        Some(fresh),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .up;
+    assert_eq!(
+        up.digests
+            .iter()
+            .find(|d| d.table == "items")
+            .unwrap()
+            .count,
+        1
+    );
+}
+
 /// Each lane keeps its own pace: one the uplink fails on does not hold back
 /// another.
 #[sqlx::test(migrations = false)]
@@ -2343,7 +2401,7 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
         &lanes,
         0,
         &Outbox::default(),
-        false,
+        None,
         None,
     )
     .await
@@ -2427,7 +2485,7 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         let lanes = lanes.clone();
         async move {
             let mut tx = pool.begin().await.unwrap();
-            let outgoing = outbox(&mut tx, &codecs(), &lanes, lane, &settings, false, None)
+            let outgoing = outbox(&mut tx, &codecs(), &lanes, lane, &settings, None, None)
                 .await
                 .unwrap();
             if let Some(o) = &outgoing {
@@ -2978,7 +3036,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
         &Settings::default().lanes,
         0,
         &settings,
-        true,
+        None,
         None,
     ));
     spawnable(install(&mut conn, &codecs()));
