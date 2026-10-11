@@ -645,6 +645,17 @@ impl Engine {
     ) -> Result<Self, Error> {
         crate::row::parity(conn, tables).await?;
         let engine = Self::read(conn, tables, replicas).await?;
+        let temporary: bool =
+            sqlx::query_scalar("SELECT has_database_privilege(current_database(), 'TEMPORARY')")
+                .fetch_one(&mut *conn)
+                .await?;
+        if !temporary {
+            return Err(Error::Misuse(
+                "the engine's role may not create temporary tables, which the relay plans in: \
+                 grant it TEMPORARY on the database"
+                    .to_owned(),
+            ));
+        }
         let live = live_triggers(conn).await?;
         let mut wrong = Vec::new();
         for expected in engine.triggers_needed() {

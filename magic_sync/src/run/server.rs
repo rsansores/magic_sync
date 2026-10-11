@@ -107,7 +107,8 @@ pub struct Settings {
     /// an alarm.
     pub inbox: NonZeroU32,
     /// The role every transaction of the engine's own assumes, when the
-    /// database gives the connecting one less than the engine needs.
+    /// database gives the connecting one less than the engine needs: its
+    /// `sync` schema, and temporary tables, which the relay plans in.
     pub role: Option<String>,
     /// How long the relay waits when nothing is pending.
     pub idle: Duration,

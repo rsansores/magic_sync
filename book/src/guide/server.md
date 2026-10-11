@@ -111,7 +111,11 @@ key, how often it retries and prunes, how long a send may take and how long
 a replica it failed to waits, how long a replica may leave what it was sent
 unconfirmed before it is provisioned again, and `role` — a role every
 transaction of the engine's own assumes, when your connecting role has less
-than it needs. Change what you need of the defaults:
+than it needs. Besides the `sync` schema, the engine needs to create
+temporary tables (the database's `TEMPORARY` privilege, which every role
+has unless revoked): the relay works out each pass's plan in them, so a
+large one is never in its memory whole. `Server::new` refuses to start
+without it. Change what you need of the defaults:
 
 ```rust,ignore
 {{#include ../../snippets/src/server.rs:settings}}

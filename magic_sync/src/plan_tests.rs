@@ -2660,3 +2660,31 @@ async fn progress_counts_a_table_with_no_rule_by_what_was_decided(pool: crate::D
         .expect("progress");
     assert_eq!(kinds(progress), (2, 1, 1), "one held, one set aside");
 }
+
+/// The relay plans in temporary tables: a role that may not create them is
+/// refused at start, rather than at every pass.
+#[sqlx::test(migrations = false)]
+async fn a_role_that_may_not_create_temporary_tables_is_refused_at_start(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let role = format!("sync_no_temp_{}", Uuid::now_v7().simple());
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {role} NOLOGIN; \
+         GRANT USAGE ON SCHEMA fixture, sync TO {role}; \
+         GRANT SELECT ON ALL TABLES IN SCHEMA fixture, sync, public TO {role}; \
+         DO $$ BEGIN EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database()); END $$; \
+         SET ROLE {role};"
+    ))
+    .execute(&mut *world.conn)
+    .await
+    .expect("a role that may not create temporary tables");
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let why = refusal(Engine::new(&mut world.conn, &tables, REPLICAS).await);
+    sqlx::raw_sql(&format!(
+        "RESET ROLE; DROP OWNED BY {role}; DROP ROLE {role};"
+    ))
+    .execute(&mut *world.conn)
+    .await
+    .expect("the role dropped");
+    assert!(why.contains("TEMPORARY"), "{why}");
+}
