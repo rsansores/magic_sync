@@ -704,7 +704,7 @@ impl Stable {
 
 /// A change owed to one replica alone, after a send to it failed, outdates
 /// only that replica's copy: the others, sent it already, hold it as it is —
-/// even while an older transaction keeps their horizon behind the change.
+/// even while an older transaction was still running when they were sent it.
 #[sqlx::test(migrations = false)]
 async fn a_change_owed_to_one_replica_outdates_no_other(pool: crate::DbPool) {
     let world = world(pool).await;

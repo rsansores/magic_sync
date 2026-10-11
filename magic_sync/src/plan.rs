@@ -153,128 +153,37 @@ pub(crate) struct Plan {
     columns: Vec<&'static str>,
 }
 
-/// The rows to send to, and take back from, each replica.
+/// A plan: what a batch of changes asks of every replica. The rows it sends
+/// and takes back are not here but in the temporary tables of the
+/// connection that planned it (see [`Engine::plan`]), read a chunk at a time
+/// by what records them, in the same transaction: a plan is never in memory
+/// whole, however large a replica it provisions.
 #[derive(Default, Debug)]
 pub(crate) struct Delta {
-    pub(crate) upserts: BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>,
-    pub(crate) deletes: BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>,
     /// Replicas being provisioned: what they held is forgotten and what they
     /// should hold sent whole, then everything else swept on their side.
     pub(crate) snapshots: BTreeSet<Uuid>,
-    /// The xmin of the snapshot the plan read: every transaction before it had
-    /// finished, so what it noted is in the rows sent.
-    pub(crate) horizon: i64,
-    /// What was planned, for [`Engine::load`] to plan it again around a row
-    /// that cannot go.
-    changes: Vec<Change>,
+    /// The snapshot the plan read, as PostgreSQL writes one: a row sent from
+    /// it holds the change of every transaction it sees.
+    pub(crate) snapshot: String,
+    /// What was planned, for [`Engine::replan`] to plan it again around a
+    /// row that cannot go.
+    pub(crate) notes: Vec<Note>,
     /// Rows that cannot go to a replica, and why: never sent it, and taken
     /// back where it holds them, with whatever points at them.
     pub(crate) blocked: BTreeMap<(Uuid, usize, String), String>,
-    /// Replicas not live: sent nothing.
-    left_out: BTreeSet<Uuid>,
 }
 
-impl Delta {
-    fn upsert(&mut self, replica: Uuid, table: usize, key: String) {
-        if self.blocked.contains_key(&(replica, table, key.clone())) {
-            return;
-        }
-        if let Some(keys) = self
-            .deletes
-            .get_mut(&replica)
-            .and_then(|t| t.get_mut(&table))
-        {
-            keys.remove(&key);
-        }
-        self.upserts
-            .entry(replica)
-            .or_default()
-            .entry(table)
-            .or_default()
-            .insert(key);
-    }
-
-    /// The keys of `table` being sent, per replica.
-    fn sent(&self, table: usize) -> Vec<(Uuid, Vec<String>)> {
-        self.upserts
-            .iter()
-            .filter_map(|(e, t)| t.get(&table).map(|k| (*e, k.iter().cloned().collect())))
-            .collect()
-    }
-
-    /// The keys of `table` being taken back, per replica.
-    fn taken(&self, table: usize) -> Vec<(Uuid, Vec<String>)> {
-        self.deletes
-            .iter()
-            .filter_map(|(e, t)| t.get(&table).map(|k| (*e, k.iter().cloned().collect())))
-            .collect()
-    }
-
-    fn unsend(&mut self, replica: Uuid, table: usize, key: &str) {
-        if let Some(keys) = self
-            .upserts
-            .get_mut(&replica)
-            .and_then(|t| t.get_mut(&table))
-        {
-            keys.remove(key);
-        }
-    }
-
-    fn delete(&mut self, replica: Uuid, table: usize, key: String) {
-        self.deletes
-            .entry(replica)
-            .or_default()
-            .entry(table)
-            .or_default()
-            .insert(key);
-    }
-
-    fn has_upsert(&self, replica: Uuid, table: usize, key: &str) -> bool {
-        self.upserts
-            .get(&replica)
-            .and_then(|t| t.get(&table))
-            .is_some_and(|k| k.contains(key))
-    }
-
-    fn has_delete(&self, replica: Uuid, table: usize, key: &str) -> bool {
-        self.deletes
-            .get(&replica)
-            .and_then(|t| t.get(&table))
-            .is_some_and(|k| k.contains(key))
-    }
-
-    /// Everything `replica` is owed, left out: it is not live, so it is sent
-    /// nothing.
-    fn forget(&mut self, replica: Uuid) {
-        self.left_out.insert(replica);
-        self.restrict();
-    }
-
-    fn restrict(&mut self) {
-        let left_out = self.left_out.clone();
-        let keep = |r: &Uuid| !left_out.contains(r);
-        self.upserts.retain(|r, _| keep(r));
-        self.deletes.retain(|r, _| keep(r));
-        self.snapshots.retain(keep);
-        self.blocked.retain(|(r, _, _), _| keep(r));
-        for rows in [&mut self.upserts, &mut self.deletes] {
-            for tables in rows.values_mut() {
-                tables.retain(|_, keys| !keys.is_empty());
-            }
-            rows.retain(|_, tables| !tables.is_empty());
-        }
-    }
-
-    /// What is held, less what the snapshot replicas held: they start from
-    /// nothing, so it is not there to count on.
-    fn fresh<T>(
-        &self,
-        held: impl IntoIterator<Item = ((Uuid, String), T)>,
-    ) -> BTreeMap<(Uuid, String), T> {
-        held.into_iter()
-            .filter(|((e, _), _)| !self.snapshots.contains(e))
-            .collect()
-    }
+/// What a batch asks about: the tables with rows changed, members moved and
+/// groups given or taken; whether a changed row released a parent, and
+/// whether a replica is provisioned.
+#[derive(Default)]
+struct Asked {
+    changed: BTreeSet<usize>,
+    regrouped: BTreeSet<usize>,
+    reassigned: BTreeSet<usize>,
+    released: bool,
+    fresh: bool,
 }
 
 /// A pending note: what changed.
@@ -332,9 +241,6 @@ type ForeignKey = (Relation, Relation, Vec<String>, Vec<String>);
 /// A [`ForeignKey`] as the catalogue query answers it, each relation as its
 /// schema and name.
 type CatalogForeignKey = (String, String, String, String, Vec<String>, Vec<String>);
-
-/// The horizon [`Engine::held`] answers for a row the replica refused.
-const REFUSED: i64 = -1;
 
 /// Rows a pass loads, encodes and records at a time: what it holds in
 /// memory however much it sends.
@@ -405,6 +311,104 @@ fn key_in(alias: &str, columns: &[impl AsRef<str>], types: &[Column], param: &st
         parts.join(", ")
     )
 }
+
+/// `columns` of the row aliased `alias` equal, part by part, to the key text
+/// `text` (an SQL expression), each part cast back to its type in `types`:
+/// what lets an index on those columns serve.
+fn key_eq(alias: &str, columns: &[impl AsRef<str>], types: &[Column], text: &str) -> String {
+    let row: Vec<String> = columns
+        .iter()
+        .map(|c| format!("{alias}.{}", ident(c.as_ref())))
+        .collect();
+    let parts: Vec<String> = types
+        .iter()
+        .enumerate()
+        .map(|(i, typed)| {
+            let part = if types.len() == 1 {
+                text.to_owned()
+            } else {
+                format!("split_part({text}, '|', {})", i + 1)
+            };
+            format!("({part})::{}", KeyPart::sql_type(typed.key))
+        })
+        .collect();
+    format!("({}) = ({})", row.join(", "), parts.join(", "))
+}
+
+/// Has PostgreSQL count what the plan's temporary `tables` hold, which it
+/// cannot do by itself: so it plans what reads them for what they hold.
+async fn analyze(conn: &mut Conn, tables: &str) -> Result<(), Error> {
+    sqlx::Executor::execute(&mut *conn, format!("ANALYZE {tables}").as_str()).await?;
+    Ok(())
+}
+
+/// A set of rows a plan is worked out in.
+#[derive(Clone, Copy)]
+enum Set {
+    Wanted,
+    Suspect,
+    Blocked,
+    /// What replicas keep of a table.
+    Kept(usize),
+}
+
+impl Set {
+    fn table(self) -> &'static str {
+        match self {
+            Set::Wanted => "sync_wanted",
+            Set::Suspect => "sync_suspect",
+            Set::Blocked => "sync_blocked",
+            Set::Kept(_) => "sync_kept",
+        }
+    }
+}
+
+/// Every one of `columns` of the row aliased `alias` holds a value.
+fn not_null(alias: &str, columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("{alias}.{} IS NOT NULL", ident(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// The temporary tables a plan is worked out in, on the connection that
+/// plans, emptied at every commit: the live replicas, those provisioned,
+/// the batch's notes and what they changed, the rows that cannot go, those
+/// a replica's rules send it, those whose place is in question and those it
+/// keeps; and what each replica holds as the plan counts it — nothing, for
+/// one provisioned, and refused while the last version sent it is the one
+/// it refused. They have no index: what reads them reads them whole,
+/// and a large plan fills them faster without, and joins them by hash.
+const PLAN_TABLES: &str = "
+CREATE TEMP TABLE IF NOT EXISTS sync_live (replica_id UUID) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_fresh (replica_id UUID) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_batch (id BIGINT) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_changed (
+    rel INTEGER, relation TEXT, row_key TEXT, xid XID8) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_regrouped (rel INTEGER, relation TEXT, row_key TEXT)
+    ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_reassigned (rel INTEGER, relation TEXT, replica_id UUID)
+    ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_released (
+    relation TEXT, row_key TEXT, parent INTEGER, parent_relation TEXT, parent_key TEXT)
+    ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_blocked (
+    replica_id UUID, rel INTEGER, row_key TEXT, why TEXT, round INTEGER) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_wanted (replica_id UUID, rel INTEGER, row_key TEXT)
+    ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_suspect (
+    replica_id UUID, rel INTEGER, row_key TEXT, round INTEGER) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_staged (
+    replica_id UUID, rel INTEGER, row_key TEXT, why TEXT, round INTEGER) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_kept (
+    replica_id UUID, rel INTEGER, row_key TEXT, round INTEGER,
+    sends BOOLEAN, up BOOLEAN, down BOOLEAN) ON COMMIT DELETE ROWS;
+CREATE OR REPLACE TEMP VIEW sync_holds AS
+    SELECT h.replica_id, h.relation, h.row_key, h.snapshot, h.refused >= h.sequence AS refused
+      FROM sync.held h
+     WHERE NOT EXISTS (SELECT 1 FROM sync_fresh f WHERE f.replica_id = h.replica_id);
+";
 
 /// Parses a key back into its parts, as the table's key columns type them.
 pub(crate) fn parse_key(columns: &[Column], text: &str) -> Result<Key, Error> {
@@ -1162,11 +1166,6 @@ impl Engine {
         self.plans[index].table
     }
 
-    /// `key` of table `i` in the one form keys are compared in.
-    pub(crate) fn canonical(&self, i: usize, key: &str) -> Result<String, Error> {
-        Ok(key_text(&parse_key(&self.plans[i].key, key)?))
-    }
-
     /// The live replicas, as a subquery `s(id, partition)`: each once, in
     /// the first of its partitions should the relation repeat it.
     pub(crate) fn replicas_sql(&self) -> String {
@@ -1354,151 +1353,140 @@ impl Engine {
         Ok(query.fetch_all(&mut *conn).await?.into_iter().collect())
     }
 
-    /// Who holds which of `keys` (`None`: every key), among `replicas`
-    /// when given, and the horizon each was last sent from — [`REFUSED`]
-    /// for a row the replica refused, which it holds for what takes rows
-    /// back, and lacks for what sends them.
-    async fn held(
-        &self,
-        conn: &mut Conn,
-        i: usize,
-        keys: Option<&[String]>,
-        replicas: Option<&[Uuid]>,
-    ) -> Result<BTreeMap<(Uuid, String), i64>, Error> {
-        let mut sql = format!(
-            "SELECT replica_id, row_key, \
-                    CASE WHEN refused IS NULL THEN horizon::text::bigint ELSE {REFUSED} END \
-               FROM sync.held WHERE relation = $1"
-        );
-        if keys.is_some() {
-            sql.push_str(" AND row_key = ANY($2)");
-        }
-        if replicas.is_some() {
-            sql.push_str(&format!(
-                " AND replica_id = ANY(${})",
-                2 + usize::from(keys.is_some())
-            ));
-        }
-        let mut query = sqlx::query_as::<_, (Uuid, String, i64)>(&sql).bind(self.plans[i].table);
-        if let Some(keys) = keys {
-            query = query.bind(keys);
-        }
-        if let Some(replicas) = replicas {
-            query = query.bind(replicas);
-        }
-        Ok(query
-            .fetch_all(&mut *conn)
-            .await?
-            .into_iter()
-            .map(|(e, k, h)| ((e, k), h))
-            .collect())
-    }
-
-    /// A change to rows of `i`: sent where its strategy sends it and the held
-    /// version predates the change; held where it should no longer be, taken
-    /// back — unless something the replica keeps points at it, which the pass
-    /// over references decides.
-    async fn reconcile_keys(
-        &self,
-        conn: &mut Conn,
-        delta: &mut Delta,
-        i: usize,
-        keys: &[String],
-        notes: Option<&BTreeMap<String, i64>>,
-    ) -> Result<(), Error> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let horizons = delta.fresh(self.held(conn, i, Some(keys), None).await?);
-        let wanted = self.wanted(conn, i, Some(keys), None).await?;
-        for holder in &wanted {
-            if Self::owed(&horizons, notes, holder) {
-                delta.upsert(holder.0, i, holder.1.clone());
-            }
-        }
-        for (replica, key) in horizons.keys() {
-            if !wanted.contains(&(*replica, key.clone())) {
-                delta.delete(*replica, i, key.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether `holder` must be sent its row: it lacks it, or refused it, or
-    /// holds a version sent from before the latest change `notes` has for it
-    /// — a change whose transaction the send's horizon is past is already in
-    /// what it holds.
-    fn owed(
-        horizons: &BTreeMap<(Uuid, String), i64>,
-        notes: Option<&BTreeMap<String, i64>>,
-        holder: &(Uuid, String),
-    ) -> bool {
-        match horizons.get(holder) {
-            None | Some(&REFUSED) => true,
-            Some(horizon) => notes
-                .and_then(|n| n.get(&holder.1))
-                .is_some_and(|xid| xid >= horizon),
-        }
-    }
-
-    /// Every row of `i`, for `replicas`: what only who-holds-what can have moved.
-    async fn reconcile_replicas(
-        &self,
-        conn: &mut Conn,
-        delta: &mut Delta,
-        i: usize,
-        replicas: &[Uuid],
-    ) -> Result<(), Error> {
-        if replicas.is_empty() {
-            return Ok(());
-        }
-        let held = delta.fresh(self.held(conn, i, None, Some(replicas)).await?);
-        let wanted = self.wanted(conn, i, None, Some(replicas)).await?;
-        for holder in &wanted {
-            if !held.contains_key(holder) {
-                delta.upsert(holder.0, i, holder.1.clone());
-            }
-        }
-        for (replica, key) in held.keys() {
-            if !wanted.contains(&(*replica, key.clone())) {
-                delta.delete(*replica, i, key.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// What a batch of changes asks of every replica, read in the caller's
-    /// `REPEATABLE READ` transaction.
-    pub(crate) async fn plan(&self, conn: &mut Conn, changes: &[Change]) -> Result<Delta, Error> {
+    /// What a batch of notes asks of every replica, worked out in the
+    /// caller's `REPEATABLE READ` transaction, in temporary tables of its
+    /// connection: one plan, so no part of it undoes another.
+    ///
+    /// What each replica should hold is the least set closed under three
+    /// rules: the rows its tables' rules send it, every row one of those
+    /// points at, and every row that follows one of those. The plan works
+    /// that out only around what changed. The rows whose place is in question
+    /// for a replica — those it holds that a change may have taken out of
+    /// its set: the changed rows it holds and should not, the parents a
+    /// changed row pointed at before, rows that cannot go — are closed over
+    /// what they point at and what follows them among the rows it holds.
+    /// Every row it holds outside them stays, as recorded. From the rows its
+    /// rules send it, the rows in question that something outside them
+    /// points at, and the followers of a parent it keeps outside them, what
+    /// it keeps spreads to the parents and followers it needs, a round at a
+    /// time from the rows the last round added. What it lacks of that is
+    /// sent, with the rows that changed since its version; the rows in
+    /// question it does not keep are taken back. A row it holds that a
+    /// change not yet planned pointed at, before that change, stays too: the
+    /// replica still holds that change's older version.
+    ///
+    /// A row that cannot go, and every row that points at it — held, or
+    /// that the plan would send — is kept by no replica: it is taken back
+    /// where held. When the plan would send a row that points at one, that
+    /// row joins them and the plan runs again.
+    pub(crate) async fn plan(&self, conn: &mut Conn, notes: &[Note]) -> Result<Delta, Error> {
         let delta = Delta {
-            changes: changes.to_vec(),
+            notes: notes.to_vec(),
             ..Delta::default()
         };
         self.plan_around(conn, delta).await
     }
 
-    /// [`Engine::plan`] of `delta`'s changes, around the rows it says cannot
-    /// go.
     async fn plan_around(&self, conn: &mut Conn, mut delta: Delta) -> Result<Delta, Error> {
-        let horizon: i64 =
-            sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
-                .fetch_one(&mut *conn)
+        let made: bool = sqlx::query_scalar("SELECT to_regclass('pg_temp.sync_holds') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+        if !made {
+            sqlx::Executor::execute(&mut *conn, PLAN_TABLES).await?;
+        }
+        sqlx::Executor::execute(
+            &mut *conn,
+            "TRUNCATE sync_live, sync_fresh, sync_batch, sync_changed, sync_regrouped, \
+             sync_reassigned, sync_released, sync_blocked, sync_wanted, sync_suspect, sync_kept",
+        )
+        .await?;
+        delta.snapshot = sqlx::query_scalar("SELECT pg_current_snapshot()::text")
+            .fetch_one(&mut *conn)
+            .await?;
+        sqlx::query(&format!(
+            "INSERT INTO sync_live SELECT s.id FROM {}",
+            self.replicas_sql()
+        ))
+        .execute(&mut *conn)
+        .await?;
+        let mut asked = self.note(conn, &delta.notes).await?;
+        delta.snapshots = sqlx::query_scalar(
+            "INSERT INTO sync_fresh SELECT DISTINCT r FROM unnest($1::uuid[]) AS r \
+              WHERE r IN (SELECT replica_id FROM sync_live) RETURNING replica_id",
+        )
+        .bind(
+            delta
+                .notes
+                .iter()
+                .filter_map(|n| match n.change {
+                    Change::Resync { replica } => Some(replica),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect();
+        asked.fresh = !delta.snapshots.is_empty();
+        let mut rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for ((replica, i, key), why) in &delta.blocked {
+            rows.0.push(*replica);
+            rows.1.push(i32::try_from(*i).unwrap_or(i32::MAX));
+            rows.2.push(key.as_str());
+            rows.3.push(why.as_str());
+        }
+        sqlx::query(
+            "INSERT INTO sync_blocked (replica_id, rel, row_key, why, round) \
+             SELECT *, 0 FROM unnest($1::uuid[], $2::int4[], $3::text[], $4::text[])",
+        )
+        .bind(&rows.0)
+        .bind(&rows.1)
+        .bind(&rows.2)
+        .bind(&rows.3)
+        .execute(&mut *conn)
+        .await?;
+        analyze(
+            conn,
+            "sync_live, sync_fresh, sync_batch, sync_changed, sync_regrouped, sync_reassigned, \
+             sync_released, sync_blocked",
+        )
+        .await?;
+        let mut blocked_from = 0;
+        loop {
+            blocked_from = self.spread_blocked(conn, blocked_from).await?;
+            self.question(conn, &asked).await?;
+            self.keep_all(conn, &asked).await?;
+            if !self.conflicts(conn, blocked_from).await? {
+                break;
+            }
+            sqlx::Executor::execute(&mut *conn, "TRUNCATE sync_wanted, sync_suspect, sync_kept")
                 .await?;
-        let live: BTreeSet<Uuid> =
-            sqlx::query_scalar(&format!("SELECT s.id FROM {}", self.replicas_sql()))
-                .fetch_all(&mut *conn)
-                .await?
-                .into_iter()
-                .collect();
-        delta.horizon = horizon;
-        let changes = std::mem::take(&mut delta.changes);
-        // Per table, each changed key and the latest transaction that noted it.
-        let mut rows: BTreeMap<usize, BTreeMap<String, i64>> = BTreeMap::new();
-        let mut released = Released::default();
-        let mut regrouped: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
-        let mut reassigned: BTreeMap<usize, BTreeSet<Uuid>> = BTreeMap::new();
-        for change in &changes {
-            match change {
+        }
+        let blocked: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
+            "SELECT b.replica_id, b.rel, b.row_key, b.why FROM sync_blocked b \
+               JOIN sync_live USING (replica_id)",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        delta.blocked = blocked
+            .into_iter()
+            .map(|(r, i, k, why)| ((r, usize::try_from(i).unwrap_or(usize::MAX), k), why))
+            .collect();
+        Ok(delta)
+    }
+
+    /// The notes of the plan, as what changed: the rows, by their key in the
+    /// one form keys are compared in, with the latest transaction that
+    /// changed each; the parents each pointed at before; the members that
+    /// moved; the groups given or taken.
+    async fn note(&self, conn: &mut Conn, notes: &[Note]) -> Result<Asked, Error> {
+        let mut changed: BTreeMap<(usize, String), i64> = BTreeMap::new();
+        let mut released: BTreeSet<(usize, String, usize, String)> = BTreeSet::new();
+        let mut regrouped: BTreeSet<(usize, String)> = BTreeSet::new();
+        let mut reassigned: BTreeSet<(usize, Uuid)> = BTreeSet::new();
+        for note in notes {
+            match &note.change {
                 Change::Row {
                     table,
                     key,
@@ -1511,100 +1499,769 @@ impl Engine {
                         ))
                     })?;
                     // A key its table cannot have fails here, the same way
-                    // every time, rather than wherever a query casts it; one it
-                    // can is read in the form every query writes it.
-                    let key =
-                        key_text(&parse_key(&self.plans[i].key, key).map_err(|e| match e {
-                            Error::Malformed { reason, .. } => Error::Malformed {
-                                table: table.clone(),
-                                reason,
-                            },
-                            other => other,
-                        })?);
-                    let latest = rows.entry(i).or_default().entry(key.clone()).or_default();
-                    *latest = (*latest).max(*xid);
-                    if let Some(previous) = previous {
-                        released
-                            .previous
-                            .entry((i, key))
-                            .or_default()
-                            .push(previous.clone());
+                    // every time, rather than wherever a query casts it; one
+                    // it can is read in the form every query writes it.
+                    let of_table = |e| match e {
+                        Error::Malformed { reason, .. } => Error::Malformed {
+                            table: table.clone(),
+                            reason,
+                        },
+                        other => other,
+                    };
+                    let key = key_text(&parse_key(&self.plans[i].key, key).map_err(of_table)?);
+                    for reference in &self.plans[i].references {
+                        let Some(parent) = previous
+                            .as_ref()
+                            .and_then(|p| key_of(p, &reference.columns))
+                        else {
+                            continue;
+                        };
+                        let parent = key_text(
+                            &parse_key(&self.plans[reference.parent].key, &parent)
+                                .map_err(of_table)?,
+                        );
+                        released.insert((i, key.clone(), reference.parent, parent));
                     }
+                    let latest = changed.entry((i, key)).or_default();
+                    *latest = (*latest).max(*xid);
                 }
                 Change::Members { table, member } => {
                     for (i, g) in self.groups_through(table, |g| &g.members) {
                         if let Some(key) = key_of(member, &g.member_row) {
-                            regrouped.entry(i).or_default().insert(key);
+                            let key = key_text(&parse_key(&self.plans[i].key, &key)?);
+                            regrouped.insert((i, key));
                         }
                     }
                 }
                 Change::Assigned { table, replica } => {
                     for (i, _) in self.groups_through(table, |g| &g.assigned) {
-                        reassigned.entry(i).or_default().insert(*replica);
+                        reassigned.insert((i, *replica));
                     }
                 }
-                Change::Resync { replica } => {
-                    delta.snapshots.insert(*replica);
-                }
+                Change::Resync { .. } => {}
             }
         }
-        // A member that moved is routed again by its key; a group given or
-        // taken, once per table and batch for its replicas.
-        for (i, keys) in regrouped {
-            let keys: Vec<String> = keys.into_iter().collect();
-            self.reconcile_keys(conn, &mut delta, i, &keys, None)
-                .await?;
+        let rel = |i: usize| i32::try_from(i).unwrap_or(i32::MAX);
+        let name = |i: usize| self.plans[i].table;
+        let ids: Vec<i64> = notes.iter().map(|n| n.id).collect();
+        sqlx::query("INSERT INTO sync_batch SELECT DISTINCT unnest($1::int8[])")
+            .bind(&ids)
+            .execute(&mut *conn)
+            .await?;
+        let (keys, xids): (Vec<_>, Vec<i64>) = changed.into_iter().unzip();
+        sqlx::query(
+            "INSERT INTO sync_changed \
+             SELECT r, t, k, x::text::xid8 FROM unnest($1::int4[], $2::text[], $3::text[], $4::int8[]) \
+                 AS u(r, t, k, x)",
+        )
+        .bind(keys.iter().map(|(i, _)| rel(*i)).collect::<Vec<_>>())
+        .bind(keys.iter().map(|(i, _)| name(*i)).collect::<Vec<_>>())
+        .bind(keys.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>())
+        .bind(&xids)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO sync_released \
+             SELECT * FROM unnest($1::text[], $2::text[], $3::int4[], $4::text[], $5::text[])",
+        )
+        .bind(released.iter().map(|r| name(r.0)).collect::<Vec<_>>())
+        .bind(released.iter().map(|r| r.1.as_str()).collect::<Vec<_>>())
+        .bind(released.iter().map(|r| rel(r.2)).collect::<Vec<_>>())
+        .bind(released.iter().map(|r| name(r.2)).collect::<Vec<_>>())
+        .bind(released.iter().map(|r| r.3.as_str()).collect::<Vec<_>>())
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO sync_regrouped SELECT * FROM unnest($1::int4[], $2::text[], $3::text[])",
+        )
+        .bind(regrouped.iter().map(|(i, _)| rel(*i)).collect::<Vec<_>>())
+        .bind(regrouped.iter().map(|(i, _)| name(*i)).collect::<Vec<_>>())
+        .bind(
+            regrouped
+                .iter()
+                .map(|(_, k)| k.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO sync_reassigned SELECT * FROM unnest($1::int4[], $2::text[], $3::uuid[])",
+        )
+        .bind(reassigned.iter().map(|(i, _)| rel(*i)).collect::<Vec<_>>())
+        .bind(reassigned.iter().map(|(i, _)| name(*i)).collect::<Vec<_>>())
+        .bind(reassigned.iter().map(|(_, r)| *r).collect::<Vec<_>>())
+        .execute(&mut *conn)
+        .await?;
+        Ok(Asked {
+            changed: keys.iter().map(|(i, _)| *i).collect(),
+            regrouped: regrouped.iter().map(|(i, _)| *i).collect(),
+            reassigned: reassigned.iter().map(|(i, _)| *i).collect(),
+            released: !released.is_empty(),
+            fresh: false,
+        })
+    }
+
+    /// Closes the rows that cannot go over what points at them that their
+    /// replica holds, from the round `from` on; answers the round after the
+    /// last.
+    async fn spread_blocked(&self, conn: &mut Conn, from: i32) -> Result<i32, Error> {
+        let mut round = from;
+        loop {
+            let parents = self.frontier(conn, "sync_blocked", round).await?;
+            if parents.is_empty() {
+                return Ok(round);
+            }
+            for (c, reference) in self
+                .references()
+                .filter(|(_, r)| parents.contains(&r.parent))
+            {
+                let child = &self.plans[c];
+                let select = format!(
+                    "SELECT h.replica_id, {c}, h.row_key, \
+                            format('it points at `%s` %s, which cannot go: %s', {}, b.row_key, b.why) \
+                       FROM sync_blocked b \
+                       JOIN {} t ON {} \
+                       JOIN sync_holds h ON h.replica_id = b.replica_id AND h.relation = {} \
+                                        AND h.row_key = {} \
+                      WHERE b.rel = {} AND b.round = $1 - 1",
+                    literal(self.plans[reference.parent].table),
+                    child.relation.sql(),
+                    self.points_at(reference, "b.row_key"),
+                    literal(child.table),
+                    self.key_of_row(c),
+                    reference.parent,
+                );
+                self.add(conn, Set::Blocked, &select, round + 1).await?;
+            }
+            round += 1;
         }
-        for (i, replicas) in reassigned {
-            let replicas: Vec<Uuid> = replicas.into_iter().collect();
-            self.reconcile_replicas(conn, &mut delta, i, &replicas)
-                .await?;
+    }
+
+    /// The rows each replica should hold that the batch asks about —
+    /// `sync_wanted` — and the rows it holds whose place is in question —
+    /// `sync_suspect` — closed over what they point at and what follows
+    /// them among the rows it holds; the rows in question its tables' rules
+    /// send it are wanted too.
+    async fn question(&self, conn: &mut Conn, asked: &Asked) -> Result<(), Error> {
+        for i in 0..self.plans.len() {
+            let mut filters = Vec::new();
+            if asked.changed.contains(&i) {
+                filters.push(self.key_among(
+                    i,
+                    &format!("SELECT row_key FROM sync_changed WHERE rel = {i}"),
+                ));
+            }
+            if asked.regrouped.contains(&i) {
+                filters.push(self.key_among(
+                    i,
+                    &format!("SELECT row_key FROM sync_regrouped WHERE rel = {i}"),
+                ));
+            }
+            if asked.reassigned.contains(&i) {
+                filters.push(format!(
+                    "s.id IN (SELECT replica_id FROM sync_reassigned WHERE rel = {i})"
+                ));
+            }
+            for filter in filters {
+                self.want(conn, i, &filter).await?;
+            }
         }
-        let mut touched: BTreeMap<usize, BTreeMap<String, i64>> = BTreeMap::new();
-        for (i, notes) in &rows {
-            if matches!(self.plans[*i].route, Route::Follows(_)) {
-                touched.insert(*i, notes.clone());
+        analyze(conn, "sync_wanted").await?;
+        let unwanted = "NOT EXISTS (SELECT 1 FROM sync_wanted w WHERE w.replica_id = h.replica_id \
+                                    AND w.rel = x.rel AND w.row_key = h.row_key)";
+        let seeds = [
+            (
+                !asked.changed.is_empty(),
+                format!(
+                    "SELECT h.replica_id, x.rel, h.row_key FROM sync_changed x \
+                       JOIN sync_holds h ON h.relation = x.relation AND h.row_key = x.row_key \
+                      WHERE {unwanted}"
+                ),
+            ),
+            (
+                !asked.regrouped.is_empty(),
+                format!(
+                    "SELECT h.replica_id, x.rel, h.row_key FROM sync_regrouped x \
+                       JOIN sync_holds h ON h.relation = x.relation AND h.row_key = x.row_key \
+                      WHERE {unwanted}"
+                ),
+            ),
+            (
+                !asked.reassigned.is_empty(),
+                format!(
+                    "SELECT h.replica_id, x.rel, h.row_key FROM sync_reassigned x \
+                       JOIN sync_holds h ON h.replica_id = x.replica_id AND h.relation = x.relation \
+                      WHERE {unwanted}"
+                ),
+            ),
+            // The parents a changed row pointed at, for whoever holds it.
+            (
+                asked.released,
+                "SELECT h.replica_id, x.parent, x.parent_key FROM sync_released x \
+                   JOIN sync_holds c ON c.relation = x.relation AND c.row_key = x.row_key \
+                   JOIN sync_holds h ON h.replica_id = c.replica_id AND h.relation = x.parent_relation \
+                                    AND h.row_key = x.parent_key"
+                    .to_owned(),
+            ),
+        ];
+        for (_, sql) in seeds.into_iter().filter(|(asked, _)| *asked) {
+            let select = format!("SELECT q.*, NULL FROM ({sql}) AS q");
+            self.add(conn, Set::Suspect, &select, 0).await?;
+        }
+        for i in self.present(conn, "sync_blocked").await? {
+            let select = format!(
+                "SELECT b.replica_id, b.rel, b.row_key, NULL FROM sync_blocked b \
+                   JOIN sync_holds h ON h.replica_id = b.replica_id AND h.relation = {} \
+                                    AND h.row_key = b.row_key \
+                  WHERE b.rel = {i}",
+                literal(self.plans[i].table)
+            );
+            self.add(conn, Set::Suspect, &select, 0).await?;
+        }
+        let mut round = 0;
+        loop {
+            analyze(conn, "sync_suspect").await?;
+            let from = self.frontier(conn, "sync_suspect", round).await?;
+            if from.is_empty() {
+                break;
+            }
+            for (c, reference) in self.references().filter(|(c, _)| from.contains(c)) {
+                let select = format!(
+                    "SELECT d.replica_id, {}, h.row_key, NULL FROM sync_suspect d \
+                       JOIN {} t ON {} \
+                       JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {} \
+                                        AND h.row_key = {} \
+                      WHERE d.rel = {c} AND d.round = $1 - 1 AND {}",
+                    reference.parent,
+                    self.plans[c].relation.sql(),
+                    self.row_is(c, "d.row_key"),
+                    literal(self.plans[reference.parent].table),
+                    key_sql("t", &reference.columns),
+                    not_null("t", &reference.columns),
+                );
+                self.add(conn, Set::Suspect, &select, round + 1).await?;
+            }
+            for (f, column, p) in self.followers().filter(|(_, _, p)| from.contains(p)) {
+                let select = format!(
+                    "SELECT d.replica_id, {f}, h.row_key, NULL FROM sync_suspect d \
+                       JOIN {} t ON {} \
+                       JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {} \
+                                        AND h.row_key = {} \
+                      WHERE d.rel = {p} AND d.round = $1 - 1",
+                    self.plans[f].relation.sql(),
+                    key_eq("t", &[column], &self.plans[p].key, "d.row_key"),
+                    literal(self.plans[f].table),
+                    self.key_of_row(f),
+                );
+                self.add(conn, Set::Suspect, &select, round + 1).await?;
+            }
+            round += 1;
+        }
+        for i in self.present(conn, "sync_suspect").await? {
+            let filter = format!(
+                "{} AND EXISTS (SELECT 1 FROM sync_suspect d WHERE d.rel = {i} \
+                                   AND d.replica_id = s.id AND d.row_key = {})",
+                self.key_among(
+                    i,
+                    &format!("SELECT row_key FROM sync_suspect WHERE rel = {i}")
+                ),
+                self.key_of_row(i),
+            );
+            self.want(conn, i, &filter).await?;
+        }
+        analyze(conn, "sync_wanted").await
+    }
+
+    /// Adds to `sync_wanted` the rows of `i` its rule sends to a live
+    /// replica, narrowed by `filter`.
+    async fn want(&self, conn: &mut Conn, i: usize, filter: &str) -> Result<(), Error> {
+        let Some(wanted) = self.wanted_sql(i, filter) else {
+            return Ok(());
+        };
+        let select = format!("SELECT w.replica_id, {i}, w.key, NULL FROM ({wanted}) w");
+        self.add(conn, Set::Wanted, &select, 0).await?;
+        Ok(())
+    }
+
+    /// What every replica keeps, in `sync_kept`: its wanted rows, the rows
+    /// in question something outside them points at, and the followers of
+    /// a parent outside them that are in question or changed; then, a
+    /// round at a time, what those need — until a round adds nothing and no
+    /// change waiting to be planned keeps anything more.
+    async fn keep_all(&self, conn: &mut Conn, asked: &Asked) -> Result<(), Error> {
+        // What a replica provisioned holds, from scratch: it holds nothing
+        // in question, so its rules' rows are kept with no question asked.
+        for i in (0..self.plans.len()).filter(|_| asked.fresh) {
+            let fresh = self.wanted_sql(i, "s.id IN (SELECT replica_id FROM sync_fresh)");
+            if let Some(wanted) = fresh {
+                self.keep(
+                    conn,
+                    i,
+                    0,
+                    &format!("SELECT w.replica_id, w.key FROM ({wanted}) w"),
+                )
+                .await?;
+            }
+        }
+        for i in self.present(conn, "sync_wanted").await? {
+            self.keep(
+                conn,
+                i,
+                0,
+                &format!("SELECT replica_id, row_key FROM sync_wanted WHERE rel = {i}"),
+            )
+            .await?;
+        }
+        let doubted = self.present(conn, "sync_suspect").await?;
+        for (c, reference) in self
+            .references()
+            .filter(|(_, r)| doubted.contains(&r.parent))
+        {
+            let source = format!(
+                "SELECT d.replica_id, d.row_key FROM sync_suspect d \
+                   JOIN {} t ON {} \
+                   JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {} \
+                                    AND h.row_key = {} \
+                  WHERE d.rel = {} \
+                    AND NOT EXISTS (SELECT 1 FROM sync_suspect x WHERE x.replica_id = h.replica_id \
+                                       AND x.rel = {c} AND x.row_key = h.row_key)",
+                self.plans[c].relation.sql(),
+                self.points_at(reference, "d.row_key"),
+                literal(self.plans[c].table),
+                self.key_of_row(c),
+                reference.parent,
+            );
+            self.keep(conn, reference.parent, 0, &source).await?;
+        }
+        for (f, column, p) in self.followers() {
+            let parent = literal(self.plans[p].table);
+            let outside = format!(
+                "NOT EXISTS (SELECT 1 FROM sync_suspect x WHERE x.replica_id = hp.replica_id \
+                                AND x.rel = {p} AND x.row_key = hp.row_key)"
+            );
+            let mut sources = Vec::new();
+            if doubted.contains(&f) {
+                sources.push(format!(
+                    "SELECT d.replica_id, d.row_key FROM sync_suspect d JOIN {} t ON {} \
+                       JOIN sync_holds hp ON hp.replica_id = d.replica_id AND hp.relation = {parent} \
+                                         AND hp.row_key = t.{}::text \
+                      WHERE d.rel = {f} AND {outside}",
+                    self.plans[f].active,
+                    self.row_is(f, "d.row_key"),
+                    ident(column),
+                ));
+            }
+            if asked.changed.contains(&f) {
+                sources.push(format!(
+                    "SELECT hp.replica_id, {} FROM {} t \
+                       JOIN sync_holds hp ON hp.relation = {parent} AND hp.row_key = t.{}::text \
+                      WHERE {} AND {outside}",
+                    self.key_of_row(f),
+                    self.plans[f].active,
+                    ident(column),
+                    self.key_among(
+                        f,
+                        &format!("SELECT row_key FROM sync_changed WHERE rel = {f}")
+                    ),
+                ));
+            }
+            for source in sources {
+                self.keep(conn, f, 0, &source).await?;
+            }
+        }
+        let mut round = 0;
+        loop {
+            analyze(conn, "sync_kept").await?;
+            let from = self.frontier(conn, "sync_kept", round).await?;
+            if from.is_empty() {
+                round += 1;
+                if doubted.is_empty() || !self.keep_older(conn, round).await? {
+                    return Ok(());
+                }
                 continue;
             }
-            let keys: Vec<String> = notes.keys().cloned().collect();
-            self.reconcile_keys(conn, &mut delta, *i, &keys, Some(notes))
-                .await?;
-        }
-        let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
-        if !snapshots.is_empty() {
-            for &i in &self.order {
-                let wanted = self.wanted(conn, i, None, Some(&snapshots)).await?;
-                for (replica, key) in wanted {
-                    delta.upsert(replica, i, key);
-                }
+            for (c, reference) in self.references().filter(|(c, _)| from.contains(c)) {
+                let source = format!(
+                    "SELECT k.replica_id, {} FROM sync_kept k JOIN {} t ON {} \
+                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND {}",
+                    key_sql("t", &reference.columns),
+                    self.plans[c].relation.sql(),
+                    self.row_is(c, "k.row_key"),
+                    not_null("t", &reference.columns),
+                );
+                self.keep(conn, reference.parent, round + 1, &source)
+                    .await?;
             }
-        }
-        // Each pass can give the others work — a parent a follower needs, a
-        // parent a deleted follower released — so they run until none does.
-        for _ in 0..16 {
-            let before = (delta.upserts.clone(), delta.deletes.clone());
-            self.close_references(conn, &mut delta).await?;
-            self.block(conn, &mut delta).await?;
-            self.release_references(conn, &mut delta, &released, &rows)
-                .await?;
-            self.follow_parents(conn, &mut delta, &touched).await?;
-            if before == (delta.upserts.clone(), delta.deletes.clone()) {
-                // One not live is sent nothing, a snapshot least of all.
-                let dead: Vec<Uuid> = Engine::replicas(&delta)
-                    .difference(&live)
-                    .copied()
-                    .collect();
-                for replica in dead {
-                    delta.forget(replica);
-                }
-                delta.changes = changes;
-                delta.restrict();
-                return Ok(delta);
+            for (f, column, p) in self.followers().filter(|(_, _, p)| from.contains(p)) {
+                let source = format!(
+                    "SELECT k.replica_id, {} FROM sync_kept k JOIN {} t ON {} \
+                      WHERE k.rel = {p} AND k.round = $1 - 1 AND k.down",
+                    self.key_of_row(f),
+                    self.plans[f].active,
+                    key_eq("t", &[column], &self.plans[p].key, "k.row_key"),
+                );
+                self.keep(conn, f, round + 1, &source).await?;
             }
+            round += 1;
         }
-        Err(Error::Misuse(
-            "the sync plan did not settle in 16 passes".to_owned(),
+    }
+
+    /// Keeps, at `round`, the rows in question that a row its replica holds
+    /// still points at in the version it holds: one a change not yet planned
+    /// — beyond the batch, or parked — pointed at before. Answers whether it
+    /// kept any.
+    async fn keep_older(&self, conn: &mut Conn, round: i32) -> Result<bool, Error> {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
+                              AND n.previous IS NOT NULL \
+                              AND NOT EXISTS (SELECT 1 FROM sync_batch b WHERE b.id = n.id))",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        if !waiting {
+            return Ok(false);
+        }
+        let mut kept = 0;
+        for (c, reference) in self.references() {
+            let pointed: Vec<String> = reference
+                .columns
+                .iter()
+                .map(|column| format!("n.previous ->> {}", literal(column)))
+                .collect();
+            let source = format!(
+                "SELECT d.replica_id, d.row_key FROM sync_suspect d \
+                   JOIN sync.notes n ON n.done_at IS NULL AND n.kind = 'row' AND n.relation = {child} \
+                                    AND concat_ws('|', {}) = d.row_key \
+                   JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {child} \
+                                    AND h.row_key = n.row_key \
+                  WHERE d.rel = {} AND {} \
+                    AND NOT EXISTS (SELECT 1 FROM sync_batch b WHERE b.id = n.id) \
+                    AND (NOT EXISTS (SELECT 1 FROM sync_suspect x WHERE x.replica_id = h.replica_id \
+                                        AND x.rel = {c} AND x.row_key = h.row_key) \
+                         OR EXISTS (SELECT 1 FROM sync_kept x WHERE x.replica_id = h.replica_id \
+                                       AND x.rel = {c} AND x.row_key = h.row_key AND NOT x.sends))",
+                pointed.join(", "),
+                reference.parent,
+                pointed
+                    .iter()
+                    .map(|p| format!("{p} IS NOT NULL"))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+                child = literal(self.plans[c].table),
+            );
+            kept += self.keep(conn, reference.parent, round, &source).await?;
+        }
+        Ok(kept > 0)
+    }
+
+    /// Keeps for `i`, at `round` — `$1` to `source` — the rows `source`
+    /// names, `(replica_id, row_key)`, but those that cannot go and those
+    /// kept already. Each is sent where its replica lacks it, refused it, or
+    /// holds a version from before a change of the batch; it spreads to its
+    /// parents when sent or in question, and to its followers when its
+    /// replica lacks it or it is in question. Answers how many it kept.
+    async fn keep(
+        &self,
+        conn: &mut Conn,
+        i: usize,
+        round: i32,
+        source: &str,
+    ) -> Result<u64, Error> {
+        let select = format!(
+            "SELECT x.replica_id, {i}, x.row_key, NULL FROM ({source}) AS x(replica_id, row_key)"
+        );
+        self.add(conn, Set::Kept(i), &select, round).await
+    }
+
+    /// Adds to the plan's `set` the rows `select` answers —
+    /// `(replica_id, rel, row_key, why)` — at `round`, which `select` reads
+    /// as `$1`: each once, but those the set has, or that cannot go, for the
+    /// rows a replica keeps. They are staged and counted first, so what
+    /// joins them to the plan's other sets is planned for how many they
+    /// are, whatever the statistics of the tables they were read from say.
+    async fn add(&self, conn: &mut Conn, set: Set, select: &str, round: i32) -> Result<u64, Error> {
+        sqlx::Executor::execute(&mut *conn, "TRUNCATE sync_staged").await?;
+        // Each row once; a row that cannot go, with one of its reasons.
+        let once = match set {
+            Set::Blocked => "DISTINCT ON (q.replica_id, q.rel, q.row_key)",
+            _ => "DISTINCT",
+        };
+        let staged = sqlx::query(&format!(
+            "INSERT INTO sync_staged \
+             SELECT {once} q.replica_id, q.rel, q.row_key, q.why, $1::int4 \
+               FROM ({select}) AS q(replica_id, rel, row_key, why)"
         ))
+        .bind(round)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if staged == 0 {
+            return Ok(0);
+        }
+        let table = set.table();
+        // Never read while written: an insert that looked into the set it
+        // fills would read every row it added so far, for every row.
+        analyze(conn, &format!("sync_staged, {table}")).await?;
+        sqlx::Executor::execute(
+            &mut *conn,
+            format!(
+                "DELETE FROM sync_staged s USING {table} x \
+                  WHERE x.replica_id = s.replica_id AND x.rel = s.rel AND x.row_key = s.row_key"
+            )
+            .as_str(),
+        )
+        .await?;
+        let sql = match set {
+            Set::Wanted => {
+                "INSERT INTO sync_wanted SELECT s.replica_id, s.rel, s.row_key FROM sync_staged s"
+                    .to_owned()
+            }
+            Set::Suspect => "INSERT INTO sync_suspect SELECT s.replica_id, s.rel, s.row_key, s.round \
+                               FROM sync_staged s"
+                .to_owned(),
+            Set::Blocked => "INSERT INTO sync_blocked \
+                             SELECT s.replica_id, s.rel, s.row_key, s.why, s.round FROM sync_staged s"
+                .to_owned(),
+            Set::Kept(i) => format!(
+                "INSERT INTO sync_kept \
+                 SELECT s.replica_id, s.rel, s.row_key, s.round, lacks OR stale, lacks OR stale OR doubt, \
+                        lacks OR doubt \
+                   FROM (SELECT s.*, h.replica_id IS NULL OR h.refused AS lacks, \
+                                coalesce(NOT pg_visible_in_snapshot(c.xid, h.snapshot), false) AS stale, \
+                                d.replica_id IS NOT NULL AS doubt \
+                           FROM sync_staged s \
+                           LEFT JOIN sync_holds h ON h.replica_id = s.replica_id AND h.relation = {} \
+                                                 AND h.row_key = s.row_key \
+                           LEFT JOIN sync_changed c ON c.rel = s.rel AND c.row_key = s.row_key \
+                           LEFT JOIN sync_suspect d ON d.replica_id = s.replica_id AND d.rel = s.rel \
+                                                   AND d.row_key = s.row_key \
+                          WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = s.replica_id \
+                                               AND b.rel = s.rel AND b.row_key = s.row_key)) AS s",
+                literal(self.plans[i].table)
+            ),
+        };
+        Ok(sqlx::query(&sql).execute(&mut *conn).await?.rows_affected())
+    }
+
+    /// Rows kept that point at a row that cannot go, there: each joins the
+    /// rows that cannot go, at round `round`. Answers whether there was one.
+    async fn conflicts(&self, conn: &mut Conn, round: i32) -> Result<bool, Error> {
+        let blocked = self.present(conn, "sync_blocked").await?;
+        let mut found = 0;
+        for (c, reference) in self
+            .references()
+            .filter(|(_, r)| blocked.contains(&r.parent))
+        {
+            let select = format!(
+                "SELECT k.replica_id, {c}, k.row_key, \
+                        format('it points at `%s` %s, which cannot go: %s', {}, b.row_key, b.why) \
+                   FROM sync_kept k JOIN {} t ON {} \
+                   JOIN sync_blocked b ON b.replica_id = k.replica_id AND b.rel = {} \
+                                      AND b.row_key = {} \
+                  WHERE k.rel = {c}",
+                literal(self.plans[reference.parent].table),
+                self.plans[c].relation.sql(),
+                self.row_is(c, "k.row_key"),
+                reference.parent,
+                key_sql("t", &reference.columns),
+            );
+            found += self.add(conn, Set::Blocked, &select, round).await?;
+        }
+        Ok(found > 0)
+    }
+
+    /// The tables `set` has rows of at `round`.
+    async fn frontier(
+        &self,
+        conn: &mut Conn,
+        set: &str,
+        round: i32,
+    ) -> Result<BTreeSet<usize>, Error> {
+        let rels: Vec<i32> =
+            sqlx::query_scalar(&format!("SELECT DISTINCT rel FROM {set} WHERE round = $1"))
+                .bind(round)
+                .fetch_all(&mut *conn)
+                .await?;
+        Ok(rels
+            .into_iter()
+            .filter_map(|r| usize::try_from(r).ok())
+            .collect())
+    }
+
+    /// The tables `set` has rows of.
+    async fn present(&self, conn: &mut Conn, set: &str) -> Result<BTreeSet<usize>, Error> {
+        let rels: Vec<i32> = sqlx::query_scalar(&format!("SELECT DISTINCT rel FROM {set}"))
+            .fetch_all(&mut *conn)
+            .await?;
+        Ok(rels
+            .into_iter()
+            .filter_map(|r| usize::try_from(r).ok())
+            .collect())
+    }
+
+    /// Every reference between the mirrored tables, by the child.
+    fn references(&self) -> impl Iterator<Item = (usize, &Reference)> {
+        self.plans
+            .iter()
+            .enumerate()
+            .flat_map(|(c, p)| p.references.iter().map(move |r| (c, r)))
+    }
+
+    /// Every table that follows another: itself, its column, its parent.
+    fn followers(&self) -> impl Iterator<Item = (usize, &'static str, usize)> + '_ {
+        self.plans.iter().enumerate().filter_map(|(f, plan)| {
+            let Route::Follows(column) = plan.route else {
+                return None;
+            };
+            let reference = plan.references.iter().find(|r| r.columns == [column])?;
+            Some((f, column, reference.parent))
+        })
+    }
+
+    /// The key text of the row of `i` aliased `t`.
+    fn key_of_row(&self, i: usize) -> String {
+        key_sql(
+            "t",
+            &self.plans[i].key.iter().map(|c| c.name).collect::<Vec<_>>(),
+        )
+    }
+
+    /// The row of `i` aliased `t` is the one whose key is the text `text`.
+    fn row_is(&self, i: usize, text: &str) -> String {
+        let plan = &self.plans[i];
+        key_eq(
+            "t",
+            &plan.key.iter().map(|c| c.name).collect::<Vec<_>>(),
+            &plan.key,
+            text,
+        )
+    }
+
+    /// The row aliased `t` points through `reference` at the row whose key
+    /// is the text `text`.
+    fn points_at(&self, reference: &Reference, text: &str) -> String {
+        key_eq(
+            "t",
+            &reference.columns,
+            &self.plans[reference.parent].key,
+            text,
+        )
+    }
+
+    /// The row of `i` aliased `t` is one of the keys `keys` — a query of one
+    /// text column, `row_key` — answers: what lets the table's key index serve.
+    fn key_among(&self, i: usize, keys: &str) -> String {
+        let plan = &self.plans[i];
+        let row: Vec<String> = plan
+            .key
+            .iter()
+            .map(|c| format!("t.{}", ident(c.name)))
+            .collect();
+        let typed: Vec<String> = plan
+            .key
+            .iter()
+            .enumerate()
+            .map(|(n, c)| {
+                let part = if plan.key.len() == 1 {
+                    "k.row_key".to_owned()
+                } else {
+                    format!("split_part(k.row_key, '|', {})", n + 1)
+                };
+                format!("({part})::{}", KeyPart::sql_type(c.key))
+            })
+            .collect();
+        format!(
+            "({}) IN (SELECT {} FROM ({keys}) AS k(row_key))",
+            row.join(", "),
+            typed.join(", ")
+        )
+    }
+
+    /// What the plan takes back: the rows in question each live replica
+    /// does not keep.
+    const DROPPED: &'static str = "SELECT d.replica_id, d.rel, d.row_key FROM sync_suspect d \
+          JOIN sync_live USING (replica_id) \
+         WHERE NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = d.replica_id \
+                              AND k.rel = d.rel AND k.row_key = d.row_key)";
+
+    /// Every replica the plan sends to, takes from or provisions.
+    pub(crate) async fn touched(&self, conn: &mut Conn) -> Result<BTreeSet<Uuid>, Error> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT replica_id FROM sync_kept JOIN sync_live USING (replica_id) WHERE sends \
+             UNION SELECT replica_id FROM ({}) AS d UNION SELECT replica_id FROM sync_fresh",
+            Self::DROPPED
+        ))
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
+    /// Opens, as the cursor `sync_sent`, every row the plan sends a live
+    /// replica — `(table, key, replica)` — tables parents first, each by
+    /// key: read once, a page at a time, by [`Engine::next`].
+    pub(crate) async fn open_sent(&self, conn: &mut Conn) -> Result<(), Error> {
+        sqlx::Executor::execute(
+            &mut *conn,
+            format!(
+                "DECLARE sync_sent NO SCROLL CURSOR FOR \
+                 SELECT k.rel, k.row_key, k.replica_id FROM sync_kept k JOIN sync_live USING (replica_id) \
+                  WHERE k.sends ORDER BY array_position({}, k.rel), k.row_key, k.replica_id",
+                self.order_array(false)
+            )
+            .as_str(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Opens, as the cursor `sync_dropped`, every row the plan takes back
+    /// from a live replica — `(table, key, replica)` — by replica, children
+    /// first.
+    pub(crate) async fn open_dropped(&self, conn: &mut Conn) -> Result<(), Error> {
+        sqlx::Executor::execute(
+            &mut *conn,
+            format!(
+                "DECLARE sync_dropped NO SCROLL CURSOR FOR \
+                 SELECT d.rel, d.row_key, d.replica_id FROM ({}) AS d \
+                  ORDER BY d.replica_id, array_position({}, d.rel), d.row_key",
+                Self::DROPPED,
+                self.order_array(true)
+            )
+            .as_str(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The next `limit` rows of the cursor `cursor`, closed once there are
+    /// none.
+    pub(crate) async fn next(
+        &self,
+        conn: &mut Conn,
+        cursor: &str,
+        limit: usize,
+    ) -> Result<Vec<(usize, String, Uuid)>, Error> {
+        let rows: Vec<(i32, String, Uuid)> =
+            sqlx::query_as(&format!("FETCH FORWARD {limit} FROM {cursor}"))
+                .fetch_all(&mut *conn)
+                .await?;
+        if rows.is_empty() {
+            sqlx::Executor::execute(&mut *conn, format!("CLOSE {cursor}").as_str()).await?;
+        }
+        Ok(rows
+            .into_iter()
+            .map(|(i, k, r)| (usize::try_from(i).unwrap_or(usize::MAX), k, r))
+            .collect())
+    }
+
+    /// The tables, parents first — or children first — as an SQL array.
+    fn order_array(&self, children_first: bool) -> String {
+        let mut order: Vec<String> = self.order.iter().map(ToString::to_string).collect();
+        if children_first {
+            order.reverse();
+        }
+        format!("ARRAY[{}]::int4[]", order.join(", "))
     }
 
     fn groups_through(
@@ -1630,592 +2287,6 @@ impl Engine {
                     .map(|g| (i, g.clone()))
             })
             .collect()
-    }
-
-    /// The parents a row points at, per row: `(child key, parent key)` for one
-    /// reference of `i`.
-    async fn parents_of(
-        &self,
-        conn: &mut Conn,
-        i: usize,
-        reference: &Reference,
-        keys: &[String],
-        active: bool,
-    ) -> Result<Vec<(String, String)>, Error> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let plan = &self.plans[i];
-        let from = if active {
-            plan.active.clone()
-        } else {
-            plan.relation.sql()
-        };
-        let names: Vec<&str> = plan.key.iter().map(|c| c.name).collect();
-        let key = key_sql("t", &names);
-        let parent_key = key_sql("t", &reference.columns);
-        let not_null: Vec<String> = reference
-            .columns
-            .iter()
-            .map(|c| format!("t.{} IS NOT NULL", ident(c)))
-            .collect();
-        Ok(sqlx::query_as(&format!(
-            "SELECT {key}, {parent_key} FROM {from} t WHERE {} AND {}",
-            key_in("t", &names, &plan.key, "$1"),
-            not_null.join(" AND ")
-        ))
-        .bind(keys)
-        .fetch_all(&mut *conn)
-        .await?)
-    }
-
-    /// Sends along every parent a sent row points at that its replica lacks —
-    /// or refused, so it goes again with what needs it — children first so a
-    /// parent's own parents follow.
-    async fn close_references(&self, conn: &mut Conn, delta: &mut Delta) -> Result<(), Error> {
-        for &i in self.order.iter().rev() {
-            let sent = delta.sent(i);
-            if sent.is_empty() {
-                continue;
-            }
-            let keys: Vec<String> = sent
-                .iter()
-                .flat_map(|(_, keys)| keys.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            for reference in self.plans[i].references.clone() {
-                let parent_of: BTreeMap<String, String> = self
-                    .parents_of(conn, i, &reference, &keys, false)
-                    .await?
-                    .into_iter()
-                    .collect();
-                let parent_keys: Vec<String> = parent_of
-                    .values()
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let replicas: Vec<Uuid> = sent.iter().map(|(e, _)| *e).collect();
-                let held = if parent_keys.is_empty() {
-                    BTreeMap::new()
-                } else {
-                    delta.fresh(
-                        self.held(conn, reference.parent, Some(&parent_keys), Some(&replicas))
-                            .await?,
-                    )
-                };
-                for (replica, keys) in &sent {
-                    for parent in keys.iter().filter_map(|k| parent_of.get(k)) {
-                        let holder = (*replica, parent.clone());
-                        if held.get(&holder).is_none_or(|h| *h == REFUSED)
-                            && !delta.has_upsert(*replica, reference.parent, parent)
-                        {
-                            delta.upsert(*replica, reference.parent, parent.clone());
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Takes back what nothing a replica keeps points at any more, and keeps
-    /// what something still does — sending it again where it changed since the
-    /// replica's version.
-    ///
-    /// The candidates are the deletes already decided — a row a replica
-    /// should no longer hold — and the parents a change released: the ones a
-    /// changed row pointed at before, for whoever holds it. Tables are visited
-    /// children first, so a delete that stands releases its own parents in
-    /// turn. A candidate stays when a row its replica keeps or is being sent
-    /// points at it, or when its own strategy still sends it there.
-    async fn release_references(
-        &self,
-        conn: &mut Conn,
-        delta: &mut Delta,
-        released: &Released,
-        changed: &BTreeMap<usize, BTreeMap<String, i64>>,
-    ) -> Result<(), Error> {
-        let mut candidates: BTreeMap<usize, BTreeSet<(Uuid, String)>> = BTreeMap::new();
-        let mut by_table: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        for (i, key) in released.previous.keys() {
-            by_table.entry(*i).or_default().push(key.clone());
-        }
-        let mut holders_of: BTreeMap<(usize, String), Vec<Uuid>> = BTreeMap::new();
-        for (i, keys) in &by_table {
-            for (replica, key) in self.held(conn, *i, Some(keys), None).await?.into_keys() {
-                holders_of.entry((*i, key)).or_default().push(replica);
-            }
-        }
-        for ((i, key), versions) in &released.previous {
-            let holders = holders_of
-                .get(&(*i, key.clone()))
-                .cloned()
-                .unwrap_or_default();
-            for reference in &self.plans[*i].references {
-                for previous in versions {
-                    let Some(parent) = key_of(previous, &reference.columns) else {
-                        continue;
-                    };
-                    for replica in &holders {
-                        candidates
-                            .entry(reference.parent)
-                            .or_default()
-                            .insert((*replica, parent.clone()));
-                    }
-                }
-            }
-        }
-
-        for &p in self.order.iter().rev() {
-            let mut examined: BTreeSet<(Uuid, String)> = delta
-                .deletes
-                .iter()
-                .flat_map(|(e, t)| {
-                    t.get(&p)
-                        .into_iter()
-                        .flatten()
-                        .map(move |k| (*e, k.clone()))
-                })
-                .collect();
-            if let Some(released) = candidates.remove(&p) {
-                // Only what is held and not on its way back can be taken back.
-                let keys: Vec<String> = released.iter().map(|(_, k)| k.clone()).collect();
-                let replicas: Vec<Uuid> = released.iter().map(|(e, _)| *e).collect();
-                let held = delta.fresh(self.held(conn, p, Some(&keys), Some(&replicas)).await?);
-                let wanted = self.wanted(conn, p, Some(&keys), Some(&replicas)).await?;
-                // A row on its way again only because it changed is still
-                // examined: sending it does not keep it.
-                for candidate in released {
-                    if held.contains_key(&candidate) && !wanted.contains(&candidate) {
-                        examined.insert(candidate);
-                    }
-                }
-            }
-            if examined.is_empty() {
-                continue;
-            }
-            let mut kept = self.pointed_at(conn, delta, p, &examined).await?;
-            kept.retain(|(r, k)| !delta.blocked.contains_key(&(*r, p, k.clone())));
-            // Kept for what points at it: it goes again where it changed.
-            if let Some(notes) = changed.get(&p) {
-                let keys: Vec<String> = kept
-                    .iter()
-                    .filter(|(_, k)| notes.contains_key(k))
-                    .map(|(_, k)| k.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                if !keys.is_empty() {
-                    let horizons = self.held(conn, p, Some(&keys), None).await?;
-                    for holder in &kept {
-                        if notes.contains_key(&holder.1)
-                            && Self::owed(&horizons, Some(notes), holder)
-                        {
-                            delta.upsert(holder.0, p, holder.1.clone());
-                        }
-                    }
-                }
-            }
-            for (replica, key) in &examined {
-                if kept.contains(&(*replica, key.clone())) {
-                    if let Some(keys) = delta.deletes.get_mut(replica).and_then(|t| t.get_mut(&p)) {
-                        keys.remove(key);
-                    }
-                } else {
-                    delta.unsend(*replica, p, key);
-                    delta.delete(*replica, p, key.clone());
-                }
-            }
-            // A delete that stands releases what the row points at.
-            let standing: Vec<(Uuid, String)> = examined.difference(&kept).cloned().collect();
-            let keys: Vec<String> = standing
-                .iter()
-                .map(|(_, k)| k.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            for reference in &self.plans[p].references {
-                let mut parents: BTreeMap<String, String> = self
-                    .parents_of(conn, p, reference, &keys, false)
-                    .await?
-                    .into_iter()
-                    .collect();
-                for key in &keys {
-                    if parents.contains_key(key) {
-                        continue;
-                    }
-                    if let Some(parent) = released
-                        .previous
-                        .get(&(p, key.clone()))
-                        .and_then(|versions| versions.last())
-                        .and_then(|row| key_of(row, &reference.columns))
-                    {
-                        parents.insert(key.clone(), parent);
-                    }
-                }
-                for (replica, key) in &standing {
-                    if let Some(parent) = parents.get(key) {
-                        candidates
-                            .entry(reference.parent)
-                            .or_default()
-                            .insert((*replica, parent.clone()));
-                    }
-                }
-            }
-        }
-        for tables in delta.deletes.values_mut() {
-            tables.retain(|_, keys| !keys.is_empty());
-        }
-        delta.deletes.retain(|_, tables| !tables.is_empty());
-        Ok(())
-    }
-
-    /// The rows of `c` that `replicas` hold and that point, through
-    /// `reference`, at one of `keys`: `(replica, row, parent)`. From the few
-    /// pointing rows to whether a replica holds them, by index.
-    async fn held_pointing(
-        &self,
-        conn: &mut Conn,
-        c: usize,
-        reference: &Reference,
-        replicas: &[Uuid],
-        keys: &[String],
-    ) -> Result<Vec<(Uuid, String, String)>, Error> {
-        let plan = &self.plans[c];
-        Ok(sqlx::query_as(&format!(
-            "SELECT h.replica_id, h.row_key, {} FROM {} t \
-               JOIN sync.held h ON h.relation = $1 AND h.replica_id = ANY($2) \
-                               AND h.row_key = {} \
-              WHERE {}",
-            key_sql("t", &reference.columns),
-            plan.relation.sql(),
-            key_sql("t", &plan.key.iter().map(|k| k.name).collect::<Vec<_>>()),
-            key_in(
-                "t",
-                &reference.columns,
-                &self.plans[reference.parent].key,
-                "$3"
-            ),
-        ))
-        .bind(plan.table)
-        .bind(replicas)
-        .bind(keys)
-        .fetch_all(&mut *conn)
-        .await?)
-    }
-
-    /// A row that cannot go to a replica takes with it, parents first, what
-    /// points at it there — held or being sent. None of them is sent it, and
-    /// one it holds is taken back.
-    async fn block(&self, conn: &mut Conn, delta: &mut Delta) -> Result<(), Error> {
-        if delta.blocked.is_empty() {
-            return Ok(());
-        }
-        for &c in &self.order {
-            for reference in &self.plans[c].references {
-                let p = reference.parent;
-                let parents: BTreeMap<(Uuid, String), String> = delta
-                    .blocked
-                    .iter()
-                    .filter(|((_, t, _), _)| *t == p)
-                    .map(|((r, _, k), why)| ((*r, k.clone()), why.clone()))
-                    .collect();
-                if parents.is_empty() {
-                    continue;
-                }
-                let replicas: Vec<Uuid> = parents
-                    .keys()
-                    .map(|(r, _)| *r)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let keys: Vec<String> = parents
-                    .keys()
-                    .map(|(_, k)| k.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let mut pointing: Vec<(Uuid, String, String)> = self
-                    .held_pointing(conn, c, reference, &replicas, &keys)
-                    .await?
-                    .into_iter()
-                    .filter(|(r, _, _)| !delta.snapshots.contains(r))
-                    .collect();
-                let sent: Vec<(Uuid, Vec<String>)> = delta
-                    .sent(c)
-                    .into_iter()
-                    .filter(|(r, _)| replicas.contains(r))
-                    .collect();
-                let child_keys: Vec<String> = sent
-                    .iter()
-                    .flat_map(|(_, keys)| keys.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let parent_of: BTreeMap<String, String> = self
-                    .parents_of(conn, c, reference, &child_keys, false)
-                    .await?
-                    .into_iter()
-                    .collect();
-                for (replica, keys) in sent {
-                    for key in keys {
-                        if let Some(parent) = parent_of.get(&key) {
-                            pointing.push((replica, key, parent.clone()));
-                        }
-                    }
-                }
-                for (replica, row, parent) in pointing {
-                    if let Some(why) = parents.get(&(replica, parent.clone())) {
-                        delta.blocked.entry((replica, c, row)).or_insert_with(|| {
-                            format!(
-                                "it points at `{}` {parent}, which cannot go: {why}",
-                                self.plans[p].table
-                            )
-                        });
-                    }
-                }
-            }
-        }
-        let mut by_table: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        for (_, i, key) in delta.blocked.keys() {
-            by_table.entry(*i).or_default().push(key.clone());
-        }
-        for (i, keys) in by_table {
-            let held = delta.fresh(self.held(conn, i, Some(&keys), None).await?);
-            let blocked: Vec<(Uuid, String)> = delta
-                .blocked
-                .keys()
-                .filter(|(_, t, _)| *t == i)
-                .map(|(r, _, k)| (*r, k.clone()))
-                .collect();
-            for (replica, key) in blocked {
-                delta.unsend(replica, i, &key);
-                if held.contains_key(&(replica, key.clone())) {
-                    delta.delete(replica, i, key);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Which of `candidates` (rows of `p`, per replica) a row the replica
-    /// keeps — held and not being taken back, or being sent — points at.
-    async fn pointed_at(
-        &self,
-        conn: &mut Conn,
-        delta: &Delta,
-        p: usize,
-        candidates: &BTreeSet<(Uuid, String)>,
-    ) -> Result<BTreeSet<(Uuid, String)>, Error> {
-        let keys: Vec<String> = candidates
-            .iter()
-            .map(|(_, k)| k.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let replicas: Vec<Uuid> = candidates
-            .iter()
-            .map(|(e, _)| *e)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut kept = BTreeSet::new();
-        for (c, plan) in self.plans.iter().enumerate() {
-            // A follower goes where its parent goes: it never keeps it.
-            let follows = match plan.route {
-                Route::Follows(column) => Some(column),
-                _ => None,
-            };
-            for reference in plan
-                .references
-                .iter()
-                .filter(|r| r.parent == p && follows.is_none_or(|f| r.columns != [f.to_owned()]))
-            {
-                let pointing = self
-                    .held_pointing(conn, c, reference, &replicas, &keys)
-                    .await?;
-                for (replica, child, parent) in pointing {
-                    if !delta.has_delete(replica, c, &child) {
-                        kept.insert((replica, parent));
-                    }
-                }
-                let sent: Vec<(Uuid, Vec<String>)> = delta
-                    .sent(c)
-                    .into_iter()
-                    .filter(|(e, _)| replicas.contains(e))
-                    .collect();
-                let child_keys: Vec<String> = sent
-                    .iter()
-                    .flat_map(|(_, keys)| keys.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let parent_of: BTreeMap<String, String> = self
-                    .parents_of(conn, c, reference, &child_keys, false)
-                    .await?
-                    .into_iter()
-                    .collect();
-                for (replica, keys) in &sent {
-                    for parent in keys.iter().filter_map(|k| parent_of.get(k)) {
-                        kept.insert((*replica, parent.clone()));
-                    }
-                }
-            }
-        }
-        Ok(kept.intersection(candidates).cloned().collect())
-    }
-
-    /// Followers go wherever their parent goes, parents first: a parent newly
-    /// sent to a replica brings its followers, one taken back takes them
-    /// back, and a follower that changed goes to whoever will hold its parent.
-    async fn follow_parents(
-        &self,
-        conn: &mut Conn,
-        delta: &mut Delta,
-        touched: &BTreeMap<usize, BTreeMap<String, i64>>,
-    ) -> Result<(), Error> {
-        for &c in &self.order {
-            let Route::Follows(column) = self.plans[c].route else {
-                continue;
-            };
-            let reference = self.plans[c]
-                .references
-                .iter()
-                .find(|r| r.columns == [column.to_owned()])
-                .expect("checked in new()")
-                .clone();
-            let parent = reference.parent;
-            let child_key = key_sql(
-                "t",
-                &self.plans[c].key.iter().map(|k| k.name).collect::<Vec<_>>(),
-            );
-
-            // Followers that changed: to whoever will hold their parent.
-            if let Some(notes) = touched.get(&c) {
-                let keys: Vec<String> = notes.keys().cloned().collect();
-                let keys = &keys;
-                // Read from the active rows: a retired follower goes to no
-                // one, and is taken back from whoever holds it.
-                let parents: BTreeMap<String, String> = self
-                    .parents_of(conn, c, &reference, keys, true)
-                    .await?
-                    .into_iter()
-                    .collect();
-                let parent_keys: Vec<String> = parents
-                    .values()
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let parent_held = if parent_keys.is_empty() {
-                    BTreeMap::new()
-                } else {
-                    delta.fresh(self.held(conn, parent, Some(&parent_keys), None).await?)
-                };
-                let horizons = delta.fresh(self.held(conn, c, Some(keys), None).await?);
-                let mut targets: BTreeSet<(Uuid, String)> = BTreeSet::new();
-                for (key, pk) in &parents {
-                    for (replica, _) in parent_held.keys().filter(|(_, k)| k == pk) {
-                        if !delta.has_delete(*replica, parent, pk) {
-                            targets.insert((*replica, key.clone()));
-                        }
-                    }
-                    for (replica, tables) in &delta.upserts {
-                        if tables.get(&parent).is_some_and(|k| k.contains(pk)) {
-                            targets.insert((*replica, key.clone()));
-                        }
-                    }
-                }
-                for target in &targets {
-                    if delta.snapshots.contains(&target.0)
-                        || Self::owed(&horizons, Some(notes), target)
-                    {
-                        delta.upsert(target.0, c, target.1.clone());
-                    }
-                }
-                for holder in horizons.keys() {
-                    if !targets.contains(holder) {
-                        delta.delete(holder.0, c, holder.1.clone());
-                    }
-                }
-            }
-
-            let column_in = |param: &str| key_in("t", &[column], &self.plans[parent].key, param);
-
-            // Parents newly sent bring their followers.
-            let sent = delta.sent(parent);
-            let parent_keys: Vec<String> = sent
-                .iter()
-                .flat_map(|(_, keys)| keys.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            if !parent_keys.is_empty() {
-                let replicas: Vec<Uuid> = sent.iter().map(|(e, _)| *e).collect();
-                let held = delta.fresh(
-                    self.held(conn, parent, Some(&parent_keys), Some(&replicas))
-                        .await?,
-                );
-                let followers: Vec<(String, String)> = sqlx::query_as(&format!(
-                    "SELECT {child_key}, t.{}::text FROM {} t WHERE {}",
-                    ident(column),
-                    self.plans[c].active,
-                    column_in("$1"),
-                ))
-                .bind(&parent_keys)
-                .fetch_all(&mut *conn)
-                .await?;
-                let mut of_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                for (follower, parent_key) in followers {
-                    of_parent.entry(parent_key).or_default().push(follower);
-                }
-                for (replica, keys) in &sent {
-                    for key in keys {
-                        if held.contains_key(&(*replica, key.clone())) {
-                            continue;
-                        }
-                        for follower in of_parent.get(key).into_iter().flatten() {
-                            delta.upsert(*replica, c, follower.clone());
-                        }
-                    }
-                }
-            }
-
-            // Parents taken back take their followers first.
-            let taken = delta.taken(parent);
-            let parent_keys: Vec<String> = taken
-                .iter()
-                .flat_map(|(_, keys)| keys.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            if !parent_keys.is_empty() {
-                let replicas: Vec<Uuid> = taken.iter().map(|(e, _)| *e).collect();
-                let held: Vec<(Uuid, String, String)> = sqlx::query_as(&format!(
-                    "SELECT h.replica_id, h.row_key, t.{}::text FROM {} t \
-                       JOIN sync.held h ON h.relation = $1 AND h.replica_id = ANY($2) \
-                                       AND h.row_key = {child_key} \
-                      WHERE {}",
-                    ident(column),
-                    self.plans[c].relation.sql(),
-                    column_in("$3"),
-                ))
-                .bind(self.plans[c].table)
-                .bind(&replicas)
-                .bind(&parent_keys)
-                .fetch_all(&mut *conn)
-                .await?;
-                for (replica, key, parent_key) in held {
-                    let taken_here = delta.has_delete(replica, parent, &parent_key);
-                    if taken_here && !delta.has_upsert(replica, c, &key) {
-                        delta.delete(replica, c, key);
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The rows of `keys` of table `i`, encoded in the plan's snapshot, by
@@ -2279,20 +2350,13 @@ impl Engine {
     pub(crate) async fn replan(
         &self,
         conn: &mut Conn,
-        delta: Delta,
+        mut delta: Delta,
         blocked: BTreeMap<(Uuid, usize, String), String>,
     ) -> Result<Delta, Error> {
-        let mut all = delta.blocked;
         for (row, why) in blocked {
-            all.entry(row).or_insert(why);
+            delta.blocked.entry(row).or_insert(why);
         }
-        let again = Delta {
-            changes: delta.changes,
-            blocked: all,
-            left_out: delta.left_out,
-            ..Delta::default()
-        };
-        self.plan_around(conn, again).await
+        self.plan_around(conn, delta).await
     }
 
     /// `delta` planned again, in the same snapshot, with `replicas`
@@ -2300,18 +2364,14 @@ impl Engine {
     pub(crate) async fn provision(
         &self,
         conn: &mut Conn,
-        delta: Delta,
+        mut delta: Delta,
         replicas: &[Uuid],
     ) -> Result<Delta, Error> {
-        let mut changes = delta.changes;
-        changes.extend(replicas.iter().map(|r| Change::Resync { replica: *r }));
-        let again = Delta {
-            changes,
-            blocked: delta.blocked,
-            left_out: delta.left_out,
-            ..Delta::default()
-        };
-        self.plan_around(conn, again).await
+        delta.notes.extend(replicas.iter().map(|r| Note {
+            id: 0,
+            change: Change::Resync { replica: *r },
+        }));
+        self.plan_around(conn, delta).await
     }
 
     /// The rows the delta could not send, each per replica it was to go to.
@@ -2331,17 +2391,6 @@ impl Engine {
     /// The tables every snapshot names, parents first.
     pub(crate) fn snapshot_tables(&self) -> Vec<&'static str> {
         self.order.iter().map(|&i| self.plans[i].table).collect()
-    }
-
-    /// Every replica the delta touches.
-    pub(crate) fn replicas(delta: &Delta) -> BTreeSet<Uuid> {
-        delta
-            .upserts
-            .keys()
-            .chain(delta.deletes.keys())
-            .chain(delta.snapshots.iter())
-            .copied()
-            .collect()
     }
 }
 
@@ -2473,12 +2522,6 @@ pub(crate) async fn prune(conn: &mut Conn, age: std::time::Duration) -> Result<u
             .execute(&mut *conn)
             .await?;
     Ok(done.rows_affected())
-}
-
-/// What a batch of changes may have released: each changed row as it was.
-#[derive(Default)]
-struct Released {
-    previous: BTreeMap<(usize, String), Vec<serde_json::Value>>,
 }
 
 /// A grouped table's members and assigned tables, read off their foreign
@@ -2661,31 +2704,5 @@ pub(crate) mod tests {
             .execute(&mut *conn)
             .await
             .expect("the schema");
-    }
-
-    #[test]
-    fn a_change_is_sent_again_only_where_the_held_version_predates_it() {
-        let replica = Uuid::now_v7();
-        let held = |horizon: i64| BTreeMap::from([((replica, "k".to_owned()), horizon)]);
-        let notes = BTreeMap::from([("k".to_owned(), 100_i64)]);
-        let holder = (replica, "k".to_owned());
-
-        assert!(Engine::owed(&BTreeMap::new(), None, &holder), "not held");
-        assert!(
-            Engine::owed(&held(90), Some(&notes), &holder),
-            "sent before the change"
-        );
-        assert!(
-            Engine::owed(&held(100), Some(&notes), &holder),
-            "the change still running then"
-        );
-        assert!(
-            !Engine::owed(&held(101), Some(&notes), &holder),
-            "the send carried it"
-        );
-        assert!(
-            !Engine::owed(&held(90), None, &holder),
-            "only who holds it moved"
-        );
     }
 }

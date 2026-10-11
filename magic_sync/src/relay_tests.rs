@@ -11,6 +11,7 @@ use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use crate::wire::MapError;
 use prost::Message as _;
 use sqlx::Connection as _;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 const SCHEMA: &str = "

@@ -5,15 +5,31 @@
 //! Each replica is modelled as what it was sent: every row it holds, as the
 //! bytes that carried it. Passes run as the relay runs them — the notes read
 //! and planned in one transaction, the rows loaded in it, with another
-//! connection writing in between — and what each replica is sent is applied
-//! to its model. After every delivery a replica never holds a row whose parent
-//! it lacks; after the outbox drains, each live replica holds exactly what its
-//! strategies say, every row as it is now, and the engine records exactly
-//! that. What each replica should hold is computed here from the rows,
-//! independently of the engine.
+//! connection writing in between, and now and then a writer whose
+//! transaction spans passes — and what each replica is sent is applied to
+//! its model. The walk writes every kind of change: rows and keys updated,
+//! members and assignments moved, groups deleted, rows moved between
+//! partitions, rows of a table that points at followers and of a chain of
+//! tables that travel only when pointed at, columns the replicas own, rows
+//! this build cannot encode or that fit no message — routed, following and
+//! mid-chain — and rows the replicas refuse; and it plans in batches that
+//! split what was written together.
+//!
+//! What each replica should hold is worked out here, from the rows, by the
+//! definition — what its rules send it, every row one of those points at,
+//! every row that follows one of those, none that cannot go or points at one
+//! that cannot — independently of the engine. Then:
+//!
+//! - after every delivery, a replica holds no row whose parent it lacks;
+//! - no message carries a row its replica holds already at that version
+//!   (every write gives a row a version of its own), but a snapshot;
+//! - a pass that planned every pending note sends a replica only rows it
+//!   should hold, and takes back only rows it should not;
+//! - whenever the system settles, each live replica holds exactly what it
+//!   should, every row as it is now, and the engine records exactly that.
 
 use super::*;
-use crate::model::{Faults, Model, Row, Rules, Wire};
+use crate::model::{Faults, Model, Received, Row, Rules, Wire};
 use crate::testkit::Walk;
 use chrono::{DateTime, Utc};
 use sqlx::Connection as _;
@@ -22,55 +38,75 @@ use std::time::Duration;
 pub(super) const SCHEMA: &str = "
 CREATE SCHEMA fixture;
 CREATE SEQUENCE fixture.numbers;
+-- Every write gives a row a version of its own: a message that carries a
+-- version its replica holds carries nothing new.
+CREATE SEQUENCE fixture.revs;
+CREATE FUNCTION fixture.bump() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN NEW.rev := nextval('fixture.revs'); RETURN NEW; END $$;
 CREATE TABLE fixture.t_replicas (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, live BOOLEAN NOT NULL,
     retired_at TIMESTAMPTZ);
+CREATE TABLE fixture.t_families (
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_kinds (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    retired_at TIMESTAMPTZ);
+    family_id UUID REFERENCES fixture.t_families (id),
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
-    name TEXT NOT NULL, retired_at TIMESTAMPTZ);
+    name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_customers (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_lists (id UUID PRIMARY KEY, partition_id UUID NOT NULL);
 CREATE TABLE fixture.t_list_members (
-    list_id UUID NOT NULL REFERENCES fixture.t_lists (id),
+    list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
     customer_id UUID NOT NULL REFERENCES fixture.t_customers (id),
     partition_id UUID NOT NULL, PRIMARY KEY (list_id, customer_id));
 CREATE TABLE fixture.t_replica_lists (
-    list_id UUID NOT NULL REFERENCES fixture.t_lists (id),
+    list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
     replica_id UUID NOT NULL REFERENCES fixture.t_replicas (id),
     partition_id UUID NOT NULL, PRIMARY KEY (list_id, replica_id));
 CREATE TABLE fixture.t_emails (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL,
     customer_id UUID NOT NULL REFERENCES fixture.t_customers (id), address TEXT NOT NULL,
-    retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_phones (
     customer_id UUID NOT NULL REFERENCES fixture.t_customers (id), number INTEGER NOT NULL,
     partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
-    retired_at TIMESTAMPTZ, PRIMARY KEY (customer_id, number));
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    PRIMARY KEY (customer_id, number));
+-- Rows of their own that point at a follower.
+CREATE TABLE fixture.t_calls (
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL,
+    replica_id UUID REFERENCES fixture.t_replicas (id),
+    customer_id UUID NOT NULL, number INTEGER NOT NULL, name TEXT NOT NULL,
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    FOREIGN KEY (customer_id, number) REFERENCES fixture.t_phones (customer_id, number)
+        ON UPDATE CASCADE);
 CREATE TABLE fixture.t_orders (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL,
     replica_id UUID REFERENCES fixture.t_replicas (id),
     customer_id UUID REFERENCES fixture.t_customers (id), name TEXT NOT NULL DEFAULT 'o',
-    retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_sizes (
     code INTEGER PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_bins (
     store INTEGER NOT NULL, slot INTEGER NOT NULL, partition_id UUID NOT NULL,
-    size_code INTEGER REFERENCES fixture.t_sizes (code), name TEXT NOT NULL,
-    retired_at TIMESTAMPTZ, PRIMARY KEY (store, slot));
+    size_code INTEGER REFERENCES fixture.t_sizes (code) ON UPDATE CASCADE, name TEXT NOT NULL,
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    PRIMARY KEY (store, slot));
 -- Keyed (region, number) by its row, and by its primary key the other way
 -- round: the row's order is the one keys are written in.
 CREATE TABLE fixture.t_accounts (
     region INTEGER NOT NULL, number BIGINT NOT NULL, partition_id UUID NOT NULL,
-    size_code INTEGER REFERENCES fixture.t_sizes (code), name TEXT NOT NULL,
-    retired_at TIMESTAMPTZ, PRIMARY KEY (number, region));
+    size_code INTEGER REFERENCES fixture.t_sizes (code) ON UPDATE CASCADE, name TEXT NOT NULL,
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    PRIMARY KEY (number, region));
 CREATE TABLE fixture.t_account_members (
-    list_id UUID NOT NULL REFERENCES fixture.t_lists (id),
+    list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
     region INTEGER NOT NULL, number BIGINT NOT NULL, partition_id UUID NOT NULL,
     FOREIGN KEY (number, region) REFERENCES fixture.t_accounts (number, region),
     PRIMARY KEY (list_id, region, number));
@@ -78,18 +114,25 @@ CREATE TABLE fixture.t_tasks (
     id BIGINT PRIMARY KEY, partition_id UUID NOT NULL,
     replica_id UUID REFERENCES fixture.t_replicas (id),
     store INTEGER, slot INTEGER, region INTEGER, number BIGINT,
-    name TEXT NOT NULL, retired_at TIMESTAMPTZ,
-    FOREIGN KEY (store, slot) REFERENCES fixture.t_bins (store, slot),
+    name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    FOREIGN KEY (store, slot) REFERENCES fixture.t_bins (store, slot) ON UPDATE CASCADE,
     FOREIGN KEY (number, region) REFERENCES fixture.t_accounts (number, region));
 CREATE TABLE fixture.t_task_lines (
-    task_id BIGINT NOT NULL REFERENCES fixture.t_tasks (id), line INTEGER NOT NULL,
-    partition_id UUID NOT NULL, size_code INTEGER REFERENCES fixture.t_sizes (code),
-    name TEXT NOT NULL, retired_at TIMESTAMPTZ, PRIMARY KEY (task_id, line));
+    task_id BIGINT NOT NULL REFERENCES fixture.t_tasks (id) ON UPDATE CASCADE, line INTEGER NOT NULL,
+    partition_id UUID NOT NULL, size_code INTEGER REFERENCES fixture.t_sizes (code) ON UPDATE CASCADE,
+    name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    PRIMARY KEY (task_id, line));
+-- Written on both sides: the replicas own `seen`.
+CREATE TABLE fixture.t_tallies (
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
+    name TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0);
 CREATE VIEW t_replicas AS SELECT * FROM fixture.t_replicas WHERE retired_at IS NULL;
+CREATE VIEW t_families AS SELECT * FROM fixture.t_families WHERE retired_at IS NULL;
 CREATE VIEW t_kinds AS SELECT * FROM fixture.t_kinds WHERE retired_at IS NULL;
 CREATE VIEW t_products AS SELECT * FROM fixture.t_products WHERE retired_at IS NULL;
 CREATE VIEW t_customers AS SELECT * FROM fixture.t_customers WHERE retired_at IS NULL;
 CREATE VIEW t_emails AS SELECT * FROM fixture.t_emails WHERE retired_at IS NULL;
+CREATE VIEW t_calls AS SELECT * FROM fixture.t_calls WHERE retired_at IS NULL;
 CREATE VIEW t_orders AS SELECT * FROM fixture.t_orders WHERE retired_at IS NULL;
 CREATE VIEW t_phones AS SELECT * FROM fixture.t_phones WHERE retired_at IS NULL;
 CREATE VIEW t_sizes AS SELECT * FROM fixture.t_sizes WHERE retired_at IS NULL;
@@ -97,10 +140,19 @@ CREATE VIEW t_bins AS SELECT * FROM fixture.t_bins WHERE retired_at IS NULL;
 CREATE VIEW t_accounts AS SELECT * FROM fixture.t_accounts WHERE retired_at IS NULL;
 CREATE VIEW t_tasks AS SELECT * FROM fixture.t_tasks WHERE retired_at IS NULL;
 CREATE VIEW t_task_lines AS SELECT * FROM fixture.t_task_lines WHERE retired_at IS NULL;
+DO $$ DECLARE t TEXT; BEGIN
+  FOREACH t IN ARRAY ARRAY['t_families', 't_kinds', 't_products', 't_customers', 't_emails',
+      't_phones', 't_calls', 't_orders', 't_sizes', 't_bins', 't_accounts', 't_tasks', 't_task_lines'] LOOP
+    EXECUTE format('CREATE TRIGGER bump BEFORE UPDATE ON fixture.%I FOR EACH ROW EXECUTE FUNCTION fixture.bump()', t);
+  END LOOP;
+END $$;
 ";
 
 /// A name this build cannot encode: the bug a deploy fixes.
 const POISON: &str = "poison";
+
+/// Longer than a name, or an address, may be for any message to carry it.
+const OVERSIZE: usize = 20_000;
 
 fn poisoned<S: serde::Serializer>(name: &str, s: S) -> Result<S::Ok, S::Error> {
     if name == POISON {
@@ -112,6 +164,18 @@ fn poisoned<S: serde::Serializer>(name: &str, s: S) -> Result<S::Ok, S::Error> {
 }
 
 #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(table = "t_families", schema = "fixture", mirror = "catalog")]
+#[row(active = "t_families", retired = "retired_at")]
+struct Family {
+    id: Uuid,
+    partition_id: Uuid,
+    #[serde(serialize_with = "poisoned")]
+    name: String,
+    rev: i64,
+    retired_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
 #[row(table = "t_kinds", schema = "fixture", mirror = "catalog")]
 #[row(active = "t_kinds", retired = "retired_at")]
 struct Kind {
@@ -119,6 +183,8 @@ struct Kind {
     partition_id: Uuid,
     #[serde(serialize_with = "poisoned")]
     name: String,
+    family_id: Option<Uuid>,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -134,7 +200,9 @@ struct Product {
     id: Uuid,
     partition_id: Uuid,
     kind_id: Option<Uuid>,
+    #[serde(serialize_with = "poisoned")]
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -145,7 +213,9 @@ struct Product {
 struct Customer {
     id: Uuid,
     partition_id: Uuid,
+    #[serde(serialize_with = "poisoned")]
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -161,7 +231,9 @@ struct Email {
     id: Uuid,
     partition_id: Uuid,
     customer_id: Uuid,
+    #[serde(serialize_with = "poisoned")]
     address: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -183,6 +255,27 @@ struct Phone {
     number: i32,
     partition_id: Uuid,
     kind_id: Option<Uuid>,
+    rev: i64,
+    retired_at: Option<DateTime<Utc>>,
+}
+
+/// A row of a replica's own that points at a follower.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "t_calls",
+    schema = "fixture",
+    mirror = "catalog",
+    sync = "assigned(replica_id)"
+)]
+#[row(active = "t_calls", retired = "retired_at")]
+struct Call {
+    id: Uuid,
+    partition_id: Uuid,
+    replica_id: Option<Uuid>,
+    customer_id: Uuid,
+    number: i32,
+    name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -200,6 +293,7 @@ struct Order {
     replica_id: Option<Uuid>,
     customer_id: Option<Uuid>,
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -216,6 +310,7 @@ struct Size {
     partition_id: Uuid,
     #[serde(serialize_with = "poisoned")]
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -232,7 +327,9 @@ struct Bin {
     slot: i32,
     partition_id: Uuid,
     size_code: Option<i32>,
+    #[serde(serialize_with = "poisoned")]
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -246,6 +343,7 @@ struct Account {
     partition_id: Uuid,
     size_code: Option<i32>,
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -265,7 +363,9 @@ struct Task {
     slot: Option<i32>,
     region: Option<i32>,
     number: Option<i64>,
+    #[serde(serialize_with = "poisoned")]
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
 
@@ -283,17 +383,38 @@ struct TaskLine {
     partition_id: Uuid,
     size_code: Option<i32>,
     name: String,
+    rev: i64,
     retired_at: Option<DateTime<Utc>>,
+}
+
+/// Written on both sides: the replicas own how often each was seen.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "t_tallies",
+    schema = "fixture",
+    mirror = "both",
+    sync = "broadcast"
+)]
+struct Tally {
+    id: Uuid,
+    partition_id: Uuid,
+    kind_id: Option<Uuid>,
+    name: String,
+    #[row(replica_owned)]
+    seen: i32,
 }
 
 pub(super) fn codecs() -> Vec<Codec<()>> {
     vec![
         Codec::json::<Phone>(None),
+        Codec::json::<Call>(None),
         Codec::json::<Order>(None),
         Codec::json::<Email>(None),
         Codec::json::<Customer>(None),
         Codec::json::<Product>(None),
+        Codec::json::<Tally>(None),
         Codec::json::<Kind>(None),
+        Codec::json::<Family>(None),
         Codec::json::<TaskLine>(None),
         Codec::json::<Task>(None),
         Codec::json::<Account>(None),
@@ -312,9 +433,12 @@ pub(super) const REPLICAS: Replicas = Replicas {
 /// Every foreign key between the mirrored tables: the child, its columns in
 /// the parent's key order, the parent.
 const REFERENCES: &[(&str, &[&str], &str)] = &[
+    ("t_kinds", &["family_id"], "t_families"),
     ("t_products", &["kind_id"], "t_kinds"),
+    ("t_tallies", &["kind_id"], "t_kinds"),
     ("t_phones", &["customer_id"], "t_customers"),
     ("t_phones", &["kind_id"], "t_kinds"),
+    ("t_calls", &["customer_id", "number"], "t_phones"),
     ("t_emails", &["customer_id"], "t_customers"),
     ("t_orders", &["customer_id"], "t_customers"),
     ("t_bins", &["size_code"], "t_sizes"),
@@ -323,6 +447,43 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
     ("t_tasks", &["region", "number"], "t_accounts"),
     ("t_task_lines", &["task_id"], "t_tasks"),
     ("t_task_lines", &["size_code"], "t_sizes"),
+];
+
+/// The tables that follow another: the follower, its column, the parent.
+const FOLLOWS: &[(&str, &str, &str)] = &[
+    ("t_emails", "customer_id", "t_customers"),
+    ("t_phones", "customer_id", "t_customers"),
+    ("t_task_lines", "task_id", "t_tasks"),
+];
+
+/// Every mirrored table, by its key's columns in the row's order.
+const KEYS: &[(&str, &[&str])] = &[
+    ("t_families", &["id"]),
+    ("t_kinds", &["id"]),
+    ("t_products", &["id"]),
+    ("t_tallies", &["id"]),
+    ("t_customers", &["id"]),
+    ("t_emails", &["id"]),
+    ("t_phones", &["customer_id", "number"]),
+    ("t_calls", &["id"]),
+    ("t_orders", &["id"]),
+    ("t_sizes", &["code"]),
+    ("t_bins", &["store", "slot"]),
+    ("t_accounts", &["region", "number"]),
+    ("t_tasks", &["id"]),
+    ("t_task_lines", &["task_id", "line"]),
+];
+
+/// The columns a table's codec cannot encode `POISON` in.
+const POISONED: &[(&str, &str)] = &[
+    ("t_families", "name"),
+    ("t_kinds", "name"),
+    ("t_products", "name"),
+    ("t_customers", "name"),
+    ("t_emails", "address"),
+    ("t_sizes", "name"),
+    ("t_bins", "name"),
+    ("t_tasks", "name"),
 ];
 
 /// A key's text from the columns of a row as JSON; `None` when one is NULL.
@@ -340,7 +501,7 @@ fn key_of(row: &serde_json::Value, columns: &[&str]) -> Option<String> {
 
 /// What a step did.
 enum Step {
-    Wrote(String),
+    Wrote(usize),
     Skipped,
     /// The bug is fixed: what was set aside goes again.
     Cured,
@@ -369,16 +530,21 @@ const RULES: Rules = Rules {
     parents,
 };
 
-/// The server's relay over the walk's tables, as a host's runs it.
-fn relay<'a>(engine: &'a Engine, codecs: &'a [Codec<()>]) -> crate::relay::Relay<'a, ()> {
+/// The server's relay over the walk's tables, as a host's runs it, planning
+/// `batch` notes a pass.
+fn relay<'a>(
+    engine: &'a Engine,
+    codecs: &'a [Codec<()>],
+    batch: i64,
+) -> crate::relay::Relay<'a, ()> {
     crate::relay::Relay {
         engine,
         codecs,
         limits: crate::envelope::Limits {
             rows: 7,
-            bytes: 1 << 20,
+            bytes: 16 << 10,
         },
-        batch: 100,
+        batch,
         timeout: std::time::Duration::from_secs(5),
         backoff: crate::run::Backoff::new(
             std::time::Duration::from_secs(1),
@@ -395,6 +561,7 @@ fn relay<'a>(engine: &'a Engine, codecs: &'a [Codec<()>]) -> crate::relay::Relay
 /// The server, its relay, and its replicas as the protocol says they behave,
 /// on a transport that keeps each one's messages in order.
 struct World {
+    pool: crate::DbPool,
     conn: sqlx::pool::PoolConnection<crate::Db>,
     engine: Engine,
     codecs: Vec<Codec<()>>,
@@ -404,6 +571,10 @@ struct World {
     history: Vec<String>,
     /// Messages the transport lost.
     lost: i64,
+    /// Notes a pass plans.
+    batch: i64,
+    /// A writer whose transaction spans passes, and how many more it spans.
+    writer: Option<(sqlx::Transaction<'static, crate::Db>, usize)>,
 }
 
 /// Two partitions: three replicas for the first — the last not live — and
@@ -415,6 +586,12 @@ async fn world(pool: crate::DbPool) -> World {
         .execute(&mut *conn)
         .await
         .expect("schema");
+    // A write that waits on the long writer gives up, rather than wait on
+    // a transaction this same thread is to commit.
+    sqlx::raw_sql("SET lock_timeout = '100ms'")
+        .execute(&mut *conn)
+        .await
+        .expect("a lock timeout");
     let partitions = vec![Uuid::now_v7(), Uuid::now_v7()];
     for (partition, live) in [
         (partitions[0], true),
@@ -439,6 +616,7 @@ async fn world(pool: crate::DbPool) -> World {
         .expect("engine");
     tx.commit().await.expect("installed");
     World {
+        pool,
         conn,
         engine,
         codecs,
@@ -447,7 +625,34 @@ async fn world(pool: crate::DbPool) -> World {
         replicas: BTreeMap::new(),
         history: Vec::new(),
         lost: 0,
+        batch: 100,
+        writer: None,
     }
+}
+
+/// The rows a message carries to hold, with their bytes, when it is not
+/// part of a snapshot.
+fn carried(bytes: &[u8]) -> Vec<(Row, Vec<u8>)> {
+    use prost::Message as _;
+    let Some(crate::envelope::Body::Down(down)) = crate::envelope::ToReplica::decode(bytes)
+        .ok()
+        .and_then(|m| m.body)
+    else {
+        return Vec::new();
+    };
+    if !down.snapshot_id.is_empty() {
+        return Vec::new();
+    }
+    down.tables
+        .into_iter()
+        .flat_map(|t| {
+            let table = t.table.clone();
+            t.upserts
+                .into_iter()
+                .zip(t.keys)
+                .map(move |(bytes, key)| ((table.clone(), key.parts.join("|")), bytes))
+        })
+        .collect()
 }
 
 impl World {
@@ -477,13 +682,20 @@ impl World {
             .expect("live")
             .into_iter()
             .collect();
-        let relay = relay(&self.engine, &self.codecs);
+        let relay = relay(&self.engine, &self.codecs, self.batch);
         let mut tx = self
             .conn
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
             .await
             .expect("a transaction");
+        let drawn: i64 = sqlx::query_scalar(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM sync.messages",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("drawn");
         let outcome = relay.record(&mut tx).await.expect("recorded");
+        assert_minimal(&mut tx, drawn, &self.history).await;
         if chance(12) {
             self.history
                 .push("the relay lost its lock while recording".to_owned());
@@ -531,7 +743,20 @@ impl World {
                     self.lost += 1;
                     continue;
                 }
-                model.receive(&bytes, &RULES);
+                let carried = carried(&bytes);
+                let held: Vec<Option<Vec<u8>>> = carried
+                    .iter()
+                    .map(|(row, _)| model.rows.get(row).cloned())
+                    .collect();
+                if model.receive(&bytes, &RULES) == Received::Applied {
+                    for ((row, bytes), held) in carried.iter().zip(held) {
+                        assert!(
+                            held.as_ref() != Some(bytes),
+                            "{replica} was sent {row:?} again at the version it holds; last steps: {:#?}",
+                            &self.history[self.history.len().saturating_sub(8)..]
+                        );
+                    }
+                }
                 moved = true;
                 let orphans = model.orphans(&RULES);
                 assert!(
@@ -572,12 +797,21 @@ impl World {
         moved
     }
 
+    /// The long writer commits, if one is open.
+    async fn commit_writer(&mut self) {
+        if let Some((writer, _)) = self.writer.take() {
+            writer.commit().await.expect("the long writer commits");
+            self.history.push("the long writer committed".to_owned());
+        }
+    }
+
     /// Rounds without a fault until nothing moves: every note planned, every
     /// outbox sent, every message applied and confirmed. Then each replica
     /// holds what the engine records it holding.
     async fn settle(&mut self) {
+        self.commit_writer().await;
         let faults = std::mem::take(&mut *self.wire.faults.lock().unwrap());
-        for _ in 0..200 {
+        for _ in 0..400 {
             if self.round(None).await {
                 continue;
             }
@@ -658,47 +892,63 @@ impl World {
         &self.history[self.history.len().saturating_sub(8)..]
     }
 
-    /// Each live replica holds exactly what its strategies say, every row as
-    /// it is now; one not live is recorded as holding nothing. A replica with
-    /// rows set aside for it is left out until the fix lets them through.
+    /// Each live replica holds exactly what it should, every row as it is
+    /// now — but a row it refused to take or to let go of, which it holds as
+    /// it had it, or not at all, and the columns it owns, which are its own.
     async fn assert_holdings(&mut self, seed: u64, step: usize) {
+        let oracle = Oracle::read(&mut self.conn).await;
         let replicas: Vec<Uuid> =
             sqlx::query_scalar("SELECT id FROM t_replicas WHERE live ORDER BY id")
                 .fetch_all(&mut *self.conn)
                 .await
                 .expect("replicas");
-        let quarantined: BTreeSet<Uuid> =
-            sqlx::query_scalar::<_, Uuid>("SELECT DISTINCT replica_id FROM sync.quarantine")
-                .fetch_all(&mut *self.conn)
-                .await
-                .expect("quarantine")
-                .into_iter()
-                .collect();
         for replica in replicas {
-            if quarantined.contains(&replica) {
-                continue;
-            }
-            let held = self
-                .replicas
-                .get(&replica)
-                .map(|m| m.rows.clone())
-                .unwrap_or_default();
-            let holds: BTreeSet<(String, String)> = held.keys().cloned().collect();
-            let should = expected(&mut self.conn, replica).await;
+            let model = self.replicas.get(&replica).cloned().unwrap_or_default();
+            let should = oracle.should(replica);
+            let holds: BTreeSet<Row> = model
+                .rows
+                .keys()
+                .filter(|row| !model.rejections.contains_key(*row))
+                .cloned()
+                .collect();
+            let missing: Vec<&Row> = should
+                .iter()
+                .filter(|row| {
+                    !model.rows.contains_key(*row) && !model.rejections.contains_key(*row)
+                })
+                .collect();
+            let extra: Vec<(&Row, Vec<&Row>)> = model
+                .rows
+                .keys()
+                .filter(|row| !should.contains(*row) && !model.rejections.contains_key(*row))
+                .map(|row| {
+                    let pointing = model
+                        .rows
+                        .iter()
+                        .filter(|((t, _), bytes)| parents(t, bytes).contains(row))
+                        .map(|(r, _)| r)
+                        .collect();
+                    (row, pointing)
+                })
+                .collect();
             assert!(
-                holds == should,
-                "seed {seed:#x}, after step {step}, {replica}:\n  holds   {}\n  missing {:?}\n  extra   {:?}\n  last steps: {:#?}",
+                missing.is_empty() && extra.is_empty(),
+                "seed {seed:#x}, after step {step}, {replica}:\n  holds   {}\n  missing {missing:?}\n  extra, and what points at it there {extra:?}\n  last steps: {:#?}",
                 holds.len(),
-                should.difference(&holds).collect::<Vec<_>>(),
-                holds.difference(&should).collect::<Vec<_>>(),
                 self.last_steps(),
             );
-            for ((table, key), bytes) in &held {
-                let row: serde_json::Value = serde_json::from_slice(bytes).expect("JSON");
-                let now = self.current(table, key).await;
+            for row in &holds {
+                let bytes = &model.rows[row];
+                let mut held: serde_json::Value = serde_json::from_slice(bytes).expect("JSON");
+                let mut now = self.current(&row.0, &row.1).await;
+                for value in std::iter::once(&mut held).chain(now.as_mut()) {
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("seen");
+                    }
+                }
                 assert!(
-                    Some(&row) == now.as_ref(),
-                    "seed {seed:#x}, after step {step}, {replica} holds {table} {key} as\n  {row}\n  and it is now\n  {now:?}\n  last steps: {:#?}",
+                    Some(&held) == now.as_ref(),
+                    "seed {seed:#x}, after step {step}, {replica} holds {row:?} as\n  {held}\n  and it is now\n  {now:?}\n  last steps: {:#?}",
                     self.last_steps(),
                 );
             }
@@ -728,58 +978,232 @@ impl World {
     }
 }
 
-/// What `replica` should hold, read off the rows: what its strategies send
-/// it, what those point at, and the followers of whatever it holds.
-async fn expected(conn: &mut Conn, replica: Uuid) -> BTreeSet<(String, String)> {
-    sqlx::query_as(
-        "WITH r AS (SELECT id, partition_id FROM t_replicas WHERE id = $1 AND live),
-         lists AS (SELECT a.list_id FROM fixture.t_replica_lists a JOIN r ON a.replica_id = r.id),
-         products AS (SELECT p.* FROM fixture.t_products p JOIN r USING (partition_id) WHERE p.retired_at IS NULL),
-         orders AS (SELECT o.* FROM fixture.t_orders o JOIN r ON o.replica_id = r.id WHERE o.retired_at IS NULL),
-         tasks AS (SELECT t.* FROM fixture.t_tasks t JOIN r ON t.replica_id = r.id WHERE t.retired_at IS NULL),
-         customers AS (
-             SELECT c.id FROM fixture.t_customers c JOIN fixture.t_list_members m ON m.customer_id = c.id
-               JOIN lists USING (list_id) WHERE c.retired_at IS NULL
-             UNION SELECT customer_id FROM orders WHERE customer_id IS NOT NULL),
-         accounts AS (
-             SELECT c.region, c.number FROM fixture.t_accounts c
-               JOIN fixture.t_account_members m USING (region, number)
-               JOIN lists USING (list_id) WHERE c.retired_at IS NULL
-             UNION SELECT region, number FROM tasks WHERE region IS NOT NULL AND number IS NOT NULL),
-         bins AS (
-             SELECT b.store, b.slot FROM fixture.t_bins b JOIN r USING (partition_id) WHERE b.retired_at IS NULL
-             UNION SELECT store, slot FROM tasks WHERE store IS NOT NULL AND slot IS NOT NULL),
-         emails AS (SELECT e.id FROM fixture.t_emails e JOIN customers c ON c.id = e.customer_id
-                     WHERE e.retired_at IS NULL),
-         phones AS (SELECT p.* FROM fixture.t_phones p JOIN customers c ON c.id = p.customer_id
-                     WHERE p.retired_at IS NULL),
-         lines AS (SELECT l.* FROM fixture.t_task_lines l JOIN tasks t ON t.id = l.task_id
-                    WHERE l.retired_at IS NULL),
-         kinds AS (SELECT kind_id FROM products WHERE kind_id IS NOT NULL
-                   UNION SELECT kind_id FROM phones WHERE kind_id IS NOT NULL),
-         sizes AS (SELECT b.size_code FROM fixture.t_bins b JOIN bins USING (store, slot)
-                    WHERE b.size_code IS NOT NULL
-                   UNION SELECT a.size_code FROM fixture.t_accounts a JOIN accounts USING (region, number)
-                    WHERE a.size_code IS NOT NULL
-                   UNION SELECT size_code FROM lines WHERE size_code IS NOT NULL)
-         SELECT 't_products', id::text FROM products
-         UNION ALL SELECT 't_orders', id::text FROM orders
-         UNION ALL SELECT 't_tasks', id::text FROM tasks
-         UNION ALL SELECT 't_customers', id::text FROM customers
-         UNION ALL SELECT 't_accounts', region || '|' || number FROM accounts
-         UNION ALL SELECT 't_bins', store || '|' || slot FROM bins
-         UNION ALL SELECT 't_emails', id::text FROM emails
-         UNION ALL SELECT 't_phones', customer_id || '|' || number FROM phones
-         UNION ALL SELECT 't_task_lines', task_id || '|' || line FROM lines
-         UNION ALL SELECT 't_kinds', kind_id::text FROM kinds
-         UNION ALL SELECT 't_sizes', size_code::text FROM sizes",
-    )
-    .bind(replica)
-    .fetch_all(&mut *conn)
-    .await
-    .expect("expected")
-    .into_iter()
-    .collect()
+/// What every replica should hold, worked out from the rows themselves by
+/// the definition, independently of the engine.
+struct Oracle {
+    /// Every row of every mirrored table, as JSON.
+    rows: BTreeMap<Row, serde_json::Value>,
+    /// The live replicas, with their partitions.
+    replicas: BTreeMap<Uuid, Uuid>,
+    /// Who each group is given to, and its members, as rows.
+    given: Vec<(Uuid, Uuid)>,
+    members: Vec<(Uuid, Row)>,
+    /// The rows that cannot go: that do not encode or fit no message, and
+    /// every row that points at one.
+    dead: BTreeSet<Row>,
+}
+
+impl Oracle {
+    async fn read(conn: &mut Conn) -> Self {
+        let mut rows = BTreeMap::new();
+        for (table, key) in KEYS {
+            let all: Vec<serde_json::Value> =
+                sqlx::query_scalar(&format!("SELECT to_jsonb(t) FROM fixture.{table} t"))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .expect(table);
+            for row in all {
+                let key = key_of(&row, key).expect("a key");
+                rows.insert(((*table).to_owned(), key), row);
+            }
+        }
+        let replicas: Vec<(Uuid, Uuid)> =
+            sqlx::query_as("SELECT id, partition_id FROM t_replicas WHERE live")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("replicas");
+        let given: Vec<(Uuid, Uuid)> =
+            sqlx::query_as("SELECT list_id, replica_id FROM fixture.t_replica_lists")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("given");
+        let mut members: Vec<(Uuid, Row)> = Vec::new();
+        for (sql, table) in [
+            (
+                "SELECT list_id, customer_id::text FROM fixture.t_list_members",
+                "t_customers",
+            ),
+            (
+                "SELECT list_id, region || '|' || number FROM fixture.t_account_members",
+                "t_accounts",
+            ),
+        ] {
+            let found: Vec<(Uuid, String)> = sqlx::query_as(sql)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("members");
+            members.extend(found.into_iter().map(|(l, k)| (l, (table.to_owned(), k))));
+        }
+        let cannot = |(table, _): &Row, row: &serde_json::Value| {
+            POISONED.iter().any(|(t, column)| {
+                t == table && row.get(*column).and_then(|v| v.as_str()) == Some(POISON)
+            }) || row.to_string().len() > OVERSIZE
+        };
+        let mut dead: BTreeSet<Row> = rows
+            .iter()
+            .filter(|(r, row)| cannot(r, row))
+            .map(|(r, _)| r.clone())
+            .collect();
+        loop {
+            let more: Vec<Row> = rows
+                .iter()
+                .filter(|(r, row)| {
+                    !dead.contains(*r)
+                        && REFERENCES.iter().any(|(child, columns, parent)| {
+                            *child == r.0
+                                && key_of(row, columns)
+                                    .is_some_and(|k| dead.contains(&((*parent).to_owned(), k)))
+                        })
+                })
+                .map(|(r, _)| r.clone())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            dead.extend(more);
+        }
+        Oracle {
+            rows,
+            replicas: replicas.into_iter().collect(),
+            given,
+            members,
+            dead,
+        }
+    }
+
+    fn active(row: &serde_json::Value) -> bool {
+        row.get("retired_at").is_none_or(serde_json::Value::is_null)
+    }
+
+    /// What `replica` should hold: what its rules send it, every row one of
+    /// those points at, every row that follows one of those — none that
+    /// cannot go.
+    fn should(&self, replica: Uuid) -> BTreeSet<Row> {
+        let Some(partition) = self.replicas.get(&replica) else {
+            return BTreeSet::new();
+        };
+        let uuid = |v: Option<&serde_json::Value>, u: &Uuid| {
+            v.and_then(|v| v.as_str()) == Some(u.to_string().as_str())
+        };
+        let lists: BTreeSet<Uuid> = self
+            .given
+            .iter()
+            .filter(|(_, r)| *r == replica)
+            .map(|(l, _)| *l)
+            .collect();
+        let grouped: BTreeSet<&Row> = self
+            .members
+            .iter()
+            .filter(|(l, _)| lists.contains(l))
+            .map(|(_, r)| r)
+            .collect();
+        let mut out: BTreeSet<Row> = BTreeSet::new();
+        let mut queue: Vec<Row> = self
+            .rows
+            .iter()
+            .filter(|(r, row)| {
+                Self::active(row)
+                    && match r.0.as_str() {
+                        "t_products" | "t_bins" | "t_tallies" => {
+                            uuid(row.get("partition_id"), partition)
+                        }
+                        "t_orders" | "t_tasks" | "t_calls" => uuid(row.get("replica_id"), &replica),
+                        "t_customers" | "t_accounts" => grouped.contains(r),
+                        _ => false,
+                    }
+            })
+            .map(|(r, _)| r.clone())
+            .collect();
+        while let Some(r) = queue.pop() {
+            if self.dead.contains(&r) || !out.insert(r.clone()) {
+                continue;
+            }
+            let row = &self.rows[&r];
+            for (child, columns, parent) in REFERENCES {
+                if *child == r.0 {
+                    if let Some(k) = key_of(row, columns) {
+                        let p = ((*parent).to_owned(), k);
+                        if self.rows.contains_key(&p) {
+                            queue.push(p);
+                        }
+                    }
+                }
+            }
+            for (follower, column, parent) in FOLLOWS {
+                if *parent == r.0 {
+                    queue.extend(
+                        self.rows
+                            .iter()
+                            .filter(|(f, frow)| {
+                                f.0 == *follower
+                                    && Self::active(frow)
+                                    && key_of(frow, &[column]).as_deref() == Some(r.1.as_str())
+                            })
+                            .map(|(f, _)| f.clone()),
+                    );
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A pass that planned every pending note sends each replica only rows it
+/// should hold, and takes back only rows it should not: what `tx` — the
+/// pass, recorded and not committed — wrote to the outboxes past the
+/// message `drawn`, against what should be held as the pass read the rows.
+async fn assert_minimal(tx: &mut Conn, drawn: i64, history: &[String]) {
+    use prost::Message as _;
+    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("waiting");
+    if waiting > 0 {
+        // The batch split what was written: the replicas hold what the
+        // rows were before the rest, which the pass did not plan.
+        return;
+    }
+    let written: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT replica_id, message FROM sync.outbox WHERE sequence > $1")
+            .bind(drawn)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("written");
+    if written.is_empty() {
+        return;
+    }
+    let oracle = Oracle::read(&mut *tx).await;
+    let mut should: BTreeMap<Uuid, BTreeSet<Row>> = BTreeMap::new();
+    for (replica, message) in written {
+        let Some(crate::envelope::Body::Down(down)) =
+            crate::envelope::ToReplica::decode(message.as_slice())
+                .ok()
+                .and_then(|m| m.body)
+        else {
+            continue;
+        };
+        let should = should
+            .entry(replica)
+            .or_insert_with(|| oracle.should(replica));
+        for table in down.tables {
+            for key in &table.keys {
+                let row = (table.table.clone(), key.parts.join("|"));
+                assert!(
+                    should.contains(&row),
+                    "{replica} was sent {row:?}, which it should not hold; last steps: {:#?}",
+                    &history[history.len().saturating_sub(8)..]
+                );
+            }
+            for key in &table.deletes {
+                let row = (table.table.clone(), key.parts.join("|"));
+                assert!(
+                    !should.contains(&row),
+                    "{replica} was told to let go of {row:?}, which it should hold; last steps: {:#?}",
+                    &history[history.len().saturating_sub(8)..]
+                );
+            }
+        }
+    }
 }
 
 async fn uuids(conn: &mut Conn, table: &str, partition: Uuid) -> Vec<Uuid> {
@@ -804,15 +1228,25 @@ where
 }
 
 /// Runs a write the schema may refuse — a row picked from none, a key taken,
-/// a row something still points at: answers whether it went in.
+/// a row something still points at, a row the long writer holds: answers
+/// whether it went in. The write is its own transaction's, or in one of its
+/// own within the long writer's, so a refusal leaves the long writer as it
+/// was.
 async fn wrote(
     conn: &mut Conn,
     query: sqlx::query::Query<'_, crate::Db, sqlx::postgres::PgArguments>,
 ) -> bool {
-    match query.execute(&mut *conn).await {
-        Ok(done) => done.rows_affected() > 0,
+    let mut tx = conn.begin().await.expect("a transaction");
+    match query.execute(&mut *tx).await {
+        Ok(done) => {
+            tx.commit().await.expect("committed");
+            done.rows_affected() > 0
+        }
         Err(sqlx::Error::Database(e))
-            if matches!(e.code().as_deref(), Some("23502" | "23503" | "23505")) =>
+            if matches!(
+                e.code().as_deref(),
+                Some("23502" | "23503" | "23505" | "55P03")
+            ) =>
         {
             false
         }
@@ -828,19 +1262,20 @@ macro_rules! write {
 
 const RETIRE: &str = "retired_at = CASE WHEN retired_at IS NULL THEN now() END";
 
-/// The fix, deployed: what this build could not encode, and what the
-/// replicas' could not take, is data both take now.
+/// The fix, deployed: what this build could not encode or no message could
+/// carry, and what the replicas' could not take, is data both take now.
 async fn cure(conn: &mut Conn) {
-    for (table, name) in [
-        ("t_kinds", POISON),
-        ("t_sizes", POISON),
-        ("t_customers", REFUSED),
-        ("t_products", REFUSED),
-    ] {
+    for (table, column) in POISONED.iter().copied().chain([
+        ("t_customers", "name"),
+        ("t_products", "name"),
+        ("t_tasks", "name"),
+    ]) {
         sqlx::query(&format!(
-            "UPDATE fixture.{table} SET name = 'cured' WHERE name = $1"
+            "UPDATE fixture.{table} SET {column} = 'cured' \
+              WHERE {column} IN ($1, $2) OR length({column}) > 1000"
         ))
-        .bind(name)
+        .bind(POISON)
+        .bind(REFUSED)
         .execute(&mut *conn)
         .await
         .expect("the fix");
@@ -855,12 +1290,15 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .fetch_all(&mut *conn)
         .await
         .expect("replicas");
+    let families = uuids(conn, "t_families", partition).await;
     let kinds = uuids(conn, "t_kinds", partition).await;
     let products = uuids(conn, "t_products", partition).await;
     let customers = uuids(conn, "t_customers", partition).await;
     let lists = uuids(conn, "t_lists", partition).await;
     let emails = uuids(conn, "t_emails", partition).await;
     let orders = uuids(conn, "t_orders", partition).await;
+    let calls = uuids(conn, "t_calls", partition).await;
+    let tallies = uuids(conn, "t_tallies", partition).await;
     let phones: Vec<(Uuid, i32)> = keys(
         conn,
         "SELECT customer_id, number FROM fixture.t_phones WHERE partition_id = $1 ORDER BY 1, 2",
@@ -902,8 +1340,9 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(70);
-    let (kind, product, customer, list, email, order) = (
+    let choice = walk.below(103);
+    let (family, kind, product, customer, list, email, order) = (
+        walk.pick(&families),
         walk.pick(&kinds),
         walk.pick(&products),
         walk.pick(&customers),
@@ -920,10 +1359,17 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         walk.pick(&tasks),
         walk.pick(&lines),
     );
+    let (call, tally, other_list, other_customer) = (
+        walk.pick(&calls),
+        walk.pick(&tallies),
+        walk.pick(&lists),
+        walk.pick(&customers),
+    );
     let small = i32::try_from(walk.below(4)).expect("small");
     let other = partitions[walk.below(partitions.len())];
+    let big = "o".repeat(OVERSIZE + 1);
     let done = match choice {
-        0 => write!(conn, "INSERT INTO fixture.t_kinds (id, partition_id, name) VALUES ($1, $2, 'k')", new, partition),
+        0 => write!(conn, "INSERT INTO fixture.t_kinds (id, partition_id, name, family_id) VALUES ($1, $2, 'k', $3)", new, partition, family),
         1 => write!(conn, "INSERT INTO fixture.t_products (id, partition_id, kind_id, name) VALUES ($1, $2, $3, 'p')", new, partition, kind),
         2 => write!(conn, "UPDATE fixture.t_products SET kind_id = $2 WHERE id = $1", product, kind),
         3 => write!(conn, "UPDATE fixture.t_products SET kind_id = NULL WHERE id = $1", product),
@@ -960,7 +1406,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         35 => write!(conn, "DELETE FROM fixture.t_sizes WHERE code = $1", size),
         36 => write!(conn, "INSERT INTO fixture.t_bins (store, slot, partition_id, size_code, name) VALUES ($1, $2, $3, $4, 'b')", small, i32::try_from(walk.below(4)).expect("small"), partition, size),
         37 => write!(conn, "UPDATE fixture.t_bins SET size_code = $3 WHERE store = $1 AND slot = $2", bin.map(|b| b.0), bin.map(|b| b.1), size),
-        38 => write!(conn, "UPDATE fixture.t_bins SET name = name || '.' WHERE store = $1 AND slot = $2", bin.map(|b| b.0), bin.map(|b| b.1)),
+        38 => write!(conn, "UPDATE fixture.t_bins SET name = name || '.' WHERE store = $1 AND slot = $2 AND name <> $3", bin.map(|b| b.0), bin.map(|b| b.1), POISON),
         39 => write!(conn, &format!("UPDATE fixture.t_bins SET {RETIRE} WHERE store = $1 AND slot = $2"), bin.map(|b| b.0), bin.map(|b| b.1)),
         40 => write!(conn, "DELETE FROM fixture.t_bins WHERE store = $1 AND slot = $2", bin.map(|b| b.0), bin.map(|b| b.1)),
         // Beyond 2^53 every other time: a number JSON would round.
@@ -973,7 +1419,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         48 => write!(conn, "UPDATE fixture.t_tasks SET replica_id = $2 WHERE id = $1", task, replica),
         49 => write!(conn, "UPDATE fixture.t_tasks SET store = $2, slot = $3 WHERE id = $1", task, bin.map(|b| b.0), bin.map(|b| b.1)),
         50 => write!(conn, "UPDATE fixture.t_tasks SET region = $2, number = $3 WHERE id = $1", task, account.map(|a| a.0), account.map(|a| a.1)),
-        51 => write!(conn, "UPDATE fixture.t_tasks SET name = name || '.' WHERE id = $1", task),
+        51 => write!(conn, "UPDATE fixture.t_tasks SET name = name || '.' WHERE id = $1 AND name <> $2", task, POISON),
         52 => write!(conn, &format!("UPDATE fixture.t_tasks SET {RETIRE} WHERE id = $1"), task),
         53 => write!(conn, "DELETE FROM fixture.t_tasks WHERE id = $1", task),
         54 => write!(conn, "INSERT INTO fixture.t_task_lines (task_id, line, partition_id, size_code, name) VALUES ($1, $2, $3, $4, 'l')", task, small, partition, size),
@@ -1006,13 +1452,54 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         // Rows the replicas' build refuses: a parent, and rows that follow it.
         67 => write!(conn, "UPDATE fixture.t_customers SET name = $2 WHERE id = $1", customer, REFUSED),
         68 => write!(conn, "UPDATE fixture.t_products SET name = $2 WHERE id = $1", product, REFUSED),
-        _ => {
-            cure(conn).await;
-            return Step::Cured;
-        }
+        // A chain of tables that travel only when pointed at.
+        69 => write!(conn, "INSERT INTO fixture.t_families (id, partition_id, name) VALUES ($1, $2, 'f')", new, partition),
+        70 => write!(conn, "UPDATE fixture.t_kinds SET family_id = $2 WHERE id = $1", kind, family),
+        71 => write!(conn, "UPDATE fixture.t_families SET name = name || '.' WHERE id = $1 AND name <> $2", family, POISON),
+        72 => write!(conn, &format!("UPDATE fixture.t_families SET {RETIRE} WHERE id = $1"), family),
+        73 => write!(conn, "DELETE FROM fixture.t_families WHERE id = $1", family),
+        // Rows that point at a follower.
+        74 => write!(conn, "INSERT INTO fixture.t_calls (id, partition_id, replica_id, customer_id, number, name) VALUES ($1, $2, $3, $4, $5, 'c')", new, partition, replica, phone.map(|p| p.0), phone.map(|p| p.1)),
+        75 => write!(conn, "UPDATE fixture.t_calls SET replica_id = $2 WHERE id = $1", call, replica),
+        76 => write!(conn, &format!("UPDATE fixture.t_calls SET {RETIRE} WHERE id = $1"), call),
+        77 => write!(conn, "DELETE FROM fixture.t_calls WHERE id = $1", call),
+        // Keys that change: a follower's, a parent's of many, an assigned
+        // row's, a broadcast row's — what points at them along.
+        78 => write!(conn, "UPDATE fixture.t_phones SET number = number + 4 WHERE customer_id = $1 AND number = $2", phone.map(|p| p.0), phone.map(|p| p.1)),
+        79 => write!(conn, "UPDATE fixture.t_sizes SET code = code + 1000000 WHERE code = $1", size),
+        80 => write!(conn, "UPDATE fixture.t_tasks SET id = id + 1 WHERE id = $1", task),
+        81 => write!(conn, "UPDATE fixture.t_bins SET slot = slot + 4 WHERE store = $1 AND slot = $2", bin.map(|b| b.0), bin.map(|b| b.1)),
+        // Members and assignments that move.
+        82 => write!(conn, "UPDATE fixture.t_list_members SET customer_id = $3 WHERE list_id = $1 AND customer_id = $2", list, customer, other_customer),
+        83 => write!(conn, "UPDATE fixture.t_list_members SET list_id = $3 WHERE list_id = $1 AND customer_id = $2", list, customer, other_list),
+        84 => write!(conn, "UPDATE fixture.t_replica_lists SET replica_id = $3 WHERE list_id = $1 AND replica_id = $2", list, replica, walk.pick(&replicas)),
+        85 => write!(conn, "UPDATE fixture.t_replica_lists SET list_id = $3 WHERE list_id = $1 AND replica_id = $2", list, replica, other_list),
+        // A group, its members and its assignments gone at once.
+        86 => write!(conn, "DELETE FROM fixture.t_lists WHERE id = $1", list),
+        // Rows moved to another partition.
+        87 => write!(conn, "UPDATE fixture.t_products SET partition_id = $2 WHERE id = $1", product, other),
+        88 => write!(conn, "UPDATE fixture.t_bins SET partition_id = $3 WHERE store = $1 AND slot = $2", bin.map(|b| b.0), bin.map(|b| b.1), other),
+        89 => write!(conn, "UPDATE fixture.t_customers SET partition_id = $2 WHERE id = $1", customer, other),
+        // A table written on both sides: a write of the replicas' column
+        // alone is no change here.
+        90 => write!(conn, "INSERT INTO fixture.t_tallies (id, partition_id, kind_id, name) VALUES ($1, $2, $3, 't')", new, partition, kind),
+        91 => write!(conn, "UPDATE fixture.t_tallies SET seen = seen + 1 WHERE id = $1", tally),
+        92 => write!(conn, "UPDATE fixture.t_tallies SET name = name || '.' WHERE id = $1", tally),
+        93 => write!(conn, "DELETE FROM fixture.t_tallies WHERE id = $1", tally),
+        // What this build cannot encode, routed, following, mid-chain.
+        94 => write!(conn, "UPDATE fixture.t_products SET name = $2 WHERE id = $1", product, POISON),
+        95 => write!(conn, "UPDATE fixture.t_emails SET address = $2 WHERE id = $1", email, POISON),
+        96 => write!(conn, "UPDATE fixture.t_bins SET name = $3 WHERE store = $1 AND slot = $2", bin.map(|b| b.0), bin.map(|b| b.1), POISON),
+        97 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, POISON),
+        98 => write!(conn, "UPDATE fixture.t_families SET name = $2 WHERE id = $1", family, POISON),
+        99 => write!(conn, "UPDATE fixture.t_customers SET name = $2 WHERE id = $1", customer, POISON),
+        // Rows no message can carry.
+        100 => write!(conn, "UPDATE fixture.t_products SET name = $2 WHERE id = $1", product, &big),
+        101 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, &big),
+        _ => return Step::Cured,
     };
     if done {
-        Step::Wrote(format!("{choice}"))
+        Step::Wrote(choice)
     } else {
         Step::Skipped
     }
@@ -1021,8 +1508,11 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
 #[sqlx::test(migrations = false)]
 async fn every_replica_holds_exactly_what_its_strategies_say(pool: crate::DbPool) {
     let mut world = world(pool).await;
-    for seed in SEEDS {
-        walk_from(&mut world, seed, None).await;
+    for (n, seed) in SEEDS.iter().enumerate() {
+        // Every other walk plans in batches that split what was written
+        // together.
+        world.batch = [100, 3, 1][n % 3];
+        walk_from(&mut world, *seed, None).await;
     }
 }
 
@@ -1037,7 +1527,8 @@ async fn every_replica_holds_exactly_what_its_strategies_say(pool: crate::DbPool
 #[sqlx::test(migrations = false)]
 async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(pool: crate::DbPool) {
     let mut world = world(pool).await;
-    for seed in &SEEDS[..3] {
+    for (n, seed) in SEEDS[..3].iter().enumerate() {
+        world.batch = [100, 5, 2][n];
         let faults = Faults {
             fail: 20,
             refuse_one_in: 4,
@@ -1068,7 +1559,7 @@ const SEEDS: [u64; 8] = [
 /// going asked for: any more were the engine covering for something.
 async fn resyncs(conn: &mut Conn) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM sync.notes WHERE kind = 'resync'")
-        .fetch_one(&mut *conn)
+        .fetch_one(conn)
         .await
         .expect("resyncs")
 }
@@ -1092,27 +1583,47 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
     let mut asked = 0;
     for n in 0..400 {
         let last = n == 399;
-        match step(&mut world.conn, &mut walk, &world.partitions).await {
+        // Now and then a write begins that commits only some passes later.
+        if world.writer.is_none() && walk.below(20) == 0 {
+            let mut writer = world.pool.begin().await.expect("a long writer");
+            sqlx::raw_sql("SET LOCAL lock_timeout = '100ms'")
+                .execute(&mut *writer)
+                .await
+                .expect("a lock timeout");
+            world.history.push("a long writer began".to_owned());
+            world.writer = Some((writer, 1 + walk.below(4)));
+        }
+        let wrote = match &mut world.writer {
+            Some((writer, _)) if walk.below(2) == 0 => {
+                step(&mut *writer, &mut walk, &world.partitions).await
+            }
+            _ => step(&mut world.conn, &mut walk, &world.partitions).await,
+        };
+        match wrote {
             Step::Wrote(what) => {
-                if what == "58"
-                    || what == "59"
-                    || what == "60"
-                    || what == "61"
-                    || what == "62"
-                    || what == "63"
-                {
+                if (58..=63).contains(&what) {
                     asked += 1;
                 }
-                world.history.push(what);
+                world.history.push(what.to_string());
             }
             Step::Skipped => {}
             Step::Cured => {
+                world.commit_writer().await;
+                cure(&mut world.conn).await;
                 world.history.push("the fix".to_owned());
                 world.retry_quarantine().await;
             }
         }
+        if let Some((_, passes)) = &mut world.writer {
+            *passes = passes.saturating_sub(1);
+            if *passes == 0 {
+                world.commit_writer().await;
+            }
+        }
         if faults.is_some() {
             world.round(Some(&mut storm)).await;
+        } else if walk.below(2) == 0 {
+            world.round(None).await;
         }
         // Settled now and then — rarely in a storm, so faults pile up.
         let settles = if faults.is_some() {
@@ -1123,6 +1634,7 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
         if settles || last {
             if last {
                 *world.wire.faults.lock().unwrap() = Faults::default();
+                world.commit_writer().await;
                 cure(&mut world.conn).await;
                 world.settle().await;
                 world.retry_quarantine().await;
@@ -1476,7 +1988,7 @@ async fn a_note_for_a_table_no_row_declares_is_refused_not_dropped(pool: crate::
         .await
         .expect("a transaction");
     assert!(matches!(
-        world.engine.plan(&mut tx, &[change]).await,
+        world.engine.plan(&mut tx, &[Note { id: 1, change }]).await,
         Err(Error::Misuse(_))
     ));
 }
@@ -1852,4 +2364,73 @@ async fn a_number_written_at_another_scale_is_noted(pool: crate::DbPool) {
         .await
         .expect("notes");
     assert_eq!(noted, 1, "the new scale, and not the same value again");
+}
+
+/// A follower a row of the replica's points at stays with it when its
+/// parent leaves the replica's rules, and so does that parent, with its
+/// other followers: what points at a row keeps it, followers included, and
+/// a follower kept keeps its parent. Once nothing points at them, they go.
+#[sqlx::test(migrations = false)]
+async fn a_follower_something_points_at_keeps_its_parent(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[0];
+    let replica: Uuid = sqlx::query_scalar(
+        "SELECT id FROM fixture.t_replicas WHERE partition_id = $1 AND live ORDER BY id LIMIT 1",
+    )
+    .bind(partition)
+    .fetch_one(&mut *world.conn)
+    .await
+    .expect("a replica");
+    let (customer, list, call, email) = (
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    );
+    sqlx::raw_sql(&format!(
+        "INSERT INTO fixture.t_customers (id, partition_id, name) VALUES ('{customer}', '{partition}', 'c');
+         INSERT INTO fixture.t_emails (id, partition_id, customer_id, address) VALUES ('{email}', '{partition}', '{customer}', 'e');
+         INSERT INTO fixture.t_phones (customer_id, number, partition_id) VALUES ('{customer}', 1, '{partition}');
+         INSERT INTO fixture.t_lists (id, partition_id) VALUES ('{list}', '{partition}');
+         INSERT INTO fixture.t_list_members VALUES ('{list}', '{customer}', '{partition}');
+         INSERT INTO fixture.t_replica_lists VALUES ('{list}', '{replica}', '{partition}');
+         INSERT INTO fixture.t_calls (id, partition_id, replica_id, customer_id, number, name)
+              VALUES ('{call}', '{partition}', '{replica}', '{customer}', 1, 'c');"
+    ))
+    .execute(&mut *world.conn)
+    .await
+    .expect("a customer, its email and phone, given to the replica; a call of its to the phone");
+    world.settle().await;
+    let holds = |world: &World| -> BTreeSet<String> {
+        world.replicas[&replica]
+            .rows
+            .keys()
+            .map(|(t, _)| t.clone())
+            .collect()
+    };
+    let all: BTreeSet<String> = ["t_customers", "t_emails", "t_phones", "t_calls"]
+        .map(str::to_owned)
+        .into();
+    assert_eq!(holds(&world), all);
+
+    sqlx::query("DELETE FROM fixture.t_list_members WHERE list_id = $1")
+        .bind(list)
+        .execute(&mut *world.conn)
+        .await
+        .expect("the customer leaves the list");
+    world.settle().await;
+    assert_eq!(
+        holds(&world),
+        all,
+        "the call keeps its phone, the phone its customer"
+    );
+    world.assert_holdings(0, 0).await;
+
+    sqlx::query("DELETE FROM fixture.t_calls WHERE id = $1")
+        .bind(call)
+        .execute(&mut *world.conn)
+        .await
+        .expect("the call goes");
+    world.settle().await;
+    assert!(holds(&world).is_empty(), "{:?}", holds(&world));
 }

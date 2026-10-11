@@ -42,7 +42,7 @@ use crate::plan::{pending, Delta, Engine, Note, Unsent, RECORD_CHUNK};
 use crate::wire::Codec;
 use crate::Conn;
 use crate::Error;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 use uuid::Uuid;
@@ -77,6 +77,13 @@ pub trait Transport: Send + Sync + 'static {
         id: &str,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 }
+
+/// Rows to send or take back a pass reads at a time.
+const PAGE: usize = 20_000;
+
+/// Bytes of rows a pass may hold in the messages it fills before it ends
+/// them all early.
+const BUFFERED: usize = 64 << 20;
 
 /// How much a replica's outbox may hold before it is provisioned again
 /// instead: then what it is owed is cheaper sent whole than in order.
@@ -143,8 +150,10 @@ struct Ready {
 
 /// What one pass writes, a chunk at a time: each replica's message being
 /// filled, and the messages filled and not yet numbered and written.
-struct Writer<'d> {
-    delta: &'d Delta,
+struct Writer {
+    /// The snapshot the plan read: what the rows it sends are recorded as
+    /// held from.
+    snapshot: String,
     epoch: String,
     packers: BTreeMap<Uuid, Packer>,
     /// The snapshot each replica provisioned is sent.
@@ -152,6 +161,8 @@ struct Writer<'d> {
     ready: Vec<Ready>,
     /// Rows the ready messages carry.
     rows: usize,
+    /// Bytes of rows in the messages being filled.
+    buffered: usize,
     /// Per replica, the last message written: what the next one follows.
     /// A replica provisioned is absent until its snapshot's first message,
     /// which follows nothing.
@@ -188,23 +199,23 @@ impl<P: Sync + 'static> Relay<'_, P> {
         // A message follows the last one its replica was sent in this epoch;
         // a replica sent none since it was last provisioned can only begin
         // with a snapshot.
+        let touched = self.engine.touched(conn).await?;
         let chains: BTreeMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
             "SELECT replica_id, last_sequence FROM sync.chains \
               WHERE replica_id = ANY($1) AND last_sequence IS NOT NULL",
         )
-        .bind(Engine::replicas(&delta).into_iter().collect::<Vec<_>>())
+        .bind(touched.iter().copied().collect::<Vec<_>>())
         .fetch_all(&mut *conn)
         .await?
         .into_iter()
         .collect();
-        let unchained: Vec<Uuid> = Engine::replicas(&delta)
+        let unchained: Vec<Uuid> = touched
             .into_iter()
             .filter(|r| !delta.snapshots.contains(r) && !chains.contains_key(r))
             .collect();
         if !unchained.is_empty() {
             delta = self.engine.provision(conn, delta, &unchained).await?;
         }
-        let replicas: Vec<Uuid> = Engine::replicas(&delta).into_iter().collect();
         // A provisioning stands for every other one pending for its replica.
         let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
         let covered: Vec<i64> = sqlx::query_scalar(
@@ -235,7 +246,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let unsent = self.engine.unsent(&delta);
         outcome.quarantined = unsent.len();
         quarantine(conn, &unsent).await?;
-        self.settle(conn, &notes, &delta).await?;
+        settle(conn).await?;
+        let replicas: Vec<Uuid> = self.engine.touched(conn).await?.into_iter().collect();
         let done: Vec<i64> = notes.iter().map(|n| n.id).chain(covered).collect();
         crate::plan::mark_done(conn, &done).await?;
         outcome.done = notes.len();
@@ -268,7 +280,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let mut parked = Vec::new();
         loop {
             if notes.is_empty() {
-                return Ok((Delta::default(), notes, parked));
+                return Ok((self.engine.plan(conn, &notes).await?, notes, parked));
             }
             let why = match self.attempt(conn, &notes).await {
                 Ok(delta) => return Ok((delta, notes, parked)),
@@ -318,8 +330,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
         sqlx::query("SAVEPOINT sync_plan")
             .execute(&mut *conn)
             .await?;
-        let changes: Vec<_> = notes.iter().map(|n| n.change.clone()).collect();
-        let planned = self.engine.plan(conn, &changes).await;
+        let planned = self.engine.plan(conn, notes).await;
         let end = if planned.is_ok() {
             "RELEASE SAVEPOINT sync_plan"
         } else {
@@ -362,9 +373,12 @@ impl<P: Sync + 'static> Relay<'_, P> {
             .map(|replica| (*replica, Uuid::now_v7().to_string()))
             .collect();
         let mut writer = Writer {
-            delta,
+            snapshot: delta.snapshot.clone(),
             epoch: epoch.to_owned(),
-            packers: Engine::replicas(delta)
+            packers: self
+                .engine
+                .touched(conn)
+                .await?
                 .into_iter()
                 .map(|replica| {
                     let snapshot = ids.get(&replica).map_or("", String::as_str);
@@ -374,6 +388,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             snapshots: ids.clone(),
             ready: Vec::new(),
             rows: 0,
+            buffered: 0,
             last: chains
                 .iter()
                 .filter(|(r, _)| !delta.snapshots.contains(r))
@@ -386,48 +401,62 @@ impl<P: Sync + 'static> Relay<'_, P> {
             deletes: 0,
         };
         let mut blocked = BTreeMap::new();
-        for &i in &self.engine.order {
-            let table = self.engine.table(i);
-            let keys: BTreeSet<&String> = delta
-                .upserts
-                .values()
-                .filter_map(|tables| tables.get(&i))
-                .flatten()
-                .collect();
-            let keys: Vec<String> = keys.into_iter().cloned().collect();
-            for chunk in keys.chunks(RECORD_CHUNK) {
+        // Every row sent, by table and key: each key encoded once, a chunk
+        // of keys at a time, however many replicas it goes to.
+        self.engine.open_sent(conn).await?;
+        loop {
+            let page = self.engine.next(conn, "sync_sent", PAGE).await?;
+            if page.is_empty() {
+                break;
+            }
+            let mut rest = page.as_slice();
+            while let Some((i, _, _)) = rest.first() {
+                let mut keys: Vec<String> = Vec::new();
+                let end = rest
+                    .iter()
+                    .position(|(t, key, _)| {
+                        if t != i {
+                            return true;
+                        }
+                        if keys.last() != Some(key) {
+                            if keys.len() == RECORD_CHUNK {
+                                return true;
+                            }
+                            keys.push(key.clone());
+                        }
+                        false
+                    })
+                    .unwrap_or(rest.len());
+                let (chunk, after) = rest.split_at(end);
+                rest = after;
                 let encoded = self
                     .engine
-                    .encode(conn, self.codecs, i, chunk, self.limits.largest_row())
+                    .encode(conn, self.codecs, *i, &keys, self.limits.largest_row())
                     .await?;
-                for (replica, tables) in &delta.upserts {
-                    for key in tables.get(&i).into_iter().flatten() {
-                        if let Some(why) = encoded.failed.get(key) {
-                            blocked.insert((*replica, i, key.clone()), why.clone());
-                        }
+                for (i, key, replica) in chunk {
+                    if let Some(why) = encoded.failed.get(key) {
+                        blocked.insert((*replica, *i, key.clone()), why.clone());
+                    } else if blocked.is_empty() {
+                        let table = self.engine.table(*i);
+                        writer.push(*replica, table, Some(encoded.rows[key].clone()), key);
                     }
                 }
-                if !blocked.is_empty() {
-                    continue;
+                if blocked.is_empty() {
+                    writer.flush(conn, false).await?;
                 }
-                for (replica, tables) in &delta.upserts {
-                    let Some(keys) = tables.get(&i) else { continue };
-                    for key in chunk.iter().filter(|k| keys.contains(*k)) {
-                        let bytes = encoded.rows[key].clone();
-                        writer.push(*replica, table, Some(bytes), key);
-                    }
-                }
-                writer.flush(conn, false).await?;
             }
         }
         if !blocked.is_empty() {
             return Ok(Err(blocked));
         }
-        for (replica, tables) in &delta.deletes {
-            for &i in self.engine.order.iter().rev() {
-                for key in tables.get(&i).into_iter().flatten() {
-                    writer.push(*replica, self.engine.table(i), None, key);
-                }
+        self.engine.open_dropped(conn).await?;
+        loop {
+            let page = self.engine.next(conn, "sync_dropped", PAGE).await?;
+            if page.is_empty() {
+                break;
+            }
+            for (i, key, replica) in &page {
+                writer.push(*replica, self.engine.table(*i), None, key);
             }
             writer.flush(conn, false).await?;
         }
@@ -452,61 +481,6 @@ impl<P: Sync + 'static> Relay<'_, P> {
         .execute(&mut *conn)
         .await?;
         Ok(Ok((writer.written, writer.upserts, writer.deletes)))
-    }
-
-    /// A row tried again that the plan no longer sends a replica — deleted,
-    /// retired, no longer its — is owed to it by nobody: it leaves that
-    /// replica's quarantine, unless it failed again.
-    async fn settle(&self, conn: &mut Conn, notes: &[Note], delta: &Delta) -> Result<(), Error> {
-        let mut tables = Vec::new();
-        let mut keys = Vec::new();
-        let mut owed: Vec<(Uuid, String, String)> = Vec::new();
-        for note in notes {
-            let crate::plan::Change::Row { table, key, .. } = &note.change else {
-                continue;
-            };
-            let Some(i) = self.engine.index(table) else {
-                continue;
-            };
-            let Ok(key) = self.engine.canonical(i, key) else {
-                continue;
-            };
-            for (replica, sent) in &delta.upserts {
-                if sent.get(&i).is_some_and(|k| k.contains(&key)) {
-                    owed.push((*replica, table.clone(), key.clone()));
-                }
-            }
-            for (replica, t, k) in delta.blocked.keys() {
-                if *t == i && *k == key {
-                    owed.push((*replica, table.clone(), key.clone()));
-                }
-            }
-            tables.push(table.clone());
-            keys.push(key);
-        }
-        let (r, t, k): (Vec<Uuid>, Vec<String>, Vec<String>) = owed.into_iter().fold(
-            (Vec::new(), Vec::new(), Vec::new()),
-            |(mut r, mut t, mut k), (a, b, c)| {
-                r.push(a);
-                t.push(b);
-                k.push(c);
-                (r, t, k)
-            },
-        );
-        sqlx::query(
-            "DELETE FROM sync.quarantine q USING unnest($1::text[], $2::text[]) AS n(t, k) \
-              WHERE q.relation = n.t AND q.row_key = n.k \
-                AND NOT EXISTS (SELECT 1 FROM unnest($3::uuid[], $4::text[], $5::text[]) AS o(r, t, k) \
-                                 WHERE o.r = q.replica_id AND o.t = q.relation AND o.k = q.row_key)",
-        )
-        .bind(&tables)
-        .bind(&keys)
-        .bind(&r)
-        .bind(&t)
-        .bind(&k)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
     }
 
     /// Provisions again, with an alarm, each of `replicas` whose outbox
@@ -733,19 +707,30 @@ async fn at_most<'a, T>(limit: usize, jobs: impl IntoIterator<Item = Job<'a, T>>
     }
 }
 
-impl Writer<'_> {
+impl Writer {
     /// Adds `key` of `table` to `replica`'s messages: the row to hold as
     /// `bytes`, or `None` to let go of.
     fn push(&mut self, replica: Uuid, table: &str, bytes: Option<Vec<u8>>, key: &str) {
         let wire = envelope::Key {
             parts: key.split('|').map(str::to_owned).collect(),
         };
+        self.buffered += bytes.as_ref().map_or(0, Vec::len);
         let packer = self
             .packers
             .get_mut(&replica)
             .expect("a packer per replica");
         if let Some(done) = packer.push(table, bytes, wire) {
             self.ready(replica, Body::Down(done));
+        }
+        if self.buffered > BUFFERED {
+            // Every replica's message being filled, ended early: what a
+            // pass holds stays bounded however many replicas it fills at once.
+            let replicas: Vec<Uuid> = self.packers.keys().copied().collect();
+            for replica in replicas {
+                if let Some(done) = self.packers.get_mut(&replica).and_then(Packer::finish) {
+                    self.ready(replica, Body::Down(done));
+                }
+            }
         }
     }
 
@@ -756,6 +741,13 @@ impl Writer<'_> {
                 .iter()
                 .map(|t| t.upserts.len() + t.deletes.len())
                 .sum::<usize>();
+            let carried: usize = down
+                .tables
+                .iter()
+                .flat_map(|t| &t.upserts)
+                .map(Vec::len)
+                .sum();
+            self.buffered = self.buffered.saturating_sub(carried);
         }
         self.ready.push(Ready { replica, body });
     }
@@ -862,32 +854,34 @@ impl Writer<'_> {
         .execute(&mut *conn)
         .await?;
         sqlx::query(
-            "INSERT INTO sync.held (replica_id, relation, row_key, horizon, sequence) \
-             SELECT r, t, k, $5::text::xid8, s \
+            "INSERT INTO sync.held (replica_id, relation, row_key, snapshot, sequence) \
+             SELECT r, t, k, $5::pg_snapshot, s \
                FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) AS u(r, t, k, s) \
              ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET \
-               sent_at = now(), horizon = EXCLUDED.horizon, sequence = EXCLUDED.sequence",
+               sent_at = now(), snapshot = EXCLUDED.snapshot, sequence = EXCLUDED.sequence",
         )
         .bind(&held.0)
         .bind(&held.1)
         .bind(&held.2)
         .bind(&held.3)
-        .bind(self.delta.horizon.to_string())
+        .bind(&self.snapshot)
         .execute(&mut *conn)
         .await?;
-        // A row set aside, carried again: the message that carries it is the
-        // one whose application lets it out.
-        sqlx::query(
-            "UPDATE sync.quarantine q SET carried = u.s \
-               FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) AS u(r, t, k, s) \
-              WHERE q.replica_id = u.r AND q.relation = u.t AND q.row_key = u.k",
-        )
-        .bind(&held.0)
-        .bind(&held.1)
-        .bind(&held.2)
-        .bind(&held.3)
-        .execute(&mut *conn)
-        .await?;
+        // A row set aside, carried again — or let go of again, after the
+        // replica refused to — leaves once the message is applied.
+        for carried in [&held, &gone] {
+            sqlx::query(
+                "UPDATE sync.quarantine q SET carried = u.s \
+                   FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) AS u(r, t, k, s) \
+                  WHERE q.replica_id = u.r AND q.relation = u.t AND q.row_key = u.k",
+            )
+            .bind(&carried.0)
+            .bind(&carried.1)
+            .bind(&carried.2)
+            .bind(&carried.3)
+            .execute(&mut *conn)
+            .await?;
+        }
         sqlx::query(
             "DELETE FROM sync.held h \
               USING unnest($1::uuid[], $2::text[], $3::text[]) AS d(r, t, k) \
@@ -935,6 +929,23 @@ async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error
     .execute(&mut *conn)
     .await?;
     resync(conn, replica).await?;
+    Ok(())
+}
+
+/// A row tried again that the plan no longer sends a replica — deleted,
+/// retired, no longer its — is owed to it by nobody: it leaves that
+/// replica's quarantine, unless it failed again.
+async fn settle(conn: &mut Conn) -> Result<(), Error> {
+    sqlx::query(
+        "DELETE FROM sync.quarantine q USING sync_changed c \
+          WHERE q.relation = c.relation AND q.row_key = c.row_key \
+            AND NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = q.replica_id \
+                               AND k.rel = c.rel AND k.row_key = c.row_key AND k.sends) \
+            AND NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
+                               AND b.rel = c.rel AND b.row_key = c.row_key)",
+    )
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

@@ -58,7 +58,7 @@ content of a change, only *that* something changed.
 | **mirrored table** | a table that exists on both sides with the same columns |
 | **note** | a record, written in the same transaction as a change, that a row (or a group, or a replica) changed |
 | **held set** | `sync.held`: which rows each replica holds, according to the server |
-| **horizon** | the point in time (a PostgreSQL transaction id) a held row was last sent from |
+| **snapshot** | the snapshot of the database a held row was last sent from: which transactions' changes it holds |
 | **retired** | a row the replica let go of but kept, because a row of its own still points at it |
 | **relay** | the server process that turns notes into messages, one at a time per server |
 | **transport** | whatever carries messages between server and replicas |
@@ -182,34 +182,49 @@ because PostgreSQL assigns ids before commit: a transaction that started first
 can commit last with a lower id. A cursor would skip it; a "not done" query
 never does.
 
-For the notes it read, the planner computes, per replica:
+What a replica should hold is the least set of rows closed under three
+rules: the rows its tables' rules send it; every row one of those points at
+(a parent goes with its child); every row that follows one of those. For the
+notes it read, the planner works out how that set moved, around what changed
+— never the whole of it but for a replica provisioned from scratch:
 
-1. **The changed rows**: who should hold each one now (by its table's `sync`
-   rule) against who holds it (`sync.held`). New holders get it, holders that
-   should not hold it any more lose it.
-2. **Parents**: every row being sent brings along each row it points at that
-   the replica lacks.
-3. **Release**: a row taken back, or one a changed row no longer points at,
-   releases what it pointed at, and a parent goes only once nothing the
-   replica keeps points at it. One kept for what points at it — a `Referenced`
-   row, or any row held only because a child needs it — is sent again when it
-   changed.
-4. **Followers**: rows that `Follow` a parent go wherever the parent goes.
+1. **Rows in question.** Of the rows a replica holds, those a change may
+   have taken out of its set: a changed row its rules no longer send it (a
+   `Referenced` or following row: any that changed), the parents a changed
+   row pointed at before, rows that cannot go. Then, closed over what they
+   point at and what follows them, the rows of its that leaned on those.
+   Every row it holds outside them stays as recorded.
+2. **What it keeps.** The rows its rules send it; the rows in question that
+   a row it holds outside them points at, or that follow one it holds; then,
+   a round at a time from the rows the last round added, what those need:
+   the parents of a row it lacks or that is in question (a follower points
+   at its parent too), and the followers of one it lacks or that is in
+   question.
+3. **The difference.** What it keeps and lacks — or holds as a version
+   older than a change of the batch, or refused — is sent; the rows in
+   question it does not keep are taken back.
 
-These steps feed each other, so they repeat until nothing changes. The result
-is a `Delta`: per replica, rows to send and rows to take back. Every note of
-the batch is planned together, in one plan: a part planned apart could undo
-what another sends — take back a parent a child planned elsewhere still
-needs.
+A row a replica holds that a change not yet planned pointed at before stays
+too — beyond the batch, or parked, that change's older version is what the
+replica holds, and it still points there. Rows that cannot go (section 4.3)
+are never kept, nor any row that points at one; a plan that would send such
+a row runs again with it among them.
 
-**The horizon.** Planning starts by reading the oldest transaction still
-running (`pg_snapshot_xmin`). Every transaction older than that has finished,
-so anything it changed is in the rows the plan reads. When a replica is
-recorded as holding a row, the horizon is recorded with it. Later, a note for
-that row is only acted on if its transaction is at or past the recorded
-horizon. That is how a change the replica already received is not sent twice,
-while a change committed *after* the plan read (by a transaction that started
-earlier) is never missed.
+The plan is worked out in the database, in temporary tables of the relay's
+connection, set by set, and read a page at a time by what records it: a
+plan, however many rows it sends — a snapshot of a large replica, a group of
+thousands given to many replicas — is never in the relay's memory whole.
+Every note of the batch is planned together, in one plan: a part planned
+apart could undo what another sends — take back a parent a child planned
+elsewhere still needs.
+
+**What a replica's version holds.** Every plan reads one snapshot of the
+database. When a replica is recorded as holding a row, that snapshot is
+recorded with it. Later, a note for that row sends it again only if the
+snapshot did not see the note's transaction: a change the replica already
+received is never sent twice — not even one committed while a transaction
+older than it was still running — and a change committed *after* the plan
+read (by a transaction that started earlier) is never missed.
 
 ### 4.3 Loading
 

@@ -554,6 +554,13 @@ pub struct Listing {
 const CONFIRMED: &str =
     "coalesce(h.sequence <= r.applied_sequence AND r.applied_epoch = e.epoch, false)";
 
+/// Whether a row a replica holds `h` has changed since it was sent: a
+/// pending change of it by a transaction its snapshot does not see.
+const OUTDATED: &str =
+    "EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
+                          AND n.relation = h.relation AND n.row_key = h.row_key \
+                          AND NOT pg_visible_in_snapshot(n.xid, h.snapshot))";
+
 /// The pending notes a scope sees: `$1` every one, else those of the
 /// partitions `$2` (or of none), about the replicas `$3` (or any).
 const NOTES_IN_SCOPE: &str = "n.done_at IS NULL AND ($1 OR ( \
@@ -767,14 +774,10 @@ impl Engine {
             });
             let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
                 "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
-                 p AS (SELECT n.row_key, max(n.xid) AS xid FROM sync.notes n \
-                        WHERE n.done_at IS NULL AND n.kind = 'row' AND n.relation = $1 \
-                        GROUP BY n.row_key), \
                  h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
-                              coalesce(p.xid >= h.horizon, false) AS outdated \
+                              {OUTDATED} AS outdated \
                          FROM sync.held h CROSS JOIN sync.epoch e \
                          LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-                         LEFT JOIN p ON p.row_key = h.row_key \
                         WHERE h.relation = $1 AND h.replica_id = ANY($2) AND h.refused IS NULL) \
                  SELECT coalesce(w.replica_id, h.replica_id), \
                         count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
@@ -854,8 +857,7 @@ impl Engine {
         let ruled = self.wanted_sql(i, "true").is_some();
         let held: Vec<(Uuid, bool, bool)> = sqlx::query_as(&format!(
             "SELECT h.replica_id, {CONFIRMED}, \
-                    EXISTS (SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
-                             AND n.relation = h.relation AND n.row_key = h.row_key AND n.xid >= h.horizon) \
+                    {OUTDATED} \
                FROM sync.held h CROSS JOIN sync.epoch e \
                LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
               WHERE h.relation = $1 AND h.row_key = $2 AND h.replica_id = ANY($3)"

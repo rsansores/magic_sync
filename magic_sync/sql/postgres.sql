@@ -68,8 +68,8 @@ COMMENT ON COLUMN sync.notes.previous IS
     'update or a delete, so a parent it no longer points at can be let go — and nothing else '
     'of the row. For a member: the member row.';
 COMMENT ON COLUMN sync.notes.xid IS
-    'The transaction that noted it. A replica sent a row from a snapshot whose horizon is past '
-    'it already holds this change.';
+    'The transaction that noted it. A replica sent a row from a snapshot that sees it already '
+    'holds this change.';
 COMMENT ON COLUMN sync.notes.done_at IS
     'When the relay recorded what the note asked for and wrote its messages to the outbox. '
     'NULL: pending.';
@@ -87,7 +87,7 @@ CREATE TABLE sync.held (
     relation     TEXT        NOT NULL,
     row_key      TEXT        NOT NULL,
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    horizon      XID8        NOT NULL,
+    snapshot     PG_SNAPSHOT NOT NULL,
     sequence     BIGINT      NOT NULL,
     refused      BIGINT,
     PRIMARY KEY (replica_id, relation, row_key)
@@ -110,9 +110,9 @@ COMMENT ON COLUMN sync.held.refused IS
     'still goes, and a refused delete is sent again; not held for progress, closure shown to '
     'users, or digests. Cleared once the replica applies a later message that carries the row. '
     'NULL: taken.';
-COMMENT ON COLUMN sync.held.horizon IS
-    'The xmin of the snapshot the row was last sent from: every transaction before it had '
-    'finished, so a change it noted is in what the replica holds.';
+COMMENT ON COLUMN sync.held.snapshot IS
+    'The snapshot the row was last sent from: a change noted by a transaction it sees is in '
+    'what the replica holds, and one by any other is not.';
 
 -- Rows taken back from a replica, until it says it applied the message that
 -- took them: a refusal of that message is a delete it could not carry out,
