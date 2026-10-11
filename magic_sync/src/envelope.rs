@@ -96,6 +96,7 @@ impl Limits {
     }
 
     /// The largest row a message can carry.
+    #[cfg(feature = "postgres")]
     pub(crate) fn largest_row(&self) -> usize {
         self.bytes.saturating_sub(ENVELOPE_ROOM)
     }

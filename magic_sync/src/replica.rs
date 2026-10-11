@@ -11,7 +11,7 @@ use crate::wire::Codec;
 use {
     crate::dialect::{ident, literal},
     crate::envelope::Up,
-    crate::envelope::{framed, opened, Body, Down, EndSnapshot, Limits, Table, ToReplica},
+    crate::envelope::{framed, opened, Body, Down, EndSnapshot, Table, ToReplica},
     crate::row::{key_text, Key, KeyKind},
     crate::{Conn, Error},
     prost::Message as _,
@@ -1529,9 +1529,10 @@ impl Outgoing {
         self.up.encode_to_vec()
     }
 
-    /// How many of the replica's writes it carries.
-    pub(crate) fn rows(&self) -> usize {
-        self.notes.len()
+    /// How many of the replica's writes, and of its rejections, it carries:
+    /// what a transport that refuses it for good may refuse it for.
+    pub(crate) fn items(&self) -> usize {
+        self.notes.len() + self.rejected.len()
     }
 }
 
@@ -1544,11 +1545,19 @@ impl Outgoing {
 /// `BEGIN IMMEDIATE`, and commit before the message goes: it reads all of
 /// that as of one moment, and draws the upload's number. Hand the message
 /// to the transport, then to [`delivered`] — or, when the transport refuses
-/// it for good, to [`set_aside`].
+/// it for good, ask again with a `cap` on the rows and rejections it
+/// carries, halving it until the one it refuses is alone: then to
+/// [`refused`]. The digests go only with the last message applied, which
+/// goes only once every refusal of it is told, and only when they fit;
+/// otherwise they wait.
+///
+/// Every byte counts against the transport's limit: what the message is
+/// built with exactly, and what it takes by the end — its upload's number,
+/// the backlog — at most.
 ///
 /// A row that cannot go as it is — of a table this build does not send up, a
 /// key it cannot read, a row that does not encode or is larger than a
-/// message — is set aside, and counted in the backlog, until
+/// message with nothing else in it — is set aside, and counted in the backlog, until
 /// [`retry_set_aside`].
 #[cfg(feature = "sqlite")]
 pub(crate) async fn outbox<P: Sync + 'static>(
@@ -1558,8 +1567,8 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     lane: usize,
     settings: &Outbox,
     digests: bool,
+    cap: Option<usize>,
 ) -> Result<Option<Outgoing>, Error> {
-    check_settings(codecs, lanes)?;
     let Some(this) = lanes.get(lane) else {
         return Err(Error::Misuse(format!("no lane {lane} of {}", lanes.len())));
     };
@@ -1568,37 +1577,46 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         protocol: envelope::PROTOCOL,
         ..Up::default()
     };
-    let mut budget = settings.limits.largest_row();
+    let limit = settings.limits.bytes;
+    // What the message takes beyond what it is built with: its upload's
+    // number (63 bits, nine bytes), and on the main lane the backlog,
+    // whatever it says by the end — per table, its name and three numbers.
+    let mut reserved = framed(9);
     let mut rejected = Vec::new();
     let mut untold_gap = false;
     // Whether the last applied is news to the server.
     let mut news = false;
+    // Rows and rejections it may carry, at most.
+    let mut items = cap.unwrap_or(usize::MAX);
     if main {
-        // Room for the backlog, whatever it says by the end: per table its
-        // name and three numbers of ten bytes at most.
-        let room: usize = progress(conn)
+        let tables: usize = progress(conn)
             .await?
             .iter()
             .map(|t| framed(framed(t.table.len()) + 3 * 11))
             .sum();
-        budget = budget.saturating_sub(framed(room) + framed(0));
-        if digests {
-            up.digests = self::digests(conn, codecs).await?;
-            let spent: usize = up.digests.iter().map(|d| framed(d.encoded_len())).sum();
-            budget = budget.saturating_sub(spent);
-        }
+        reserved += framed(tables);
+        let applied: Option<(String, i64, i64, bool, bool)> = sqlx::query_as(
+            "SELECT epoch, sequence, acknowledged, gap = 1, gap_told = 1 FROM sync_applied \
+              WHERE id = 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        // The last applied, and a gap, whether or not they go.
+        reserved += applied
+            .as_ref()
+            .map_or(0, |(epoch, ..)| framed(epoch.len()) + 11 + 2);
         // One over the cap says whether this message reports them all: the
         // server must hear of a refusal before the message it refused is
         // confirmed, or it would take the refused row for applied.
-        let pending = unreported(conn, settings.rejections.get() + 1).await?;
-        let mut all_reported = pending.len() <= settings.rejections.get();
-        for (row, sequence) in pending.into_iter().take(settings.rejections.get()) {
+        let most = settings.rejections.get().min(items);
+        let pending = unreported(conn, most + 1).await?;
+        let mut all_reported = pending.len() <= most;
+        for (row, sequence) in pending.into_iter().take(most) {
             let weight = framed(row.encoded_len());
-            if weight > budget {
+            if up.encoded_len() + reserved + weight > limit {
                 all_reported = false;
                 break;
             }
-            budget -= weight;
             let key = row
                 .key
                 .as_ref()
@@ -1608,31 +1626,40 @@ pub(crate) async fn outbox<P: Sync + 'static>(
             rejected.push((row.table.clone(), key, sequence, kept));
             up.rejected.push(row);
         }
-        let applied: Option<(String, i64, i64, bool, bool)> = sqlx::query_as(
-            "SELECT epoch, sequence, acknowledged, gap = 1, gap_told = 1 FROM sync_applied \
-              WHERE id = 1",
-        )
-        .fetch_optional(&mut *conn)
-        .await?;
-        if let Some((_, _, _, true, told)) = &applied {
-            up.gap = true;
-            untold_gap = !*told;
-            budget = budget.saturating_sub(2);
-        }
-        if let (Some((epoch, sequence, acknowledged, gap, _)), true) = (applied, all_reported) {
-            // The last applied goes with digests always (they are compared
-            // against it), with a gap (the server reads what it missed
-            // against it), and otherwise when the server has not heard of it.
-            news = sequence > acknowledged;
-            if news || !up.digests.is_empty() || gap {
-                up.epoch = epoch;
-                up.sequence = u64::try_from(sequence).unwrap_or_default();
-                budget = budget.saturating_sub(framed(up.epoch.len()) + 11);
+        items -= up.rejected.len();
+        if let Some((epoch, sequence, acknowledged, gap, told)) = applied {
+            up.gap = gap;
+            untold_gap = gap && !told;
+            // The last applied goes once every refusal of it is told: with
+            // digests always (they are compared against it), with a gap (the
+            // server reads what it missed against it), and otherwise when
+            // the server has not heard of it.
+            if all_reported {
+                if digests {
+                    let held = self::digests(conn, codecs).await?;
+                    let weight: usize = held.iter().map(|d| framed(d.encoded_len())).sum();
+                    if up.encoded_len() + reserved + weight <= limit {
+                        up.digests = held;
+                    }
+                }
+                news = sequence > acknowledged;
+                if news || !up.digests.is_empty() || gap {
+                    up.epoch = epoch;
+                    up.sequence = u64::try_from(sequence).unwrap_or_default();
+                }
             }
         }
     }
-    let notes = unsent(conn, lanes, this, settings).await?;
-    let gathered = gather(conn, codecs, notes, settings.limits, budget).await?;
+    // A row larger than a message with nothing else in it can carry never
+    // goes; one that does not fit this one waits for the next.
+    let bare = Up {
+        protocol: envelope::PROTOCOL,
+        ..Up::default()
+    };
+    let largest = limit.saturating_sub(bare.encoded_len() + reserved);
+    let budget = limit.saturating_sub(up.encoded_len() + reserved);
+    let notes = unsent(conn, lanes, this, settings, items).await?;
+    let gathered = gather(conn, codecs, notes, largest, budget).await?;
     up.tables = gathered.tables;
     if !gathered.carried.is_empty() {
         // A random number, a fresh one on every send: no answer meant for
@@ -1676,7 +1703,8 @@ struct Note {
     row_key: String,
 }
 
-/// Up to a message's rows of notes to send on `lane`, oldest first: the ones
+/// Up to a message's rows of notes, and `most`, to send on `lane`, oldest
+/// first: the ones
 /// never sent, or whose send the transport did not take, or written since
 /// they were sent, and the ones sent longer than `resend_after` ago — or, by
 /// a clock set back since, in the future — that the server never said it
@@ -1687,6 +1715,7 @@ async fn unsent(
     lanes: &[Lane],
     lane: &Lane,
     settings: &Outbox,
+    most: usize,
 ) -> Result<Vec<Note>, Error> {
     let quoted = |tables: &mut dyn Iterator<Item = &&str>| {
         tables.map(|t| literal(t)).collect::<Vec<_>>().join(", ")
@@ -1711,7 +1740,7 @@ async fn unsent(
           ORDER BY id LIMIT $1",
         settings.resend_after.as_secs()
     ))
-    .bind(i64::try_from(settings.limits.rows).unwrap_or(i64::MAX))
+    .bind(i64::try_from(settings.limits.rows.min(most)).unwrap_or(i64::MAX))
     .fetch_all(&mut *conn)
     .await?)
 }
@@ -1734,13 +1763,14 @@ struct Gathered {
 /// that is gone goes as its key only for a table keyed by its replica:
 /// history a replica let go of before it went up is not the server's to
 /// delete, and its note is done here. What does not fit waits for the next
-/// message; a note that cannot go as it is is set aside.
+/// message; a note that cannot go as it is — a row more than `largest`
+/// bytes among them — is set aside.
 #[cfg(feature = "sqlite")]
 async fn gather<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     notes: Vec<Note>,
-    limits: Limits,
+    largest: usize,
     mut budget: usize,
 ) -> Result<Gathered, Error> {
     let mut aside: Vec<(i64, String)> = Vec::new();
@@ -1796,9 +1826,7 @@ async fn gather<P: Sync + 'static>(
                 0
             };
             let weight = framed(bytes.len()) + framed(wire.encoded_len()) + opening;
-            if framed(bytes.len()) + framed(wire.encoded_len()) + opened(&part.table)
-                > limits.largest_row()
-            {
+            if framed(bytes.len()) + framed(wire.encoded_len()) + opened(&part.table) > largest {
                 let why = format!(
                     "a row of {} bytes, more than a message carries",
                     bytes.len()
@@ -1972,19 +2000,18 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
     Ok(())
 }
 
-/// The transport refused `outgoing` for good: its rows are set aside, with
-/// why, until [`retry_set_aside`]. Everything else it carried goes again.
+/// The transport refused `outgoing` for good, and it carries one row or one
+/// rejection: what the transport refuses. The row is set aside, with why,
+/// until [`retry_set_aside`] — unless written since, which goes as it is
+/// now. The rejection is taken as told, since no message can tell it: it
+/// must not hold back the confirmation of what was applied.
 #[cfg(feature = "sqlite")]
-pub(crate) async fn set_aside(
-    conn: &mut Conn,
-    outgoing: &Outgoing,
-    why: &str,
-) -> Result<(), Error> {
+pub(crate) async fn refused(conn: &mut Conn, outgoing: &Outgoing, why: &str) -> Result<(), Error> {
     sqlx::query(
         "UPDATE sync_notes SET set_aside = $1 \
-          WHERE upload = $3 AND id IN (SELECT value FROM json_each($2))",
+          WHERE upload = $3 AND writes = sent AND id IN (SELECT value FROM json_each($2))",
     )
-    .bind(why)
+    .bind(capped(why))
     .bind(json(&outgoing.notes))
     .bind(
         outgoing
@@ -1995,6 +2022,23 @@ pub(crate) async fn set_aside(
     )
     .execute(&mut *conn)
     .await?;
+    for (table, key, sequence, _) in &outgoing.rejected {
+        tracing::error!(
+            table,
+            key,
+            "sync: a rejection the uplink refuses for good — taken as told: {why}"
+        );
+        sqlx::query(&format!(
+            "UPDATE sync_rejections SET reported_at = {} \
+              WHERE table_name = $1 AND row_key = $2 AND sequence = $3",
+            crate::dialect::NOW
+        ))
+        .bind(table)
+        .bind(key)
+        .bind(sequence)
+        .execute(&mut *conn)
+        .await?;
+    }
     Ok(())
 }
 

@@ -10,7 +10,9 @@
 
 use super::*;
 use crate::conformance::{codecs, json, settled, Event, Price, Reading, Shelf, Task, Uplinked};
-use crate::envelope::{Backlog, Down, EndSnapshot, Filed, Key as WireKey, Table, ToReplica};
+use crate::envelope::{
+    Backlog, Down, EndSnapshot, Filed, Key as WireKey, Limits, Table, ToReplica,
+};
 use crate::run::replica::{Replica, Settings};
 use crate::testkit::ItemRow;
 use chrono::{TimeZone, Utc};
@@ -1755,7 +1757,7 @@ async fn a_late_answer_forgets_only_what_its_upload_carried(pool: SqlitePool) {
         || sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')").bind(Uuid::now_v7());
     let send = || async {
         let mut tx = w.pool.begin().await.unwrap();
-        let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &settings, false)
+        let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &settings, false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1767,11 +1769,11 @@ async fn a_late_answer_forgets_only_what_its_upload_carried(pool: SqlitePool) {
     let lost = send().await;
     write().execute(&w.pool).await.unwrap();
     let late = send().await;
-    assert_eq!((lost.rows(), late.rows()), (1, 1));
+    assert_eq!((lost.items(), late.items()), (1, 1));
     w.exec("UPDATE sync_notes SET sent_at = '2000-01-01T00:00:00.000Z'")
         .await
         .unwrap();
-    assert_eq!(send().await.rows(), 2, "both go again");
+    assert_eq!(send().await.items(), 2, "both go again");
     w.receive(
         &Body::Filed(Filed {
             uploads: late.up.uploads.clone(),
@@ -1844,10 +1846,18 @@ async fn an_answer_that_overtakes_the_send_or_is_not_ours_is_read_right(pool: Sq
         .await
         .unwrap();
     let mut tx = w.pool.begin().await.unwrap();
-    let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &Outbox::default(), false)
-        .await
-        .unwrap()
-        .unwrap();
+    let outgoing = outbox(
+        &mut tx,
+        &codecs(),
+        &lanes,
+        0,
+        &Outbox::default(),
+        false,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     tx.commit().await.unwrap();
     let number = outgoing.up.uploads[0];
     assert!(number > 0 && i64::try_from(number).is_ok());
@@ -1928,7 +1938,7 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
             }
             2 | 3 => {
                 let mut tx = w.pool.begin().await.unwrap();
-                let outgoing = outbox(&mut tx, &codecs(), lanes, 0, settings, false)
+                let outgoing = outbox(&mut tx, &codecs(), lanes, 0, settings, false, None)
                     .await
                     .unwrap();
                 tx.commit().await.unwrap();
@@ -2009,53 +2019,70 @@ async fn forgets_nothing_unfiled(w: &World, lanes: &[Lane], settings: &Outbox, w
     );
 }
 
-/// A message up never outgrows the transport's bytes: what does not fit
-/// waits for the next, and a row no message can carry is set aside — and
-/// counted — rather than offered for ever.
+/// A message up fills the transport's bytes and never outgrows them, every
+/// byte counted: each one that left a row for the next is short of the
+/// limit by less than that row and what it reserves for its number. A row
+/// no message can carry is set aside — and counted — rather than offered
+/// for ever; one that fills a message alone goes.
 #[sqlx::test(migrations = false)]
-async fn a_message_up_fits_the_transport_and_a_row_too_large_is_set_aside(pool: SqlitePool) {
-    let pool = settled(pool).await;
-    let limits = Limits {
-        rows: 100,
-        bytes: envelope::ENVELOPE_ROOM + 600,
-    };
+async fn a_message_up_fills_the_transport_and_a_row_too_large_is_set_aside(pool: SqlitePool) {
+    let limits = Limits::new(100, 5000).unwrap();
     let settings = Settings {
         outbox: Outbox {
             limits,
             ..Outbox::default()
         },
+        lanes: vec![Lane::new("main", &[]), Lane::new("history", &["events"])],
         ..Settings::default()
     };
     let w = world_with(pool, settings).await;
-    for what in [
-        "a".repeat(200),
-        "b".repeat(200),
-        "c".repeat(200),
-        "d".repeat(2000),
-    ] {
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut sizes: Vec<usize> = (0..60)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            1 + usize::try_from(seed % 900).unwrap()
+        })
+        .collect();
+    // Alone, the largest that goes, and the smallest that never can.
+    let alone = 5000 - 150;
+    sizes.extend([alone, 5000]);
+    for size in &sizes {
         sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
             .bind(Uuid::now_v7())
-            .bind(what)
+            .bind("w".repeat(*size))
             .execute(&w.pool)
             .await
             .unwrap();
     }
-    let mut rows = 0;
-    while let Some(up) = w.up(0, false).await {
-        assert!(
-            up.encoded_len() <= limits.bytes,
-            "{} bytes",
-            up.encoded_len()
-        );
-        rows += up.tables.iter().map(|t| t.upserts.len()).sum::<usize>();
-        if up.tables.is_empty() {
-            break;
-        }
+    let mut ups = Vec::new();
+    while let Some(up) = w.up(1, false).await {
+        ups.push(up);
     }
-    assert_eq!(rows, 3);
+    let weight = |up: &Up| {
+        let table = &up.tables[0];
+        framed(table.upserts[0].len()) + framed(table.keys[0].encoded_len()) + opened(&table.table)
+    };
+    for (up, next) in ups.iter().zip(ups.iter().skip(1)) {
+        let used = up.encoded_len();
+        assert!(used <= limits.bytes(), "{used} bytes");
+        // Nine bytes reserved for the number, a few for the table's length.
+        let short = limits.bytes() - used;
+        assert!(
+            short < weight(next) + 16,
+            "{short} bytes left, and the next row weighs {}",
+            weight(next)
+        );
+    }
+    let rows: usize = ups.iter().map(|up| up.tables[0].upserts.len()).sum();
+    assert_eq!(rows, sizes.len() - 1);
     let mut conn = w.pool.acquire().await.unwrap();
     let progress = progress(&mut conn).await.unwrap();
-    assert_eq!((progress[0].set_aside, progress[0].unfiled), (1, 3));
+    assert_eq!(
+        (progress[0].set_aside, progress[0].unfiled),
+        (1, i64::try_from(rows).unwrap())
+    );
 }
 
 /// A message the uplink refuses for good does not come back for ever: its
@@ -2070,7 +2097,10 @@ async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool:
         .await
         .unwrap();
     *w.uplink.refusing.lock().unwrap() = Some(false);
-    assert!(w.replica.send_lane(0, false).await.unwrap(), "set aside");
+    assert!(
+        w.replica.send_lane(0, false).await.unwrap().message,
+        "set aside"
+    );
     *w.uplink.refusing.lock().unwrap() = None;
     let up = w.up(0, false).await.expect("the backlog");
     assert!(up.tables.is_empty());
@@ -2088,6 +2118,152 @@ async fn rows_the_uplink_refuses_for_good_are_set_aside_until_the_next_run(pool:
     again.send_lane(0, false).await.unwrap();
     let (_, up) = w.uplink.taken().pop().unwrap();
     assert_eq!(up.tables[0].upserts.len(), 1, "offered again");
+}
+
+/// A message the uplink refuses for good is asked again by halves until
+/// what it refuses is alone: that row is set aside, and that rejection
+/// taken as told — so it holds back no confirmation — and nothing beside
+/// either is.
+#[sqlx::test(migrations = false)]
+async fn what_the_uplink_refuses_for_good_is_found_and_only_it_set_aside(pool: SqlitePool) {
+    let w = world(pool).await;
+    for what in ["a", "b", "bad", "c", "d", "e", "f"] {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+            .bind(Uuid::now_v7())
+            .bind(what)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    let [good] = ids();
+    let odd = Uuid::from_u128(0xbad);
+    let broken = |id: Uuid| (key(&[&id.to_string()]), vec![0xff]);
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![broken(good), broken(odd)])],
+    ))
+    .await;
+    *w.uplink.cannot_take.lock().unwrap() = Some(|up: &Up| {
+        let bad = String::from("\"what\":\"bad\"");
+        up.tables
+            .iter()
+            .flat_map(|t| &t.upserts)
+            .any(|row| String::from_utf8_lossy(row).contains(&bad))
+            || up.rejected.iter().any(|r| {
+                r.key
+                    .as_ref()
+                    .is_some_and(|k| k.parts == ["00000000-0000-0000-0000-000000000bad"])
+            })
+    });
+    let mut taken = Vec::new();
+    for _ in 0..30 {
+        w.replica.send_lane(0, false).await.unwrap();
+        taken.extend(w.uplink.taken());
+    }
+    let rows: usize = taken
+        .iter()
+        .flat_map(|(_, up)| &up.tables)
+        .map(|t| t.upserts.len())
+        .sum();
+    assert_eq!(rows, 6, "every row but the one refused");
+    let told: usize = taken.iter().map(|(_, up)| up.rejected.len()).sum();
+    assert_eq!(told, 1, "one rejection told, the other refused alone");
+    assert!(
+        taken.iter().any(|(_, up)| up.sequence == BASE + 1),
+        "confirmed once both are done with"
+    );
+    let mut conn = w.pool.acquire().await.unwrap();
+    let progress = progress(&mut conn).await.unwrap();
+    assert_eq!((progress[0].set_aside, progress[0].unfiled), (1, 6));
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_rejections WHERE reported_at IS NULL")
+            .await,
+        0
+    );
+}
+
+/// A row this build cannot encode is set aside, with why, and counted: the
+/// rest of its table goes.
+#[sqlx::test(migrations = false)]
+async fn a_row_that_does_not_encode_is_set_aside_and_the_rest_goes(pool: SqlitePool) {
+    fn to_wire(event: Event) -> Result<ItemRow, crate::wire::MapError> {
+        if event.what == "poison" {
+            return Err(crate::wire::MapError::new(
+                "a value this build cannot encode",
+            ));
+        }
+        Ok(ItemRow {
+            id: event.id.to_string(),
+            partition_id: String::new(),
+            name: event.what,
+        })
+    }
+    fn from_wire(row: ItemRow) -> Result<Event, crate::wire::MapError> {
+        Ok(Event {
+            id: row.id.parse()?,
+            what: row.name,
+        })
+    }
+    let w = world(pool).await;
+    let mut codecs = codecs();
+    *codecs.last_mut().unwrap() = Codec::new::<Event, ItemRow>(to_wire, from_wire, None);
+    let replica = Replica::new(
+        w.pool.clone(),
+        codecs,
+        w.me,
+        w.uplink.clone(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    for what in ["fine", "poison", "also fine"] {
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, $2)")
+            .bind(Uuid::now_v7())
+            .bind(what)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    replica.send_lane(0, false).await.unwrap();
+    let (_, up) = w.uplink.taken().pop().unwrap();
+    assert_eq!(up.tables[0].upserts.len(), 2);
+    assert_eq!(up.backlog.unwrap().tables[0].set_aside, 1);
+    assert_eq!(
+        w.texts("SELECT set_aside FROM sync_notes WHERE set_aside IS NOT NULL")
+            .await,
+        ["`events` does not encode: a value this build cannot encode"]
+    );
+}
+
+/// Digests go with the last message applied, which goes only once every
+/// refusal of it is told: until then they wait, rather than go unanchored.
+#[sqlx::test(migrations = false)]
+async fn digests_wait_for_the_confirmation_they_are_read_against(pool: SqlitePool) {
+    let settings = Settings {
+        outbox: Outbox {
+            rejections: std::num::NonZeroUsize::MIN,
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    let [a, b] = ids();
+    let broken = |id: Uuid| (key(&[&id.to_string()]), vec![0xff]);
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![broken(a), broken(b)])],
+    ))
+    .await;
+    let first = w.up(0, true).await.unwrap();
+    assert_eq!(
+        (first.rejected.len(), first.sequence, first.digests.len()),
+        (1, 0, 0)
+    );
+    let last = w.up(0, true).await.unwrap();
+    assert_eq!((last.rejected.len(), last.sequence), (1, BASE + 1));
+    assert!(!last.digests.is_empty());
 }
 
 /// Each lane keeps its own pace: one the uplink fails on does not hold back
@@ -2161,10 +2337,18 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
         .await;
     let lanes = Settings::default().lanes;
     let mut tx = w.pool.begin().await.unwrap();
-    let outgoing = outbox(&mut tx, &codecs(), &lanes, 0, &Outbox::default(), false)
-        .await
-        .unwrap()
-        .unwrap();
+    let outgoing = outbox(
+        &mut tx,
+        &codecs(),
+        &lanes,
+        0,
+        &Outbox::default(),
+        false,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(outgoing.up.sequence, BASE + 1);
     let s = Uuid::now_v7().to_string();
@@ -2243,7 +2427,7 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         let lanes = lanes.clone();
         async move {
             let mut tx = pool.begin().await.unwrap();
-            let outgoing = outbox(&mut tx, &codecs(), &lanes, lane, &settings, false)
+            let outgoing = outbox(&mut tx, &codecs(), &lanes, lane, &settings, false, None)
                 .await
                 .unwrap();
             if let Some(o) = &outgoing {
@@ -2795,6 +2979,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
         0,
         &settings,
         true,
+        None,
     ));
     spawnable(install(&mut conn, &codecs()));
 }

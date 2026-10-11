@@ -11,6 +11,7 @@ use crate::wire::Codec;
 use crate::{Conn, Error};
 use sqlx::SqlitePool;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -47,9 +48,10 @@ pub trait Uplink: Send + Sync + 'static {
     ///
     /// [`Error::Transport`] (or any other) when the transport did not take
     /// it. A permanent one — the transport will never take this message —
-    /// sets the rows it carried aside, counted in the backlog, until the
-    /// replica runs again with a build that may send them; anything else
-    /// goes again after a backoff.
+    /// has the replica send half of what it carried, and half again, until
+    /// what the transport refuses is alone: that row is set aside, counted
+    /// in the backlog, until the replica runs again with a build that may
+    /// send it. Anything else goes again after a backoff.
     fn send(
         &self,
         replica: Uuid,
@@ -132,6 +134,9 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     settings: Settings,
     /// Something new to say: a message applied, or a write noted.
     wake: Notify,
+    /// Per lane, how many rows and rejections a message carries at most
+    /// while the uplink refuses one for good: 0 for no cap.
+    caps: Vec<AtomicUsize>,
 }
 
 impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
@@ -180,6 +185,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             codecs,
             identity,
             uplink,
+            caps: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
             settings,
             wake: Notify::new(),
         })
@@ -254,10 +260,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 due[lane] = match self.send_lane(lane, digests).await {
                     Ok(went) => {
                         backoff[lane] = first;
-                        if digests {
+                        if went.digests {
                             digests_at = now + self.settings.digests_every;
                         }
-                        if went {
+                        if went.message {
                             now
                         } else {
                             now + self.settings.idle
@@ -293,12 +299,14 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
 
     /// One message on `lane`, when it has something to say: read and
     /// numbered in one transaction, handed to the uplink with none open,
-    /// recorded in another. Answers whether one went. A message the uplink
-    /// refuses for good has its rows set aside rather than offered for ever.
-    pub(crate) async fn send_lane(&self, lane: usize, digests: bool) -> Result<bool, Error> {
+    /// recorded in another. A message the uplink refuses for good is asked
+    /// again with half its rows and rejections, until the one it refuses is
+    /// alone: that one is set aside, never the ones beside it.
+    pub(crate) async fn send_lane(&self, lane: usize, digests: bool) -> Result<Went, Error> {
         let Some(id) = self.identity.id(&mut *self.pool.acquire().await?).await? else {
-            return Ok(false);
+            return Ok(Went::default());
         };
+        let cap = self.caps[lane].load(Ordering::Relaxed);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outgoing = replica::outbox(
             &mut tx,
@@ -307,29 +315,57 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             lane,
             &self.settings.outbox,
             digests,
+            (cap > 0).then_some(cap),
         )
         .await?;
         tx.commit().await?;
         let Some(outgoing) = outgoing else {
-            return Ok(false);
+            return Ok(Went::default());
         };
         let sent = self.uplink.send(id, outgoing.lane, outgoing.bytes()).await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let went = Went {
+            message: true,
+            digests: !outgoing.up.digests.is_empty(),
+        };
+        let items = outgoing.items();
         match sent {
-            Ok(()) => replica::delivered(&mut tx, &outgoing).await?,
-            Err(e) if !e.is_transient() && outgoing.rows() > 0 => {
+            Ok(()) => {
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                replica::delivered(&mut tx, &outgoing).await?;
+                tx.commit().await?;
+                self.caps[lane].store(0, Ordering::Relaxed);
+            }
+            Err(e) if !e.is_transient() && items > 1 => {
+                tracing::warn!(
+                    lane = outgoing.lane,
+                    items,
+                    "sync: the uplink refuses a message for good — half of it goes, to find why: {e}"
+                );
+                self.caps[lane].store(items / 2, Ordering::Relaxed);
+            }
+            Err(e) if !e.is_transient() && items == 1 => {
                 tracing::error!(
                     lane = outgoing.lane,
-                    rows = outgoing.rows(),
-                    "sync: the uplink refuses a message for good — its rows set aside: {e}"
+                    "sync: the uplink refuses a row or a rejection for good — set aside: {e}"
                 );
-                replica::set_aside(&mut tx, &outgoing, &e.to_string()).await?;
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                replica::refused(&mut tx, &outgoing, &e.to_string()).await?;
+                tx.commit().await?;
+                self.caps[lane].store(0, Ordering::Relaxed);
             }
             Err(e) => return Err(e),
         }
-        tx.commit().await?;
-        Ok(true)
+        Ok(went)
     }
+}
+
+/// What one turn of a lane sent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Went {
+    /// A message went to the uplink.
+    pub(crate) message: bool,
+    /// It carried the digests.
+    pub(crate) digests: bool,
 }
 
 #[cfg(test)]

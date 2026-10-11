@@ -368,9 +368,12 @@ For a table the replica writes and the server mirrors:
      meant for another replica, or for this replica before it was restored
      from an older copy, never names its notes;
    - within the transport's size limit: what does not fit waits for the next
-     upload. A row that can never fit, or that the transport refuses for
-     good, is set aside — kept, counted in the backlog, never sent until the
-     replica runs again with a build that may send it.
+     upload. A row that can never fit is set aside — kept, counted in the
+     backlog, never sent until the replica runs again with a build that may
+     send it. An `Up` the transport refuses for good is sent again with half
+     its rows and rejections, and so on, until what it refuses is alone: that
+     row is set aside, that rejection taken as told (it must not hold back
+     the confirmation of what was applied), and nothing beside them.
 3. **Wait for `Filed`** (4.4) naming that upload, then forget its notes. An
    upload not answered after a while (minutes) should be sent again; the
    server files the same rows idempotently.

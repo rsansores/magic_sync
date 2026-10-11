@@ -142,7 +142,7 @@ async fn nothing_goes_up_until_the_replica_knows_who_it_is(pool_: SqlitePool) {
         .await
         .unwrap();
     replica.receive(&rows(1, 0, "one")).await.unwrap();
-    assert!(!replica.send_lane(0, true).await.unwrap());
+    assert!(!replica.send_lane(0, true).await.unwrap().message);
     assert!(uplink.sent.lock().unwrap().is_empty());
 }
 

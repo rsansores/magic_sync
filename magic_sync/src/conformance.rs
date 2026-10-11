@@ -133,6 +133,10 @@ pub fn golden(text: &str) -> Vec<(String, Vec<u8>)> {
 #[cfg(feature = "sqlite")]
 pub type Sent = (Uuid, &'static str, crate::envelope::Up);
 
+/// Says which messages up a transport can never take.
+#[cfg(feature = "sqlite")]
+pub type CannotTake = fn(&crate::envelope::Up) -> bool;
+
 /// An uplink that keeps what it is given, refusing — for a while or for
 /// good — while told to.
 #[cfg(feature = "sqlite")]
@@ -143,6 +147,8 @@ pub struct Uplinked {
     pub refusing: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
     /// The lanes it refuses; every lane when empty.
     pub refused_lanes: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Refuses for good every message this says it cannot take.
+    pub cannot_take: std::sync::Arc<std::sync::Mutex<Option<CannotTake>>>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -164,6 +170,17 @@ impl crate::run::replica::Uplink for Uplinked {
             }
         }
         let up = crate::envelope::Up::decode(message.as_slice()).expect("an upload");
+        if self
+            .cannot_take
+            .lock()
+            .unwrap()
+            .is_some_and(|cannot| cannot(&up))
+        {
+            return Err(crate::Error::Transport {
+                reason: "cannot take it".into(),
+                transient: false,
+            });
+        }
         self.sent.lock().unwrap().push((replica, lane, up));
         Ok(())
     }
