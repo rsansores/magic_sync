@@ -44,9 +44,10 @@ The first release: the engine extracted from the system it was built in.
 - A pass records what each replica will hold, and writes the messages that
   carry it to that replica's outbox, before anything is sent; the outbox is
   sent in order, and a replica out of reach keeps its own while the others
-  are sent to. Messages are chained — each names the one before it — so a
-  replica that missed one says so and is provisioned again, and a server or
-  a replica restored from an older copy is found out. A row a replica
+  are sent to. Messages are chained — each names the one before it, by
+  number and random nonce — and sealed, so a replica that missed one says
+  so and is provisioned again, and a server or a replica restored from an
+  older copy is found out, however many numbers it drew since. A row a replica
   refuses stays recorded as refused, and a rejection names the message that
   refused it.
 - `magic_sync_dashboard` (npm): the dashboard for Vue 3 — a ready-made
