@@ -67,6 +67,15 @@ declaration changes.
 > it needs. Leave a trigger on a table no row declares, and it refuses too: its
 > changes would be noted and never sent.
 
+> **Mind:** a trigger as printed does not fire in a session whose
+> `session_replication_role` is `replica` — a logical replication
+> subscription applying changes, a restore told to disable triggers — so
+> what such a session writes reaches no replica. If one writes your mirrored
+> tables, enable their triggers always
+> (`ALTER TABLE … ENABLE ALWAYS TRIGGER sync_note_row`, and the same for
+> `sync_refuse_truncate` and `sync_note_group`): the server takes a trigger
+> enabled always, and refuses one enabled for replication sessions only.
+
 > **You write**, if you have no migrations — the shop's way — nothing: build
 > the server with `Server::install` instead of `Server::new`
 > ([The server](server.md)). Every time it starts, in one transaction and one

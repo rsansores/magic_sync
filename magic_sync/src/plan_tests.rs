@@ -1255,6 +1255,22 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         why.contains("t_kinds"),
         "a disabled trigger notes nothing: {why}"
     );
+    sqlx::raw_sql("ALTER TABLE fixture.t_kinds ENABLE REPLICA TRIGGER sync_note_row")
+        .execute(&mut *conn)
+        .await
+        .expect("enabled for replication sessions");
+    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    assert!(
+        why.contains("t_kinds"),
+        "a trigger that fires for replication sessions only notes no other write: {why}"
+    );
+    sqlx::raw_sql("ALTER TABLE fixture.t_kinds ENABLE ALWAYS TRIGGER sync_note_row")
+        .execute(&mut *conn)
+        .await
+        .expect("enabled always");
+    Engine::new(&mut conn, &tables, REPLICAS)
+        .await
+        .expect("a trigger enabled always notes every write");
 
     let fewer: Vec<&Table> = tables
         .iter()

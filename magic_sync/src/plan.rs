@@ -506,7 +506,9 @@ struct LiveTrigger {
     function: String,
     nargs: i16,
     args: Vec<u8>,
-    /// Enabled, with no `WHEN` and no column list: it fires on every row.
+    /// Fires on every row of every write: enabled for every session but a
+    /// replication one, or for every session — not disabled, not for
+    /// replication sessions only — with no `WHEN` and no column list.
     plain: bool,
 }
 
@@ -538,7 +540,7 @@ async fn live_triggers(conn: &mut Conn) -> Result<Vec<LiveTrigger>, Error> {
     Ok(sqlx::query_as(
         "SELECT n.nspname::text AS schema, c.relname::text AS table, t.tgname::text AS name, \
                 t.tgtype AS kind, p.proname::text AS function, t.tgnargs AS nargs, t.tgargs AS args, \
-                t.tgenabled <> 'D' AND t.tgqual IS NULL AND t.tgattr::text = '' AS plain \
+                t.tgenabled IN ('O', 'A') AND t.tgqual IS NULL AND t.tgattr::text = '' AS plain \
            FROM pg_trigger t \
            JOIN pg_class c ON c.oid = t.tgrelid \
            JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -730,6 +732,14 @@ impl Engine {
     /// replicas, and refuses a truncate; a group table notes every write.
     /// [`Server::new`](crate::Server::new) refuses to start while one is
     /// missing or differs.
+    ///
+    /// A trigger as printed fires in every session but one whose
+    /// `session_replication_role` is `replica` — a logical replication
+    /// subscription applying changes, a restore told to disable triggers —
+    /// and what such a session writes is never noted. Where one writes
+    /// mirrored tables, make their triggers `ENABLE ALWAYS`: the engine takes
+    /// a trigger enabled always as well as one enabled as printed, and
+    /// refuses one disabled, or enabled for replication sessions only.
     ///
     /// ```no_run
     /// # async fn print(pool: sqlx::PgPool, codecs: Vec<magic_sync::wire::Codec<()>>) -> Result<(), magic_sync::Error> {
