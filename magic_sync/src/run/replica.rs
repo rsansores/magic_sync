@@ -21,6 +21,10 @@ use uuid::Uuid;
 pub trait Identity: Send + Sync + 'static {
     /// The replica's id; `None` while it does not know it yet, and nothing
     /// goes up until it does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever kept the host from answering: nothing goes up this turn.
     fn id(&self, conn: &mut Conn) -> impl Future<Output = Result<Option<Uuid>, Error>> + Send;
 }
 
@@ -30,10 +34,22 @@ impl Identity for Uuid {
     }
 }
 
-/// Where a replica's messages up go.
+/// Where a replica's messages up go: the host's transport, which provides
+/// what [the protocol requires of a transport][contract], keeping each lane
+/// in order.
+///
+/// [contract]: https://rsansores.github.io/magic_sync/protocol.html#2-what-the-transport-must-provide
 pub trait Uplink: Send + Sync + 'static {
     /// Sends `message`, one message up, encoded, from `replica`, on `lane`.
-    /// An error means it was not taken, and it goes again.
+    /// `Ok` means the transport took it, and will deliver it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] (or any other) when the transport did not take
+    /// it. A permanent one — the transport will never take this message —
+    /// sets the rows it carried aside, counted in the backlog, until the
+    /// replica runs again with a build that may send them; anything else
+    /// goes again after a backoff.
     fn send(
         &self,
         replica: Uuid,
@@ -126,6 +142,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// settings cannot send up: no lane, a table on two lanes or on none.
     /// What an earlier run set aside, because it could not go up as it was,
     /// is offered again: this build may send it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Misuse`] for such settings, or a database [`replica::check`]
+    /// refuses; [`Error::Database`] when the database fails.
     pub async fn new(
         pool: SqlitePool,
         codecs: Vec<Codec<P>>,
@@ -158,9 +179,13 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     }
 
     /// A message from the server, acted on and committed. Acknowledge it to
-    /// the transport only when this returns `Ok`; an error means it must come
-    /// again (the replica's storage failed, or it speaks a later protocol than
-    /// this build).
+    /// the transport only when this returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// The message must come again: the replica's storage failed
+    /// ([`Error::Database`]), or it speaks a later protocol than this build
+    /// ([`Error::Protocol`]). Nothing of it was applied.
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let received = replica::receive(&mut tx, &self.codecs, bytes).await?;

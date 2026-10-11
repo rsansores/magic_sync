@@ -43,18 +43,28 @@ use std::future::Future;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Where the server's messages go: the host's transport. `message` is one
-/// message, encoded, for `replica`. `id` names the message, one of its own
-/// for every message the engine sends, for a transport that deduplicates a
-/// send it retries itself; a pass sent again after a relay died before
-/// recording it is numbered anew, and goes again.
+/// Where the server's messages go: the host's transport, which provides
+/// what [the protocol requires of a transport][contract].
 ///
 /// An error is transient when a retry may get it through (the network, the
 /// broker away) and permanent when the transport will never take this message;
 /// the engine already keeps every message within [`Limits`]. Either way the
 /// replica waits out a backoff and is sent what it is owed again.
+///
+/// [contract]: https://rsansores.github.io/magic_sync/protocol.html#2-what-the-transport-must-provide
 pub trait Transport: Sync {
-    /// Sends `message` to `replica`, or says why it could not.
+    /// Sends `message`, one message, encoded, to `replica` — or says why it
+    /// could not. `Ok` means the transport took it, and will deliver it.
+    ///
+    /// `id` names the message, one of its own for every message the engine
+    /// sends: what the replica's acknowledgement names, and what a transport
+    /// that retries a send itself deduplicates by. A pass sent again after a
+    /// relay died before recording it is numbered anew, and goes again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] (or any other) when the transport did not take
+    /// the message, transient or not as above.
     fn send(
         &self,
         replica: Uuid,

@@ -1786,6 +1786,35 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
     );
 }
 
+/// A database whose engine tables are of another version is refused, with
+/// what brings it to this build's: an install for one behind, never for one
+/// a later build wrote.
+#[sqlx::test(migrations = false)]
+async fn a_database_of_another_version_is_refused_with_the_way_forward(pool: SqlitePool) {
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql(TABLES).execute(&mut *conn).await.unwrap();
+    let Err(Error::Misuse(why)) = check(&mut conn, &codecs()).await else {
+        panic!("a database without the engine passed the check");
+    };
+    assert!(
+        why.contains("replica::install") && why.contains("migration"),
+        "{why}"
+    );
+
+    install(&mut conn, &codecs()).await.expect("installed");
+    sqlx::raw_sql("UPDATE sync_version SET version = version + 1")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let Err(Error::Misuse(why)) = check(&mut conn, &codecs()).await else {
+        panic!("a later build's database passed the check");
+    };
+    assert!(
+        why.contains("later build") && !why.contains("install"),
+        "{why}"
+    );
+}
+
 /// An install that fails leaves nothing behind: the engine's tables and
 /// triggers go in together, or not at all.
 #[sqlx::test(migrations = false)]

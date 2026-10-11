@@ -12,12 +12,15 @@
 //!
 //! **[The book](https://rsansores.github.io/magic_sync/)** builds a small
 //! system step by step and explains the engine from the ground up;
-//! [the replica protocol](https://github.com/rsansores/magic_sync/blob/main/magic_sync/PROTOCOL.md)
+//! [the replica protocol](https://rsansores.github.io/magic_sync/protocol.html)
 //! is what a replica in any language must do.
 //!
 //! A build of this crate is one side: enable `postgres` for the server or
-//! `sqlite` for a replica. These docs show the side they were built for;
-//! `cargo doc --features sqlite` shows a replica's.
+//! `sqlite` for a replica, each in a workspace of its own
+//! ([Set up a project](https://rsansores.github.io/magic_sync/guide/setup.html)).
+//! These docs show the side they were built for; the book publishes both,
+//! [the server's](https://rsansores.github.io/magic_sync/api/server/magic_sync/)
+//! and [a replica's](https://rsansores.github.io/magic_sync/api/replica/magic_sync/).
 //!
 //! # Public dependencies
 //!
@@ -27,7 +30,7 @@
 //! is a [`prost`] 0.14 message. A new major version of either is a new major
 //! version of this crate.
 
-#![warn(missing_docs)]
+#![warn(missing_docs, clippy::missing_errors_doc)]
 
 #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
 compile_error!(

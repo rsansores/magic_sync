@@ -449,6 +449,11 @@ fn update_clause_where<R: Row>(take: impl Fn(&str) -> bool) -> String {
 /// The rows of `keys` replicas see, every column: on the server through the
 /// relation the row's `active` names, on a replica less the rows it retired.
 /// A key with no such row is left out.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or a row does not decode as
+/// `R`.
 pub async fn get_many<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
     let relation = crate::dialect::active::<R>();
@@ -462,6 +467,11 @@ pub async fn get_many<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, E
 }
 
 /// The row of `key` replicas see, as [`get_many`] reads it.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or a row does not decode as
+/// `R`.
 pub async fn get<R: Row>(exec: &mut Conn, key: &Key) -> Result<Option<R>, Error> {
     Ok(get_many::<R>(exec, std::slice::from_ref(key)).await?.pop())
 }
@@ -491,6 +501,11 @@ fn keys_per_statement<R: Row>() -> usize {
 /// Every row of `keys` the table holds, retired or not — what sync sends,
 /// read from the table itself rather than as the replicas see it. A key with
 /// no row is left out.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or a row does not decode as
+/// `R`.
 pub async fn get_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
     let mut out = Vec::with_capacity(keys.len());
@@ -792,12 +807,20 @@ pub(crate) async fn update_only<R: Row>(
 /// Writes every column of every row, the incoming value winning on a key the
 /// table holds — unless the row has a version and the stored one is newer,
 /// so a late write never rolls the row back. Answers the keys it wrote.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails or refuses a row.
 pub async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
     write_keys(exec, rows, &newest::<R>(update_clause_where::<R>(|_| true))).await
 }
 
 /// Inserts every row whose key is new; one the table holds is left as it
 /// was. Answers the keys it inserted.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails or refuses a row.
 pub async fn insert_ignore<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
     let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(R::KEY));
     write_keys(exec, rows, &conflict).await

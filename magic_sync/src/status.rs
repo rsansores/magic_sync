@@ -649,6 +649,12 @@ impl Engine {
     /// table, counted from what each has acknowledged applying — never from
     /// what was merely sent. See [`TableProgress`]. It counts the rows each
     /// replica should hold: ask it for the replicas a person is looking at.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
+    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
+    /// [`Scope::Partition`] when the replicas have no partition.
     pub async fn progress(&self, conn: &mut Conn, scope: Scope<'_>) -> Result<Progress, Error> {
         let mut tx = snapshot(conn).await?;
         let replicas = self.scoped(&mut tx, scope).await?.ids();
@@ -736,6 +742,11 @@ impl Engine {
 
     /// Where one row stands on every replica of `scope` that holds it,
     /// should, or is owed it.
+    ///
+    /// # Errors
+    ///
+    /// As the other reads, and besides: [`Error::Misuse`] when `table` is not
+    /// mirrored, [`Error::Malformed`] when `key` is not a key of it.
     pub async fn row_progress(
         &self,
         conn: &mut Conn,
@@ -812,6 +823,12 @@ impl Engine {
     /// Everything a dashboard shows first, over `scope`: the engine's health
     /// with up to `limit` entries of each list, how many replicas are in each
     /// state with up to `limit` of them worst first, and each table's state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
+    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
+    /// [`Scope::Partition`] when the replicas have no partition.
     pub async fn overview(
         &self,
         conn: &mut Conn,
@@ -839,6 +856,12 @@ impl Engine {
     /// The replicas of `scope` in `state` (every one, when `None`), worst
     /// first: up to `limit` of them from `offset`. Worst first is by state,
     /// then the longest silent, then by id.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
+    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
+    /// [`Scope::Partition`] when the replicas have no partition.
     pub async fn listing(
         &self,
         conn: &mut Conn,
@@ -864,6 +887,12 @@ impl Engine {
 
     /// What the engine is waiting on over `scope`, with up to `limit`
     /// entries of each list.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
+    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
+    /// [`Scope::Partition`] when the replicas have no partition.
     pub async fn health(
         &self,
         conn: &mut Conn,

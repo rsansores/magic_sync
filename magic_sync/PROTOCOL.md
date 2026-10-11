@@ -5,7 +5,7 @@ is written in and whatever database it keeps its rows in. The engine's own
 replica (`src/replica.rs`, on SQLite) is one implementation of it; this
 document is the contract that one follows, and any other must.
 
-The messages are in [`proto/sync.proto`](proto/sync.proto). Generate code for
+The messages are in [`proto/sync.proto`](https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto). Generate code for
 your language from it; the engine's own types are generated from it too, and
 a test fails while they differ.
 
@@ -21,7 +21,7 @@ The words **must**, **must not** and **should** mean what they mean in RFCs.
   tables of its own that go up to the server. It is identified by a UUID the
   server knows.
 - The **transport** carries messages between them. The engine does not depend
-  on which one, but it requires the three properties in section 2.
+  on which one, but it requires what section 2 lists.
 
 A replica never decides what it should hold. It applies what it is sent,
 reports what it could not apply, and reports what it holds.
@@ -30,26 +30,45 @@ reports what it could not apply, and reports what it holds.
 
 ## 2. What the transport must provide
 
-1. **Per-replica order, one message at a time.** Messages to a replica are
-   delivered in the order they were sent, and the next one is not delivered
-   until the replica acknowledged the previous one. (With NATS JetStream: a
-   durable pull consumer per replica with `max_ack_pending = 1`.)
-2. **At-least-once delivery.** A message the replica did not acknowledge is
-   delivered again. A replica must therefore treat every message as one it
-   may have seen before (section 4).
-3. **Store and forward.** A message sent while the replica is unreachable is
-   delivered when it is reachable again.
-
 The server sends one kind of message, `ToReplica`, which carries a `Down`, an
-`EndSnapshot` or a `Filed`. A replica sends one kind, `Up`. So a transport
-carries bytes and nothing else: it never needs to know what is inside.
+`EndSnapshot` or a `Filed`. A replica sends one kind, `Up`, on one or more
+lanes (section 7). A transport carries bytes and nothing else: it never needs
+to know what is inside. Whatever it is — a broker, HTTP over a queue of your
+own, files on a USB stick — it **must** provide, in both directions:
 
-A message the transport carries has a size limit of its own; a replica must
-keep every `Up` within it (section 7).
+1. **Nothing it took is lost.** Once the transport accepted a message, it
+   delivers it: while the other end is unreachable, and across a restart of
+   either end or of the transport itself. It stores, then forwards.
+2. **In order.** A replica's messages are delivered in the order the server
+   sent them, and a replica's `Up`s on one lane reach the server in the order
+   it sent them.
+3. **One at a time, down.** The next message to a replica is not delivered
+   until the replica acknowledged the previous one (5.1).
+4. **At least once.** A message that was not acknowledged is delivered
+   again. Each side therefore treats every message as one it may have seen
+   before (4.1, 7).
+5. **An acknowledgement names its message.** It releases that message and no
+   other: one that arrives twice, or late, never releases a message the
+   replica has not applied.
+
+With NATS JetStream, that is a stream on file storage, and per replica a
+durable pull consumer with explicit acknowledgements and
+`max_ack_pending = 1`; up, a stream the server consumes per lane in order.
+
+A message the transport carries has a size limit of its own; the server keeps
+every message within it, and a replica must keep every `Up` within it
+(section 7).
 
 A **transport acknowledgement** (section 5.1) is what makes the transport
 deliver the next message. It is not the same as telling the server what was
 applied (section 5.2).
+
+A transport that loses a message anyway costs time, not data: a replica that
+leaves messages unconfirmed while nothing newer goes to it is provisioned
+again (section 9), an upload the server did not answer is sent again
+(section 7), and a digest that disagrees provisions the replica again
+(section 8). That is the engine's safety net, not a licence: until it acts,
+the replica holds less than it should.
 
 ---
 
@@ -315,9 +334,9 @@ A replica may send its writes on several **lanes** — streams of `Up`s the
 transport keeps apart, each carrying the writes of some of its tables, so a
 table that writes often never waits behind the rest. Every table that goes up
 is on exactly one lane. Rejections, the last applied message, digests and
-the backlog go on the first. A replica's `Up`s on one lane reach the server
-in the order it sent them: the backlog an earlier one carried must not arrive
-after a later one's.
+the backlog go on the first. The transport keeps each lane in order
+(section 2): the backlog an earlier `Up` carried must not arrive after a
+later one's.
 
 One `Up` may carry several of these at once: rows, rejections, digests, the
 backlog, and the last applied message.

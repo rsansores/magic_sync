@@ -1192,6 +1192,30 @@ async fn a_schema_from_a_later_build_is_left_alone(pool: crate::DbPool) {
     let mut tx = conn.begin().await.expect("a transaction");
     let why = refusal(Engine::install(&mut tx, &tables, REPLICAS).await);
     assert!(why.contains("later build"), "{why}");
+    drop(tx);
+    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    assert!(
+        why.contains("later build") && !why.contains("install"),
+        "not installed over, nor told to be: {why}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_database_without_the_engine_names_both_ways_to_install_it(pool: crate::DbPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::raw_sql(SCHEMA)
+        .execute(&mut *conn)
+        .await
+        .expect("schema");
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    assert!(
+        why.contains("not installed")
+            && why.contains("Server::install")
+            && why.contains("migration"),
+        "{why}"
+    );
 }
 
 #[sqlx::test(migrations = false)]

@@ -32,6 +32,12 @@ pub trait Senders: Send + Sync + 'static {
 
     /// What the server knows about `replica`; `None` for one it does not know,
     /// whose messages are dropped with a log.
+    ///
+    /// # Errors
+    ///
+    /// Whatever kept the host from answering ([`Error::Host`], say). A
+    /// transient one has the upload come again; any other keeps it whole in
+    /// the inbox, filed again after a deploy.
     fn known(
         &self,
         replica: Uuid,
@@ -40,6 +46,10 @@ pub trait Senders: Send + Sync + 'static {
     /// The transaction an upload from that replica is filed in: where the
     /// host says who is writing, when its database cares (a role, a setting its
     /// row policies read).
+    ///
+    /// # Errors
+    ///
+    /// As [`Senders::known`].
     fn filing(
         &self,
         known: &Self::Known,
@@ -201,10 +211,14 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// replicas; `transport` how a message reaches one; `senders` what the
     /// host knows of a replica that sends something up.
     ///
-    /// Refused when the database is not what the engine needs — its schema
-    /// at another version, a table that is not its row column for column, a
-    /// trigger missing or different from what [`Engine::triggers`] prints —
-    /// or a declaration the schema cannot honour, or the settings cannot run.
+    /// # Errors
+    ///
+    /// [`Error::Misuse`] when the database is not what the engine needs —
+    /// its schema at another version, a table that is not its row column for
+    /// column, a trigger missing or different from what [`Engine::triggers`]
+    /// prints — or for a declaration the schema cannot honour, or settings
+    /// the server cannot run with; [`Error::Database`] when the database
+    /// fails.
     pub async fn new(
         pool: PgPool,
         codecs: Vec<Codec<S::Known>>,
@@ -231,6 +245,12 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// already has rows is sent whole. Run it before anything writes a
     /// mirrored table — a write before its trigger is never noted — on a
     /// pool whose connections may create triggers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Server::new`], and [`Error::Misuse`] when the engine's schema is
+    /// at a later version than this build's. Whatever fails, nothing is
+    /// installed.
     pub async fn install(
         pool: PgPool,
         codecs: Vec<Codec<S::Known>>,
@@ -275,12 +295,17 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
 
     /// A transaction as the engine's own begin — assuming the settings'
     /// `role` — for the host to ask the engine things in.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails, or refuses the role.
     pub async fn begin(&self) -> Result<Transaction<'static, Postgres>, Error> {
         begin(&self.pool, "BEGIN", self.settings.role.as_deref()).await
     }
 
     /// Runs the relay until `shutdown` resolves: stands by while another
-    /// process holds the lock, and runs passes while this one does.
+    /// process holds the lock, and runs passes while this one does. A pass
+    /// `shutdown` cuts short runs again, as after a crash.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
         loop {
@@ -304,6 +329,11 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// inbox, answered, and filed again after a deploy.
     ///
     /// Answers what was filed, per table, for the host to act on.
+    ///
+    /// # Errors
+    ///
+    /// Only an error that is [transient](Error::is_transient): the database,
+    /// the host ([`Senders`]) or the transport away, or [`Error::Protocol`].
     pub async fn receive(&self, replica: Uuid, bytes: &[u8]) -> Result<Vec<filing::Filed>, Error> {
         use prost::Message as _;
         let up = match Up::decode(bytes) {
@@ -363,6 +393,11 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
 
     /// One pass now, as the relay, for a host's tests or a tool: what was
     /// done, or `None` when another process runs the relay.
+    ///
+    /// # Errors
+    ///
+    /// What stopped the pass: the database or the transport away. What the
+    /// pass sets aside is not an error.
     pub async fn pass_now(&self) -> Result<Option<usize>, Error> {
         let Some(mut lock) = Lock::take(&self.pool, self.settings.lock_key).await? else {
             return Ok(None);

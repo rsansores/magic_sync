@@ -242,13 +242,25 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// its migrations build.
 ///
 /// [`Replica::new`]: crate::Replica::new
+///
+/// # Errors
+///
+/// [`Error::Misuse`] naming whatever the database is not, as above;
+/// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
-    let version = schema_version(conn).await?;
-    if version != crate::SCHEMA_VERSION {
+    let (version, needed) = (schema_version(conn).await?, crate::SCHEMA_VERSION);
+    if version > needed {
         return Err(Error::Misuse(format!(
-            "the engine's tables are version {version}, and this build needs {}: install them",
-            crate::SCHEMA_VERSION
+            "the engine's tables are version {version}, from a later build than this one \
+             ({needed}): run that build, or a later one"
+        )));
+    }
+    if version < needed {
+        return Err(Error::Misuse(format!(
+            "the engine's tables are version {version}, and this build needs {needed}: \
+             `replica::install` brings them there, or a migration of yours runs the \
+             engine's steps (the book's \"Upgrading\")"
         )));
     }
     let tables: Vec<&crate::row::Table> = codecs.iter().map(|c| &c.table).collect();
@@ -307,6 +319,12 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
 /// trigger [`triggers`] writes, in place of the engine's own it had. Then
 /// [`check`]s it. For a host with no migrations of its own; run it before
 /// anything writes, on a connection with no transaction open. Idempotent.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails (the transaction is rolled back,
+/// and nothing is installed), and [`Error::Misuse`] when the engine's tables
+/// are at a later version than this build's, or [`check`] refuses what results.
 #[cfg(feature = "sqlite")]
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
@@ -868,6 +886,10 @@ impl From<&envelope::TableBacklog> for UpProgress {
 }
 
 /// [`UpProgress`] for every table with something on its way.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
     Ok(sqlx::query_as(

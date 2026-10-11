@@ -722,6 +722,12 @@ impl Engine {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails, and [`Error::Misuse`] when
+    /// the engine's schema is missing or at another version, or a declaration
+    /// is one the schema cannot honour.
     pub async fn triggers<P: std::marker::Sync + 'static>(
         conn: &mut Conn,
         codecs: &[Codec<P>],
@@ -803,13 +809,23 @@ impl Engine {
     }
 
     async fn read(conn: &mut Conn, tables: &[&Table], replicas: Replicas) -> Result<Self, Error> {
-        let version = version(conn).await?;
-        if version != Some(crate::SCHEMA_VERSION) {
-            return Err(Error::Misuse(format!(
-                "the engine's schema is version {}, and this build needs {}: install it",
-                version.map_or("none".to_owned(), |v| v.to_string()),
-                crate::SCHEMA_VERSION
-            )));
+        let needed = crate::SCHEMA_VERSION;
+        match version(conn).await? {
+            Some(v) if v == needed => {}
+            Some(v) if v > needed => {
+                return Err(Error::Misuse(format!(
+                    "the engine's schema is version {v}, from a later build than this one \
+                     ({needed}): run that build, or a later one"
+                )))
+            }
+            v => {
+                return Err(Error::Misuse(format!(
+                    "the engine's schema is {}, and this build needs version {needed}: \
+                     `Server::install` brings it there, or a migration of yours runs the \
+                     engine's steps (the book's \"Upgrading\")",
+                    v.map_or("not installed".to_owned(), |v| format!("version {v}"))
+                )))
+            }
         }
         let tables: Vec<&Table> = tables
             .iter()
@@ -2351,6 +2367,10 @@ const RESYNC_PENDING: &str = "NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kin
 /// Queues `replica`'s provisioning from scratch, in the caller's transaction,
 /// unless one is pending: it is sent everything it should hold and sweeps the
 /// rest.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails.
 pub async fn note_resync(
     conn: &mut Conn,
     partition: Option<Uuid>,

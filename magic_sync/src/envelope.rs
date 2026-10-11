@@ -71,6 +71,10 @@ impl Limits {
     /// At most `rows` rows and `bytes` bytes a message. Refused unless a
     /// message can carry a row: `rows` at least one, and `bytes` more than
     /// [`ENVELOPE_ROOM`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Misuse`] for limits no message could carry a row within.
     pub fn new(rows: usize, bytes: usize) -> Result<Self, Error> {
         if rows == 0 || bytes <= ENVELOPE_ROOM {
             return Err(Error::Misuse(format!(
