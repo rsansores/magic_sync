@@ -63,9 +63,10 @@ A **transport acknowledgement** (section 5.1) is what makes the transport
 deliver the next message. It is not the same as telling the server what was
 applied (section 5.2).
 
-A transport that loses a message anyway costs time, not data: a replica that
-leaves messages unconfirmed while nothing newer goes to it is provisioned
-again (section 9), an upload the server did not answer is sent again
+A transport that loses a message anyway costs time, not data: the next
+message names the one before it, so the replica knows it missed one and is
+provisioned again (4.1); a replica that leaves messages unconfirmed while
+nothing newer goes to it is provisioned again (section 9), an upload the server did not answer is sent again
 (section 7), and a digest that disagrees provisions the replica again
 (section 8). That is the engine's safety net, not a licence: until it acts,
 the replica holds less than it should.
@@ -112,12 +113,13 @@ document its sender speaks (now `1`).
   **must not** act on it and **must not** acknowledge it to the transport: it
   waits to be updated, and the message is delivered again then. Every message
   behind it waits too, which is right, because they speak the same version.
-- The server does the same with an `Up` of a later protocol than its own.
+- The server does the same with an `Up` of a later protocol than its own,
+  and drops an `Up` of protocol 0 as malformed.
 
 A message that is **malformed** — bytes that do not decode as a `ToReplica`;
-one of the replica's own protocol or earlier whose body it does not know, or
-that has none; a sequence or an epoch no server sends (4.1) — carries nothing
-a replica can act on: it **must** apply none of it, **should** log it, and
+one of protocol 0 (unset), or of the replica's own protocol or earlier whose
+body it does not know, or that has none; numbers no server sends (4.1) —
+carries nothing a replica can act on: it **must** apply none of it, **should** log it, and
 **must** acknowledge it, so it does not hold back the queue. The digests
 (section 8) find whatever it carried, if it mattered.
 
@@ -131,20 +133,33 @@ it what it meant before.
 A replica **must** apply a `Down` in one transaction: either all of it, or
 none of it.
 
-**The number comes first.** Every `Down` carries a `sequence` and an `epoch`.
-The replica keeps the `(epoch, sequence)` of the last message it applied:
+**The number comes first.** Every `Down` carries a `sequence` and an
+`epoch`, and `previous`: the sequence of the message the server sent this
+replica before this one, in this epoch — 0 on a message that begins a
+snapshot (4.2), which follows nothing. The replica keeps the
+`(epoch, sequence)` of the last message it applied, and checks, in order:
 
+- `sequence` 0 or above 2^63 − 1, an `epoch` that is not a UUID, a
+  `previous` at or past `sequence`, or a `previous` of 0 on a message that
+  begins no snapshot: no server numbers a message so. The message is
+  malformed (4.0).
 - the same `epoch` and a `sequence` **at or below** the last one: the message
-  changes nothing. The replica **must not** apply it, and **must** acknowledge
-  it to the transport (it is a redelivery, or a message from a server process
-  that lost its leadership);
-- a different `epoch`: the server was installed again. The replica applies
-  the message and keeps its numbers from now on. Epochs are not ordered: any
-  other one is a new installation. The replica forgets the snapshot it was
-  following (4.2), and says again its backlog and its rejections, which that
-  server never heard;
-- `sequence` 0, one above 2^63 − 1, or an `epoch` that is not a UUID: no
-  server numbers a message so. The message is malformed (4.0).
+  changes nothing. The replica **must not** apply it, and **must**
+  acknowledge it to the transport: it is a redelivery, or the server's
+  database was restored from an older copy and is numbering again. Either
+  way the replica **should** tell the server the last message it applied
+  again (5.2), so a restored server hears of it.
+- `previous` 0: the message begins a snapshot, and the replica applies it,
+  whatever it applied before — of this epoch, or of another, which is a
+  server installed again or restored: it keeps that epoch's numbers from
+  now on. A new epoch always begins with a snapshot.
+- otherwise `previous` **must** be the last message applied, of the same
+  epoch. If it is not, the replica missed one — lost on the way, or the
+  replica's own database restored from an older copy — and has a **gap**: it
+  **must not** apply the message, **must** acknowledge it to the transport,
+  and from then on applies nothing but a message that begins a snapshot,
+  saying it has a gap to the server (5.2) until one does. The server
+  answers with one.
 
 Then the replica applies `tables` **in the order given**. The server puts
 parents' rows before their children's, and children's deletes before their
@@ -191,24 +206,24 @@ replica should hold in `Down` messages that carry a `snapshot_id`, then an
 `EndSnapshot` naming the tables the snapshot covered. A snapshot of nothing
 is its `EndSnapshot` alone.
 
-- A snapshot **begins with its first message, whichever it is**. A snapshot
-  id the replica has not seen, on a message newer than the last applied
-  (4.1), begins it and supersedes the one in progress: the replica forgets
-  what the older one named. Snapshots are ordered by the sequence of the
-  messages that carry them, never by their ids.
+- A snapshot **begins with its first message**, the one whose `previous` is
+  0 — the `EndSnapshot` itself, for a snapshot of nothing. It supersedes the
+  snapshot in progress, if any: the replica forgets what that one named. The
+  messages after it follow it, as any do (4.1).
 - While applying a `Down` of the snapshot in progress, the replica **must**
-  remember the key of every row it took, per table.
-- On `EndSnapshot` for the snapshot in progress — or for one never seen,
-  which it begins and ends, having named nothing — the replica **must** let
-  go of every row of the named tables that the snapshot did not name (delete,
-  or retire as in 4.3), children before parents: **in reverse** of the order
-  the tables are listed. The rejections it recorded for those tables before
-  the snapshot began are forgotten: the snapshot sent again what it should
-  hold.
-- A `Down` of a snapshot that ended, or was superseded, names nothing; its
-  rows still apply. Its `EndSnapshot` changes nothing.
-- `EndSnapshot` carries a `sequence` and `epoch` and follows the same rule as
-  `Down` (4.1).
+  remember the key of every row it carried, per table.
+- On `EndSnapshot`, the replica **must** let go of every row of the named
+  tables that the snapshot did not name (delete, or retire as in 4.3),
+  children before parents: **in reverse** of the order the tables are
+  listed. The rejections it recorded for those tables before the snapshot
+  began are forgotten: the snapshot sent again what it should hold. Then the
+  snapshot is no longer in progress.
+- A message that follows the last applied and names a snapshot other than
+  the one in progress — one that ended, or was superseded — is one no
+  server sends: malformed (4.0).
+- `EndSnapshot` carries `sequence`, `epoch` and `previous`, and follows the
+  same rules as `Down` (4.1). It needs no count of what the snapshot sent:
+  its messages are chained, and one lost is a gap.
 
 ### 4.3 Retired rows
 
@@ -248,10 +263,19 @@ The replica **must** tell the server the `(epoch, sequence)` of the last
 message it applied, in an `Up` that carries them in `epoch` and `sequence`.
 It may do so after every message, or once for several (a replica that
 applied messages 5, 6 and 7 reports 7). It should do so within seconds of
-applying, and again whenever it applied something new. `sequence` 0 says it
-has applied nothing yet. The server ignores a report of another epoch, one
-behind the last it heard, and one past the last message it records sending
-the replica.
+applying, and again whenever it applied something new, or was delivered a
+message at or below the last it applied. `sequence` 0 says it has applied
+nothing yet. The server ignores a report of another epoch, one behind the
+last it heard, and one past the last message it records sending the
+replica — except one past every number it ever drew in its epoch: that says
+its own database was restored from a copy older than what the replica
+applied. The server then takes a new epoch, drops what it was about to
+send, and provisions every replica again.
+
+A replica with a gap (4.1) **must** say so, in an `Up` with `gap` set and
+its last applied `(epoch, sequence)`, and set `gap` on every `Up` it sends
+until a snapshot begins. The server provisions it again, unless a snapshot
+written for it since that message is on its way.
 
 ---
 
@@ -384,13 +408,19 @@ this safety net.
 - A row is sent with every row it points at that the replica lacks, and is
   taken back only once nothing the replica keeps points at it.
 - Every message carries a number of its own, and the numbers a replica is
-  sent rise within an epoch in the order it is sent them. What a message
+  sent rise within an epoch in the order it is sent them; each names the
+  one before it, so a replica can tell it missed one. What a message
   carries is recorded before it is sent, and a message that the transport
   did not take is sent again, under the same number, before anything after
   it.
 - A replica that leaves the last messages it was sent unconfirmed, while
   nothing newer goes to it, is provisioned again after a while: the transport
   may have lost them.
+  One that says it missed a message is provisioned again at once.
+- A server whose database was restored from an older copy finds out from
+  the first replica that says it applied more than that copy remembers, and
+  provisions every replica again, under a new epoch. A replica restored from
+  an older copy finds out from the next message it is sent, and says so.
 - A row the server cannot send to a replica, or that a replica rejected, is
   set aside and sent again after a fix: it is never silently dropped.
 - An upload is answered with `Filed` only after the transaction that filed it
@@ -403,19 +433,23 @@ this safety net.
 ```
 server                                         replica
   │  (every arrow down is a ToReplica carrying the message named)
-  │  Down {snapshot s1, seq 101, products…}  ──▶  applies, remembers s1's keys
-  │  Down {snapshot s1, seq 102, orders…}    ──▶  applies
-  │  EndSnapshot {s1, seq 103, [products,orders]}
+  │  Down {snapshot s1, seq 101, previous 0, products…}
+  │                                          ──▶  begins s1, applies, remembers its keys
+  │  Down {snapshot s1, seq 102, previous 101, orders…}
+  │                                          ──▶  applies
+  │  EndSnapshot {s1, seq 103, previous 102, [products,orders]}
   │                                          ──▶  sweeps what s1 did not name
   │  ◀── Up {epoch E, sequence 103}               "applied up to 103"
   │      progress: holds 3,200 of 3,200
   │
   │  (a product is renamed)
-  │  Down {seq 104, products: 1 row}         ──▶  applies
+  │  Down {seq 104, previous 103, products: 1 row}
+  │                                          ──▶  applies
   │  ◀── Up {epoch E, sequence 104}
   │
   │  (a row the replica refuses: a check it has, the server lacks)
-  │  Down {seq 105, orders: 2 rows}          ──▶  applies one, rejects one
+  │  Down {seq 105, previous 104, orders: 2 rows}
+  │                                          ──▶  applies one, rejects one
   │  ◀── Up {sequence 105, rejected [orders 9f…: "check failed"]}
   │      the row is set aside for this replica
   │
@@ -438,15 +472,17 @@ A replica implementation is complete when:
       unacknowledged, and sets `protocol` on every `Up`;
 - [ ] it applies a `Down` in one transaction, tables in the order given;
 - [ ] it ignores a message at or below the last applied in the same epoch,
-      starts over on a new epoch, and acknowledges without applying a
+      and says again what it applied; acknowledges without applying a
       malformed message (4.0, 4.1);
+- [ ] it applies a message only when it follows the last applied, or begins
+      a snapshot; one that follows another is a gap, which it says with
+      every `Up` until a snapshot begins (4.1, 5.2);
 - [ ] it keeps a newer stored version over an older incoming one, comparing
       versions as what they are;
 - [ ] it never overwrites the columns it owns;
 - [ ] it retires a row it cannot delete, and revives a retired row sent again;
-- [ ] it follows snapshots by sequence, begins one with its first message —
-      an `EndSnapshot` included — and sweeps on its end, in reverse table
-      order;
+- [ ] it begins a snapshot with the message that follows nothing — an
+      `EndSnapshot` included — and sweeps on its end, in reverse table order;
 - [ ] it leaves as it was and records, in the same transaction, a row it
       cannot take or let go of;
 - [ ] it reports rejections, and keeps them until it takes the row;

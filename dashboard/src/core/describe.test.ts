@@ -44,11 +44,11 @@ describe('describeReplica', () => {
     expect(describeReplica(away, speech())).toEqual([
       'Cannot be reached.',
       'Tried again now.',
-      '1 message waits to be sent to it.',
+      '2 messages wait to be sent to it.',
     ])
     expect(describeReplica({ ...away, retryAt: null }, speech())).toEqual([
       'Cannot be reached.',
-      '1 message waits to be sent to it.',
+      '2 messages wait to be sent to it.',
     ])
   })
 

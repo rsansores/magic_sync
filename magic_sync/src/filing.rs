@@ -82,8 +82,13 @@ impl Unfiled {
 /// was sent is what the relay committed; a pass in flight has sent nothing.
 struct Standing {
     epoch: Uuid,
-    /// The last message sent to it; `None` while nothing was.
+    /// The last number the server drew for any message: a replica that
+    /// applied one past it saw a server this database no longer remembers.
+    drawn: i64,
+    /// The last message written for it; `None` while none was.
     last: Option<i64>,
+    /// The first message of the last snapshot written for it.
+    snapshot: Option<i64>,
     drifted_at: Option<DateTime<Utc>>,
 }
 
@@ -189,30 +194,48 @@ async fn file_parts<P: Sync + 'static>(
     // What it refused first: a row it applied a message of and refused is
     // not held, and stays in quarantine.
     rejected(conn, codecs, sender, &upload.rejected).await?;
-    acknowledge(conn, sender, &standing, &upload.epoch, upload.sequence).await?;
-    compare(conn, codecs, sender, &standing, upload).await?;
+    if acknowledge(conn, sender, &standing, &upload.epoch, upload.sequence).await? {
+        gap(conn, sender, &standing, upload).await?;
+        compare(conn, codecs, sender, &standing, upload).await?;
+    }
     if let Some(told) = &upload.backlog {
         backlog(conn, sender, told).await?;
     }
     Ok((filed, unfiled))
 }
 
+/// What the server records of a sender.
+#[derive(Default, sqlx::FromRow)]
+struct Recorded {
+    last: Option<i64>,
+    snapshot: Option<i64>,
+    drifted_at: Option<DateTime<Utc>>,
+}
+
 async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
     let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
         .fetch_one(&mut *conn)
         .await?;
-    let row: Option<(Option<i64>, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT c.last_sequence, r.drifted_at FROM sync.replicas r \
-           LEFT JOIN sync.chains c USING (replica_id) WHERE r.replica_id = $1 FOR UPDATE OF r",
+    let drawn: i64 = sqlx::query_scalar(
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM sync.messages",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let recorded: Recorded = sqlx::query_as(
+        "SELECT c.last_sequence AS last, c.snapshot_sequence AS snapshot, r.drifted_at \
+           FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
+          WHERE r.replica_id = $1 FOR UPDATE OF r",
     )
     .bind(sender)
     .fetch_optional(&mut *conn)
-    .await?;
-    let (last, drifted_at) = row.unwrap_or_default();
+    .await?
+    .unwrap_or_default();
     Ok(Standing {
         epoch,
-        last,
-        drifted_at,
+        drawn,
+        last: recorded.last,
+        snapshot: recorded.snapshot,
+        drifted_at: recorded.drifted_at,
     })
 }
 
@@ -333,29 +356,37 @@ async fn rejected<P: Sync + 'static>(
 /// server installation `epoch`: the rows those messages carried are held from
 /// now on. Sequence 0 says nothing was applied yet. One from another epoch,
 /// or behind the last one, is outdated and changes nothing; one past every
-/// message the server records sending it is not believed — a pass that sent
-/// and never recorded, or a replica that lies — and changes nothing either.
+/// message the server records sending it is not believed — a replica that
+/// lies — and changes nothing either. One past every number the server ever
+/// drew, in its epoch, says this database was restored from a copy older
+/// than what the replicas applied: the server takes a new epoch and
+/// provisions every replica again. Answers whether the server is as the
+/// replica last knew it — not restored.
 async fn acknowledge(
     conn: &mut Conn,
     replica: Uuid,
     standing: &Standing,
     epoch: &str,
     sequence: u64,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     if sequence == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let Ok(epoch) = Uuid::parse_str(epoch) else {
         tracing::error!(%replica, epoch = stored(epoch), "upload: an epoch that is no UUID — malformed, left out");
-        return Ok(());
+        return Ok(true);
     };
     if epoch != standing.epoch {
-        return Ok(());
+        return Ok(true);
     }
     let Ok(sequence) = i64::try_from(sequence) else {
         tracing::error!(%replica, sequence, "upload: a sequence no message has — malformed, left out");
-        return Ok(());
+        return Ok(true);
     };
+    if sequence > standing.drawn {
+        restored(conn, replica, epoch, sequence).await?;
+        return Ok(false);
+    }
     if standing.last.is_none_or(|last| sequence > last) {
         tracing::warn!(
             %replica,
@@ -363,7 +394,7 @@ async fn acknowledge(
             last = standing.last,
             "upload: it acknowledges a message the server does not record sending it — left out"
         );
-        return Ok(());
+        return Ok(true);
     }
     sqlx::query(
         "UPDATE sync.replicas SET applied_epoch = $2, applied_sequence = $3, applied_at = now(), \
@@ -389,6 +420,67 @@ async fn acknowledge(
     .bind(epoch)
     .execute(&mut *conn)
     .await?;
+    Ok(true)
+}
+
+/// This database is older than what `replica` applied — restored from a
+/// copy — so what it records of every replica is too: it takes a new epoch,
+/// unless a filing at once took it already, drops every outbox, and
+/// provisions every replica again. Messages of the old epoch still on
+/// their way are a server's a replica no longer follows.
+async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) -> Result<(), Error> {
+    let rotated = sqlx::query("UPDATE sync.epoch SET epoch = gen_random_uuid() WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&mut *conn)
+        .await?;
+    if rotated.rows_affected() == 0 {
+        return Ok(());
+    }
+    tracing::error!(
+        %replica,
+        sequence,
+        "sync ALARM: a replica applied a message this database never numbered — it was restored \
+         from an older copy; a new epoch begins and every replica is provisioned again"
+    );
+    for sql in [
+        "DELETE FROM sync.outbox",
+        "UPDATE sync.chains SET last_sequence = NULL, snapshot_sequence = NULL",
+    ] {
+        sqlx::query(sql).execute(&mut *conn).await?;
+    }
+    // Every replica the engine knows of: one not live is sent nothing.
+    let known: Vec<Uuid> = sqlx::query_scalar("SELECT replica_id FROM sync.replicas")
+        .fetch_all(&mut *conn)
+        .await?;
+    for replica in known {
+        resync(conn, replica).await?;
+    }
+    Ok(())
+}
+
+/// `replica` says it missed a message: it applies nothing more until a
+/// snapshot begins, so it is provisioned again — unless one is on its way,
+/// written for it since the last message it applied.
+async fn gap(
+    conn: &mut Conn,
+    replica: Uuid,
+    standing: &Standing,
+    upload: &Up,
+) -> Result<(), Error> {
+    if !upload.gap {
+        return Ok(());
+    }
+    let since = Uuid::parse_str(&upload.epoch).ok() == Some(standing.epoch);
+    let on_its_way = standing.snapshot.is_some_and(|began| {
+        !since || i64::try_from(upload.sequence).is_ok_and(|applied| applied < began)
+    });
+    if on_its_way {
+        tracing::debug!(%replica, "sync: a replica that missed a message has its snapshot on the way");
+        return Ok(());
+    }
+    if resync(conn, replica).await? {
+        tracing::warn!(%replica, "sync: a replica missed a message — it is provisioned again");
+    }
     Ok(())
 }
 

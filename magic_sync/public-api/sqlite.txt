@@ -30,6 +30,7 @@ pub mod magic_sync::replica
 pub magic_sync::replica::Received::AlreadyApplied
 pub magic_sync::replica::Received::Applied(alloc::vec::Vec<magic_sync::replica::Applied>)
 pub magic_sync::replica::Received::Filed
+pub magic_sync::replica::Received::Gap
 pub magic_sync::replica::Received::Malformed(alloc::string::String)
 pub magic_sync::replica::Received::SnapshotEnded
 impl core::fmt::Debug for magic_sync::replica::Received

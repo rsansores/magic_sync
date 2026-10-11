@@ -56,12 +56,18 @@ async fn world_with(pool: SqlitePool, settings: Settings) -> World {
     let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings)
         .await
         .expect("a replica");
-    World {
+    let w = World {
         pool,
         me,
         uplink,
         replica,
-    }
+    };
+    let provisioned = w.receive(&ending(BASE, 0, "provisioned", &[])).await;
+    assert!(
+        matches!(provisioned, Received::SnapshotEnded),
+        "{provisioned:?}"
+    );
+    w
 }
 
 impl World {
@@ -146,22 +152,44 @@ fn deletes(table: &str, keys: Vec<WireKey>) -> Table {
     }
 }
 
-fn down(sequence: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
+/// Where the suite's replica stands when a test begins: provisioned, by the
+/// end of a snapshot of nothing, numbered so. A test's message `n` is the
+/// server's `BASE + n`.
+const BASE: u64 = 100;
+
+/// Message `n` of a test, following message `n - 1` (or the provisioning).
+fn down(n: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
+    numbered(BASE + n, BASE + n - 1, snapshot, tables)
+}
+
+/// Message `n`, beginning the snapshot `snapshot`: it follows nothing.
+fn begin(n: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
+    numbered(BASE + n, 0, snapshot, tables)
+}
+
+fn numbered(sequence: u64, previous: u64, snapshot: &str, tables: Vec<Table>) -> Vec<u8> {
     Body::Down(Down {
         snapshot_id: snapshot.to_owned(),
         tables,
         sequence,
         epoch: EPOCH.to_owned(),
+        previous,
     })
     .encoded()
 }
 
-fn end(sequence: u64, snapshot: &str, tables: &[&str]) -> Vec<u8> {
+/// Message `n`, ending the snapshot in progress, `snapshot`.
+fn end(n: u64, snapshot: &str, tables: &[&str]) -> Vec<u8> {
+    ending(BASE + n, BASE + n - 1, snapshot, tables)
+}
+
+fn ending(sequence: u64, previous: u64, snapshot: &str, tables: &[&str]) -> Vec<u8> {
     Body::EndSnapshot(EndSnapshot {
         snapshot_id: snapshot.to_owned(),
         tables: tables.iter().map(|t| (*t).to_owned()).collect(),
         sequence,
         epoch: EPOCH.to_owned(),
+        previous,
     })
     .encoded()
 }
@@ -266,7 +294,7 @@ async fn a_snapshot_keeps_what_it_names_and_lets_go_of_the_rest(pool: SqlitePool
         .await;
 
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(2, &s, vec![upserts("items", vec![item(a, "a")])]))
+    w.receive(&begin(2, &s, vec![upserts("items", vec![item(a, "a")])]))
         .await;
     w.receive(&down(3, &s, vec![upserts("items", vec![item(b, "b")])]))
         .await;
@@ -287,8 +315,13 @@ async fn a_snapshot_that_names_no_row_lets_go_of_every_row(pool: SqlitePool) {
     let [a] = ids();
     w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
         .await;
-    w.receive(&end(2, &Uuid::now_v7().to_string(), &["items"]))
-        .await;
+    w.receive(&ending(
+        BASE + 2,
+        0,
+        &Uuid::now_v7().to_string(),
+        &["items"],
+    ))
+    .await;
     assert!(w.items().await.is_empty());
 }
 
@@ -312,82 +345,78 @@ async fn a_table_a_snapshot_names_no_row_of_is_emptied(pool: SqlitePool) {
     ))
     .await;
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(2, &s, vec![upserts("items", vec![item(a, "a")])]))
+    w.receive(&begin(2, &s, vec![upserts("items", vec![item(a, "a")])]))
         .await;
     w.receive(&end(3, &s, &["items", "shelves"])).await;
     assert_eq!(w.items().await, ["a"]);
     assert_eq!(w.count("SELECT count(*) FROM shelves").await, 0);
 }
 
-/// A snapshot not seen before supersedes the one in progress, whatever
-/// their ids say: the sequence orders them. The end of the superseded one
-/// does nothing; the end of the newer sweeps what only the older named.
+/// A message that follows nothing begins a snapshot, and supersedes the one
+/// in progress, whatever their ids say; a message of the superseded one is
+/// one no server sends after it, and the end of the newer sweeps what only
+/// the older named.
 #[sqlx::test(migrations = false)]
-async fn a_newer_snapshot_supersedes_the_one_in_progress_by_sequence(pool: SqlitePool) {
+async fn a_snapshot_begun_supersedes_the_one_in_progress(pool: SqlitePool) {
     let w = world(pool).await;
     let [a, b] = ids();
     let newer_id = Uuid::now_v7().to_string();
     let older_id = Uuid::now_v7().to_string();
     // The later id begins first: an id's clock says nothing of the order.
-    w.receive(&down(
+    w.receive(&begin(
         1,
         &older_id,
         vec![upserts("items", vec![item(a, "a")])],
     ))
     .await;
-    w.receive(&down(
+    w.receive(&begin(
         2,
         &newer_id,
         vec![upserts("items", vec![item(b, "b")])],
     ))
     .await;
-    w.receive(&end(3, &older_id, &["items"])).await;
+    let stale = w.receive(&end(3, &older_id, &["items"])).await;
+    assert!(matches!(stale, Received::Malformed(_)), "{stale:?}");
     assert_eq!(
         w.items().await,
         ["a", "b"],
         "the superseded end sweeps nothing"
     );
-    w.receive(&end(4, &newer_id, &["items"])).await;
+    w.receive(&end(3, &newer_id, &["items"])).await;
     assert_eq!(w.items().await, ["b"]);
 }
 
-/// An end delivered again changes nothing, and a later message of a
-/// snapshot that ended names nothing.
+/// An end delivered again changes nothing, and a message of a snapshot
+/// that ended is one no server sends.
 #[sqlx::test(migrations = false)]
 async fn an_end_delivered_again_changes_nothing(pool: SqlitePool) {
     let w = world(pool).await;
     let [a, b] = ids();
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(1, &s, vec![upserts("items", vec![item(a, "a")])]))
+    w.receive(&begin(1, &s, vec![upserts("items", vec![item(a, "a")])]))
         .await;
     w.receive(&end(2, &s, &["items"])).await;
     let again = w.receive(&end(2, &s, &["items"])).await;
     assert!(matches!(again, Received::AlreadyApplied), "{again:?}");
-    w.receive(&down(3, &s, vec![upserts("items", vec![item(b, "b")])]))
+    let late = w
+        .receive(&down(3, &s, vec![upserts("items", vec![item(b, "b")])]))
         .await;
-    let late = w.receive(&end(4, &s, &["items"])).await;
-    assert!(matches!(late, Received::SnapshotEnded));
-    assert_eq!(
-        w.items().await,
-        ["a", "b"],
-        "an ended snapshot sweeps nothing"
-    );
+    assert!(matches!(late, Received::Malformed(_)), "{late:?}");
+    assert_eq!(w.items().await, ["a"]);
 }
 
-/// A server installed again knows nothing of the snapshot it was sending:
-/// the replica forgets it, and the end of it is the end of one never seen.
+/// A server installed again begins with a snapshot, which the replica
+/// follows whatever came before; a message of that epoch that follows one
+/// the replica never applied is a gap.
 #[sqlx::test(migrations = false)]
-async fn a_new_epoch_forgets_the_snapshot_in_progress(pool: SqlitePool) {
+async fn a_new_epoch_begins_with_a_snapshot(pool: SqlitePool) {
     let w = world(pool).await;
     let [a, b] = ids();
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(5, &s, vec![upserts("items", vec![item(a, "a")])]))
+    w.receive(&begin(1, &s, vec![upserts("items", vec![item(a, "a")])]))
         .await;
-    let other = |body: Body| {
-        let mut message = ToReplica {
-            protocol: envelope::PROTOCOL,
-            body: Some(body),
-        };
+    let other = |bytes: Vec<u8>| {
+        let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
         match &mut message.body {
             Some(Body::Down(m)) => m.epoch = OTHER_EPOCH.to_owned(),
             Some(Body::EndSnapshot(m)) => m.epoch = OTHER_EPOCH.to_owned(),
@@ -395,15 +424,57 @@ async fn a_new_epoch_forgets_the_snapshot_in_progress(pool: SqlitePool) {
         }
         message.encode_to_vec()
     };
-    let decoded = |bytes: Vec<u8>| ToReplica::decode(bytes.as_slice()).unwrap().body.unwrap();
-    w.receive(&other(decoded(down(
-        1,
-        "",
-        vec![upserts("items", vec![item(b, "b")])],
-    ))))
-    .await;
-    w.receive(&other(decoded(end(2, &s, &["items"])))).await;
+    let followed = w
+        .receive(&other(down(
+            2,
+            "",
+            vec![upserts("items", vec![item(b, "b")])],
+        )))
+        .await;
+    assert!(matches!(followed, Received::Gap), "{followed:?}");
+    let t = Uuid::now_v7().to_string();
+    w.receive(&other(ending(5, 0, &t, &["items"]))).await;
     assert!(w.items().await.is_empty(), "named nothing in this epoch");
+    let applied: (String, i64) = sqlx::query_as("SELECT epoch, sequence FROM sync_applied")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(applied, (OTHER_EPOCH.to_owned(), 5));
+}
+
+/// A message that follows one the replica never applied — lost on the way,
+/// or a replica restored from an older copy — is a gap: it applies nothing
+/// more, says so to the server once, and with every message up after, until
+/// a snapshot begins; then it follows that.
+#[sqlx::test(migrations = false)]
+async fn a_replica_that_missed_a_message_applies_nothing_until_a_snapshot(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b, c] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    w.up(0, false).await;
+    // Message 2 is lost.
+    let after = w
+        .receive(&down(3, "", vec![upserts("items", vec![item(b, "b")])]))
+        .await;
+    assert!(matches!(after, Received::Gap), "{after:?}");
+    let next = w
+        .receive(&down(4, "", vec![upserts("items", vec![item(c, "c")])]))
+        .await;
+    assert!(matches!(next, Received::Gap), "{next:?}");
+    assert_eq!(w.items().await, ["a"]);
+    let told = w.up(0, false).await.expect("the gap said");
+    assert!(told.gap);
+    assert_eq!((told.epoch.as_str(), told.sequence), (EPOCH, BASE + 1));
+    assert!(w.up(0, false).await.is_none(), "said once");
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(5, &s, vec![upserts("items", vec![item(c, "c")])]))
+        .await;
+    w.receive(&end(6, &s, &["items"])).await;
+    assert_eq!(w.items().await, ["c"]);
+    let up = w.up(0, false).await.expect("what it applied");
+    assert!(!up.gap);
+    assert_eq!(up.sequence, BASE + 6);
 }
 
 // ---------------------------------------------------------------------------
@@ -413,46 +484,67 @@ async fn a_new_epoch_forgets_the_snapshot_in_progress(pool: SqlitePool) {
 async fn a_message_at_or_below_the_last_applied_changes_nothing(pool: SqlitePool) {
     let w = world(pool).await;
     let [a, b, c] = ids();
-    w.receive(&down(5, "", vec![upserts("items", vec![item(a, "five")])]))
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "one")])]))
+        .await;
+    w.receive(&down(2, "", vec![upserts("items", vec![item(b, "two")])]))
         .await;
     let past = w
-        .receive(&down(4, "", vec![upserts("items", vec![item(b, "four")])]))
+        .receive(&down(1, "", vec![upserts("items", vec![item(c, "again")])]))
         .await;
     assert!(matches!(past, Received::AlreadyApplied), "{past:?}");
-    w.receive(&down(5, "", vec![upserts("items", vec![item(c, "again")])]))
-        .await;
-    assert_eq!(w.items().await, ["five"]);
+    assert_eq!(w.items().await, ["one", "two"]);
 }
 
-/// Numbers no server sends — 0, past 2^63 - 1 — and an epoch that is no
-/// uuid make the message malformed: acknowledged, and nothing applied.
+/// Numbers no server sends — 0, past 2^63 - 1, a message that follows
+/// itself or a later one, one that follows nothing and begins no snapshot —
+/// and an epoch that is no uuid, or no protocol, make the message
+/// malformed: acknowledged, and nothing applied.
 #[sqlx::test(migrations = false)]
 async fn a_message_numbered_as_no_server_numbers_one_is_malformed(pool: SqlitePool) {
     let w = world(pool).await;
     let [a, b, c] = ids();
-    for sequence in [0, u64::try_from(i64::MAX).unwrap() + 1, u64::MAX] {
+    let max = u64::try_from(i64::MAX).unwrap();
+    for (sequence, previous) in [
+        (0, 0),
+        (max + 1, BASE),
+        (u64::MAX, BASE),
+        (BASE + 1, BASE + 1),
+        (BASE + 1, BASE + 2),
+        (BASE + 1, 0),
+    ] {
         let got = w
-            .receive(&down(
+            .receive(&numbered(
                 sequence,
+                previous,
                 "",
                 vec![upserts("items", vec![item(a, "a")])],
             ))
             .await;
-        assert!(matches!(got, Received::Malformed(_)), "{sequence}: {got:?}");
+        assert!(
+            matches!(got, Received::Malformed(_)),
+            "{sequence} after {previous}: {got:?}"
+        );
     }
     let no_epoch = Body::Down(Down {
         tables: vec![upserts("items", vec![item(b, "b")])],
-        sequence: 1,
+        sequence: BASE + 1,
+        previous: BASE,
         epoch: "e".into(),
         ..Down::default()
     })
     .encoded();
     assert!(matches!(w.receive(&no_epoch).await, Received::Malformed(_)));
+    let mut no_protocol = ToReplica::decode(down(1, "", Vec::new()).as_slice()).unwrap();
+    no_protocol.protocol = 0;
+    assert!(matches!(
+        w.receive(&no_protocol.encode_to_vec()).await,
+        Received::Malformed(_)
+    ));
     assert!(w.items().await.is_empty());
-    assert_eq!(w.count("SELECT count(*) FROM sync_applied").await, 0);
     // The largest number is one.
-    w.receive(&down(
-        u64::try_from(i64::MAX).unwrap(),
+    w.receive(&numbered(
+        max,
+        BASE,
         "",
         vec![upserts("items", vec![item(c, "c")])],
     ))
@@ -493,7 +585,7 @@ async fn no_bytes_make_receiving_an_error(pool: SqlitePool) {
         label: "x".into(),
         revision: 2,
     };
-    let message = down(
+    let message = begin(
         7,
         &Uuid::now_v7().to_string(),
         vec![
@@ -530,9 +622,11 @@ async fn no_bytes_make_receiving_an_error(pool: SqlitePool) {
             Err(e) => panic!("round {round}: {e}"),
         }
     }
-    w.receive(&down(
+    // Whatever the rounds left it at, a snapshot that begins is followed.
+    w.receive(&numbered(
         u64::MAX >> 1,
-        "",
+        0,
+        "after",
         vec![upserts("items", vec![item(b, "after")])],
     ))
     .await;
@@ -644,7 +738,7 @@ async fn keys_of_every_shape_are_read_and_written_in_one_form(pool: SqlitePool) 
         ["slot 1", "slot 3"]
     );
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(3, &s, vec![upserts("shelves", vec![shelf(3)])]))
+    w.receive(&begin(3, &s, vec![upserts("shelves", vec![shelf(3)])]))
         .await;
     w.receive(&end(4, &s, &["shelves"])).await;
     assert_eq!(w.texts("SELECT label FROM shelves").await, ["slot 3"]);
@@ -684,7 +778,7 @@ async fn a_row_the_replica_cannot_take_is_reported_until_it_takes_it(pool: Sqlit
     let up = w.up(0, false).await.expect("the refusal");
     assert_eq!(up.rejected.len(), 1);
     assert_eq!(up.rejected[0].key, Some(key(&[&broken.to_string()])));
-    assert_eq!(up.sequence, 1, "confirmed with its refusal");
+    assert_eq!(up.sequence, BASE + 1, "confirmed with its refusal");
     assert!(w.up(0, false).await.is_none(), "said once");
 
     w.receive(&down(
@@ -841,7 +935,7 @@ async fn a_snapshot_forgets_the_rejections_from_before_it(pool: SqlitePool) {
     ))
     .await;
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(
+    w.receive(&begin(
         2,
         &s,
         vec![upserts(
@@ -965,7 +1059,7 @@ async fn a_record_is_the_replicas_and_history_is_written_once(pool: SqlitePool) 
     };
     let reading_key = key(&[&me.to_string(), &reading.to_string()]);
     let s = Uuid::now_v7().to_string();
-    w.receive(&down(
+    w.receive(&begin(
         1,
         &s,
         vec![
@@ -1356,7 +1450,7 @@ async fn a_lane_that_fails_holds_back_no_other(pool: SqlitePool) {
 async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
     let w = world(pool).await;
     let [a, b] = ids();
-    w.receive(&down(7, "", vec![upserts("items", vec![item(a, "a")])]))
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
         .await;
     let lanes = Settings::default().lanes;
     let mut tx = w.pool.begin().await.unwrap();
@@ -1365,9 +1459,10 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
         .unwrap()
         .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(outgoing.up.sequence, 7);
+    assert_eq!(outgoing.up.sequence, BASE + 1);
+    let s = Uuid::now_v7().to_string();
     let mut message =
-        ToReplica::decode(down(1, "", vec![upserts("items", vec![item(b, "b")])]).as_slice())
+        ToReplica::decode(begin(1, &s, vec![upserts("items", vec![item(b, "b")])]).as_slice())
             .unwrap();
     if let Some(Body::Down(down)) = &mut message.body {
         down.epoch = OTHER_EPOCH.to_owned();
@@ -1377,7 +1472,7 @@ async fn a_confirmation_is_of_its_epoch(pool: SqlitePool) {
     delivered(&mut tx, &outgoing).await.unwrap();
     tx.commit().await.unwrap();
     let up = w.up(0, false).await.expect("the new epoch's confirmation");
-    assert_eq!((up.epoch.as_str(), up.sequence), (OTHER_EPOCH, 1));
+    assert_eq!((up.epoch.as_str(), up.sequence), (OTHER_EPOCH, BASE + 1));
 }
 
 /// A replica does not confirm a message while refusals of it are still to
@@ -1395,7 +1490,7 @@ async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool
     let [a, b] = ids();
     let broken = |id: Uuid| (key(&[&id.to_string()]), vec![0xff]);
     w.receive(&down(
-        7,
+        1,
         "",
         vec![upserts("items", vec![broken(a), broken(b)])],
     ))
@@ -1403,7 +1498,7 @@ async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool
     let first = w.up(0, false).await.unwrap();
     assert_eq!((first.rejected.len(), first.sequence), (1, 0));
     let last = w.up(0, false).await.unwrap();
-    assert_eq!((last.rejected.len(), last.sequence), (1, 7));
+    assert_eq!((last.rejected.len(), last.sequence), (1, BASE + 1));
 }
 
 /// The replica tells the server what it wrote and the server has not filed:
@@ -1496,7 +1591,8 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
     let [a] = ids();
     w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
         .await;
-    let mut message = ToReplica::decode(down(1, "", vec![]).as_slice()).unwrap();
+    let s = Uuid::now_v7().to_string();
+    let mut message = ToReplica::decode(begin(2, &s, vec![]).as_slice()).unwrap();
     if let Some(Body::Down(down)) = &mut message.body {
         down.epoch = OTHER_EPOCH.to_owned();
     }

@@ -35,7 +35,7 @@ export default {
       "first": [
         {
           "attempts": 1,
-          "id": 4,
+          "id": 6,
           "key": "not-a-key",
           "kind": "row",
           "last_error": "`not-a-key` is not a key of `id`",
@@ -45,7 +45,7 @@ export default {
         },
         {
           "attempts": 1,
-          "id": 5,
+          "id": 7,
           "key": null,
           "kind": "members",
           "last_error": "a bug",
@@ -55,7 +55,7 @@ export default {
         },
         {
           "attempts": 1,
-          "id": 6,
+          "id": 8,
           "key": null,
           "kind": "assigned",
           "last_error": "a bug",
@@ -65,7 +65,7 @@ export default {
         },
         {
           "attempts": 1,
-          "id": 7,
+          "id": 9,
           "key": null,
           "kind": "resync",
           "last_error": "a bug",
@@ -117,7 +117,7 @@ export default {
         "backlog": null,
         "failures": 1,
         "last_error": "00000000-0000-7000-8000-000000000001 unreachable",
-        "owed": 1,
+        "owed": 2,
         "parked": 0,
         "pending": 0,
         "quarantined": 0,

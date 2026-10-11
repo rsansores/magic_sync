@@ -234,17 +234,24 @@ message is set aside at loading, like one that does not encode (section 6).
 Each row travels with its key, so a replica that cannot even decode a row can
 still say which one it was.
 
-**Every message is numbered.** Once a pass is planned, the relay draws one
-number per message from a PostgreSQL sequence, and gives them out in the
-order the messages go. A sequence never goes backwards, whichever relay draws
-from it, and is not rolled back with a transaction, so no two messages ever
-share a number. A replica applies nothing at or below the last
-number it applied. That protects against a message delivered twice, and
-against a relay that lost its lock and sends a stale message late: its numbers
-are lower than the new relay's, so the replica drops them. Messages also carry
-the *epoch*, a random id made when the server's schema was installed: a server
-installed again numbers from scratch, and a replica that sees a new epoch
-starts counting again.
+**Every message is numbered, and chained.** The relay draws one number per
+message from a PostgreSQL sequence, and gives them out in the order the
+messages go. A sequence never goes backwards and is not rolled back with a
+transaction, so no two messages ever share a number. A replica applies
+nothing at or below the last number it applied: a message delivered twice
+changes nothing. Each message also names the one sent the replica before it
+(`previous`); a replica applies a message only when it follows the last one
+it applied, so one that follows a message it never got — lost on the way,
+or the replica's database restored from an older copy — is a *gap*: it
+applies nothing more, tells the server, and is provisioned again. Messages
+carry the *epoch* too, a random id of the server's installation: a new
+epoch always begins with a snapshot.
+
+A server database restored from an older copy numbers again from where the
+copy left off: its replicas drop those messages as applied already, and say
+what they applied — past every number the restored database remembers
+drawing. The server then takes a new epoch and provisions every replica
+again.
 
 A provisioning (a *snapshot*) sends everything the replica should hold, then an
 [`envelope::EndSnapshot`]. On the end, the replica deletes every row of those
@@ -532,14 +539,18 @@ The crate is compiled for one backend at a time: `postgres` for the server,
   exactly what its strategies say, and never a row without its parent.
 - **Each failure** in section 6 has its own test, against a fake transport and
   a codec with a deliberate bug that a "deploy" fixes.
-- **A chaos test** runs storms of random writes (inserts, renames, rows retired
-  and deleted, a tenth of them rows the encoding refuses) while the transport
-  fails a third of the sends at random. Replicas are modelled as real ones
-  behave: they only apply messages numbered above the last one. Then the
-  network comes back and the fix is deployed. Every replica must end up holding
-  exactly the live rows, with nothing pending and nothing in quarantine.
-- **Races**: a transaction that commits after a plan read past it, and a relay
-  that sent but died before recording.
+- **A storm** runs the same walk through the real relay while the transport
+  fails a fifth of the sends — some for good — and loses messages; the relay
+  dies between its record and its sends, or loses its lock mid-pass; replicas
+  take part of what waits for them, die before acknowledging, or are not
+  heard. Replicas are modelled from the protocol (`src/model.rs`): epochs,
+  chaining and gaps, snapshots, rejections. Each time the system settles,
+  every replica holds exactly what the engine records; once the faults stop
+  and the fix is deployed, exactly what it should, with provisionings rare.
+- **Races and restores**: a transaction that commits after a plan read past
+  it, a pass recorded and never sent, a lock lost mid-pass, a send cut short
+  before a row leaves the replica's scope, a message lost, a server or a
+  replica restored from an older copy.
 - **The replica side** runs on SQLite: messages from the past, rows it cannot
   decode, tables it does not have, digests.
 

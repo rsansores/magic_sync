@@ -57,6 +57,7 @@ pub(crate) enum Received {
     Ended,
     Filed,
     Already,
+    Gap,
     Malformed,
 }
 
@@ -70,7 +71,8 @@ pub(crate) struct Model {
     /// The last one the server heard of.
     acknowledged: Option<(String, u64)>,
     snapshot: Option<Snapshot>,
-    ended: BTreeSet<String>,
+    /// It missed a message, and waits for a snapshot to begin.
+    pub(crate) gap: bool,
     pub(crate) rejections: BTreeMap<Row, Rejection>,
 }
 
@@ -81,17 +83,57 @@ impl Model {
         let Ok(message) = ToReplica::decode(bytes) else {
             return Received::Malformed;
         };
+        if message.protocol == 0 {
+            return Received::Malformed;
+        }
         let Some(body) = message.body else {
             return Received::Malformed;
         };
+        let (epoch, sequence, previous, snapshot_id) = match &body {
+            Body::Filed(_) => return Received::Filed,
+            Body::Down(d) => (
+                d.epoch.clone(),
+                d.sequence,
+                d.previous,
+                d.snapshot_id.clone(),
+            ),
+            Body::EndSnapshot(e) => (
+                e.epoch.clone(),
+                e.sequence,
+                e.previous,
+                e.snapshot_id.clone(),
+            ),
+        };
+        if sequence == 0 || previous >= sequence || (previous == 0 && snapshot_id.is_empty()) {
+            return Received::Malformed;
+        }
+        if let Some((e, s)) = &self.applied {
+            if *e == epoch && sequence <= *s {
+                // The server may have lost what it was told: say it again.
+                self.acknowledged = None;
+                return Received::Already;
+            }
+        }
+        if previous == 0 {
+            self.snapshot = Some(Snapshot {
+                id: snapshot_id.clone(),
+                began: sequence,
+                named: BTreeSet::new(),
+            });
+            self.gap = false;
+        } else if self.applied != Some((epoch.clone(), previous)) {
+            self.gap = true;
+            return Received::Gap;
+        } else if !snapshot_id.is_empty()
+            && self.snapshot.as_ref().is_none_or(|s| s.id != snapshot_id)
+        {
+            return Received::Malformed;
+        }
+        self.applied = Some((epoch, sequence));
         match body {
             Body::Filed(_) => Received::Filed,
             Body::Down(down) => {
-                let Some(sequence) = self.numbered(&down.epoch, down.sequence) else {
-                    return Received::Already;
-                };
-                let naming =
-                    !down.snapshot_id.is_empty() && self.names(&down.snapshot_id, sequence);
+                let naming = !down.snapshot_id.is_empty();
                 for table in down.tables {
                     for (bytes, key) in table.upserts.iter().zip(&table.keys) {
                         let row = (table.table.clone(), key.parts.join("|"));
@@ -115,20 +157,7 @@ impl Model {
                 Received::Applied
             }
             Body::EndSnapshot(end) => {
-                let Some(sequence) = self.numbered(&end.epoch, end.sequence) else {
-                    return Received::Already;
-                };
-                if self.ended.contains(&end.snapshot_id) {
-                    return Received::Ended;
-                }
-                if self
-                    .snapshot
-                    .as_ref()
-                    .is_none_or(|s| s.id != end.snapshot_id)
-                {
-                    self.begin(&end.snapshot_id, sequence);
-                }
-                let snapshot = self.snapshot.take().expect("begun");
+                let snapshot = self.snapshot.take().expect("begun, or malformed");
                 for table in end.tables.iter().rev() {
                     self.rejections
                         .retain(|(t, _), r| t != table || r.sequence >= snapshot.began);
@@ -142,52 +171,9 @@ impl Model {
                         self.let_go(row, sequence, rules);
                     }
                 }
-                self.ended.insert(snapshot.id);
                 Received::Ended
             }
         }
-    }
-
-    /// The sequence to apply a message numbered so at, recorded as the last
-    /// applied; `None` when it changes nothing.
-    fn numbered(&mut self, epoch: &str, sequence: u64) -> Option<u64> {
-        if let Some((e, s)) = &self.applied {
-            if e == epoch && sequence <= *s {
-                return None;
-            }
-            if e != epoch {
-                self.snapshot = None;
-                self.ended.clear();
-                for rejection in self.rejections.values_mut() {
-                    (rejection.reported, rejection.sequence) = (false, 0);
-                }
-            }
-        }
-        self.applied = Some((epoch.to_owned(), sequence));
-        Some(sequence)
-    }
-
-    /// Whether a message of the snapshot `id` names its rows, beginning the
-    /// snapshot when it is new.
-    fn names(&mut self, id: &str, sequence: u64) -> bool {
-        if self.ended.contains(id) {
-            return false;
-        }
-        if self.snapshot.as_ref().is_none_or(|s| s.id != id) {
-            self.begin(id, sequence);
-        }
-        true
-    }
-
-    fn begin(&mut self, id: &str, sequence: u64) {
-        if let Some(old) = self.snapshot.take() {
-            self.ended.insert(old.id);
-        }
-        self.snapshot = Some(Snapshot {
-            id: id.to_owned(),
-            began: sequence,
-            named: BTreeSet::new(),
-        });
     }
 
     /// Lets go of `row`, unless a row it holds points at it: then it is
@@ -219,7 +205,8 @@ impl Model {
     /// What it has to tell the server on its first lane: its rejections not
     /// reported yet, and the last message it applied when the server has not
     /// heard of it — never before every rejection of it is reported, which
-    /// one `Up` here always does. `None` when it has nothing to say.
+    /// one `Up` here always does — or always, while it has a gap to say.
+    /// `None` when it has nothing to say.
     pub(crate) fn up(&self) -> Option<Up> {
         let rejected: Vec<Rejected> = self
             .rejections
@@ -236,14 +223,15 @@ impl Model {
         let mut up = Up {
             protocol: crate::envelope::PROTOCOL,
             rejected,
+            gap: self.gap,
             ..Up::default()
         };
-        if self.applied != self.acknowledged {
+        if self.applied != self.acknowledged || self.gap {
             if let Some((epoch, sequence)) = &self.applied {
                 (up.epoch, up.sequence) = (epoch.clone(), *sequence);
             }
         }
-        (!up.rejected.is_empty() || up.sequence > 0).then_some(up)
+        (!up.rejected.is_empty() || up.sequence > 0 || up.gap).then_some(up)
     }
 
     /// The uplink took `up`.

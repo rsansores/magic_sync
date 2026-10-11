@@ -869,6 +869,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         set_aside: 0,
                     }],
                 }),
+                gap: walk.below(4) == 0,
             };
             came += up
                 .tables

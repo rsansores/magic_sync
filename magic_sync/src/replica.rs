@@ -388,6 +388,10 @@ pub enum Received {
     /// A message at or below the last one applied from the same server: a
     /// redelivery, or one a relay that lost its lock sent late. Nothing done.
     AlreadyApplied,
+    /// A message that follows one this replica never applied: it missed
+    /// one. Nothing done, now or until a snapshot begins; the server is told,
+    /// and provisions it again.
+    Gap,
     /// Bytes this build can do nothing with, and never will — no message, a
     /// message with nothing it knows in it, a sequence or an epoch no server
     /// sends — logged and dropped. The digests find what they carried, if
@@ -421,6 +425,9 @@ pub(crate) async fn receive<P: Sync + 'static>(
             theirs: message.protocol,
             ours: envelope::PROTOCOL,
         });
+    }
+    if message.protocol == 0 {
+        return Ok(malformed("a message that names no protocol".to_owned()));
     }
     let Some(body) = message.body else {
         return Ok(malformed(
@@ -456,76 +463,154 @@ async fn act<P: Sync + 'static>(
             filed(conn, &message).await?;
             Ok(Received::Filed)
         }
-        Body::Down(down) => match numbered(conn, &down.epoch, down.sequence).await? {
-            Ok(sequence) => Ok(Received::Applied(
-                apply(conn, codecs, &down, sequence).await?,
-            )),
-            Err(skipped) => Ok(skipped),
-        },
-        Body::EndSnapshot(end) => match numbered(conn, &end.epoch, end.sequence).await? {
-            Ok(sequence) => {
-                end_snapshot(conn, codecs, &end, sequence).await?;
-                Ok(Received::SnapshotEnded)
+        Body::Down(down) => {
+            let place = Place {
+                epoch: &down.epoch,
+                sequence: down.sequence,
+                previous: down.previous,
+                snapshot: &down.snapshot_id,
+                ends: false,
+            };
+            match chained(conn, place).await? {
+                Ok(sequence) => Ok(Received::Applied(
+                    apply(conn, codecs, &down, sequence).await?,
+                )),
+                Err(skipped) => Ok(skipped),
             }
-            Err(skipped) => Ok(skipped),
-        },
+        }
+        Body::EndSnapshot(end) => {
+            let place = Place {
+                epoch: &end.epoch,
+                sequence: end.sequence,
+                previous: end.previous,
+                snapshot: &end.snapshot_id,
+                ends: true,
+            };
+            match chained(conn, place).await? {
+                Ok(sequence) => {
+                    end_snapshot(conn, codecs, &end, sequence).await?;
+                    Ok(Received::SnapshotEnded)
+                }
+                Err(skipped) => Ok(skipped),
+            }
+        }
     }
 }
 
-/// Whether a message numbered `sequence` by the server installation `epoch`
-/// is newer than the last one applied, recording it as the last when it is:
-/// its sequence when it is, and otherwise what it did instead — nothing, or
-/// nothing because no server numbers a message so.
-/// A message of another epoch is of a server installed again, which knows
-/// nothing it was told: the replica forgets the snapshot it was following,
-/// and says again its backlog and its rejections.
+/// Where a message stands in what the server sends this replica.
 #[cfg(feature = "sqlite")]
-async fn numbered(
-    conn: &mut Conn,
-    epoch: &str,
+struct Place<'m> {
+    epoch: &'m str,
     sequence: u64,
-) -> Result<Result<i64, Received>, Error> {
-    let Some(sequence) = i64::try_from(sequence).ok().filter(|s| *s > 0) else {
+    previous: u64,
+    snapshot: &'m str,
+    /// It ends the snapshot it names.
+    ends: bool,
+}
+
+/// Whether the message at `place` is the next one to apply, recording it as
+/// the last applied when it is: its sequence when it is, and otherwise what
+/// it is instead. The next one follows the last applied (`previous`), or
+/// begins a snapshot (`previous` 0), whatever came before — of this epoch or
+/// another, which is a server installed again, or one that missed nothing
+/// this replica must know. One that follows another the replica never
+/// applied is a gap: nothing is applied until a snapshot begins. One at or
+/// below the last applied of its epoch is a redelivery; and since the
+/// server may have lost what it was told, it is told again.
+#[cfg(feature = "sqlite")]
+async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Received>, Error> {
+    let Some(sequence) = i64::try_from(place.sequence).ok().filter(|s| *s > 0) else {
         return Ok(Err(malformed(format!(
-            "sequence {sequence}, outside 1 to 2^63 - 1"
+            "sequence {}, outside 1 to 2^63 - 1",
+            place.sequence
         ))));
     };
-    let Ok(epoch) = Uuid::parse_str(epoch).map(|e| e.to_string()) else {
-        return Ok(Err(malformed(format!("epoch `{epoch}` is not a uuid"))));
+    let Ok(epoch) = Uuid::parse_str(place.epoch).map(|e| e.to_string()) else {
+        return Ok(Err(malformed(format!(
+            "epoch `{}` is not a uuid",
+            place.epoch
+        ))));
     };
-    let last: Option<(String, i64)> =
-        sqlx::query_as("SELECT epoch, sequence FROM sync_applied WHERE id = 1")
+    let Some(previous) = i64::try_from(place.previous).ok().filter(|p| *p < sequence) else {
+        return Ok(Err(malformed(format!(
+            "message {sequence} follows {}, which is not before it",
+            place.previous
+        ))));
+    };
+    if previous == 0 && place.snapshot.is_empty() {
+        return Ok(Err(malformed(
+            "a message that follows nothing and begins no snapshot".to_owned(),
+        )));
+    }
+    let last: Option<(String, i64, Option<String>)> =
+        sqlx::query_as("SELECT epoch, sequence, snapshot_id FROM sync_applied WHERE id = 1")
             .fetch_optional(&mut *conn)
             .await?;
     if last
         .as_ref()
-        .is_some_and(|(e, s)| *e == epoch && sequence <= *s)
+        .is_some_and(|(e, s, _)| *e == epoch && sequence <= *s)
     {
         tracing::info!(
             sequence,
             "sync: a message at or below the last applied — nothing to do"
         );
+        sqlx::query("UPDATE sync_applied SET acknowledged = 0 WHERE id = 1")
+            .execute(&mut *conn)
+            .await?;
         return Ok(Err(Received::AlreadyApplied));
     }
-    if last.is_some_and(|(e, _)| e != epoch) {
-        for forgotten in [
-            "DELETE FROM sync_backlog",
-            "DELETE FROM sync_snapshots",
-            "DELETE FROM sync_snapshot_keys",
-            "UPDATE sync_rejections SET reported_at = NULL, sequence = 0",
-        ] {
-            sqlx::query(forgotten).execute(&mut *conn).await?;
+    if previous == 0 {
+        if last.as_ref().is_some_and(|(e, _, _)| *e != epoch) {
+            // A server installed again, which knows nothing it was told.
+            sqlx::query("DELETE FROM sync_backlog")
+                .execute(&mut *conn)
+                .await?;
         }
+        sqlx::query("DELETE FROM sync_snapshot_keys")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "INSERT INTO sync_applied (id, epoch, sequence, snapshot_id, snapshot_began) \
+             VALUES (1, $1, $2, $3, $2) \
+             ON CONFLICT (id) DO UPDATE SET epoch = EXCLUDED.epoch, sequence = EXCLUDED.sequence, \
+               snapshot_id = EXCLUDED.snapshot_id, snapshot_began = EXCLUDED.snapshot_began, \
+               gap = 0, gap_told = 0, \
+               acknowledged = CASE WHEN sync_applied.epoch = EXCLUDED.epoch \
+                                   THEN sync_applied.acknowledged ELSE 0 END",
+        )
+        .bind(&epoch)
+        .bind(sequence)
+        .bind(place.snapshot)
+        .execute(&mut *conn)
+        .await?;
+        return Ok(Ok(sequence));
     }
-    sqlx::query(
-        "INSERT INTO sync_applied (id, epoch, sequence) VALUES (1, $1, $2) \
-         ON CONFLICT (id) DO UPDATE SET epoch = EXCLUDED.epoch, sequence = EXCLUDED.sequence, \
-           acknowledged = CASE WHEN sync_applied.epoch = EXCLUDED.epoch THEN sync_applied.acknowledged ELSE 0 END",
-    )
-    .bind(epoch)
-    .bind(sequence)
-    .execute(&mut *conn)
-    .await?;
+    let Some((_, _, in_progress)) = last.filter(|(e, s, _)| *e == epoch && *s == previous) else {
+        tracing::warn!(
+            sequence,
+            previous,
+            "sync: a message that follows one this replica never applied — it missed one, \
+             and waits to be provisioned again"
+        );
+        sqlx::query(
+            "INSERT INTO sync_applied (id, epoch, sequence, gap) VALUES (1, '', 0, 1) \
+             ON CONFLICT (id) DO UPDATE SET gap = 1",
+        )
+        .execute(&mut *conn)
+        .await?;
+        return Ok(Err(Received::Gap));
+    };
+    let named = (!place.snapshot.is_empty() || place.ends).then_some(place.snapshot);
+    if named.is_some_and(|id| in_progress.as_deref() != Some(id)) {
+        return Ok(Err(malformed(format!(
+            "message {sequence} of a snapshot not in progress, `{}`",
+            place.snapshot
+        ))));
+    }
+    sqlx::query("UPDATE sync_applied SET sequence = $1 WHERE id = 1")
+        .bind(sequence)
+        .execute(&mut *conn)
+        .await?;
     Ok(Ok(sequence))
 }
 
@@ -572,11 +657,7 @@ async fn apply<P: Sync + 'static>(
     message: &Down,
     sequence: i64,
 ) -> Result<Vec<Applied>, Error> {
-    let naming = if message.snapshot_id.is_empty() {
-        false
-    } else {
-        names(conn, &message.snapshot_id, sequence).await?
-    };
+    let naming = !message.snapshot_id.is_empty();
     let mut taken = Vec::new();
     for table in &message.tables {
         if table.keys.len() != table.upserts.len() {
@@ -708,66 +789,10 @@ async fn cleared(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Er
     Ok(())
 }
 
-/// The state of the snapshot `id`: `None` when never seen, `Some(None)` while
-/// in progress, `Some(Some(sequence))` once it ended or was superseded.
-#[cfg(feature = "sqlite")]
-async fn snapshot(conn: &mut Conn, id: &str) -> Result<Option<Option<i64>>, Error> {
-    Ok(
-        sqlx::query_scalar("SELECT ended FROM sync_snapshots WHERE snapshot_id = $1")
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await?,
-    )
-}
-
-/// Begins the snapshot `id` with the message numbered `sequence`: the one in
-/// progress, if any, is superseded, and what it named forgotten.
-#[cfg(feature = "sqlite")]
-async fn begin(conn: &mut Conn, id: &str, sequence: i64) -> Result<(), Error> {
-    sqlx::query("UPDATE sync_snapshots SET ended = $1 WHERE ended IS NULL")
-        .bind(sequence)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("DELETE FROM sync_snapshot_keys")
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("INSERT INTO sync_snapshots (snapshot_id, began) VALUES ($1, $2)")
-        .bind(id)
-        .bind(sequence)
-        .execute(&mut *conn)
-        .await?;
-    // A handful of ended snapshots is all a late message can refer to.
-    sqlx::query(
-        "DELETE FROM sync_snapshots WHERE snapshot_id NOT IN \
-         (SELECT snapshot_id FROM sync_snapshots ORDER BY began DESC LIMIT 20)",
-    )
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
-/// Whether a message of the snapshot `id`, numbered `sequence`, names the
-/// rows it carries: it does in the snapshot in progress, and in one never
-/// seen, which it begins — whatever the snapshot id says, the message's
-/// sequence orders it. One that ended names nothing; its rows still apply.
-#[cfg(feature = "sqlite")]
-async fn names(conn: &mut Conn, id: &str, sequence: i64) -> Result<bool, Error> {
-    match snapshot(conn, id).await? {
-        Some(None) => Ok(true),
-        Some(Some(_)) => Ok(false),
-        None => {
-            begin(conn, id, sequence).await?;
-            Ok(true)
-        }
-    }
-}
-
-/// A snapshot is complete: every row of its tables it did not name goes,
-/// children first — the server lists them parents first. The end of one
-/// never seen begins and ends it: it named nothing, so every row of its
-/// tables goes. The end of one that ended or was superseded does nothing.
-/// What was rejected in those tables before it began is forgotten: it sent
-/// again what the replica should hold.
+/// The snapshot in progress is complete: every row of its tables it did not
+/// name goes, children first — the server lists them parents first. What
+/// was rejected in those tables before it began is forgotten: it sent again
+/// what the replica should hold.
 #[cfg(feature = "sqlite")]
 async fn end_snapshot<P: Sync + 'static>(
     conn: &mut Conn,
@@ -775,20 +800,7 @@ async fn end_snapshot<P: Sync + 'static>(
     message: &EndSnapshot,
     sequence: i64,
 ) -> Result<(), Error> {
-    let id = &message.snapshot_id;
-    match snapshot(conn, id).await? {
-        Some(Some(_)) => {
-            tracing::info!(
-                snapshot = id,
-                "sync: the end of a snapshot that ended — nothing to sweep"
-            );
-            return Ok(());
-        }
-        Some(None) => {}
-        None => begin(conn, id, sequence).await?,
-    }
-    let began: i64 = sqlx::query_scalar("SELECT began FROM sync_snapshots WHERE snapshot_id = $1")
-        .bind(id)
+    let began: i64 = sqlx::query_scalar("SELECT snapshot_began FROM sync_applied WHERE id = 1")
         .fetch_one(&mut *conn)
         .await?;
     for table in message.tables.iter().rev() {
@@ -829,9 +841,7 @@ async fn end_snapshot<P: Sync + 'static>(
     sqlx::query("DELETE FROM sync_snapshot_keys")
         .execute(&mut *conn)
         .await?;
-    sqlx::query("UPDATE sync_snapshots SET ended = $2 WHERE snapshot_id = $1")
-        .bind(id)
-        .bind(sequence)
+    sqlx::query("UPDATE sync_applied SET snapshot_id = NULL, snapshot_began = NULL WHERE id = 1")
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -1105,6 +1115,9 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     };
     let mut budget = settings.limits.largest_row();
     let mut rejected = Vec::new();
+    let mut untold_gap = false;
+    // Whether the last applied is news to the server.
+    let mut news = false;
     if main {
         // Room for the backlog, whatever it says by the end: per table its
         // name and three numbers of ten bytes at most.
@@ -1139,14 +1152,23 @@ pub(crate) async fn outbox<P: Sync + 'static>(
             rejected.push((row.table.clone(), key, sequence));
             up.rejected.push(row);
         }
-        let applied: Option<(String, i64, i64)> =
-            sqlx::query_as("SELECT epoch, sequence, acknowledged FROM sync_applied WHERE id = 1")
-                .fetch_optional(&mut *conn)
-                .await?;
-        if let (Some((epoch, sequence, acknowledged)), true) = (applied, all_reported) {
+        let applied: Option<(String, i64, i64, bool, bool)> = sqlx::query_as(
+            "SELECT epoch, sequence, acknowledged, gap = 1, gap_told = 1 FROM sync_applied \
+              WHERE id = 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some((_, _, _, true, told)) = &applied {
+            up.gap = true;
+            untold_gap = !*told;
+            budget = budget.saturating_sub(2);
+        }
+        if let (Some((epoch, sequence, acknowledged, gap, _)), true) = (applied, all_reported) {
             // The last applied goes with digests always (they are compared
+            // against it), with a gap (the server reads what it missed
             // against it), and otherwise when the server has not heard of it.
-            if sequence > acknowledged || !up.digests.is_empty() {
+            news = sequence > acknowledged;
+            if news || !up.digests.is_empty() || gap {
                 up.epoch = epoch;
                 up.sequence = u64::try_from(sequence).unwrap_or_default();
                 budget = budget.saturating_sub(framed(up.epoch.len()) + 11);
@@ -1167,7 +1189,8 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     let sending = !up.tables.is_empty()
         || !up.rejected.is_empty()
         || !up.digests.is_empty()
-        || up.sequence > 0;
+        || news
+        || untold_gap;
     if main {
         let now = progress(conn).await?;
         up.backlog = backlog_due(conn, now, settings, sending).await?;
@@ -1455,6 +1478,11 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
         .bind(chrono::Utc::now().timestamp())
         .execute(&mut *conn)
         .await?;
+    }
+    if outgoing.up.gap {
+        sqlx::query("UPDATE sync_applied SET gap_told = 1 WHERE id = 1 AND gap = 1")
+            .execute(&mut *conn)
+            .await?;
     }
     if outgoing.up.sequence > 0 {
         sqlx::query(

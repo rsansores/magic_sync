@@ -150,7 +150,9 @@ struct Writer<'d> {
     ready: Vec<Ready>,
     /// Rows the ready messages carry.
     rows: usize,
-    /// Per replica, the last message written.
+    /// Per replica, the last message written: what the next one follows.
+    /// A replica provisioned is absent until its snapshot's first message,
+    /// which follows nothing.
     last: BTreeMap<Uuid, i64>,
     /// Per replica provisioned, its snapshot's first message.
     began: BTreeMap<Uuid, i64>,
@@ -180,12 +182,31 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
             .fetch_one(&mut *conn)
             .await?;
+        // A message follows the last one its replica was sent in this epoch;
+        // a replica sent none since it was last provisioned can only begin
+        // with a snapshot.
+        let chains: BTreeMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT replica_id, last_sequence FROM sync.chains \
+              WHERE replica_id = ANY($1) AND last_sequence IS NOT NULL",
+        )
+        .bind(Engine::replicas(&delta).into_iter().collect::<Vec<_>>())
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect();
+        let unchained: Vec<Uuid> = Engine::replicas(&delta)
+            .into_iter()
+            .filter(|r| !delta.snapshots.contains(r) && !chains.contains_key(r))
+            .collect();
+        if !unchained.is_empty() {
+            delta = self.engine.provision(conn, delta, &unchained).await?;
+        }
         let replicas: Vec<Uuid> = Engine::replicas(&delta).into_iter().collect();
         // A provisioning stands for every other one pending for its replica.
         let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
         let covered: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL \
-               AND replica_id = ANY($1)",
+               AND parked_at IS NULL AND replica_id = ANY($1)",
         )
         .bind(&snapshots)
         .fetch_all(&mut *conn)
@@ -194,7 +215,9 @@ impl<P: Sync + 'static> Relay<'_, P> {
             sqlx::query("SAVEPOINT sync_write")
                 .execute(&mut *conn)
                 .await?;
-            let written = self.write(conn, &delta, &epoch.to_string()).await?;
+            let written = self
+                .write(conn, &delta, &epoch.to_string(), &chains)
+                .await?;
             let end = match written {
                 Ok(_) => "RELEASE SAVEPOINT sync_write",
                 Err(_) => "ROLLBACK TO SAVEPOINT sync_write",
@@ -312,6 +335,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
         conn: &mut Conn,
         delta: &Delta,
         epoch: &str,
+        chains: &BTreeMap<Uuid, i64>,
     ) -> Result<Result<(usize, usize, usize), BTreeMap<(Uuid, usize, String), String>>, Error> {
         let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
         if !snapshots.is_empty() {
@@ -343,7 +367,11 @@ impl<P: Sync + 'static> Relay<'_, P> {
             snapshots: ids.clone(),
             ready: Vec::new(),
             rows: 0,
-            last: BTreeMap::new(),
+            last: chains
+                .iter()
+                .filter(|(r, _)| !delta.snapshots.contains(r))
+                .map(|(r, s)| (*r, *s))
+                .collect(),
             began: BTreeMap::new(),
             written: 0,
             upserts: 0,
@@ -683,8 +711,7 @@ impl Writer<'_> {
                     Body::EndSnapshot(EndSnapshot {
                         snapshot_id,
                         tables: tables.iter().map(|t| (*t).to_owned()).collect(),
-                        sequence: 0,
-                        epoch: String::new(),
+                        ..EndSnapshot::default()
                     }),
                 );
             }
@@ -714,9 +741,14 @@ impl Writer<'_> {
         for (Ready { replica, mut body }, sequence) in ready.into_iter().zip(drawn) {
             let number = u64::try_from(sequence)
                 .map_err(|_| Error::Misuse(format!("sync.messages drew {sequence}")))?;
+            let previous = self
+                .last
+                .get(&replica)
+                .map_or(0, |s| u64::try_from(*s).unwrap_or_default());
             match &mut body {
                 Body::Down(down) => {
-                    (down.sequence, down.epoch) = (number, self.epoch.clone());
+                    (down.sequence, down.epoch, down.previous) =
+                        (number, self.epoch.clone(), previous);
                     for table in &down.tables {
                         for key in &table.keys {
                             held.0.push(replica);
@@ -735,7 +767,8 @@ impl Writer<'_> {
                     }
                 }
                 Body::EndSnapshot(end) => {
-                    (end.sequence, end.epoch) = (number, self.epoch.clone());
+                    (end.sequence, end.epoch, end.previous) =
+                        (number, self.epoch.clone(), previous);
                     self.began.entry(replica).or_insert(sequence);
                 }
                 Body::Filed(_) => {}

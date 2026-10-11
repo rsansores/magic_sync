@@ -49,6 +49,10 @@ message Down {
   uint64 sequence = 3;
   // The server installation the sequence is from, a uuid.
   string epoch = 4;
+  // The sequence of the message sent this replica before this one, in this
+  // epoch: a replica that did not apply that one missed it. 0 only on the
+  // message that begins a snapshot, which follows nothing.
+  uint64 previous = 5;
 }
 
 // Server to replica: a snapshot is complete. Every row of `tables` the
@@ -61,6 +65,8 @@ message EndSnapshot {
   uint64 sequence = 3;
   // As Down's.
   string epoch = 4;
+  // As Down's: 0 when it ends a snapshot of nothing, which it begins.
+  uint64 previous = 5;
 }
 
 // Server to replica: these uploads are filed, or kept to be filed once they
@@ -92,6 +98,10 @@ message Up {
   // What the replica wrote that the server has not filed, when it says: on
   // the first lane, when it changed. Absent: it did not say this time.
   Backlog backlog = 9;
+  // It missed a message: one arrived whose `previous` is not the last it
+  // applied. Said, with epoch and sequence, until a snapshot begins; the
+  // server answers with one.
+  bool gap = 10;
 }
 
 // What a replica wrote that the server has not filed yet.

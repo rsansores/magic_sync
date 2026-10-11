@@ -17,6 +17,7 @@ use crate::model::{Faults, Model, Row, Rules, Wire};
 use crate::testkit::Walk;
 use chrono::{DateTime, Utc};
 use sqlx::Connection as _;
+use std::time::Duration;
 
 pub(super) const SCHEMA: &str = "
 CREATE SCHEMA fixture;
@@ -393,6 +394,8 @@ struct World {
     wire: Wire,
     replicas: BTreeMap<Uuid, Model>,
     history: Vec<String>,
+    /// Messages the transport lost.
+    lost: i64,
 }
 
 /// Two partitions: three replicas for the first — the last not live — and
@@ -435,6 +438,7 @@ async fn world(pool: crate::DbPool) -> World {
         wire: Wire::new(0x5EED),
         replicas: BTreeMap::new(),
         history: Vec::new(),
+        lost: 0,
     }
 }
 
@@ -511,6 +515,13 @@ impl World {
                 let Some(bytes) = self.wire.next(replica) else {
                     break;
                 };
+                if storm.as_deref_mut().is_some_and(|w| w.below(60) == 0) {
+                    // Lost on the way, against the transport's contract: the
+                    // replica sees a gap, and says so.
+                    self.wire.acknowledge(replica);
+                    self.lost += 1;
+                    continue;
+                }
                 model.receive(&bytes, &RULES);
                 moved = true;
                 let orphans = model.orphans(&RULES);
@@ -556,7 +567,16 @@ impl World {
     async fn settle(&mut self) {
         let faults = std::mem::take(&mut *self.wire.faults.lock().unwrap());
         for _ in 0..200 {
-            if !self.round(None).await {
+            if self.round(None).await {
+                continue;
+            }
+            // A message lost on the way, against the transport's contract,
+            // leaves a replica waiting; the engine's net for it is to
+            // provision a replica silent on what it was sent, after a while.
+            let healed = crate::relay::heal(&mut self.conn, &self.engine, Duration::ZERO)
+                .await
+                .expect("healed");
+            if healed == 0 {
                 *self.wire.faults.lock().unwrap() = faults;
                 let replicas: Vec<Uuid> = self.replicas.keys().copied().collect();
                 for replica in replicas {
@@ -983,8 +1003,9 @@ async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(poo
         walk_from(&mut world, *seed, Some(faults)).await;
         let (failed, refused) = *world.wire.failed.lock().unwrap();
         assert!(
-            failed > 0 && refused > 0,
-            "seed {seed:#x}: the storm was none"
+            failed > 0 && refused > 0 && world.lost > 0,
+            "seed {seed:#x}: the storm was none: {failed} failed, {refused} refused, {} lost",
+            world.lost
         );
     }
 }
@@ -1025,6 +1046,7 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
     let mut storm = Walk(seed ^ 0xFFFF);
     world.history.clear();
     let before = resyncs(&mut world.conn).await;
+    let lost = world.lost;
     let mut asked = 0;
     for n in 0..400 {
         let last = n == 399;
@@ -1047,10 +1069,16 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
                 world.retry_quarantine().await;
             }
         }
-        if faults.is_some() && walk.below(2) == 0 {
+        if faults.is_some() {
             world.round(Some(&mut storm)).await;
         }
-        if walk.below(3) == 0 || last {
+        // Settled now and then — rarely in a storm, so faults pile up.
+        let settles = if faults.is_some() {
+            n % 25 == 24
+        } else {
+            walk.below(3) == 0
+        };
+        if settles || last {
             if last {
                 *world.wire.faults.lock().unwrap() = Faults::default();
                 for table in ["t_kinds", "t_sizes"] {
@@ -1078,11 +1106,13 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
         "seed {seed:#x}: still set aside after the fix"
     );
     let resynced = resyncs(&mut world.conn).await - before;
-    // A replica the transport refuses again and again, or whose outbox
-    // outgrows its bound, is provisioned again: rare, never the rule.
+    let lost = world.lost - lost;
+    // A replica that missed a message, that the transport refuses again and
+    // again, or whose outbox outgrows its bound, is provisioned again: rare,
+    // never the rule.
     assert!(
-        resynced <= asked * 2 + 3,
-        "seed {seed:#x}: {resynced} provisionings for {asked} asked for"
+        resynced <= asked * 2 + lost + 3,
+        "seed {seed:#x}: {resynced} provisionings for {asked} asked for and {lost} messages lost"
     );
 }
 

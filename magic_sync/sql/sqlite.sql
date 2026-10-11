@@ -15,16 +15,6 @@ CREATE TABLE sync_applying (
     id INTEGER PRIMARY KEY CHECK (id = 1)
 );
 
--- The snapshots the server provisioned this replica with, by the sequence of
--- the message that began each: the one not ended is in progress, and a
--- snapshot not seen before supersedes it. The latest few are kept, so a
--- message of one that ended names nothing.
-CREATE TABLE sync_snapshots (
-    snapshot_id TEXT    PRIMARY KEY NOT NULL,
-    began       INTEGER NOT NULL,
-    ended       INTEGER
-);
-
 -- The rows the snapshot in progress has named, per table: at its end every
 -- row of those tables it did not name goes. Emptied when a snapshot begins.
 CREATE TABLE sync_snapshot_keys (
@@ -35,14 +25,22 @@ CREATE TABLE sync_snapshot_keys (
 
 -- The last message this replica applied, from which server: one at or below
 -- it is a redelivery, or comes from a relay that lost its lock, and changes
--- nothing. A server whose schema was installed again starts a new epoch. The
+-- nothing; the next names it as the one it follows, or the replica missed
+-- one (`gap`) and applies nothing more until a snapshot begins. A server
+-- whose schema was installed again starts a new epoch, with a snapshot. The
 -- server counts a row as held only once it has been told it was applied.
 CREATE TABLE sync_applied (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     epoch        TEXT    NOT NULL,
     sequence     INTEGER NOT NULL,
     -- The last one the server of this epoch has been told of.
-    acknowledged INTEGER NOT NULL DEFAULT 0
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    -- The snapshot in progress, and the message that began it.
+    snapshot_id    TEXT,
+    snapshot_began INTEGER,
+    -- 1 while it missed a message; `gap_told` once the server was told.
+    gap          INTEGER NOT NULL DEFAULT 0,
+    gap_told     INTEGER NOT NULL DEFAULT 0
 );
 
 -- What this replica last told the server it wrote and the server has not

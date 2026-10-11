@@ -175,6 +175,7 @@ impl Packer {
             tables: std::mem::take(&mut self.tables),
             sequence: 0,
             epoch: String::new(),
+            previous: 0,
         })
     }
 }

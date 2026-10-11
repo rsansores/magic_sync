@@ -27,7 +27,9 @@ async fn pool(pool: SqlitePool) -> SqlitePool {
     pool
 }
 
-fn rows(sequence: u64, name: &str) -> Vec<u8> {
+/// Message `sequence`, following `previous` — or, after none, beginning a
+/// snapshot.
+fn rows(sequence: u64, previous: u64, name: &str) -> Vec<u8> {
     let id = Uuid::now_v7();
     Body::Down(Down {
         tables: vec![Table {
@@ -44,8 +46,13 @@ fn rows(sequence: u64, name: &str) -> Vec<u8> {
             ..Table::default()
         }],
         sequence,
+        previous,
+        snapshot_id: if previous == 0 {
+            "s".to_owned()
+        } else {
+            String::new()
+        },
         epoch: Uuid::nil().to_string(),
-        ..Down::default()
     })
     .encoded()
 }
@@ -95,7 +102,7 @@ async fn what_the_replica_applied_reaches_the_server_even_through_an_outage(pool
         .await
         .unwrap();
 
-    let received = replica.receive(&rows(4, "four")).await.unwrap();
+    let received = replica.receive(&rows(4, 0, "four")).await.unwrap();
     assert!(matches!(received, Received::Applied(_)));
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM items")
         .fetch_all(&pool)
@@ -104,7 +111,7 @@ async fn what_the_replica_applied_reaches_the_server_even_through_an_outage(pool
     assert_eq!(names, ["four"], "committed before it returns");
 
     *uplink.refusing.lock().unwrap() = Some(true);
-    replica.receive(&rows(5, "five")).await.unwrap();
+    replica.receive(&rows(5, 4, "five")).await.unwrap();
     let outage = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         *uplink.refusing.lock().unwrap() = None;
@@ -132,7 +139,7 @@ async fn nothing_goes_up_until_the_replica_knows_who_it_is(pool_: SqlitePool) {
     let replica = Replica::new(pool, codecs(), Nobody, uplink.clone(), settings())
         .await
         .unwrap();
-    replica.receive(&rows(1, "one")).await.unwrap();
+    replica.receive(&rows(1, 0, "one")).await.unwrap();
     assert!(!replica.send_lane(0, true).await.unwrap());
     assert!(uplink.sent.lock().unwrap().is_empty());
 }

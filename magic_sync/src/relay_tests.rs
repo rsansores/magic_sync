@@ -107,6 +107,8 @@ struct World {
     codecs: Vec<Codec<()>>,
     replicas: [Uuid; 2],
     partition: Uuid,
+    /// Each replica as its provisioning left it.
+    provisioned: BTreeMap<Uuid, Model>,
 }
 
 async fn world(pool: crate::DbPool) -> World {
@@ -132,13 +134,36 @@ async fn world(pool: crate::DbPool) -> World {
         .await
         .expect("the engine");
     tx.commit().await.expect("installed");
-    World {
+    let mut world = World {
         pool,
         engine,
         codecs: vec![Codec::new::<Item, ItemRow>(to_wire, from_wire, None)],
         replicas,
         partition,
+        provisioned: BTreeMap::new(),
+    };
+    // Each replica provisioned, of nothing yet: what follows is chained to it.
+    for replica in replicas {
+        sqlx::query("INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', $1)")
+            .bind(replica)
+            .execute(&world.pool)
+            .await
+            .expect("provisioned");
     }
+    let wire = Wire::new(0);
+    world.pass(&wire).await;
+    for replica in replicas {
+        let mut model = Model::default();
+        while let Some(bytes) = wire.next(replica) {
+            model.receive(&bytes, &Rules::ANY);
+            wire.acknowledge(replica);
+        }
+        world.provisioned.insert(replica, model);
+        world
+            .acknowledge(replica, world.last_sent(replica).await)
+            .await;
+    }
+    world
 }
 
 impl World {
@@ -544,7 +569,7 @@ async fn a_message_the_transport_refuses_for_good_leaves_its_replica_owed_everyt
         .filter(|(r, _)| *r == a)
         .map(|(_, m)| m)
         .collect();
-    let mut model = Model::default();
+    let mut model = world.follower(a);
     model.rows.insert(
         ("items".to_owned(), gone.to_string()),
         ItemRow {
@@ -766,7 +791,7 @@ async fn a_replica_away_long_is_owed_one_provisioning_not_every_change(pool: cra
         .await
         .unwrap();
     world.pass_relay(&relay, &wire).await;
-    let mut model = Model::default();
+    let mut model = world.follower(a);
     for (_, message) in wire.sent.lock().unwrap().drain(..).filter(|(r, _)| *r == a) {
         let bytes = envelope::ToReplica {
             protocol: envelope::PROTOCOL,
@@ -787,6 +812,11 @@ async fn a_replica_silent_on_what_it_was_sent_is_provisioned_again(pool: crate::
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
+    // Its provisioning is long past.
+    sqlx::query("UPDATE sync.notes SET noted_at = now() - interval '1 day'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
     world.item("lost").await;
     world.pass(&wire).await;
     wire.delivered();
@@ -823,7 +853,8 @@ async fn a_replica_silent_on_what_it_was_sent_is_provisioned_again(pool: crate::
     // Lost again: the next one waits twice as long.
     silent_for(90).await.unwrap();
     sqlx::query(
-        "UPDATE sync.notes SET noted_at = now() - interval '80 seconds' WHERE kind = 'resync'",
+        "UPDATE sync.notes SET noted_at = now() - interval '80 seconds' \
+          WHERE kind = 'resync' AND noted_at > now() - interval '1 hour'",
     )
     .execute(&world.pool)
     .await
@@ -895,16 +926,24 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
     assert_eq!(world.held(a).await, 1);
 }
 
-/// An acknowledgement past every message the server records sending is not
-/// believed, nor one no message could have, nor one of another epoch.
+/// An acknowledgement past every message the server records sending a
+/// replica is not believed, nor one no message could have, nor one of another
+/// epoch.
 #[sqlx::test(migrations = false)]
 async fn an_acknowledgement_of_more_than_was_sent_changes_nothing(pool: crate::DbPool) {
     let world = world(pool).await;
-    let [a, _] = world.replicas;
+    let [a, b] = world.replicas;
     let wire = Fake::default();
     world.item("one").await;
     world.pass(&wire).await;
     let last = world.last_sent(a).await;
+    // Numbers past it drawn for another replica.
+    sqlx::query("INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', $1)")
+        .bind(b)
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass(&wire).await;
     let applied = || async {
         sqlx::query_scalar::<_, Option<i64>>(
             "SELECT applied_sequence FROM sync.replicas WHERE replica_id = $1",
@@ -914,9 +953,10 @@ async fn an_acknowledgement_of_more_than_was_sent_changes_nothing(pool: crate::D
         .await
         .unwrap()
     };
-    for sequence in [last + 1, u64::MAX, i64::MAX as u64 + 1] {
+    let before = applied().await;
+    for sequence in [world.last_sent(b).await, u64::MAX, i64::MAX as u64 + 1] {
         world.acknowledge(a, sequence).await;
-        assert_eq!(applied().await, None, "{sequence}");
+        assert_eq!(applied().await, before, "{sequence}");
     }
     world.acknowledge(a, last).await;
     assert_eq!(applied().await, Some(last as i64));
@@ -1135,7 +1175,7 @@ async fn a_pass_recorded_and_never_sent_is_sent_by_the_next_relay(pool: crate::D
     for replica in [a, b] {
         let ids = wire.ids(replica);
         assert_eq!(ids.len(), 1, "sent once");
-        let mut model = Model::default();
+        let mut model = world.follower(replica);
         model.receive(&wire.next(replica).unwrap(), &Rules::ANY);
         assert_eq!(items_of(&model), names(&["once"]));
     }
@@ -1167,7 +1207,7 @@ async fn a_relay_that_loses_its_lock_mid_pass_sends_and_records_nothing(pool: cr
     );
 
     world.pass_relay(&relay, &wire).await;
-    let mut model = Model::default();
+    let mut model = world.follower(a);
     model.receive(&wire.next(a).unwrap(), &Rules::ANY);
     assert_eq!(items_of(&model), names(&["kept"]));
     assert_eq!(world.held(a).await, 1);
@@ -1234,7 +1274,7 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
         .unwrap();
     world.pass_relay(&relay, &wire).await;
 
-    let mut model = Model::default();
+    let mut model = world.follower(a);
     while let Some(bytes) = wire.wire.next(a) {
         model.receive(&bytes, &Rules::ANY);
         wire.wire.acknowledge(a);
@@ -1250,6 +1290,12 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
 }
 
 impl World {
+    /// A model of `replica` as it stands once provisioned, with nothing:
+    /// what each test's replica starts as.
+    fn follower(&self, replica: Uuid) -> Model {
+        self.provisioned[&replica].clone()
+    }
+
     /// The last message sent to `replica`.
     async fn last_sent(&self, replica: Uuid) -> u64 {
         sqlx::query_scalar::<_, i64>("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
@@ -1437,6 +1483,158 @@ async fn a_row_set_aside_and_owed_to_no_one_leaves_while_its_namesake_stays(pool
 
     assert_eq!(set_aside("items").await, 0, "owed to no one");
     assert_eq!(set_aside("tags").await, 2, "still failing");
+}
+
+impl World {
+    /// Passes, each followed by every replica taking what reached it and
+    /// saying what it applied, until nothing moves.
+    async fn settle(&self, wire: &Wire, models: &mut BTreeMap<Uuid, Model>) {
+        sqlx::query("UPDATE sync.replicas SET retry_after = NULL")
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            let passed = self.pass(wire).await;
+            let mut moved = passed.done + passed.sent > 0;
+            for (replica, model) in models.iter_mut() {
+                while let Some(bytes) = wire.next(*replica) {
+                    model.receive(&bytes, &Rules::ANY);
+                    wire.acknowledge(*replica);
+                    moved = true;
+                }
+                if let Some(up) = model.up() {
+                    let mut conn = self.pool.acquire().await.unwrap();
+                    crate::filing::file(&mut conn, &self.codecs, &up, *replica, &())
+                        .await
+                        .unwrap();
+                    model.delivered(&up);
+                    moved = true;
+                }
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("did not settle");
+    }
+
+    /// The modelled replicas, each as its provisioning left it.
+    fn models(&self) -> BTreeMap<Uuid, Model> {
+        self.replicas
+            .iter()
+            .map(|r| (*r, self.follower(*r)))
+            .collect()
+    }
+
+    /// Each replica holds what the engine records, and what it should.
+    async fn assert_converged(&self, models: &BTreeMap<Uuid, Model>) {
+        let should: BTreeSet<String> =
+            sqlx::query_scalar("SELECT name FROM fixture.items WHERE retired_at IS NULL")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        for (replica, model) in models {
+            assert_eq!(
+                items_of(model),
+                should,
+                "{replica} holds other than it should"
+            );
+            let recorded: BTreeSet<String> =
+                sqlx::query_scalar("SELECT row_key FROM sync.held WHERE replica_id = $1")
+                    .bind(replica)
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+            let held: BTreeSet<String> = model.rows.keys().map(|(_, k)| k.clone()).collect();
+            assert_eq!(
+                recorded, held,
+                "{replica} is recorded holding other than it holds"
+            );
+        }
+    }
+}
+
+/// A server database restored from a copy older than what its replicas
+/// applied numbers its messages again from where the copy left off: a
+/// replica drops them as applied already, and says what it applied, which
+/// is past every number the server remembers drawing. The server takes a
+/// new epoch and provisions every replica again, and each ends holding
+/// what the restored server has.
+#[sqlx::test(migrations = false)]
+async fn a_server_restored_from_an_older_copy_provisions_its_replicas_again(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let wire = Wire::new(7);
+    let mut models = world.models();
+    world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let mut conn = world.pool.acquire().await.unwrap();
+    crate::testkit::back_up(&mut conn, &["fixture", "sync"]).await;
+    let before: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    for n in 0..5 {
+        world.item(&format!("lost {n}")).await;
+        world.settle(&wire, &mut models).await;
+    }
+    crate::testkit::restore(&mut conn, &["fixture", "sync"]).await;
+    world.item("after").await;
+    world.settle(&wire, &mut models).await;
+
+    let after: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_ne!(before, after, "a new epoch");
+    world.assert_converged(&models).await;
+    assert_eq!(
+        items_of(&models[&world.replicas[0]]),
+        names(&["one", "after"])
+    );
+}
+
+/// A replica restored from a copy older than what it applied misses the
+/// messages since: the next one follows one it never applied, so it says it
+/// has a gap, is provisioned again, and ends holding what it should.
+#[sqlx::test(migrations = false)]
+async fn a_replica_restored_from_an_older_copy_is_provisioned_again(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(8);
+    let mut models = world.models();
+    world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let copy = models[&a].clone();
+    world.item("two").await;
+    world.settle(&wire, &mut models).await;
+    models.insert(a, copy);
+    world.item("three").await;
+    world.settle(&wire, &mut models).await;
+
+    assert!(!models[&a].gap);
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["one", "two", "three"]));
+}
+
+/// A message the transport lost is a gap the replica says, and is answered
+/// by a provisioning: what the lost message carried arrives.
+#[sqlx::test(migrations = false)]
+async fn a_message_lost_on_the_way_is_found_by_the_next(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(9);
+    let mut models = world.models();
+    world.item("lost").await;
+    world.pass(&wire).await;
+    wire.acknowledge(a);
+    world.item("next").await;
+    world.settle(&wire, &mut models).await;
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["lost", "next"]));
 }
 
 #[path = "status_tests.rs"]

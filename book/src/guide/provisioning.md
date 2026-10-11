@@ -24,11 +24,15 @@ function.
 > held, and sends everything its rules say it should hold, numbered as one
 > *snapshot*, followed by an end marker. On the end marker, the replica deletes
 > (or retires) every row of those tables the snapshot did not name. A newer
-> snapshot supersedes one still in progress.
+> snapshot supersedes one still in progress, and what the replica was owed
+> before it is dropped: the snapshot carries it.
 >
 > You rarely need it to repair anything. The server provisions a replica
-> again by itself when what it holds may be wrong: when, every hour, the fingerprint it
-> reports of what it holds does not match what the server recorded, and when
+> again by itself when what it holds may be wrong: when it says it missed a
+> message (each names the one before it), or applied one this server never
+> numbered — its database restored from an older copy, which provisions
+> every replica again; when, every hour, the fingerprint it
+> reports of what it holds does not match what the server recorded; and when
 > it leaves the last messages it was sent unconfirmed for long
 > (`Settings::unconfirmed_after`) while nothing newer goes to it — the
 > transport may have lost them.

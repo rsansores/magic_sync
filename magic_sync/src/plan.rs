@@ -2103,6 +2103,25 @@ impl Engine {
         self.plan_around(conn, again).await
     }
 
+    /// `delta` planned again, in the same snapshot, with `replicas`
+    /// provisioned from scratch besides.
+    pub(crate) async fn provision(
+        &self,
+        conn: &mut Conn,
+        delta: Delta,
+        replicas: &[Uuid],
+    ) -> Result<Delta, Error> {
+        let mut changes = delta.changes;
+        changes.extend(replicas.iter().map(|r| Change::Resync { replica: *r }));
+        let again = Delta {
+            changes,
+            blocked: delta.blocked,
+            left_out: delta.left_out,
+            ..Delta::default()
+        };
+        self.plan_around(conn, again).await
+    }
+
     /// The rows the delta could not send, each per replica it was to go to.
     pub(crate) fn unsent(&self, delta: &Delta) -> Vec<Unsent> {
         delta

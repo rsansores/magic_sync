@@ -190,8 +190,12 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let received = replica::receive(&mut tx, &self.codecs, bytes).await?;
         tx.commit().await?;
-        if matches!(received, Received::Applied(_) | Received::SnapshotEnded) {
-            // The server counts nothing as held until it hears of it.
+        if matches!(
+            received,
+            Received::Applied(_) | Received::SnapshotEnded | Received::Gap
+        ) {
+            // The server counts nothing as held until it hears of it, and
+            // provisions a replica that missed a message once it hears.
             self.wake.notify_one();
         }
         Ok(received)

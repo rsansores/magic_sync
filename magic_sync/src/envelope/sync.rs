@@ -62,6 +62,11 @@ pub struct Down {
     /// The server installation the sequence is from, a uuid.
     #[prost(string, tag = "4")]
     pub epoch: ::prost::alloc::string::String,
+    /// The sequence of the message sent this replica before this one, in this
+    /// epoch: a replica that did not apply that one missed it. 0 only on the
+    /// message that begins a snapshot, which follows nothing.
+    #[prost(uint64, tag = "5")]
+    pub previous: u64,
 }
 /// Server to replica: a snapshot is complete. Every row of `tables` the
 /// replica holds and the snapshot did not name goes, children first: in
@@ -78,6 +83,9 @@ pub struct EndSnapshot {
     /// As Down's.
     #[prost(string, tag = "4")]
     pub epoch: ::prost::alloc::string::String,
+    /// As Down's: 0 when it ends a snapshot of nothing, which it begins.
+    #[prost(uint64, tag = "5")]
+    pub previous: u64,
 }
 /// Server to replica: these uploads are filed, or kept to be filed once they
 /// can be. The notes they carried are done.
@@ -116,6 +124,11 @@ pub struct Up {
     /// the first lane, when it changed. Absent: it did not say this time.
     #[prost(message, optional, tag = "9")]
     pub backlog: ::core::option::Option<Backlog>,
+    /// It missed a message: one arrived whose `previous` is not the last it
+    /// applied. Said, with epoch and sequence, until a snapshot begins; the
+    /// server answers with one.
+    #[prost(bool, tag = "10")]
+    pub gap: bool,
 }
 /// What a replica wrote that the server has not filed yet.
 #[derive(Clone, PartialEq, ::prost::Message)]

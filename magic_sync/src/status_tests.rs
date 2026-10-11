@@ -154,7 +154,13 @@ async fn a_replica_called_synced_holds_exactly_what_it_should(pool: crate::DbPoo
     let world = world(pool).await;
     let chaos = Mailbox {
         wire: crate::model::Wire::new(0x5EED),
-        replicas: Mutex::new(BTreeMap::new()),
+        replicas: Mutex::new(
+            world
+                .replicas
+                .iter()
+                .map(|r| (*r, world.follower(*r)))
+                .collect(),
+        ),
     };
     chaos.failing(20);
     let mut walk = crate::testkit::Walk(0xACC0);
@@ -315,7 +321,7 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
             (ReplicaState::CatchingUp, 0, true),
             "sent is not held"
         );
-        assert!(replica.sent_at.is_some() && replica.applied_at.is_none());
+        assert!(replica.sent_at.is_some());
     }
     assert_eq!((sent.tables[0].in_flight, sent.tables[0].replicas), (4, 2));
 
@@ -969,8 +975,8 @@ async fn a_backlog_that_does_not_read_fails_the_read(pool: crate::DbPool) {
     let world = world(pool).await;
     let [a, _] = world.replicas;
     sqlx::query(
-        "INSERT INTO sync.replicas (replica_id, backlog, backlog_at) \
-         VALUES ($1, '{\"not\": \"a backlog\"}', now())",
+        "UPDATE sync.replicas SET backlog = '{\"not\": \"a backlog\"}', backlog_at = now() \
+          WHERE replica_id = $1",
     )
     .bind(a)
     .execute(&world.pool)
