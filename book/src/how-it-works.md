@@ -76,7 +76,7 @@ A table is declared once, as the Rust struct that is its row, implementing
 |---|---|---|
 | `Catalog` | the server | down to the replicas that should hold its rows |
 | `Record` | a replica | up to the server |
-| `Both` | both, column by column | the columns the replicas own (`Column::replica_owned`) go up; the rest go down |
+| `Both` | both, column by column | the columns the replicas own (`#[row(replica_owned)]`) go up; the rest go down |
 | `ServerOnly` | the server | nowhere |
 
 ### Which replicas hold which rows? (`sync`, for tables that go down)
@@ -98,18 +98,20 @@ catalogue, so this needs no declaration: the schema already says it.
 
 ### The rest of a declaration
 
-| `Row` constant | What it is for |
+| Declaration | What it is for |
 |---|---|
-| `TABLE`, `SCHEMA`, `KEY` | where the table lives and its primary key (one or more uuid or integer columns) |
-| `VERSION` | a column whose value only moves forward (an `updated_at`): a replica never overwrites a newer copy with an older one |
-| `CREATED` | a column written once, never by an update |
-| `RETIRED` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
-| `ORIGIN` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
-| `UNMIRRORED` | columns one side has that the row leaves out |
-| `ACTIVE` | a relation (a view) the rows replicas should hold are read through, leaving the others out; the table itself when there is none |
+| `table`, `schema`, `key` | where the table lives and its primary key (one or more uuid or integer columns) |
+| `#[row(version)]` | a column whose value only moves forward (an `updated_at`): a replica never overwrites a newer copy with an older one |
+| `#[row(created)]` | a column written once, never by an update |
+| `retired` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
+| `origin` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
+| `unmirrored` | columns one side has that the row leaves out |
+| `active` | a relation (a view) the rows replicas should hold are read through, leaving the others out; the table itself when there is none |
 
-`#[derive(Row)]` writes all of them from the struct and its attributes
-([The rows](guide/rows.md)); a host can implement the trait by hand too.
+`#[derive(Row)]` turns them into the row's implementation of [`row::Row`]
+([The rows](guide/rows.md)), and is the only way to implement it: what it
+writes is checked where it is written, and again against the database when
+either side starts.
 
 ### The codec
 
@@ -386,7 +388,8 @@ It never counts the rows a replica should hold: it reads only what the engine
 records, so it costs little for a fleet — a few milliseconds for 200 replicas
 holding 3 million rows, while they are caught up; the rows still on their way
 are counted one by one, about a fifth of a second when every replica has all
-of them unconfirmed — and it is exact all the same. A change a replica lacks is in one of three places — a note not
+of them unconfirmed (`bench_the_dashboard_over_200_units_holding_3m_rows`, on
+a 32-core workstation) — and it is exact all the same. A change a replica lacks is in one of three places — a note not
 yet planned, a message it has not confirmed, or set aside — and each is
 recorded. It counts every replica per state and lists the worst up to a
 limit; [`plan::Engine::listing`] pages through the rest. Per table, the same
@@ -446,12 +449,10 @@ They rest on:
 
 - **One relay at a time.** The server's runner holds a PostgreSQL advisory
   lock while it relays, and records each pass on that lock's connection.
-- **One message in flight per replica.** The transport delivers a replica's
-  messages in order and does not deliver the next one until the previous one
-  is acknowledged. With NATS JetStream, that is a durable pull consumer with
-  `max_ack_pending = 1`. Without this, a failed message could be retried after
-  the ones behind it. The way up is the same, per lane: a replica's uploads
-  reach the server in the order it sent them.
+- **A transport that keeps its contract**
+  ([the protocol, section 2](protocol.md#2-what-the-transport-must-provide)).
+  Without it, a failed message could be retried after the ones behind it, or
+  lost until the safety net of section 6 catches it.
 - **Transactions.** `prepare` and `file` run in a transaction (they use
   savepoints); `apply` runs in one so a message applies whole or not at all.
 - **A monotonic version column**, if tables have one: the server must stamp it
@@ -529,35 +530,34 @@ Run them with `cargo test -p magic_sync --features postgres` (PostgreSQL
 through `DATABASE_URL`; each test gets a database of its own) and
 `cargo test -p magic_sync --features sqlite`.
 
-[`row::Row`]: https://docs.rs/magic_sync/latest/magic_sync/row/trait.Row.html
-[`wire::Codec`]: https://docs.rs/magic_sync/latest/magic_sync/wire/struct.Codec.html
+[`row::Row`]: api/server/magic_sync/row/trait.Row.html
+[`wire::Codec`]: api/server/magic_sync/wire/struct.Codec.html
 [`envelope::Down`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
 [`envelope::EndSnapshot`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
 [`envelope::ToReplica`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
 [`envelope::Up`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
 [`replica::apply`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/replica.rs
 [`filing::file`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/filing.rs
-[`Error::is_transient`]: https://docs.rs/magic_sync/latest/magic_sync/enum.Error.html#method.is_transient
-[`plan::Engine::overview`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.overview
-[`plan::Engine::health`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.health
-[`plan::Engine::progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.progress
-[`plan::Engine::listing`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.listing
-[`plan::Engine::row_progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.row_progress
-[`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html#method.new
-[`plan::Replicas`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Replicas.html
-[`replica::progress`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.progress.html
-[`run::server::Transport`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Transport.html
-[`run::replica::Uplink`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/trait.Uplink.html
-[`run::server::Senders`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Senders.html
-[`run`]: https://docs.rs/magic_sync/latest/magic_sync/run/index.html
-[`row`]: https://docs.rs/magic_sync/latest/magic_sync/row/index.html
-[`wire`]: https://docs.rs/magic_sync/latest/magic_sync/wire/index.html
-[`envelope`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/index.html
-[`plan`]: https://docs.rs/magic_sync/latest/magic_sync/plan/index.html
+[`Error::is_transient`]: api/server/magic_sync/enum.Error.html#method.is_transient
+[`plan::Engine::overview`]: api/server/magic_sync/plan/struct.Engine.html#method.overview
+[`plan::Engine::health`]: api/server/magic_sync/plan/struct.Engine.html#method.health
+[`plan::Engine::progress`]: api/server/magic_sync/plan/struct.Engine.html#method.progress
+[`plan::Engine::listing`]: api/server/magic_sync/plan/struct.Engine.html#method.listing
+[`plan::Engine::row_progress`]: api/server/magic_sync/plan/struct.Engine.html#method.row_progress
+[`plan::Replicas`]: api/server/magic_sync/plan/struct.Replicas.html
+[`replica::progress`]: api/replica/magic_sync/replica/fn.progress.html
+[`run::server::Transport`]: api/server/magic_sync/run/server/trait.Transport.html
+[`run::replica::Uplink`]: api/replica/magic_sync/run/replica/trait.Uplink.html
+[`run::server::Senders`]: api/server/magic_sync/run/server/trait.Senders.html
+[`run`]: api/server/magic_sync/run/index.html
+[`row`]: api/server/magic_sync/row/index.html
+[`wire`]: api/server/magic_sync/wire/index.html
+[`envelope`]: api/server/magic_sync/envelope/index.html
+[`plan`]: api/server/magic_sync/plan/index.html
 [`relay`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/relay.rs
 [`filing`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/filing.rs
-[`status`]: https://docs.rs/magic_sync/latest/magic_sync/status/index.html
-[`replica`]: https://docs.rs/magic_sync/latest/magic_sync/replica/index.html
+[`status`]: api/server/magic_sync/status/index.html
+[`replica`]: api/replica/magic_sync/replica/index.html
 [`dialect`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/dialect.rs
-[`Server`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html
-[`Replica`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/struct.Replica.html
+[`Server`]: api/server/magic_sync/run/server/struct.Server.html
+[`Replica`]: api/replica/magic_sync/run/replica/struct.Replica.html

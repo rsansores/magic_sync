@@ -3,41 +3,10 @@
 Each table that travels is a Rust struct whose fields are exactly its columns,
 and which says how it travels. The same struct serves both sides.
 
-> **You write:**
+> **You write** (`examples/shop/rows/src/lib.rs`):
 
-```rust
-use chrono::{DateTime, Utc};
-use uuid::Uuid;
-
-/// A product: written at the head office, held by every register.
-#[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, magic_sync::Row)]
-#[row(
-    table = "products",
-    schema = "shop",
-    mirror = "catalog",
-    sync = "broadcast",
-    retired = "retired_at"
-)]
-pub struct Product {
-    pub id: Uuid,
-    pub name: String,
-    pub price_cents: i64,
-    #[row(version)]
-    pub updated_at: DateTime<Utc>,
-}
-
-/// A receipt: written by a register, filed at the head office.
-#[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, magic_sync::Row)]
-#[row(table = "receipts", schema = "shop", mirror = "record")]
-pub struct Receipt {
-    pub id: Uuid,
-    pub register_id: Uuid,
-    pub product_id: Uuid,
-    pub quantity: i32,
-    pub total_cents: i64,
-    #[row(created)]
-    pub created_at: DateTime<Utc>,
-}
+```rust,ignore
+{{#include ../../../examples/shop/rows/src/lib.rs:rows}}
 ```
 
 ## Which way it travels: `mirror`
@@ -68,25 +37,14 @@ For a table that goes down:
 
 ## The rest
 
-On the struct:
-
-| key | means |
-|---|---|
-| `schema` | its PostgreSQL schema; `public` when left out |
-| `key` | the primary key's columns, when it is not `id` (`key = "list_id, customer_id"`) |
-| `retired` | the column a replica sets on a row it lets go of but must keep |
-| `active` | a view the rows replicas hold are read through, leaving rows out — archived ones, say |
-| `origin` | for a record keyed by its replica, that key column: a replica may delete only its own rows |
-| `unmirrored` | columns one side's table has that the struct leaves out |
-
-On a field:
-
-| key | means |
-|---|---|
-| `version` | a column whose value only moves forward: an older copy never overwrites a newer one |
-| `created` | written once, never by an update |
-| `replica_owned` | in a `both` table, a column only replicas write |
-| `generated` | computed by the database: read, never written |
+The shop's rows use a few more: `schema`, the table's PostgreSQL schema;
+`retired`, the column a register sets on a product it lets go of but must
+keep; `#[row(version)]`, the column whose value only moves forward; and
+`#[row(created)]`, a column written once. Every key and flag the derive takes
+— a key of several columns, a view rows are read through, the columns one
+side leaves out, the columns replicas own — is in
+[the derive's reference](../api/server/magic_sync/derive.Row.html), and
+[Recipes](recipes.md) puts most of them to work.
 
 Fields follow `sqlx::FromRow`: `#[sqlx(rename = "…")]` names the column,
 `#[sqlx(skip)]` is no column, `#[sqlx(flatten)]` brings in a part's columns

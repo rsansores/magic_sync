@@ -169,8 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("the head office is at http://{bind}");
 
     // ANCHOR: shutdown
-    // On Ctrl-C: no new request, the relay ends its pass, and the registers
-    // waiting for a message are answered.
+    // On Ctrl-C: no new request, the registers waiting for a message are
+    // answered, and the relay stops — a pass it cuts short runs again.
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             interrupted().await;

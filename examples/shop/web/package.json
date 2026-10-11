@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.5.0",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "dev": "vite --port 5173",
     "build": "vue-tsc --noEmit && vite build"

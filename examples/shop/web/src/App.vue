@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // The head office: the catalog, the receipts the registers sent, and the
 // sync dashboard over the registers, each register's own page beside it.
+// ANCHOR: script
 import { computed, onUnmounted, ref, watch } from 'vue'
 import {
   RowPlaces,
@@ -48,6 +49,7 @@ refresh()
 const timer = setInterval(refresh, 1000)
 onUnmounted(() => clearInterval(timer))
 watch([selected, holding, filter, offset], refresh)
+// ANCHOR_END: script
 
 // Every action says what went wrong, rather than nothing.
 async function act(action: () => Promise<void>) {
@@ -133,9 +135,11 @@ function pageOf(url: string) {
               </template>
             </tr>
             <!-- Where this product is, register by register: asked next to it. -->
+            <!-- ANCHOR: row -->
             <tr v-if="holding === p.id">
               <td colspan="3"><RowPlaces :places="places" :names="names" /></td>
             </tr>
+            <!-- ANCHOR_END: row -->
           </template>
         </table>
       </section>
@@ -154,6 +158,7 @@ function pageOf(url: string) {
     <div class="column">
       <section>
         <h2>Sync</h2>
+        <!-- ANCHOR: dashboard -->
         <!-- A register unplugged is "not answering" after 30 s, not 15 min: it is a demo. -->
         <SyncDashboard
           v-model:selected="selected"
@@ -167,6 +172,7 @@ function pageOf(url: string) {
           :labels="labels"
           :silent-after="30_000"
         />
+        <!-- ANCHOR_END: dashboard -->
       </section>
       <section>
         <h2>Registers</h2>

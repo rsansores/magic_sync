@@ -4,22 +4,11 @@ A **codec** is a table's row type, and how its rows are turned into bytes and
 back. The engine holds every table's codec in one list, and never names a
 table itself.
 
-> **You write** the list, parents before children:
+> **You write** the list, parents before children
+> (`examples/shop/rows/src/lib.rs`):
 
-```rust
-use magic_sync::wire::Codec;
-
-pub fn codecs() -> Vec<Codec<()>> {
-    vec![
-        Codec::json::<Product>(None),
-        Codec::json::<Receipt>(Some(place_receipt)),
-    ]
-}
-
-/// A receipt is filed under the register that sent it, whatever it says.
-fn place_receipt(receipt: &mut Receipt, register: Uuid, _: &()) {
-    receipt.register_id = register;
-}
+```rust,ignore
+{{#include ../../../examples/shop/rows/src/lib.rs:codecs}}
 ```
 
 ## JSON or protobuf
@@ -33,19 +22,26 @@ declare. That is the simple way, and the one to start with.
 way — smaller on the wire, and a schema a replica in another language can
 generate code from:
 
-```rust
-Codec::new::<Product, ProductRow>(product_to_wire, product_from_wire, None)
+```rust,ignore
+{{#include ../../snippets/src/codecs.rs:codec}}
 ```
 
-where `ProductRow` is a [`prost`] message and the two functions map the row to
-it and back, failing with a `magic_sync::wire::MapError` — which any error
-converts into with `?`, so a [`magic_map`] mapping, say, is one line:
+where `ProductRow` is a [`prost`] message:
 
-```rust
-fn product_to_wire(p: Product) -> Result<ProductRow, MapError> {
-    Ok(p.try_map_into()?)
-}
+```rust,ignore
+{{#include ../../snippets/src/codecs.rs:message}}
 ```
+
+and the two functions map the row to it and back, failing with a
+`magic_sync::wire::MapError`, which any error converts into with `?`:
+
+```rust,ignore
+{{#include ../../snippets/src/codecs.rs:mapping}}
+```
+
+A row that does not encode is set aside on the server, for every replica
+that was to get it; one that does not decode on a replica is refused there,
+and reported. Either comes back once a fix lets it through.
 
 ## What the server knows about a sender: `P` and `place`
 
@@ -56,7 +52,7 @@ so a receipt is filed under the register that **sent** it — the transport says
 which — whatever the row itself claims.
 
 A multi-company shop would make `P` the register's company, read when the
-upload arrives, and stamp it on every receipt.
+upload arrives ([`Senders`](server.md#what-you-know-about-a-sender-senders)),
+and stamp it on every receipt.
 
 [`prost`]: https://crates.io/crates/prost
-[`magic_map`]: https://crates.io/crates/magic_map

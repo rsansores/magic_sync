@@ -12,37 +12,10 @@ answer as a scope.
 ## The handlers
 
 > **You write** the reads, in whatever your server is built with. The
-> shop's, in axum (`examples/shop/server`):
+> shop's, in axum (`examples/shop/server/src/main.rs`):
 
-```rust
-use magic_sync::status::{Listing, Overview, Progress, ReplicaState, RowProgress, Scope};
-
-async fn overview(State(app): State<App>) -> Result<Json<Overview>, Failure> {
-    let mut conn = app.pool.acquire().await?;
-    Ok(Json(app.server.engine().overview(&mut conn, Scope::All, 20).await?))
-}
-
-#[derive(Deserialize)]
-struct Page { state: Option<ReplicaState>, #[serde(default)] offset: u32 }
-
-async fn listing(State(app): State<App>, Query(page): Query<Page>) -> Result<Json<Listing>, Failure> {
-    let mut conn = app.pool.acquire().await?;
-    Ok(Json(app.server.engine().listing(&mut conn, Scope::All, page.state, page.offset, 20).await?))
-}
-
-async fn progress(State(app): State<App>, Path(register): Path<Uuid>)
-    -> Result<Json<Progress>, Failure>
-{
-    let mut conn = app.pool.acquire().await?;
-    Ok(Json(app.server.engine().progress(&mut conn, Scope::Replicas(&[register])).await?))
-}
-
-async fn row(State(app): State<App>, Path((table, key)): Path<(String, String)>)
-    -> Result<Json<RowProgress>, Failure>
-{
-    let mut conn = app.pool.acquire().await?;
-    Ok(Json(app.server.engine().row_progress(&mut conn, Scope::All, &table, &key).await?))
-}
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:dashboard}}
 ```
 
 The shop has no login, so it asks over every register (`Scope::All`). A
@@ -68,44 +41,21 @@ pnpm add magic_sync_dashboard
 ```
 
 > **You write** the fetching, and your names for what the engine knows by
-> id. The shop's (`examples/shop/web/src/App.vue`), cut down:
+> id. The shop's (`examples/shop/web/src/App.vue`), where `api` is a `fetch`
+> of each handler above (`examples/shop/web/src/api.ts`):
+
+```ts
+{{#include ../../../examples/shop/web/src/App.vue:script}}
+```
 
 ```vue
-<script setup lang="ts">
-import { SyncDashboard, type Listing, type Overview, type Progress, type ReplicaState } from 'magic_sync_dashboard'
+{{#include ../../../examples/shop/web/src/App.vue:dashboard}}
+```
+
+and its styles, once, where the app starts (`examples/shop/web/src/main.ts`):
+
+```ts
 import 'magic_sync_dashboard/styles.css'
-
-const overview = ref<Overview | null>(null)
-const listing = ref<Listing | null>(null)
-const progress = ref<Progress | null>(null)
-const selected = ref<string | null>(null)
-const filter = ref<ReplicaState | null>(null)
-const offset = ref(0)
-// Ask again a moment after each answer, never two at a time.
-async function poll() {
-  overview.value = await (await fetch('/api/sync/overview')).json()
-  listing.value = await (await fetch(`/api/sync/replicas?offset=${offset.value}${filter.value ? `&state=${filter.value}` : ''}`)).json()
-  progress.value = selected.value
-    ? await (await fetch(`/api/sync/progress/${selected.value}`)).json()
-    : null
-  setTimeout(poll, 2000)
-}
-poll()
-</script>
-
-<template>
-  <SyncDashboard
-    v-model:selected="selected"
-    v-model:filter="filter"
-    v-model:offset="offset"
-    :overview="overview"
-    :listing="listing"
-    :progress="progress"
-    :page-size="20"
-    :names="registerNames"
-    :labels="{ products: 'Products' }"
-  />
-</template>
 ```
 
 > **What happens:** a banner says in one line where things stand — green,
@@ -124,14 +74,13 @@ poll()
 
 "Which registers hold this product?" is asked next to the product, in your own
 listing — not on the dashboard, which knows rows only by key. The shop puts a
-*who holds it?* link on each product: it asks the third handler with the
-product's id, and shows the answer with `RowPlaces`:
+*who holds it?* link on each product: it asks the `row` handler with the
+product's id (`places`, above), and shows the answer with `RowPlaces`, under
+the product:
 
 ```vue
-<RowPlaces :places="places" :names="registerNames" />
+{{#include ../../../examples/shop/web/src/App.vue:row}}
 ```
-
-where `places` is the handler's answer, as it came.
 
 > **What happens:** each register, and where the row stands on it — holds it,
 > holds an older version, on its way, letting it go, or set aside. In a system

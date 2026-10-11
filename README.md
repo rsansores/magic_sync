@@ -14,7 +14,12 @@ two receipts are on their way. Plug it back in and both catch up.*
 ```rust
 // One struct is one table, and says how it travels. Both sides share it.
 #[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, magic_sync::Row)]
-#[row(table = "products", schema = "shop", mirror = "catalog", sync = "broadcast")]
+#[row(
+    table = "products",
+    schema = "shop",
+    mirror = "catalog",
+    sync = "broadcast"
+)]
 pub struct Product {
     pub id: Uuid,
     pub name: String,
@@ -25,16 +30,36 @@ pub struct Product {
 ```
 
 ```rust
-// The server (feature `postgres`): the engine runs itself. You say how bytes
-// reach a replica.
-let server = magic_sync::Server::install(pool.clone(), codecs(), REGISTERS, my_transport, Anyone(pool), Settings::default()).await?;
-tokio::spawn(async move { server.run(shutdown).await });
+// The server (feature `postgres`), on a database your migrations set up.
+// You say how bytes reach a replica; the engine runs itself.
+let server = Arc::new(
+    Server::new(
+        pool.clone(),
+        codecs(),
+        REGISTERS,
+        transport,
+        Anyone(pool),
+        Settings::default(),
+    )
+    .await?,
+);
+tokio::spawn({
+    let server = server.clone();
+    async move { server.run(shutdown).await }
+});
+// Every message a replica sends up, from the replica your transport says sent it.
+server.receive(replica, &bytes).await?;
 ```
 
 ```rust
-// A replica (feature `sqlite`): hand it what arrives; acknowledge it to your
-// transport once `receive` returned Ok.
-let replica = magic_sync::Replica::new(sqlite, codecs(), my_id, my_uplink, Settings::default()).await?;
+// A replica (feature `sqlite`): its way up runs itself. Hand it what arrives,
+// and acknowledge it to your transport once `receive` returned Ok.
+let replica =
+    Arc::new(Replica::new(sqlite, codecs(), me, uplink, Settings::default()).await?);
+tokio::spawn({
+    let replica = replica.clone();
+    async move { replica.run(shutdown).await }
+});
 replica.receive(&bytes).await?;
 ```
 
@@ -82,8 +107,8 @@ Built on that:
 - **Progress that does not lie.** "Register 7 holds 480 of 500 products"
   counts only what the register confirmed it applied.
 - **Any transport.** You implement one method that sends bytes to a replica
-  (NATS JetStream, HTTP, a queue, a USB stick). The engine needs one property
-  from it: a replica's messages arrive in order, one at a time.
+  (NATS JetStream, HTTP, a queue, a USB stick), and it provides
+  [what the protocol requires of a transport](https://rsansores.github.io/magic_sync/protocol.html#2-what-the-transport-must-provide).
 - **Any language on the replica side.** The [protocol](https://rsansores.github.io/magic_sync/protocol.html)
   is written down, its messages are a [`.proto`](https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto),
   and the engine's own replica is just one implementation of it.
@@ -124,7 +149,10 @@ API is young and will change before `1.0`. PostgreSQL 14 or later on the
 server, SQLite on the replicas, [sqlx] underneath.
 
 A build of the crate is one side: the `postgres` feature for the server, the
-`sqlite` feature for a replica.
+`sqlite` feature for a replica, each in a workspace of its own
+([Set up a project](https://rsansores.github.io/magic_sync/guide/setup.html)).
+The API reference of each side is
+[published with the book](https://rsansores.github.io/magic_sync/api.html).
 
 [sqlx]: https://crates.io/crates/sqlx
 

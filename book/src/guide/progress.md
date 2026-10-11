@@ -20,38 +20,19 @@ not read.
 
 ## The overview: is everything where it should be?
 
-> **You write:**
+> **You write** (`server.engine()` hands out the engine):
 
-```rust
-use magic_sync::status::{ReplicaState, Scope};
-
-let mut conn = pool.acquire().await?;
-let overview = server.engine().overview(&mut conn, Scope::Partition(customer), 20).await?;
-if overview.health.healthy {
-    // nothing waits for a fix
-}
-let states = overview.states; // how many replicas are synced, catching up, …
-for r in &overview.replicas.first {
-    // the 20 that need attention most, worst first
-    match r.state {
-        ReplicaState::Synced => {}       // holds what it should; everything it wrote is filed
-        ReplicaState::CatchingUp => {}   // r.pending, r.unconfirmed, r.backlog, r.parked
-        ReplicaState::Unreachable => {}  // r.failures, r.last_error, r.retry_at
-        ReplicaState::AwaitingFix => {}  // r.quarantined, r.unfiled, a change of its own parked
-        _ => {}
-    }
-}
-for t in &overview.tables {
-    // t.synced: every replica of the scope holds it as it should; else
-    // t.pending, t.in_flight, t.quarantined, t.unfiled say what it waits on
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:overview}}
 ```
 
 > **What happens:** the overview never counts the rows a replica should hold.
 > It reads what the engine records — the changes not yet planned, the messages
 > a replica has not confirmed, what is set aside — so it costs a few
 > milliseconds for 200 replicas holding 3 million rows while they are caught
-> up, and about a fifth of a second at worst, when every row is on its way.
+> up, and about a fifth of a second at worst, when every row is on its way
+> (the engine's `bench_the_dashboard_over_200_units_holding_3m_rows`, on a
+> 32-core workstation).
 > Whether a replica is synced is exact all the same: a change it lacks is
 > either noted and not yet planned, or in a message it has not said it
 > applied, or set aside. A test holds the engine to it under a failing
@@ -88,14 +69,8 @@ runner logs it every few minutes.
 
 The overview says *whether*; progress says *how far*: "holds 480 of 500".
 
-```rust
-let progress = server.engine().progress(&mut conn, Scope::Replicas(&[register])).await?;
-for register in progress.replicas {
-    for t in register.tables {
-        println!("{}: {} of {} ({} on their way, {} set aside)",
-            t.table, t.up_to_date(), t.should, t.in_flight, t.quarantined);
-    }
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:progress}}
 ```
 
 > **What happens:** a row counts as held only once the replica *confirmed* it
@@ -107,21 +82,16 @@ for register in progress.replicas {
 
 Where is one row?
 
-```rust
-let row = server.engine().row_progress(&mut conn, Scope::All, "products", &id.to_string()).await?;
-for place in row.places {
-    // place.replica, place.state: RowState::Holds, Outdated, OnItsWay, Missing, Leaving, Quarantined
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:row}}
 ```
 
 ## The other direction
 
 On a replica:
 
-```rust
-for t in magic_sync::replica::progress(&mut conn).await? {
-    println!("{}: {} not sent, {} not filed yet", t.table, t.unsent, t.unfiled);
-}
+```rust,ignore
+{{#include ../../../examples/shop/register/src/main.rs:progress}}
 ```
 
 That is the shop register's "2 receipts not at the head office yet". The
