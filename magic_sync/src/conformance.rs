@@ -149,6 +149,10 @@ pub struct Uplinked {
     pub refused_lanes: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     /// Refuses for good every message this says it cannot take.
     pub cannot_take: std::sync::Arc<std::sync::Mutex<Option<CannotTake>>>,
+    /// The lanes whose sends never return.
+    pub hanging: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Every send it was asked to make.
+    pub attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -160,6 +164,11 @@ impl crate::run::replica::Uplink for Uplinked {
         message: Vec<u8>,
     ) -> Result<(), crate::Error> {
         use prost::Message as _;
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.hanging.lock().unwrap().contains(&lane) {
+            std::future::pending::<()>().await;
+        }
         let lanes = self.refused_lanes.lock().unwrap().clone();
         if let Some(transient) = *self.refusing.lock().unwrap() {
             if lanes.is_empty() || lanes.contains(&lane) {

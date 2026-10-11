@@ -205,3 +205,155 @@ async fn a_replica_refuses_settings_it_cannot_run_with(pool_: SqlitePool) {
         }
     }
 }
+
+/// A lane whose uplink hangs holds back no other lane, and only for the
+/// send timeout: then it goes again, and its message goes once the uplink
+/// takes it.
+#[sqlx::test(migrations = false)]
+async fn a_lane_whose_uplink_hangs_holds_back_nothing_for_long(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let settings = Settings {
+        lanes: vec![
+            replica::Lane::new("main", &[]),
+            replica::Lane::new("fast", &["readings"]),
+        ],
+        send_timeout: Duration::from_millis(50),
+        ..settings()
+    };
+    let me = Uuid::now_v7();
+    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings)
+        .await
+        .unwrap();
+    uplink.hanging.lock().unwrap().push("main");
+    replica.receive(&rows(1, 0, "one")).await.unwrap();
+    sqlx::query("INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, 1, 1)")
+        .bind(me)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let went = |lane: &str| {
+        uplink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, l, _)| *l == lane)
+    };
+    let unhang = async {
+        until_true(|| went("fast")).await;
+        assert!(!went("main"));
+        uplink.hanging.lock().unwrap().clear();
+    };
+    let (_, ()) = tokio::join!(unhang, until(&replica, || went("main")));
+    assert_eq!(acknowledged(&uplink), [1]);
+}
+
+/// A nudge wakes an idle lane at once, rather than at its next turn.
+#[sqlx::test(migrations = false)]
+async fn a_nudge_sends_what_was_written_at_once(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let settings = Settings {
+        idle: Duration::from_secs(60),
+        ..settings()
+    };
+    let me = Uuid::now_v7();
+    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings)
+        .await
+        .unwrap();
+    let write = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'now')")
+            .bind(Uuid::now_v7())
+            .execute(&pool)
+            .await
+            .unwrap();
+        replica.nudge();
+    };
+    let carried = || {
+        uplink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, up)| !up.tables.is_empty())
+    };
+    let (_, ()) = tokio::join!(write, until(&replica, carried));
+}
+
+/// A lane that fails waits out its backoff, doubling up to its longest —
+/// and a nudge does not cut the wait short.
+#[sqlx::test(migrations = false)]
+async fn a_failing_lane_backs_off_whatever_nudges_it(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let settings = Settings {
+        backoff: crate::run::Backoff::new(Duration::from_millis(50), Duration::from_millis(100)),
+        ..settings()
+    };
+    let replica = Replica::new(pool, codecs(), Uuid::now_v7(), uplink.clone(), settings)
+        .await
+        .unwrap();
+    replica.receive(&rows(1, 0, "one")).await.unwrap();
+    *uplink.refusing.lock().unwrap() = Some(true);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let run = replica.run(async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    });
+    let nudge = async {
+        for _ in 0..60 {
+            replica.nudge();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop.send(true).unwrap();
+    };
+    tokio::join!(run, nudge);
+    // Sends at 0, 50, 150, 250, 350, 450, 550 ms, give or take.
+    let attempts = uplink.attempts.load(std::sync::atomic::Ordering::Relaxed);
+    assert!((5..=9).contains(&attempts), "{attempts} sends in 600 ms");
+}
+
+/// A second run of a replica that runs already returns at once: two would
+/// send the same rows under two numbers.
+#[sqlx::test(migrations = false)]
+async fn a_replica_runs_once_at_a_time(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let replica = Replica::new(
+        pool,
+        codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        settings(),
+    )
+    .await
+    .unwrap();
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let first = replica.run(async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    });
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(1), replica.run(std::future::pending()))
+            .await
+            .expect("the second run returns at once");
+        stop.send(true).unwrap();
+    };
+    tokio::join!(first, second);
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        replica.run(std::future::ready(())),
+    )
+    .await
+    .expect("one that ended frees the next");
+}
+
+/// Waits until `done` holds, or fails after five seconds.
+async fn until_true(done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "not done within five seconds");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

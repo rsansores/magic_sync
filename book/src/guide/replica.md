@@ -89,7 +89,9 @@ of its own, so it never waits behind the rest, nor the rest behind it:
 ```
 
 Your uplink gets the lane's name and sends each on its own stream, each kept
-in order.
+in order. Each lane runs on its own: one whose uplink fails waits out its own
+backoff, and one whose send hangs is given up on after `send_timeout` (30
+seconds unless you set it), while the others go on.
 
 [`Replica`]: ../api/replica/magic_sync/run/replica/struct.Replica.html
 [`Identity`]: ../api/replica/magic_sync/run/replica/trait.Identity.html

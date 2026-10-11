@@ -11,9 +11,11 @@ use crate::wire::Codec;
 use crate::{Conn, Error};
 use sqlx::SqlitePool;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -74,6 +76,10 @@ pub struct Settings {
     pub idle: Duration,
     /// How long a lane waits after a failure.
     pub backoff: Backoff,
+    /// How long the uplink has to take a message before the send counts as
+    /// failed, for a while: a send that hangs holds back only its lane, and
+    /// only so long.
+    pub send_timeout: Duration,
     /// When the first digests go, after the replica starts: once it settled.
     pub digests_first: Duration,
     /// How often digests go after that.
@@ -87,6 +93,7 @@ impl Default for Settings {
             lanes: vec![Lane::new("main", &[])],
             idle: Duration::from_secs(1),
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
+            send_timeout: Duration::from_secs(30),
             digests_first: Duration::from_secs(5 * 60),
             digests_every: Duration::from_secs(60 * 60),
         }
@@ -132,8 +139,11 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     identity: I,
     uplink: U,
     settings: Settings,
-    /// Something new to say: a message applied, or a write noted.
-    wake: Notify,
+    /// Per lane, something new to say: a message applied, or a write noted.
+    wake: Vec<Notify>,
+    /// Whether [`Replica::run`] runs: one at a time, or two would send the
+    /// same rows under two numbers.
+    running: AtomicBool,
     /// Per lane, how many rows and rejections a message carries at most
     /// while the uplink refuses one for good: 0 for no cap.
     caps: Vec<AtomicUsize>,
@@ -163,6 +173,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         settings.backoff.check("backoff")?;
         let zero = [
             ("idle", settings.idle),
+            ("send_timeout", settings.send_timeout),
             ("digests_first", settings.digests_first),
             ("digests_every", settings.digests_every),
             ("outbox.resend_after", settings.outbox.resend_after),
@@ -186,8 +197,9 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             identity,
             uplink,
             caps: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
+            wake: settings.lanes.iter().map(|_| Notify::new()).collect(),
+            running: AtomicBool::new(false),
             settings,
-            wake: Notify::new(),
         })
     }
 
@@ -228,71 +240,96 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         ) {
             // The server counts nothing as held until it hears of it, and
             // provisions a replica that missed a message once it hears.
-            self.wake.notify_one();
+            self.nudge();
         }
         Ok(received)
     }
 
-    /// Wakes the upward loop now rather than at its next turn: for a host
-    /// that just wrote something it wants to see go up.
+    /// Wakes every lane now rather than at its next turn — but one waiting
+    /// out a failure: for a host that just wrote something it wants to see
+    /// go up.
     pub fn nudge(&self) {
-        self.wake.notify_one();
+        for wake in &self.wake {
+            wake.notify_one();
+        }
     }
 
-    /// Sends up what the replica has to say, until `shutdown` resolves. Each
-    /// lane keeps its own pace: one that fails waits out its own backoff
-    /// while the others go on; one with more to say goes again at once.
+    /// Sends up what the replica has to say, until `shutdown` resolves,
+    /// finishing what it is sending. Each lane runs on its own: one whose
+    /// uplink fails, or hangs (for `send_timeout` at most), waits out its own
+    /// backoff while the others go on; one with more to say goes again at
+    /// once. A second `run` of the same replica while one runs returns at
+    /// once.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
-        tokio::pin!(shutdown);
-        let first = self.settings.backoff.first;
-        let lanes = self.settings.lanes.len();
-        let start = Instant::now();
-        let mut due = vec![start; lanes];
-        let mut backoff = vec![first; lanes];
-        let mut digests_at = start + self.settings.digests_first;
-        loop {
-            for lane in 0..lanes {
-                let now = Instant::now();
-                if due[lane] > now {
-                    continue;
+        if self.running.swap(true, Ordering::AcqRel) {
+            tracing::error!("sync: this replica runs already — a second run returns");
+            return;
+        }
+        let _running = Running(&self.running);
+        let (stop, stopped) = watch::channel(false);
+        let mut lanes: Vec<Option<Pin<Box<dyn Future<Output = ()> + Send + '_>>>> =
+            (0..self.settings.lanes.len())
+                .map(|lane| Some(Box::pin(self.lane(lane, stopped.clone())) as Pin<Box<_>>))
+                .collect();
+        let all = std::future::poll_fn(|cx| {
+            for lane in &mut lanes {
+                if lane
+                    .as_mut()
+                    .is_some_and(|f| f.as_mut().poll(cx).is_ready())
+                {
+                    *lane = None;
                 }
-                let digests = lane == 0 && now >= digests_at;
-                due[lane] = match self.send_lane(lane, digests).await {
-                    Ok(went) => {
-                        backoff[lane] = first;
-                        if went.digests {
-                            digests_at = now + self.settings.digests_every;
-                        }
-                        if went.message {
-                            now
-                        } else {
-                            now + self.settings.idle
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            lane = self.settings.lanes[lane].name,
-                            "sync: what this replica has to say did not go up, and goes again: {e}"
-                        );
-                        let wait = backoff[lane];
-                        backoff[lane] = self.settings.backoff.after(wait);
-                        now + wait
-                    }
-                };
             }
-            let next = due.iter().min().copied().unwrap_or(start);
+            if lanes.iter().all(Option::is_none) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        tokio::pin!(shutdown, all);
+        tokio::select! {
+            () = &mut shutdown => {
+                let _ = stop.send(true);
+                all.await;
+            }
+            () = &mut all => {}
+        }
+    }
+
+    /// One lane's loop, until `stopped`.
+    async fn lane(&self, lane: usize, mut stopped: watch::Receiver<bool>) {
+        let first = self.settings.backoff.first;
+        let mut backoff = first;
+        let mut digests_at = Instant::now() + self.settings.digests_first;
+        while !*stopped.borrow() {
+            let now = Instant::now();
+            let digests = lane == 0 && now >= digests_at;
+            let (wait, failed) = match self.send_lane(lane, digests).await {
+                Ok(went) => {
+                    backoff = first;
+                    if went.digests {
+                        digests_at = now + self.settings.digests_every;
+                    }
+                    if went.message {
+                        continue;
+                    }
+                    (self.settings.idle, false)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        lane = self.settings.lanes[lane].name,
+                        "sync: what this replica has to say did not go up, and goes again: {e}"
+                    );
+                    let wait = backoff;
+                    backoff = self.settings.backoff.after(wait);
+                    (wait, true)
+                }
+            };
             tokio::select! {
                 biased;
-                () = &mut shutdown => return,
-                () = self.wake.notified() => {
-                    let now = Instant::now();
-                    for (due, backoff) in due.iter_mut().zip(&backoff) {
-                        if *backoff == first {
-                            *due = now;
-                        }
-                    }
-                }
-                () = tokio::time::sleep_until(next) => {}
+                _ = stopped.wait_for(|stop| *stop) => return,
+                () = self.wake[lane].notified(), if !failed => {}
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }
@@ -322,7 +359,18 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let Some(outgoing) = outgoing else {
             return Ok(Went::default());
         };
-        let sent = self.uplink.send(id, outgoing.lane, outgoing.bytes()).await;
+        let timeout = self.settings.send_timeout;
+        let sent = tokio::time::timeout(
+            timeout,
+            self.uplink.send(id, outgoing.lane, outgoing.bytes()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Transport {
+                reason: format!("the uplink did not take the message within {timeout:?}"),
+                transient: true,
+            })
+        });
         let went = Went {
             message: true,
             digests: !outgoing.up.digests.is_empty(),
@@ -356,6 +404,15 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             Err(e) => return Err(e),
         }
         Ok(went)
+    }
+}
+
+/// A run under way: over once dropped, however it ends.
+struct Running<'a>(&'a AtomicBool);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
