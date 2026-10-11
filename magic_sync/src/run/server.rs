@@ -101,6 +101,11 @@ pub struct Settings {
     pub outbox_messages: NonZeroU32,
     /// Bytes its outbox may hold, likewise.
     pub outbox_bytes: NonZeroU64,
+    /// Parts of a replica's uploads the server may keep, unable to file
+    /// them, until a fix files them: past that its uploads fail as
+    /// transient and come again, waiting on the replica instead, which is
+    /// an alarm.
+    pub inbox: NonZeroU32,
     /// The role every transaction of the engine's own assumes, when the
     /// database gives the connecting one less than the engine needs.
     pub role: Option<String>,
@@ -121,7 +126,8 @@ pub struct Settings {
     /// How often what was set aside is tried again, besides when the relay
     /// starts — usually after a deploy, which may have fixed the cause.
     pub retry_every: Duration,
-    /// How long a note is kept once it is done.
+    /// How long a note is kept once it is done, and how long what a replica
+    /// uploaded waits in the inbox for the host to know it again.
     pub prune_after: Duration,
     /// How often the engine's health is looked at, and what is wrong logged.
     pub watch_every: Duration,
@@ -139,6 +145,7 @@ impl Default for Settings {
             batch: NonZeroU32::new(500).expect("not zero"),
             outbox_messages: NonZeroU32::new(10_000).expect("not zero"),
             outbox_bytes: NonZeroU64::new(256 << 20).expect("not zero"),
+            inbox: NonZeroU32::new(10_000).expect("not zero"),
             role: None,
             idle: Duration::from_secs(1),
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
@@ -399,7 +406,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
             Err(e) if e.is_transient() => return Err(e),
             Err(e) => {
                 let mut tx = self.begin().await?;
-                filing::keep_whole(&mut tx, replica, bytes, &e.to_string()).await?;
+                filing::keep_whole(&mut tx, replica, bytes, &e.to_string(), self.inbox()).await?;
                 tx.commit().await?;
                 Vec::new()
             }
@@ -442,7 +449,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         if !self.engine.is_replica(&mut tx, replica).await? {
             return Ok(None);
         }
-        let filed = filing::file(&mut tx, &self.codecs, up, replica, &known).await?;
+        let filed = filing::file(&mut tx, &self.codecs, up, replica, &known, self.inbox()).await?;
         tx.commit().await?;
         Ok(Some(filed))
     }
@@ -462,6 +469,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
         let done = self.pass(&mut lock).await;
         lock.release(LOCK_KEY).await;
         done.map(Some)
+    }
+
+    fn inbox(&self) -> i64 {
+        i64::from(self.settings.inbox.get())
     }
 
     fn relay(&self) -> Relay<'_, S::Known> {
@@ -520,6 +531,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         // longest backoff, not on every pass.
         let now = Instant::now();
         let (mut retry_at, mut prune_at, mut watch_at) = (now, now, now);
+        let mut refiling = None;
         loop {
             if !lock.still_held().await {
                 tracing::error!("sync: the relay's lock is gone — standing by");
@@ -528,7 +540,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
             if Instant::now() >= retry_at {
                 retry_at = Instant::now()
                     + match self.retry(&mut lock).await {
-                        Ok(()) => self.settings.retry_every,
+                        Ok(walk) => {
+                            refiling = Some(walk);
+                            self.settings.retry_every
+                        }
                         Err(e) => {
                             tracing::warn!("sync: trying again what was set aside failed: {e}");
                             self.settings.backoff.max
@@ -543,6 +558,15 @@ impl<S: Senders, T: Transport> Server<S, T> {
             if Instant::now() >= watch_at {
                 self.watch(&mut lock).await;
                 watch_at = Instant::now() + self.settings.watch_every;
+            }
+            if let Some(walk) = refiling {
+                refiling = match self.refile_page(walk).await {
+                    Ok(next) => next,
+                    Err(e) => {
+                        tracing::warn!("sync: filing the inbox again failed, and goes on: {e}");
+                        Some(walk)
+                    }
+                };
             }
             match self.pass(&mut lock).await {
                 Ok(done) => {
@@ -572,10 +596,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
         }
     }
 
-    /// Plans the parked notes again, sends the quarantine again, and files
-    /// the inbox again, all of it: an upload that fails again holds back no
-    /// other.
-    async fn retry(&self, lock: &mut Lock) -> Result<(), Error> {
+    /// Plans the parked notes again and sends the quarantine again; answers
+    /// the walk that files the inbox again, a page at a time beside the
+    /// passes, up to what it holds now.
+    async fn retry(&self, lock: &mut Lock) -> Result<Refiling, Error> {
         let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
         let unparked = relay::unpark(&mut tx).await?;
         let retried = relay::retry_quarantine(&mut tx).await?;
@@ -583,48 +607,66 @@ impl<S: Senders, T: Transport> Server<S, T> {
         if unparked + retried > 0 {
             tracing::info!(unparked, retried, "sync: trying again what was set aside");
         }
-        let through = filing::newest(&mut *self.begin().await?).await?;
-        let (mut after, mut filed) = (0, 0);
-        loop {
-            let kept = filing::inbox(
-                &mut *self.begin().await?,
-                after,
-                through,
-                i64::from(self.settings.batch.get()),
-            )
-            .await?;
-            let Some(last) = kept.last() else {
-                break;
-            };
-            after = last.id;
-            for kept in &kept {
-                match self.refile(kept).await {
-                    Ok(all) => filed += usize::from(all),
-                    Err(e) if e.is_transient() && !matches!(e, Error::Protocol { .. }) => {
-                        return Err(e)
-                    }
-                    Err(e) => {
-                        let mut tx = self.begin().await?;
-                        filing::failed_again(&mut tx, kept, &e.to_string()).await?;
-                        tx.commit().await?;
-                    }
+        Ok(Refiling {
+            after: 0,
+            through: filing::newest(&mut *self.begin().await?).await?,
+            filed: 0,
+        })
+    }
+
+    /// Files again the next page of the inbox `walk` goes over: an upload
+    /// that fails again holds back no other. Answers the rest of the walk,
+    /// `None` once it is over.
+    async fn refile_page(&self, mut walk: Refiling) -> Result<Option<Refiling>, Error> {
+        let kept = filing::inbox(
+            &mut *self.begin().await?,
+            walk.after,
+            walk.through,
+            i64::from(self.settings.batch.get()),
+        )
+        .await?;
+        let Some(last) = kept.last() else {
+            if walk.filed > 0 {
+                tracing::info!(filed = walk.filed, "sync: uploads filed after all");
+            }
+            return Ok(None);
+        };
+        for kept in &kept {
+            match self.refile(kept).await {
+                Ok(all) => walk.filed += usize::from(all),
+                Err(e) if e.is_transient() && !matches!(e, Error::Protocol { .. }) => {
+                    return Err(e)
+                }
+                Err(e) => {
+                    let mut tx = self.begin().await?;
+                    filing::failed_again(&mut tx, kept, &e.to_string()).await?;
+                    tx.commit().await?;
                 }
             }
+            walk.after = kept.id;
         }
-        if filed > 0 {
-            tracing::info!(filed, "sync: uploads filed after all");
-        }
-        Ok(())
+        walk.after = last.id;
+        Ok(Some(walk))
     }
 
     /// Files `kept` again, in the transaction the host gives for its
-    /// replica; answers whether all of it was filed. One whose replica the
-    /// host no longer knows waits.
+    /// replica; answers whether all of it was filed. One from a sender the
+    /// host no longer knows, or that is no replica any more, waits — and is
+    /// dropped, an alarm, once it waited `prune_after`.
     async fn refile(&self, kept: &filing::Kept) -> Result<bool, Error> {
-        let Some(known) = self.senders.known(kept.replica_id).await? else {
+        let known = self.senders.known(kept.replica_id).await?;
+        let mut tx = match &known {
+            Some(known) => self.senders.filing(known).await?,
+            None => self.begin().await?,
+        };
+        let replica = self.engine.is_replica(&mut tx, kept.replica_id).await?;
+        let (Some(known), true) = (known, replica) else {
+            if filing::forget(&mut tx, kept, self.settings.prune_after).await? {
+                tracing::error!(replica = %kept.replica_id, "sync ALARM: what a sender no longer known uploaded waited too long to be filed — dropped");
+            }
+            tx.commit().await?;
             return Ok(false);
         };
-        let mut tx = self.senders.filing(&known).await?;
         let all = filing::refile(&mut tx, &self.codecs, kept, &known).await?;
         tx.commit().await?;
         Ok(all)
@@ -746,6 +788,15 @@ async fn assume(conn: &mut PgConnection, role: Option<&str>) -> Result<(), Error
             .await?;
     }
     Ok(())
+}
+
+/// A walk over the inbox filing again what it kept: past the id `after`,
+/// up to `through`, and how many uploads it filed whole so far.
+#[derive(Clone, Copy, Debug)]
+struct Refiling {
+    after: i64,
+    through: i64,
+    filed: usize,
 }
 
 /// Proof that this process runs the relay: a connection holding the

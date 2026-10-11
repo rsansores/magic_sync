@@ -100,16 +100,20 @@ struct Standing {
 /// server does not mirror, a row that does not decode, a row or a delete the
 /// database refuses for its data — is kept as it came in the server's inbox,
 /// to be filed again once a fix is deployed; rows whose filing fails as a
-/// whole are kept whole. What the upload says of the replica — what it
-/// refused, applied, missed, holds and has not sent — is filed apart from
-/// its rows, so neither holds back the other. An error is the storage's, or
-/// an upload of a later protocol than this build speaks.
+/// whole are kept whole — while the sender's part of the inbox holds fewer
+/// than `inbox`: past that the upload fails as transient and comes again,
+/// waiting on the replica rather than here. What the upload says of the
+/// replica — what it refused, applied, missed, holds and has not sent — is
+/// filed apart from its rows, so neither holds back the other. An error is
+/// the storage's, a full inbox, or an upload of a later protocol than this
+/// build speaks.
 pub(crate) async fn file<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     upload: &Up,
     sender: Uuid,
     known: &P,
+    inbox: i64,
 ) -> Result<Vec<Filed>, Error> {
     if upload.protocol > envelope::PROTOCOL {
         return Err(Error::Protocol {
@@ -119,7 +123,7 @@ pub(crate) async fn file<P: Sync + 'static>(
     }
     let standing = standing(conn, sender).await?;
     crate::row::savepoint(conn).await?;
-    let filed = file_rows(conn, codecs, upload, sender, known).await;
+    let filed = file_rows(conn, codecs, upload, sender, known, inbox).await;
     let filed = match crate::row::released(conn, filed).await? {
         Ok(filed) => filed,
         Err(e) => {
@@ -129,7 +133,7 @@ pub(crate) async fn file<P: Sync + 'static>(
                 ..Up::default()
             };
             use prost::Message as _;
-            keep_whole(conn, sender, &rows.encode_to_vec(), &e.to_string()).await?;
+            keep_whole(conn, sender, &rows.encode_to_vec(), &e.to_string(), inbox).await?;
             Vec::new()
         }
     };
@@ -149,9 +153,10 @@ async fn file_rows<P: Sync + 'static>(
     upload: &Up,
     sender: Uuid,
     known: &P,
+    inbox: i64,
 ) -> Result<Vec<Filed>, Error> {
     let (filed, unfiled) = file_tables(conn, codecs, upload, sender, known).await?;
-    keep(conn, sender, &unfiled, None).await?;
+    keep(conn, sender, &unfiled, Keeping::New(inbox)).await?;
     Ok(filed)
 }
 
@@ -740,13 +745,21 @@ pub(crate) struct Kept {
     attempts: i32,
 }
 
-/// Keeps what of an upload from `replica` could not be filed; `since`, when
-/// it was kept before and failed again, keeps its age.
+/// What is kept in the inbox: a part new to it, while the replica's part of
+/// it holds fewer than so many, or one kept before that failed again, which
+/// keeps its age.
+#[derive(Clone, Copy)]
+enum Keeping<'k> {
+    New(i64),
+    Again(&'k Kept),
+}
+
+/// Keeps what of an upload from `replica` could not be filed.
 async fn keep(
     conn: &mut Conn,
     replica: Uuid,
     unfiled: &[Unfiled],
-    since: Option<&Kept>,
+    keeping: Keeping<'_>,
 ) -> Result<(), Error> {
     use prost::Message as _;
     for part in unfiled {
@@ -762,7 +775,7 @@ async fn keep(
             Some(&part.table),
             &part.up.encode_to_vec(),
             &part.reason,
-            since,
+            keeping,
         )
         .await?;
     }
@@ -775,8 +788,29 @@ async fn insert(
     table: Option<&str>,
     upload: &[u8],
     reason: &str,
-    since: Option<&Kept>,
+    keeping: Keeping<'_>,
 ) -> Result<(), Error> {
+    let since = match keeping {
+        Keeping::Again(kept) => Some(kept),
+        Keeping::New(bound) => {
+            let held: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM sync.inbox WHERE replica_id = $1")
+                    .bind(replica)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if held >= bound {
+                tracing::error!(%replica, held, "sync ALARM: a replica's inbox is full — its uploads wait on it until a fix files what is kept");
+                return Err(Error::Host {
+                    reason: format!(
+                        "the server keeps {held} parts of this replica's uploads it could not \
+                         file, as many as it may: the upload comes again once a fix files them"
+                    ),
+                    transient: true,
+                });
+            }
+            None
+        }
+    };
     sqlx::query(
         "INSERT INTO sync.inbox AS i (replica_id, relation, upload, reason, first_at, attempts) \
          VALUES ($1, $2, $3, $4, coalesce($5, now()), $6) \
@@ -795,19 +829,21 @@ async fn insert(
 }
 
 /// Keeps a whole upload from `replica`, as it came, when filing it failed
-/// as a whole for a reason a retry cannot change.
+/// as a whole for a reason a retry cannot change — while its part of the
+/// inbox holds fewer than `inbox`.
 pub(crate) async fn keep_whole(
     conn: &mut Conn,
     replica: Uuid,
     upload: &[u8],
     reason: &str,
+    inbox: i64,
 ) -> Result<(), Error> {
     tracing::error!(
         %replica,
         reason,
         "sync: an upload the server could not file — kept whole until a fix files it"
     );
-    insert(conn, replica, None, upload, reason, None).await
+    insert(conn, replica, None, upload, reason, Keeping::New(inbox)).await
 }
 
 /// The parts of uploads waiting in the inbox with an id past `after` and up
@@ -866,8 +902,25 @@ pub(crate) async fn refile<P: Sync + 'static>(
         .execute(&mut *conn)
         .await?;
     let (_, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known).await?;
-    keep(conn, kept.replica_id, &unfiled, Some(kept)).await?;
+    keep(conn, kept.replica_id, &unfiled, Keeping::Again(kept)).await?;
     Ok(unfiled.is_empty())
+}
+
+/// Drops `kept` once it waited longer than `after` to be filed: its sender
+/// is known no more. Answers whether it was.
+pub(crate) async fn forget(
+    conn: &mut Conn,
+    kept: &Kept,
+    after: std::time::Duration,
+) -> Result<bool, Error> {
+    let gone = sqlx::query(
+        "DELETE FROM sync.inbox WHERE id = $1 AND first_at < now() - make_interval(secs => $2)",
+    )
+    .bind(kept.id)
+    .bind(after.as_secs_f64())
+    .execute(&mut *conn)
+    .await?;
+    Ok(gone.rows_affected() > 0)
 }
 
 /// `kept` failed to file again, as a whole, with why.

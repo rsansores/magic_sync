@@ -540,6 +540,18 @@ fn upload(number: u64, table: &str, rows: Vec<Vec<u8>>) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// What the relay does with the inbox once it is due: every page of it
+/// filed again. A failure set aside is no error.
+async fn refile<S: Senders, T: Transport>(server: &Server<S, T>, lock: &mut Lock) -> usize {
+    let mut walk = server.retry(lock).await.unwrap();
+    let mut pages = 0;
+    while let Some(next) = server.refile_page(walk).await.unwrap() {
+        walk = next;
+        pages += 1;
+    }
+    pages
+}
+
 async fn count(pool: &PgPool, sql: &str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
 }
@@ -593,10 +605,7 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     // b's sender is fixed, a's is not: a fails again, and b is filed.
     senders.failing.lock().unwrap().remove(&b);
     let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
-    server
-        .retry(&mut lock)
-        .await
-        .expect("a failure set aside is no error");
+    refile(&server, &mut lock).await;
     assert_eq!(
         count(&pool, "SELECT count(*) FROM fixture.readings").await,
         1
@@ -608,7 +617,7 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     assert_eq!(left, (a, 2));
 
     senders.failing.lock().unwrap().clear();
-    server.retry(&mut lock).await.unwrap();
+    refile(&server, &mut lock).await;
     assert_eq!(
         count(&pool, "SELECT count(*) FROM fixture.readings").await,
         2
@@ -1204,4 +1213,101 @@ async fn a_replica_named_twice_by_its_relation_is_one(pool: PgPool) {
     while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
     assert_eq!(wire.items(a), ["one"]);
     assert_eq!(wire.items(b), ["one"]);
+}
+
+/// Senders the host knows as the test says: the rest are no one it knows.
+#[derive(Clone)]
+struct Known {
+    pool: PgPool,
+    known: Arc<Mutex<std::collections::BTreeSet<Uuid>>>,
+}
+
+impl Senders for Known {
+    type Known = ();
+
+    async fn known(&self, replica: Uuid) -> Result<Option<()>, Error> {
+        Ok(self.known.lock().unwrap().contains(&replica).then_some(()))
+    }
+
+    async fn filing(&self, _known: &()) -> Result<Transaction<'static, Postgres>, Error> {
+        Ok(self.pool.begin().await?)
+    }
+}
+
+/// A replica whose uploads the server cannot file keeps at most so many of
+/// them in the inbox: past that its uploads come again, waiting on it. The
+/// inbox is filed again a page at a time, beside the passes; what a sender
+/// the host no longer knows uploaded waits, and is dropped once it waited
+/// `prune_after`.
+#[sqlx::test(migrations = false)]
+async fn the_inbox_is_bounded_per_replica_filed_a_page_at_a_time_and_pruned_of_strangers(
+    pool: PgPool,
+) {
+    let (_, [a, b]) = world(&pool).await;
+    let wire = Wire::default();
+    let senders = Known {
+        pool: pool.clone(),
+        known: Arc::new(Mutex::new([a, b].into())),
+    };
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        senders.clone(),
+        Settings {
+            inbox: NonZeroU32::new(2).unwrap(),
+            batch: NonZeroU32::new(1).unwrap(),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    for number in 1..=2 {
+        server
+            .receive(a, &upload(number, "readings", vec![reading(a, "poison")]))
+            .await
+            .unwrap();
+    }
+    server
+        .receive(b, &upload(9, "readings", vec![reading(b, "poison")]))
+        .await
+        .unwrap();
+    let full = server
+        .receive(a, &upload(3, "readings", vec![reading(a, "poison")]))
+        .await;
+    assert!(matches!(&full, Err(e) if e.is_transient()), "{full:?}");
+    assert_eq!(wire.filed(a), [1, 2], "the third is not answered");
+    let kept = |replica: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sync.inbox WHERE replica_id = $1")
+                .bind(replica)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        (kept(a).await, kept(b).await),
+        (2, 1),
+        "a's part is full, b's is not"
+    );
+
+    BUGGY.set(false);
+    senders.known.lock().unwrap().remove(&b);
+    let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
+    assert_eq!(refile(&server, &mut lock).await, 3, "one upload a page");
+    assert_eq!(
+        (kept(a).await, kept(b).await),
+        (0, 1),
+        "a's filed, and b's waits for the host to know b again"
+    );
+    sqlx::query("UPDATE sync.inbox SET first_at = now() - interval '31 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    refile(&server, &mut lock).await;
+    assert_eq!(kept(b).await, 0, "waited too long: dropped");
+    BUGGY.set(true);
 }

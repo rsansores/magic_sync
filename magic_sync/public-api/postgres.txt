@@ -237,6 +237,7 @@ impl<S, T> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Se
 pub magic_sync::run::server::Settings::backoff: magic_sync::run::Backoff
 pub magic_sync::run::server::Settings::batch: core::num::nonzero::NonZeroU32
 pub magic_sync::run::server::Settings::idle: core::time::Duration
+pub magic_sync::run::server::Settings::inbox: core::num::nonzero::NonZeroU32
 pub magic_sync::run::server::Settings::limits: magic_sync::envelope::Limits
 pub magic_sync::run::server::Settings::outbox_bytes: core::num::nonzero::NonZeroU64
 pub magic_sync::run::server::Settings::outbox_messages: core::num::nonzero::NonZeroU32
@@ -891,6 +892,7 @@ impl<S, T> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Se
 pub magic_sync::Settings::backoff: magic_sync::run::Backoff
 pub magic_sync::Settings::batch: core::num::nonzero::NonZeroU32
 pub magic_sync::Settings::idle: core::time::Duration
+pub magic_sync::Settings::inbox: core::num::nonzero::NonZeroU32
 pub magic_sync::Settings::limits: magic_sync::envelope::Limits
 pub magic_sync::Settings::outbox_bytes: core::num::nonzero::NonZeroU64
 pub magic_sync::Settings::outbox_messages: core::num::nonzero::NonZeroU32

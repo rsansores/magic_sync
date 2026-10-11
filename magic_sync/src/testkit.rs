@@ -226,7 +226,7 @@ pub async fn file<P: Sync + 'static>(
     known: &P,
 ) {
     let mut tx = pool.begin().await.expect("a transaction");
-    crate::filing::file(&mut tx, codecs, up, sender, known)
+    crate::filing::file(&mut tx, codecs, up, sender, known, i64::MAX)
         .await
         .expect("filed");
     tx.commit().await.expect("committed");

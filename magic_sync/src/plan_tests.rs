@@ -554,7 +554,7 @@ impl World {
                 continue;
             };
             let mut tx = self.conn.begin().await.expect("a transaction");
-            crate::filing::file(&mut tx, &self.codecs, &up, replica, &())
+            crate::filing::file(&mut tx, &self.codecs, &up, replica, &(), i64::MAX)
                 .await
                 .expect("filed");
             tx.commit().await.expect("filed");
