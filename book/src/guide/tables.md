@@ -33,8 +33,9 @@ replaces.
 ### The engine's part: installed for you, or in your migrations
 
 The engine keeps its own tables in a `sync` schema, and puts a trigger on every
-table that travels down, noting each change in the writing transaction. There
-are two ways to get them there.
+table that travels down, noting each change in the writing transaction — so a
+schema of yours by that name needs another: the server refuses to install
+into it, or to read it as its own. There are two ways to get them there.
 
 > **You write**, if you have migrations — the way a system in production
 > should — the engine's schema in one of them: it is

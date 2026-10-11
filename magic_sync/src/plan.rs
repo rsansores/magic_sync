@@ -557,7 +557,13 @@ async fn migrate(conn: &mut Conn) -> Result<(), Error> {
         .bind(INSTALL_LOCK)
         .execute(&mut *conn)
         .await?;
-    let installed = version(conn).await?.unwrap_or(0);
+    let installed = match version(conn).await? {
+        Some(installed) => installed,
+        None => {
+            refuse_foreign_schema(conn).await?;
+            0
+        }
+    };
     let from = usize::try_from(installed).unwrap_or(usize::MAX);
     if from > MIGRATIONS.len() {
         return Err(Error::Misuse(format!(
@@ -569,6 +575,23 @@ async fn migrate(conn: &mut Conn) -> Result<(), Error> {
         // Not `raw_sql`: its future is not `Send` for every lifetime a
         // host's spawn asks of it.
         sqlx::Executor::execute(&mut *conn, *script).await?;
+    }
+    Ok(())
+}
+
+/// Refuses a database whose schema `sync` is not the engine's — a host's
+/// own, of that name — rather than install into it, or fail half-way.
+async fn refuse_foreign_schema(conn: &mut Conn) -> Result<(), Error> {
+    let taken: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'sync')")
+            .fetch_one(&mut *conn)
+            .await?;
+    if taken {
+        return Err(Error::Misuse(
+            "the database has a schema named `sync` that is not the engine's: the engine \
+             keeps its tables in `sync`, so that one needs another name"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -821,12 +844,15 @@ impl Engine {
                 )))
             }
             v => {
+                if v.is_none() {
+                    refuse_foreign_schema(conn).await?;
+                }
                 return Err(Error::Misuse(format!(
                     "the engine's schema is {}, and this build needs version {needed}: \
                      `Server::install` brings it there, or a migration of yours runs the \
                      engine's steps (the book's \"Upgrading\")",
                     v.map_or("not installed".to_owned(), |v| format!("version {v}"))
-                )))
+                )));
             }
         }
         let tables: Vec<&Table> = tables

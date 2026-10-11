@@ -1385,6 +1385,28 @@ async fn a_database_without_the_engine_names_both_ways_to_install_it(pool: crate
     );
 }
 
+/// A host's own schema named `sync` is not installed into, nor read as the
+/// engine's: either way the host is told the name is taken.
+#[sqlx::test(migrations = false)]
+async fn a_schema_of_the_hosts_named_sync_is_named_as_the_trouble(pool: crate::DbPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::raw_sql(&format!(
+        "DROP SCHEMA IF EXISTS sync CASCADE; CREATE SCHEMA sync; \
+         CREATE TABLE sync.jobs (id INTEGER PRIMARY KEY); {SCHEMA}"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("a host's schema");
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = conn.begin().await.expect("a transaction");
+    let why = refusal(Engine::install(&mut tx, &tables, REPLICAS).await);
+    assert!(why.contains("schema named `sync`"), "{why}");
+    drop(tx);
+    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    assert!(why.contains("schema named `sync`"), "{why}");
+}
+
 #[sqlx::test(migrations = false)]
 async fn notes_are_planned_in_one_snapshot_or_not_at_all(pool: crate::DbPool) {
     let mut world = world(pool).await;
