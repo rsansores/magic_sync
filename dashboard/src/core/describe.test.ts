@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   bannerOf,
   describeProblem,
+  describePlace,
   describeReplica,
+  describeState,
   describeTable,
   mismatchOf,
   type Speech,
@@ -95,5 +97,16 @@ describe('mismatchOf', () => {
   it('refuses an answer of another contract, naming both', () => {
     expect(mismatchOf(overview, translator('en'))).toBeNull()
     expect(mismatchOf({ contract: 2 }, translator('en'))).toMatch(/version 1.*version 2/)
+  })
+})
+
+describe('a value an engine newer than the dashboard added', () => {
+  it('is named as it came, never as a message key', () => {
+    const t = translator('en')
+    expect(describeState('synced', t)).toBe('Synced')
+    expect(describeState('resting', t)).toBe('Unknown (resting)')
+    expect(describePlace('holds', t)).toEqual({ mood: 'holds', label: 'Holds it' })
+    expect(describePlace('teleporting', t)).toEqual({ mood: 'unknown', label: 'Unknown (teleporting)' })
+    expect(describePlace('teleporting', translator('es')).label).toBe('Desconocido (teleporting)')
   })
 })

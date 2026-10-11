@@ -21,7 +21,7 @@
   --_radius: var(--msd-radius, 10px);
   --_gap: var(--msd-gap, 12px);
 
-  font: var(--msd-font, inherit);
+  font-family: var(--msd-font, inherit);
   color: var(--_fg);
   background: var(--_bg);
   display: flex;

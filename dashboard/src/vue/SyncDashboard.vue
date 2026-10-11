@@ -15,6 +15,7 @@ import {
   describeProblem,
   describeReplica,
   describeShare,
+  describeState,
   describeTable,
   percent,
   tableMood,
@@ -144,7 +145,7 @@ watch(selected, async (now, before) => {
         </button>
         <header class="msd-row-head">
           <span v-if="current.row" class="msd-state" :data-state="current.row.state">
-            {{ t(`state.${current.row.state}`) }}
+            {{ describeState(current.row.state, t) }}
           </span>
           <h3 :id="`${id}-detail`" ref="detailHeading" class="msd-name" tabindex="-1">{{ current.name }}</h3>
         </header>
@@ -266,7 +267,7 @@ watch(selected, async (now, before) => {
                 @click="selected = r.id"
               >
                 <span class="msd-row-head">
-                  <span class="msd-state" :data-state="r.state">{{ t(`state.${r.state}`) }}</span>
+                  <span class="msd-state" :data-state="r.state">{{ describeState(r.state, t) }}</span>
                   <span class="msd-name">{{ r.name }}</span>
                 </span>
                 <span v-for="line in describeReplica(r, speech)" :key="line" class="msd-muted">{{

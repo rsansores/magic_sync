@@ -9,6 +9,7 @@ import type {
   ReplicaOverview,
   ReplicaProgress,
   ReplicaState,
+  RowState,
   TableOverview,
 } from './contract/types.js'
 import { timeOf } from './time.js'
@@ -116,8 +117,39 @@ export interface Summary {
 
 const MINUTE = 60_000
 
-const everyone = (states: ReplicaCounts) =>
-  states.awaiting_fix + states.unreachable + states.catching_up + states.synced
+// Every replica, including those in a state an engine newer than this
+// dashboard added: they are counted, and are not settled.
+const everyone = (states: ReplicaCounts) => Object.values(states).reduce((n, count) => n + count, 0)
+
+/** Where a row is on a replica, in one word: settled, on its way, set aside,
+ * or `unknown` for a state this dashboard was not written for. */
+export type PlaceMood = 'holds' | 'moving' | 'set_aside' | 'unknown'
+
+const placeMoods: Record<RowState, PlaceMood> = {
+  holds: 'holds',
+  outdated: 'moving',
+  on_its_way: 'moving',
+  missing: 'moving',
+  leaving: 'moving',
+  quarantined: 'set_aside',
+}
+
+/** The mood of a row's state, whatever the engine answered. */
+export function placeMoodOf(state: string): PlaceMood {
+  return Object.hasOwn(placeMoods, state) ? placeMoods[state as RowState] : 'unknown'
+}
+
+const replicaStates: Record<ReplicaState, true> = {
+  awaiting_fix: true,
+  unreachable: true,
+  catching_up: true,
+  synced: true,
+}
+
+/** Whether this dashboard has a word for a replica's state. */
+export function knowsReplicaState(state: string): state is ReplicaState {
+  return Object.hasOwn(replicaStates, state)
+}
 
 /** Whether an answer is of the contract this dashboard reads. */
 export function readsContract(answer: { contract: number }): boolean {

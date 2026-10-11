@@ -16,7 +16,8 @@ see, and returns the answers as they are. The dashboard draws them.
 pnpm add magic_sync_dashboard
 ```
 
-It needs Vue 3.5 or later.
+It needs Vue 3.5 or later, and is ESM only: `import` it (a bundler does; a
+CommonJS `require` finds no entry point).
 
 ## The ready-made dashboard
 
@@ -86,11 +87,13 @@ listing: ask `Engine::row_progress` with its key, and show the answer with
 ### Its look
 
 Every colour and size is a CSS variable; set them on `.msd` or any ancestor:
-`--msd-font`, `--msd-fg`, `--msd-muted`, `--msd-bg`, `--msd-card`,
+`--msd-font` (a font family), `--msd-fg`, `--msd-muted`, `--msd-bg`, `--msd-card`,
 `--msd-border`, `--msd-accent`, `--msd-ok`, `--msd-warn`,
 `--msd-danger`, `--msd-ok-soft`, `--msd-warn-soft`, `--msd-danger-soft`,
 `--msd-radius`, `--msd-gap`. The defaults keep every text at a contrast of
-4.5:1 or more against what it is drawn on.
+4.5:1 or more against what it is drawn on. They are a light scheme and do not
+follow `prefers-color-scheme`: a host with a dark theme sets the variables for
+it, which is also what keeps the contrast.
 
 ## The same, with your own components
 
@@ -103,14 +106,22 @@ import { describeReplica, describeTable, describeProblem, useSyncDashboard } fro
 
 const dash = useSyncDashboard({ overview, listing, filter, selected, progress, names, labels })
 dash.error.value // why the answer cannot be shown (another contract), or null
+dash.speech.value // how to say things; null until an answer that reads has come
 dash.banner.value // { mood: 'healthy' | 'catching_up' | 'attention' | 'empty', title, lines }
 dash.summary.value // counts per state, the worst replicas, tables, problems
 dash.page.value // the replicas to list: rows, offset, total
 dash.progress.value // the selected replica, per table: upToDate of should
-describeReplica(row, dash.speech.value) // ["Last answered 3 hr. ago.", "2 rows set aside."]
-describeTable(table, dash.speech.value) // ["840 rows on their way.", "5 replicas are behind on it."]
-describeProblem(problem, dash.speech.value) // { title, about, reason, facts }
+const speech = dash.speech.value
+if (speech) {
+  describeReplica(row, speech) // ["Last answered 3 hr. ago.", "2 rows set aside."]
+  describeTable(table, speech) // ["840 rows on their way.", "5 replicas are behind on it."]
+  describeProblem(problem, speech) // { title, about, reason, facts }
+}
 ```
+
+`useSyncDashboard` keeps the server's time moving while it is called in a
+component's `setup` or an effect scope; called anywhere else it has nothing to
+tie a timer to, and the times it says stay as of the last answer.
 
 Everything that does not need Vue — the types, `summarize`, `pageOf`,
 `progressOf`, the sentence functions and `translator` — is also in
@@ -135,7 +146,9 @@ always:
 ## Versions
 
 The dashboard reads the JSON of the engine of the same version: release and
-upgrade them together. Its types are generated from the engine's
+upgrade them together. A value the engine adds to a state (a replica's, a
+row's) is shown by this dashboard as unknown, with the word it came as, and
+counted; the contract number changes only when a word changes its meaning. Its types are generated from the engine's
 (`src/core/contract/types.ts`), and the engine's tests write what it answers
 into `src/core/contract/fixtures/`, which the dashboard's type-check holds
 field for field to those types and its tests read.

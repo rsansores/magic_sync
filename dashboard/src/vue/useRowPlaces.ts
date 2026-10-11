@@ -3,9 +3,9 @@
 // listing. `RowPlaces` is the ready-made list over it.
 
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
-import type { RowProgress, RowState } from '../core/contract/types.js'
+import type { RowProgress } from '../core/contract/types.js'
 import { nameOf } from '../core/derive.js'
-import { mismatchOf } from '../core/describe.js'
+import { describePlace, mismatchOf } from '../core/describe.js'
 import { collator } from '../core/format.js'
 import type { Messages } from '../core/i18n.js'
 import { useDashboardI18n } from './i18n.js'
@@ -18,18 +18,6 @@ export interface RowPlacesOptions {
   names?: MaybeRefOrGetter<Names | undefined>
   locale?: MaybeRefOrGetter<string | undefined>
   messages?: MaybeRefOrGetter<Messages | undefined>
-}
-
-/** Where a row is on a replica, in one word: settled, on its way, or set aside. */
-export type PlaceMood = 'holds' | 'moving' | 'set_aside'
-
-const moods: Record<RowState, PlaceMood> = {
-  holds: 'holds',
-  outdated: 'moving',
-  on_its_way: 'moving',
-  missing: 'moving',
-  leaving: 'moving',
-  quarantined: 'set_aside',
 }
 
 export function useRowPlaces(options: RowPlacesOptions) {
@@ -47,8 +35,7 @@ export function useRowPlaces(options: RowPlacesOptions) {
         replica: p.replica,
         name: nameOf({ name: (r) => lookup(toValue(options.names), r) }, p.replica),
         state: p.state,
-        mood: moods[p.state],
-        label: t(`row.${p.state}`),
+        ...describePlace(p.state, t),
       }))
       .sort((a, b) => compare(a.name, b.name))
   })

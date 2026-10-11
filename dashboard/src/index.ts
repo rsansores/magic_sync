@@ -16,7 +16,7 @@ export type {
 // Where one row is: next to the row, in the host's own listing.
 export { default as RowPlaces } from './vue/RowPlaces.vue'
 export { useRowPlaces } from './vue/useRowPlaces.js'
-export type { RowPlacesOptions, PlaceMood } from './vue/useRowPlaces.js'
+export type { RowPlacesOptions } from './vue/useRowPlaces.js'
 
 // Everything framework-free, also as `magic_sync_dashboard/core`.
 export * from './core/index.js'

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { pageOf, progressOf, summarize } from './derive.js'
+import { knowsReplicaState, pageOf, placeMoodOf, progressOf, summarize } from './derive.js'
 import type { Overview } from './contract/types.js'
 import overview from './contract/fixtures/overview.js'
 import listing from './contract/fixtures/listing.js'
@@ -181,5 +181,27 @@ describe('progressOf', () => {
 
   it('is complete when a replica should hold nothing', () => {
     expect(progressOf({ replica: id(9), tables: [] }).share).toBe(1)
+  })
+})
+
+describe('a value an engine newer than the dashboard added', () => {
+  it('counts a replica in a state it does not know, and does not call everything in sync', () => {
+    const newer = {
+      ...settled,
+      states: { ...settled.states, synced: 3, resting: 1 },
+    } as Overview
+    const summary = summarize(newer, options)
+    expect([summary.total, summary.mood]).toEqual([4, 'catching_up'])
+  })
+
+  it('knows the states it was written for, and no other word', () => {
+    expect(['awaiting_fix', 'unreachable', 'catching_up', 'synced'].every(knowsReplicaState)).toBe(true)
+    expect(['resting', 'constructor', '__proto__', ''].some(knowsReplicaState)).toBe(false)
+  })
+
+  it('puts a row state it does not know in no mood of the ones it does', () => {
+    expect(placeMoodOf('holds')).toBe('holds')
+    expect(placeMoodOf('quarantined')).toBe('set_aside')
+    expect(['teleporting', 'toString'].map(placeMoodOf)).toEqual(['unknown', 'unknown'])
   })
 })

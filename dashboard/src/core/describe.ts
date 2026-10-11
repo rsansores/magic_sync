@@ -3,8 +3,11 @@
 
 import { CONTRACT } from './contract/types.js'
 import {
+  knowsReplicaState,
+  placeMoodOf,
   readsContract,
   type Mood,
+  type PlaceMood,
   type Problem,
   type ProblemKind,
   type ReplicaRow,
@@ -130,4 +133,16 @@ export function describeShare(share: TableShare, speech: Speech): string[] {
 /** A share as a whole percentage, never rounded up to 100 before it is. */
 export function percent(share: number): number {
   return Math.floor(share * 100)
+}
+
+/** A replica's state in a word; an unknown one is named as it came. */
+export function describeState(state: string, t: Translate): string {
+  return knowsReplicaState(state) ? t(`state.${state}`) : t('state.unknown', { state })
+}
+
+/** What a row is to a replica: its mood, and the word for it. An unknown
+ * state is named as it came, neither settled nor a problem. */
+export function describePlace(state: string, t: Translate): { mood: PlaceMood; label: string } {
+  const mood = placeMoodOf(state)
+  return { mood, label: mood === 'unknown' ? t('row.unknown', { state }) : t(`row.${state}`) }
 }

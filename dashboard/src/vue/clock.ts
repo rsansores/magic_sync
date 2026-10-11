@@ -16,7 +16,8 @@ import { serverNow } from '../core/time.js'
 
 /** The server's time now, from the `now` of the answer `answered` returns.
  * It ticks only in a browser: on the server a page renders once, and no
- * timer outlives the render. */
+ * timer outlives the render. It needs a component or an effect scope to tie
+ * its timer to: called outside both, it does not tick. */
 export function useServerClock(answered: () => { now: string } | null | undefined) {
   const current = ref(Date.now())
   const receivedAt = ref(current.value)

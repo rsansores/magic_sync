@@ -56,6 +56,7 @@ const en: MessageTable = {
   'state.unreachable': 'Unreachable',
   'state.catching_up': 'Catching up',
   'state.synced': 'Synced',
+  'state.unknown': 'Unknown ({state})',
   'replicas.worst': {
     one: 'The replica that needs attention most, of {total}.',
     other: 'The {n} replicas that need attention most, of {total}.',
@@ -159,6 +160,7 @@ const en: MessageTable = {
   'row.missing': 'Should hold it, does not yet',
   'row.leaving': 'Letting it go',
   'row.quarantined': 'Set aside',
+  'row.unknown': 'Unknown ({state})',
 }
 
 const es: MessageTable = {
@@ -202,6 +204,7 @@ const es: MessageTable = {
   'state.unreachable': 'Inalcanzable',
   'state.catching_up': 'Poniéndose al día',
   'state.synced': 'Sincronizada',
+  'state.unknown': 'Desconocido ({state})',
   'replicas.worst': {
     one: 'La réplica que más requiere atención, de {total}.',
     other: 'Las {n} réplicas que más requieren atención, de {total}.',
@@ -305,6 +308,7 @@ const es: MessageTable = {
   'row.missing': 'Debe tenerlo, aún no',
   'row.leaving': 'Lo está soltando',
   'row.quarantined': 'Apartado',
+  'row.unknown': 'Desconocido ({state})',
 }
 
 export const builtinMessages: Messages = { en, es }
