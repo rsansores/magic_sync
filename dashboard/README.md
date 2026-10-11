@@ -66,7 +66,7 @@ const offset = ref(0)
 | `v-model:filter`             | the state the replicas are listed in (`null`: all of them)                                         |
 | `v-model:offset`, `pageSize` | where the page of the listing begins, and the `limit` you ask it for (50)                          |
 | `locale`, `messages`         | see below                                                                                          |
-| `silentAfter`, `stuckAfter`  | when a replica is "not answering" (15 min) and when waiting changes need attention (10 min), in ms |
+| `silentAfter`, `stuckAfter`  | when a replica is "not answering" (15 min) and when waiting changes need attention (15 min), in ms |
 
 An answer carries the version of its JSON (`contract`): one this dashboard
 does not read is refused, with a message that says so, rather than drawn

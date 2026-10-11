@@ -27,7 +27,7 @@ export interface SummaryOptions {
    * answering (it is off, or out of reach). Default 15 minutes. */
   silentAfter?: number
   /** A change waiting this long to be sent means the engine is stuck.
-   * Default 10 minutes. */
+   * Default 15 minutes: the server's own alarm (`Settings::stuck_after`). */
   stuckAfter?: number
 }
 
@@ -226,7 +226,7 @@ export function summarize(overview: Overview, options: SummaryOptions): Summary 
   const total = everyone(states)
   const worst = overview.replicas.first.map((r) => replicaRow(r, options))
   const waitingSince = timeOf(health.oldest)
-  const stuck = waitingSince != null && options.now - waitingSince > (options.stuckAfter ?? 10 * MINUTE)
+  const stuck = waitingSince != null && options.now - waitingSince > (options.stuckAfter ?? 15 * MINUTE)
   const tables = overview.tables
     .map((t): TableRow => ({
       table: t.table,

@@ -75,8 +75,11 @@ describe('summarize', () => {
     expect(summarize(settled, options).mood).toBe('healthy')
     const busy = { ...settled, health: { ...settled.health, pending: 3, oldest: overview.now } }
     expect(summarize(busy, options).mood).toBe('catching_up')
-    // The same backlog, waiting longer than it should: stuck.
-    const stuck = summarize(busy, { ...options, now: AT + 11 * MINUTE })
+    // The same backlog, waiting longer than the server's own alarm allows:
+    // stuck, at the moment the server says so in its log.
+    const waiting = summarize(busy, { ...options, now: AT + 14 * MINUTE })
+    expect([waiting.mood, waiting.stuck]).toEqual(['catching_up', false])
+    const stuck = summarize(busy, { ...options, now: AT + 16 * MINUTE })
     expect([stuck.mood, stuck.stuck]).toEqual(['attention', true])
   })
 

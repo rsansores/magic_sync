@@ -39,7 +39,7 @@ export interface SyncDashboardOptions {
    * "not answering", in ms. Default 15 minutes. */
   silentAfter?: MaybeRefOrGetter<number | undefined>
   /** How long a change may wait to be sent before the page asks for
-   * attention, in ms. Default 10 minutes. */
+   * attention, in ms. Default 15 minutes, the server's own alarm. */
   stuckAfter?: MaybeRefOrGetter<number | undefined>
 }
 
