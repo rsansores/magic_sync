@@ -357,3 +357,38 @@ async fn until_true(done: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// Digests wait for the replica to settle — `digests_first` — and then go
+/// every `digests_every`.
+#[sqlx::test(migrations = false)]
+async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let settings = Settings {
+        digests_first: Duration::from_millis(300),
+        digests_every: Duration::from_secs(3600),
+        ..settings()
+    };
+    let replica = Replica::new(pool, codecs(), Uuid::now_v7(), uplink.clone(), settings)
+        .await
+        .unwrap();
+    replica.receive(&rows(1, 0, "one")).await.unwrap();
+    let digested = || {
+        uplink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, up)| !up.digests.is_empty())
+            .count()
+    };
+    let started = Instant::now();
+    until(&replica, || started.elapsed() > Duration::from_millis(700)).await;
+    assert_eq!(digested(), 1, "once settled, and not again within the hour");
+    let first = uplink.sent.lock().unwrap()[0].2.clone();
+    assert_eq!(
+        (first.sequence, first.digests.len()),
+        (1, 0),
+        "confirmed at once, without them"
+    );
+}

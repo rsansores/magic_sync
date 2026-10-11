@@ -3468,5 +3468,28 @@ async fn a_failure_that_is_not_the_rows_fails_the_message(pool: SqlitePool) {
     assert_eq!(w.items().await, ["a"]);
 }
 
+/// A table takes a replica's deletes only when keyed by it — alone or with
+/// other columns — and history does not.
+#[test]
+fn a_table_takes_deletes_only_when_keyed_by_its_replica() {
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
+    )]
+    #[row(
+        table = "beacons",
+        mirror = "record",
+        key = "replica_id",
+        origin = "replica_id"
+    )]
+    struct Beacon {
+        replica_id: Uuid,
+        #[row(version)]
+        seen: i64,
+    }
+    assert!(Codec::<()>::json::<Beacon>(None).takes_deletes());
+    assert!(Codec::<()>::json::<Reading>(None).takes_deletes());
+    assert!(!Codec::<()>::json::<Event>(None).takes_deletes());
+}
+
 #[path = "replica_walk_tests.rs"]
 mod walk;
