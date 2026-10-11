@@ -3441,5 +3441,32 @@ async fn an_unknown_tables_name_and_key_are_kept_to_the_byte(pool: SqlitePool) {
     );
 }
 
+/// What the database fails with that is not the rows' — a host's trigger
+/// that reads a table there is not — fails the message, rather than
+/// refusing every row it touched: the next build may fix it.
+#[sqlx::test(migrations = false)]
+async fn a_failure_that_is_not_the_rows_fails_the_message(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec(
+        "CREATE TRIGGER broken BEFORE INSERT ON items \
+         BEGIN SELECT count(*) FROM no_such_table; END",
+    )
+    .await
+    .unwrap();
+    let message = down(
+        1,
+        "",
+        vec![upserts("items", vec![item(Uuid::now_v7(), "a")])],
+    );
+    match w.replica.receive(&message).await {
+        Err(Error::Database(e)) => assert!(e.to_string().contains("no such table"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.rejected().await.is_empty());
+    w.exec("DROP TRIGGER broken").await.unwrap();
+    w.receive(&message).await;
+    assert_eq!(w.items().await, ["a"]);
+}
+
 #[path = "replica_walk_tests.rs"]
 mod walk;
