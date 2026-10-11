@@ -1452,10 +1452,7 @@ pub struct Outbox {
 impl Default for Outbox {
     fn default() -> Self {
         Outbox {
-            limits: envelope::Limits {
-                rows: 500,
-                bytes: 1 << 20,
-            },
+            limits: envelope::Limits::default(),
             resend_after: std::time::Duration::from_secs(600),
             rejections: std::num::NonZeroUsize::new(500).expect("not zero"),
             backlog_every: std::time::Duration::from_secs(60),

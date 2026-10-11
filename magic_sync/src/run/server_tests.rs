@@ -1311,3 +1311,10 @@ async fn the_inbox_is_bounded_per_replica_filed_a_page_at_a_time_and_pruned_of_s
     assert_eq!(kept(b).await, 0, "waited too long: dropped");
     BUGGY.set(true);
 }
+
+/// A server left at its defaults takes every upload a replica left at its
+/// own builds: both take the one default.
+#[test]
+fn a_servers_default_limits_are_the_replicas() {
+    assert_eq!(Settings::default().limits, Limits::default());
+}

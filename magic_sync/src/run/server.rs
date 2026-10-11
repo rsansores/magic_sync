@@ -142,10 +142,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            limits: Limits {
-                rows: 500,
-                bytes: 512 * 1024,
-            },
+            limits: Limits::default(),
             batch: NonZeroU32::new(500).expect("not zero"),
             outbox_messages: NonZeroU32::new(10_000).expect("not zero"),
             outbox_bytes: NonZeroU64::new(256 << 20).expect("not zero"),

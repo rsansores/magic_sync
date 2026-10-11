@@ -3475,3 +3475,10 @@ fn a_table_takes_deletes_only_when_keyed_by_its_replica() {
 
 #[path = "replica_walk_tests.rs"]
 mod walk;
+
+/// A replica left at its defaults never builds an upload a server left at
+/// its own drops as beyond its limits: both take the one default.
+#[test]
+fn a_replicas_default_limits_are_the_servers() {
+    assert_eq!(Outbox::default().limits, Limits::default());
+}

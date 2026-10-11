@@ -12,6 +12,8 @@ pub fn magic_sync::envelope::Limits::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::envelope::Limits
 impl core::cmp::PartialEq for magic_sync::envelope::Limits
 pub fn magic_sync::envelope::Limits::eq(&self, &Self) -> bool
+impl core::default::Default for magic_sync::envelope::Limits
+pub fn magic_sync::envelope::Limits::default() -> Self
 impl core::fmt::Debug for magic_sync::envelope::Limits
 pub fn magic_sync::envelope::Limits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for magic_sync::envelope::Limits

@@ -65,6 +65,18 @@ pub struct Limits {
     pub(crate) bytes: usize,
 }
 
+/// What both sides take by default, so that a replica of default settings
+/// never builds an upload a server of default settings drops: 500 rows, in
+/// half a megabyte.
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            rows: 500,
+            bytes: 512 * 1024,
+        }
+    }
+}
+
 impl Limits {
     /// At most `rows` rows and `bytes` bytes a message. Refused unless a
     /// message can carry a row: `rows` at least one, and `bytes` more than
@@ -407,6 +419,15 @@ mod tests {
                 other => panic!("{rows} rows in {bytes} bytes: {other:?}"),
             }
         }
+    }
+
+    /// Pinned: a replica and a server of different builds both take it.
+    #[test]
+    fn the_default_limits_are_500_rows_in_half_a_megabyte() {
+        assert_eq!(
+            (Limits::default().rows(), Limits::default().bytes()),
+            (500, 512 * 1024)
+        );
     }
 
     #[test]
