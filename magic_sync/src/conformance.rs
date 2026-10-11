@@ -113,18 +113,22 @@ pub fn json<R: Row + Serialize>(row: &R) -> Vec<u8> {
 /// Where the golden messages are kept.
 pub const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/to_replica.txt");
 
-/// The golden messages, as `(step, bytes)`, in the order they were sent:
-/// one line each, the step's name and the message in hex.
-pub fn golden(text: &str) -> Vec<(String, Vec<u8>)> {
+/// The messages of a golden file, as `(name, outcome, bytes)`, in order:
+/// one line each — its name, what the other side makes of it, and the
+/// message in hex. Lines of what a replica then holds (`holds …`) are
+/// not messages.
+pub fn golden(text: &str) -> Vec<(String, String, Vec<u8>)> {
     text.lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("holds "))
         .map(|line| {
-            let (step, hex) = line.split_once(' ').expect("a step and its bytes");
+            let mut fields = line.splitn(3, ' ');
+            let mut next = || fields.next().expect("a name, an outcome and the bytes");
+            let (name, outcome, hex) = (next(), next(), next());
             let bytes = (0..hex.len())
                 .step_by(2)
                 .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
                 .collect();
-            (step.to_owned(), bytes)
+            (name.to_owned(), outcome.to_owned(), bytes)
         })
         .collect()
 }
@@ -260,85 +264,167 @@ pub fn matches_golden(path: &str, text: &str) {
     );
 }
 
-/// Messages no server sends, each named for what is wrong with it: a
-/// replica of any build takes each as malformed (PROTOCOL.md 4.0, 4.1, 4.2).
-/// They follow a replica provisioned by a snapshot of nothing, `EndSnapshot`
-/// 100 of [`EPOCH`].
-pub fn malformed() -> Vec<(&'static str, Vec<u8>)> {
-    use crate::envelope::{Body, Down, EndSnapshot, ToReplica};
+/// The nonce the messages built by hand carry at `sequence`: a server draws
+/// its own at random.
+pub fn nonce_of(sequence: u64) -> u64 {
+    0x5eed_0000_0000_0000 | sequence
+}
+
+/// What a replica makes of a message, as the corpora name it beside the
+/// bytes: `applied`, `ended`, `filed`, `already` (at or below the last
+/// applied), `gap` or `malformed`.
+pub type Outcome = &'static str;
+
+/// Messages no server sends — and, between them, the few that set the
+/// scene — each named for what it is and given with what a replica of any
+/// build makes of it (PROTOCOL.md 3, 4.0, 4.1, 4.2), in order: they follow a
+/// replica provisioned by a snapshot of nothing, `EndSnapshot` 100 of
+/// [`EPOCH`], nonce `nonce_of(100)`.
+pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
+    use crate::envelope::{Body, Down, EndSnapshot, Table, ToReplica};
     use prost::Message as _;
+    let chained = |sequence: u64, previous: u64, snapshot: &str, epoch: &str| Down {
+        snapshot_id: snapshot.to_owned(),
+        sequence,
+        epoch: epoch.to_owned(),
+        previous,
+        nonce: nonce_of(sequence),
+        previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+        ..Down::default()
+    };
     let down = |sequence: u64, previous: u64, snapshot: &str, epoch: &str| {
-        Body::Down(Down {
+        Body::Down(chained(sequence, previous, snapshot, epoch))
+    };
+    let end = |sequence: u64, previous: u64, snapshot: &str| {
+        Body::EndSnapshot(EndSnapshot {
             snapshot_id: snapshot.to_owned(),
-            tables: Vec::new(),
+            tables: vec!["items".to_owned()],
             sequence,
-            epoch: epoch.to_owned(),
+            epoch: EPOCH.to_owned(),
             previous,
+            nonce: nonce_of(sequence),
+            previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+            ..EndSnapshot::default()
         })
     };
     let message = |protocol: u32, body: Option<Body>| ToReplica { protocol, body }.encode_to_vec();
-    let mut truncated = message(1, Some(down(101, 100, "", EPOCH)));
+    let one = |body: Body| message(1, Some(body));
+    let with = |change: fn(&mut Down)| {
+        let mut d = chained(101, 100, "", EPOCH);
+        change(&mut d);
+        one(Body::Down(d))
+    };
+    let mut truncated = one(down(101, 100, "", EPOCH));
     truncated.truncate(truncated.len() - 3);
+    let snapshot = "0192f6a0-0000-7000-8000-000000005eee";
+    let other = "0192f6a0-0000-7000-8000-000000005fff";
     vec![
-        ("no_message", vec![0xff, 0xff, 0xff]),
-        ("truncated", truncated),
-        ("no_protocol", message(0, Some(down(101, 100, "", EPOCH)))),
-        ("no_body", message(1, None)),
-        ("unknown_body", vec![0x08, 0x01, 0x4a, 0x02, 0x08, 0x01]),
-        ("sequence_zero", message(1, Some(down(0, 0, "s", EPOCH)))),
+        ("no_message", "malformed", vec![0xff, 0xff, 0xff]),
+        ("truncated", "malformed", truncated),
+        (
+            "no_protocol",
+            "malformed",
+            message(0, Some(down(101, 100, "", EPOCH))),
+        ),
+        ("no_body", "malformed", message(1, None)),
+        (
+            "unknown_body",
+            "malformed",
+            vec![0x08, 0x01, 0x4a, 0x02, 0x08, 0x01],
+        ),
+        ("sequence_zero", "malformed", one(down(0, 0, "s", EPOCH))),
         (
             "sequence_too_large",
-            message(1, Some(down(1 << 63, 100, "", EPOCH))),
+            "malformed",
+            one(down(1 << 63, 100, "", EPOCH)),
         ),
-        ("epoch_no_uuid", message(1, Some(down(101, 100, "", "e")))),
+        ("epoch_no_uuid", "malformed", one(down(101, 100, "", "e"))),
         (
             "follows_itself",
-            message(1, Some(down(101, 101, "", EPOCH))),
+            "malformed",
+            one(down(101, 101, "", EPOCH)),
         ),
         (
             "follows_a_later_one",
-            message(1, Some(down(101, 102, "", EPOCH))),
+            "malformed",
+            one(down(101, 102, "", EPOCH)),
         ),
-        ("keys_not_one_per_row", {
-            let mut down = down(101, 100, "", EPOCH);
-            if let Body::Down(d) = &mut down {
-                d.tables.push(crate::envelope::Table {
+        ("no_nonce", "malformed", with(|d| d.nonce = 0)),
+        ("nonce_too_large", "malformed", with(|d| d.nonce = 1 << 63)),
+        (
+            "follows_without_its_nonce",
+            "malformed",
+            with(|d| d.previous_nonce = 0),
+        ),
+        (
+            "follows_nothing_with_a_nonce",
+            "malformed",
+            one(Body::Down(Down {
+                previous_nonce: 7,
+                ..chained(101, 0, "s", EPOCH)
+            })),
+        ),
+        (
+            "keys_not_one_per_row",
+            "malformed",
+            with(|d| {
+                d.tables.push(Table {
                     table: "items".to_owned(),
                     upserts: vec![Vec::new()],
-                    ..crate::envelope::Table::default()
+                    ..Table::default()
                 });
-            }
-            message(1, Some(down))
-        }),
+            }),
+        ),
         (
             "follows_nothing_and_begins_nothing",
-            message(1, Some(down(101, 0, "", EPOCH))),
+            "malformed",
+            one(down(101, 0, "", EPOCH)),
         ),
         (
             "of_a_snapshot_not_in_progress",
-            message(
-                1,
-                Some(down(
-                    101,
-                    100,
-                    "0192f6a0-0000-7000-8000-000000005fff",
-                    EPOCH,
-                )),
-            ),
+            "malformed",
+            one(down(101, 100, other, EPOCH)),
         ),
         (
             "ends_a_snapshot_not_in_progress",
-            message(
-                1,
-                Some(Body::EndSnapshot(EndSnapshot {
-                    snapshot_id: "0192f6a0-0000-7000-8000-000000005fff".to_owned(),
-                    tables: vec!["items".to_owned()],
-                    sequence: 101,
-                    epoch: EPOCH.to_owned(),
-                    previous: 100,
-                })),
-            ),
+            "malformed",
+            one(end(101, 100, other)),
         ),
+        (
+            "ends_a_snapshot_of_no_id",
+            "malformed",
+            one(end(101, 100, "")),
+        ),
+        // A key that does not parse is left out, and the rest applied.
+        (
+            "a_delete_of_a_key_that_does_not_parse",
+            "applied",
+            with(|d| {
+                d.tables.push(Table {
+                    table: "items".to_owned(),
+                    deletes: vec![crate::envelope::Key {
+                        parts: vec!["not a uuid".to_owned()],
+                    }],
+                    ..Table::default()
+                });
+            }),
+        ),
+        (
+            "begins_a_snapshot",
+            "applied",
+            one(down(102, 0, snapshot, EPOCH)),
+        ),
+        (
+            "follows_the_snapshot_and_is_not_of_it",
+            "malformed",
+            one(down(103, 102, "", EPOCH)),
+        ),
+        (
+            "follows_the_snapshot_and_is_of_another",
+            "malformed",
+            one(down(103, 102, other, EPOCH)),
+        ),
+        ("ends_the_snapshot", "ended", one(end(103, 102, snapshot))),
     ]
 }
 
@@ -346,12 +432,14 @@ pub fn malformed() -> Vec<(&'static str, Vec<u8>)> {
 /// language reads its cases from the file.
 #[test]
 fn the_malformed_corpus_is_the_one_checked_in() {
-    let header = "# Messages no server sends: `case hex` per message. A replica provisioned by an\n\
-                  # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, of nothing, takes each\n\
-                  # as malformed: it acknowledges it and applies nothing (PROTOCOL.md 4.0, 4.1, 4.2).\n";
+    let header = "# Messages no server sends, and between them the few that set the scene:\n\
+                  # `case outcome hex` per message, in order. A replica provisioned by an\n\
+                  # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, nonce\n\
+                  # 0x5eed000000000064, of nothing, makes of each what `outcome` says: `malformed`\n\
+                  # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2).\n";
     let text: String = malformed()
         .iter()
-        .map(|(case, bytes)| format!("{case} {}\n", hex(bytes)))
+        .map(|(case, outcome, bytes)| format!("{case} {outcome} {}\n", hex(bytes)))
         .collect();
     matches_golden(MALFORMED, &format!("{header}{text}"));
 }
@@ -491,11 +579,13 @@ mod server {
         let mut conn = pool.acquire().await.unwrap();
         crate::plan::tests::install(&mut conn).await;
         sqlx::raw_sql(SCHEMA).execute(&mut *conn).await.unwrap();
-        sqlx::query("UPDATE sync.epoch SET epoch = $1::uuid")
+        // Pinned, with the nonces: the same build seals the same bytes.
+        sqlx::query("UPDATE sync.epoch SET epoch = $1::uuid, secret = '\\x5eed'")
             .bind(EPOCH)
             .execute(&mut *conn)
             .await
             .unwrap();
+        crate::envelope::PINNED_NONCES.set(Some(nonce_of(1)));
         sqlx::query("INSERT INTO fixture.t_replicas VALUES ($1::uuid, true)")
             .bind(REPLICA)
             .execute(&mut *conn)
@@ -530,7 +620,7 @@ mod server {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
             *kept.takes.lock().unwrap() = *takes;
             if *step == "filed" {
-                for (_, bytes) in golden(&uploads) {
+                for (_, _, bytes) in golden(&uploads) {
                     server
                         .receive(REPLICA.parse().unwrap(), &bytes)
                         .await
@@ -569,7 +659,17 @@ mod server {
                     });
                     *id = format!("0192f6a0-0000-7000-8000-{:012x}", 0x5000 + at);
                 }
-                out.push_str(&format!("{step} {}\n", hex(&message.encode_to_vec())));
+                let outcome = match (&message.body, *step) {
+                    (_, "lost") => "lost",
+                    (_, "gap") => "gap",
+                    (Some(Body::Down(_)), _) => "applied",
+                    (Some(Body::EndSnapshot(_)), _) => "ended",
+                    _ => "filed",
+                };
+                out.push_str(&format!(
+                    "{step} {outcome} {}\n",
+                    hex(&message.encode_to_vec())
+                ));
             }
         }
         out
@@ -580,9 +680,10 @@ mod server {
     /// applies. `MAGIC_SYNC_BLESS=1` writes them anew.
     #[sqlx::test(migrations = false)]
     async fn the_golden_messages_are_what_the_server_sends(pool: crate::DbPool) {
-        let header = "# What the server sends one replica, step by step: `step hex` per message.\n\
-                      # Generated by conformance::server; applied by the replica conformance suite,\n\
-                      # which reads each step by its name (the transport loses the `lost` one).\n";
+        let header = "# What the server sends one replica, step by step: `step outcome hex` per\n\
+                      # message, `outcome` what the replica makes of it (the transport loses the\n\
+                      # `lost` one). Generated by conformance::server; applied by the replica\n\
+                      # conformance suite, which reads each step by its name.\n";
         matches_golden(GOLDEN, &format!("{header}{}", sent(pool).await));
     }
 }

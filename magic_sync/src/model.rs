@@ -33,7 +33,6 @@ pub(crate) struct Rules {
 
 impl Rules {
     /// A replica that takes everything, of rows that point at nothing.
-    #[cfg(feature = "postgres")]
     pub(crate) const ANY: Rules = Rules {
         refuses: |_, _| false,
         parents: |_, _| Vec::new(),
@@ -68,6 +67,20 @@ pub(crate) enum Received {
     Malformed,
 }
 
+impl Received {
+    /// What the corpora call it.
+    pub(crate) fn outcome(&self) -> &'static str {
+        match self {
+            Received::Applied => "applied",
+            Received::Ended => "ended",
+            Received::Filed => "filed",
+            Received::Already => "already",
+            Received::Gap => "gap",
+            Received::Malformed => "malformed",
+        }
+    }
+}
+
 /// One replica: what it holds, and what it has to tell the server.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Model {
@@ -75,15 +88,35 @@ pub(crate) struct Model {
     pub(crate) rows: BTreeMap<Row, Vec<u8>>,
     /// The last message it applied, and from which epoch.
     pub(crate) applied: Option<(String, u64)>,
+    /// That message's nonce and seal, given back with it.
+    nonce: u64,
+    mac: Vec<u8>,
     /// The last one the server heard of.
     acknowledged: Option<(String, u64)>,
     snapshot: Option<Snapshot>,
-    /// It missed a message, and waits for a snapshot to begin.
-    pub(crate) gap: bool,
+    /// The newest message it could not follow, while it waits for a
+    /// snapshot to begin; 0 when it missed none.
+    pub(crate) gap: u64,
+    /// The gap the server was last told of.
+    gap_told: u64,
     pub(crate) rejections: BTreeMap<Row, Rejection>,
     /// Rows a row of its own points at, in a table with nothing to retire
     /// them by: it cannot let them go.
     pub(crate) pinned: BTreeSet<Row>,
+}
+
+/// The largest number a server sends: 2^63 - 1.
+const MOST: u64 = i64::MAX as u64;
+
+/// Where a message stands in the server's chain.
+struct Place {
+    epoch: String,
+    sequence: u64,
+    nonce: u64,
+    previous: u64,
+    previous_nonce: u64,
+    mac: Vec<u8>,
+    snapshot_id: String,
 }
 
 impl Model {
@@ -99,22 +132,48 @@ impl Model {
         let Some(body) = message.body else {
             return Received::Malformed;
         };
-        let (epoch, sequence, previous, snapshot_id) = match &body {
+        let (place, ends) = match &body {
             Body::Filed(_) => return Received::Filed,
-            Body::Down(d) => (
-                d.epoch.clone(),
-                d.sequence,
-                d.previous,
-                d.snapshot_id.clone(),
-            ),
-            Body::EndSnapshot(e) => (
-                e.epoch.clone(),
-                e.sequence,
-                e.previous,
-                e.snapshot_id.clone(),
-            ),
+            Body::Down(d) => {
+                if d.tables.iter().any(|t| t.keys.len() != t.upserts.len()) {
+                    return Received::Malformed;
+                }
+                let place = Place {
+                    epoch: d.epoch.clone(),
+                    sequence: d.sequence,
+                    nonce: d.nonce,
+                    previous: d.previous,
+                    previous_nonce: d.previous_nonce,
+                    mac: d.mac.clone(),
+                    snapshot_id: d.snapshot_id.clone(),
+                };
+                (place, false)
+            }
+            Body::EndSnapshot(e) => {
+                let place = Place {
+                    epoch: e.epoch.clone(),
+                    sequence: e.sequence,
+                    nonce: e.nonce,
+                    previous: e.previous,
+                    previous_nonce: e.previous_nonce,
+                    mac: e.mac.clone(),
+                    snapshot_id: e.snapshot_id.clone(),
+                };
+                (place, true)
+            }
         };
-        if sequence == 0 || previous >= sequence || (previous == 0 && snapshot_id.is_empty()) {
+        // Numbers no server sends (4.1).
+        let Ok(epoch) = uuid::Uuid::parse_str(&place.epoch).map(|e| e.to_string()) else {
+            return Received::Malformed;
+        };
+        let sequence = place.sequence;
+        if !(1..=MOST).contains(&sequence)
+            || place.previous >= sequence
+            || !(1..=MOST).contains(&place.nonce)
+            || place.previous_nonce > MOST
+            || (place.previous == 0) != (place.previous_nonce == 0)
+            || (place.previous == 0 && place.snapshot_id.is_empty())
+        {
             return Received::Malformed;
         }
         if let Some((e, s)) = &self.applied {
@@ -124,22 +183,28 @@ impl Model {
                 return Received::Already;
             }
         }
-        if previous == 0 {
+        if place.previous == 0 {
             self.snapshot = Some(Snapshot {
-                id: snapshot_id.clone(),
+                id: place.snapshot_id.clone(),
                 began: sequence,
                 named: BTreeSet::new(),
             });
-            self.gap = false;
-        } else if self.applied != Some((epoch.clone(), previous)) {
-            self.gap = true;
-            return Received::Gap;
-        } else if !snapshot_id.is_empty()
-            && self.snapshot.as_ref().is_none_or(|s| s.id != snapshot_id)
-        {
-            return Received::Malformed;
+            (self.gap, self.gap_told) = (0, 0);
+        } else {
+            let follows = self.gap == 0
+                && self.applied == Some((epoch.clone(), place.previous))
+                && self.nonce == place.previous_nonce;
+            if !follows {
+                self.gap = self.gap.max(sequence);
+                return Received::Gap;
+            }
+            let named = (!place.snapshot_id.is_empty() || ends).then_some(&place.snapshot_id);
+            if named != self.snapshot.as_ref().map(|s| &s.id) {
+                return Received::Malformed;
+            }
         }
         self.applied = Some((epoch, sequence));
+        (self.nonce, self.mac) = (place.nonce, place.mac);
         match body {
             Body::Filed(_) => Received::Filed,
             Body::Down(down) => {
@@ -167,7 +232,7 @@ impl Model {
                 Received::Applied
             }
             Body::EndSnapshot(end) => {
-                let snapshot = self.snapshot.take().expect("begun, or malformed");
+                let snapshot = self.snapshot.take().expect("in progress, or malformed");
                 for table in end.tables.iter().rev() {
                     let epoch = self.applied.as_ref().map(|(e, _)| e.clone());
                     self.rejections.retain(|(t, _), r| {
@@ -250,12 +315,46 @@ impl Model {
             gap: self.gap,
             ..Up::default()
         };
-        if self.applied != self.acknowledged || self.gap {
-            if let Some((epoch, sequence)) = &self.applied {
-                (up.epoch, up.sequence) = (epoch.clone(), *sequence);
-            }
+        if self.applied != self.acknowledged || self.gap > 0 {
+            self.confirm(&mut up);
         }
-        (!up.rejected.is_empty() || up.sequence > 0 || up.gap).then_some(up)
+        let news = self.applied != self.acknowledged || self.gap > self.gap_told;
+        (!up.rejected.is_empty() || news).then_some(up)
+    }
+
+    /// The last message it applied, as it gives it back to the server.
+    #[cfg(feature = "postgres")]
+    fn confirm(&self, up: &mut Up) {
+        if let Some((epoch, sequence)) = &self.applied {
+            (up.epoch, up.sequence) = (epoch.clone(), *sequence);
+            (up.nonce, up.mac) = (self.nonce, self.mac.clone());
+        }
+    }
+
+    /// What it holds of each of `tables`, with the last message it applied:
+    /// the digests a replica reports now and then (PROTOCOL.md section 8),
+    /// leaving out the rows it rejected.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn digests(&self, tables: &[&str]) -> Up {
+        let mut up = Up {
+            protocol: crate::envelope::PROTOCOL,
+            ..Up::default()
+        };
+        self.confirm(&mut up);
+        for table in tables {
+            let keys: Vec<String> = self
+                .rows
+                .keys()
+                .filter(|row| row.0 == *table && !self.rejections.contains_key(*row))
+                .map(|(_, key)| key.clone())
+                .collect();
+            up.digests.push(crate::envelope::Digest {
+                table: (*table).to_owned(),
+                count: keys.len() as u64,
+                fingerprint: crate::envelope::fingerprint(keys),
+            });
+        }
+        up
     }
 
     /// The uplink took `up`.
@@ -275,6 +374,7 @@ impl Model {
         if up.sequence > 0 {
             self.acknowledged = Some((up.epoch.clone(), up.sequence));
         }
+        self.gap_told = self.gap_told.max(up.gap);
     }
 
     /// Rows it holds that point at a row it neither holds nor refused.
@@ -401,5 +501,41 @@ impl Transport for Wire {
             Ok(())
         };
         async move { result }
+    }
+}
+
+/// The model is written from PROTOCOL.md, and the corpora say what the
+/// protocol makes of each message: the two agree, line by line.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::{golden, nonce_of, EPOCH, GOLDEN, MALFORMED};
+    use crate::envelope::EndSnapshot;
+
+    #[test]
+    fn the_model_makes_of_every_corpus_line_what_it_says() {
+        let provisioned = Body::EndSnapshot(EndSnapshot {
+            snapshot_id: "provisioned".to_owned(),
+            sequence: 100,
+            epoch: EPOCH.to_owned(),
+            nonce: nonce_of(100),
+            ..EndSnapshot::default()
+        })
+        .encoded();
+        let mut model = Model::default();
+        assert_eq!(model.receive(&provisioned, &Rules::ANY), Received::Ended);
+        let corpus = std::fs::read_to_string(MALFORMED).expect("the corpus");
+        for (case, outcome, bytes) in golden(&corpus) {
+            let got = model.receive(&bytes, &Rules::ANY);
+            assert_eq!(got.outcome(), outcome, "{case}");
+        }
+        let mut model = Model::default();
+        let sent = std::fs::read_to_string(GOLDEN).expect("the golden messages");
+        for (step, outcome, bytes) in golden(&sent) {
+            if outcome != "lost" {
+                let got = model.receive(&bytes, &Rules::ANY);
+                assert_eq!(got.outcome(), outcome, "{step}");
+            }
+        }
     }
 }

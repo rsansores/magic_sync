@@ -67,6 +67,19 @@ pub struct Down {
     /// message that begins a snapshot, which follows nothing.
     #[prost(uint64, tag = "5")]
     pub previous: u64,
+    /// A number of this message's own, drawn at random from 1 to 2^63 - 1: a
+    /// server restored from an older copy numbers its messages again, and
+    /// draws other nonces for them.
+    #[prost(uint64, tag = "6")]
+    pub nonce: u64,
+    /// The nonce of the message `previous` names: the one this follows is that
+    /// sequence with that nonce. 0 when `previous` is 0.
+    #[prost(uint64, tag = "7")]
+    pub previous_nonce: u64,
+    /// The server's seal on this message for this replica, opaque to it: the
+    /// replica gives it back as it came when it says it applied the message.
+    #[prost(bytes = "vec", tag = "8")]
+    pub mac: ::prost::alloc::vec::Vec<u8>,
 }
 /// Server to replica: a snapshot is complete. Every row of `tables` the
 /// replica holds and the snapshot did not name goes, children first: in
@@ -86,6 +99,13 @@ pub struct EndSnapshot {
     /// As Down's: 0 when it ends a snapshot of nothing, which it begins.
     #[prost(uint64, tag = "5")]
     pub previous: u64,
+    /// As Down's.
+    #[prost(uint64, tag = "6")]
+    pub nonce: u64,
+    #[prost(uint64, tag = "7")]
+    pub previous_nonce: u64,
+    #[prost(bytes = "vec", tag = "8")]
+    pub mac: ::prost::alloc::vec::Vec<u8>,
 }
 /// Server to replica: these uploads are filed, or kept to be filed once they
 /// can be. The notes they carried are done.
@@ -106,13 +126,18 @@ pub struct Up {
     /// server records it holds.
     #[prost(message, repeated, tag = "4")]
     pub digests: ::prost::alloc::vec::Vec<Digest>,
-    /// The last message the replica applied: its epoch and sequence. Set when
-    /// the server has not heard of it, and always with digests, which are only
-    /// comparable once the replica applied every message recorded for it.
+    /// The last message the replica applied: its epoch, sequence, nonce and
+    /// mac, as the message carried them. Set on the first lane when the server
+    /// has not heard of it, and always with digests, which are only comparable
+    /// once the replica applied every message recorded for it, and with a gap.
     #[prost(string, tag = "5")]
     pub epoch: ::prost::alloc::string::String,
     #[prost(uint64, tag = "6")]
     pub sequence: u64,
+    #[prost(uint64, tag = "11")]
+    pub nonce: u64,
+    #[prost(bytes = "vec", tag = "12")]
+    pub mac: ::prost::alloc::vec::Vec<u8>,
     /// The number of this upload, when it carries rows: a fresh one on every
     /// send, drawn at random from 1 to 2^63 - 1, so no answer meant for another
     /// replica, or for this one before a restore, names it. The server answers
@@ -126,11 +151,13 @@ pub struct Up {
     /// the first lane, when it changed. Absent: it did not say this time.
     #[prost(message, optional, tag = "9")]
     pub backlog: ::core::option::Option<Backlog>,
-    /// It missed a message: one arrived whose `previous` is not the last it
-    /// applied. Said, with epoch and sequence, until a snapshot begins; the
-    /// server answers with one.
-    #[prost(bool, tag = "10")]
-    pub gap: bool,
+    /// It missed a message: the sequence of the newest one that arrived not
+    /// following the last it applied, and that it therefore did not apply. 0:
+    /// none. Said on the first lane, with the last applied, until a snapshot
+    /// begins, and told again whenever it grows; the server answers with a
+    /// snapshot, unless one that began after this sequence is on its way.
+    #[prost(uint64, tag = "10")]
+    pub gap: u64,
 }
 /// What a replica wrote that the server has not filed yet.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -166,7 +193,7 @@ pub struct Rejected {
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
     /// The message whose row, or delete, the replica refused: the server
-    /// ignores a rejection of a message older than the last one that carried
+    /// ignores a rejection of a message other than the last one that carried
     /// the row, or of another epoch.
     #[prost(string, tag = "4")]
     pub epoch: ::prost::alloc::string::String,

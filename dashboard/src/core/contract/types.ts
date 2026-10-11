@@ -118,9 +118,9 @@ sent_at: string | null,
  */
 applied_at: string | null, 
 /**
- * While it has messages it has not said it applied: since when it has
- * not moved — the first one it did not confirm, or its last confirmation
- * that left it behind. How long a replica has not answered.
+ * While it has messages it has not said it applied: since it last
+ * moved — its last send or its last confirmation, whichever came later.
+ * How long a replica has not answered.
  */
 waiting_since: string | null, 
 /**

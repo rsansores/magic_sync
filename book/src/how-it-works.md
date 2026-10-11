@@ -254,19 +254,27 @@ message from a PostgreSQL sequence, and gives them out in the order the
 messages go. A sequence never goes backwards and is not rolled back with a
 transaction, so no two messages ever share a number. A replica applies
 nothing at or below the last number it applied: a message delivered twice
-changes nothing. Each message also names the one sent the replica before it
-(`previous`); a replica applies a message only when it follows the last one
-it applied, so one that follows a message it never got — lost on the way,
-or the replica's database restored from an older copy — is a *gap*: it
-applies nothing more, tells the server, and is provisioned again. Messages
-carry the *epoch* too, a random id of the server's installation: a new
-epoch always begins with a snapshot.
+changes nothing. Each message also carries a random *nonce*, and names the
+one sent the replica before it, by number and nonce (`previous`,
+`previous_nonce`); a replica applies a message only when it follows the last
+one it applied, so one that follows a message it never got — lost on the
+way, or the replica's database restored from an older copy — is a *gap*: it
+applies nothing more until a snapshot begins, tells the server the newest
+message it could not follow, and is provisioned again, unless a snapshot
+that began after that message is already on its way. Messages carry the
+*epoch* too, a random id of the server's installation: a new epoch always
+begins with a snapshot.
 
-A server database restored from an older copy numbers again from where the
-copy left off: its replicas drop those messages as applied already, and say
-what they applied — past every number the restored database remembers
-drawing. The server then takes a new epoch and provisions every replica
-again.
+Every message is sealed for its replica: an HMAC of its replica, epoch,
+number and nonce under a secret of the epoch (`sync.epoch`). The replica
+gives the seal back, as it came, when it says what it applied, so the
+server knows it sent that message. A server database restored from an
+older copy numbers again from where the copy left off, but draws other
+nonces: its replicas apply none of it, and say what they applied — a
+message the server sealed and has no record of sending. The server then
+takes a new epoch and provisions every replica again. A replica that says
+it applied less than it said before was restored itself, and is
+provisioned again.
 
 A provisioning (a *snapshot*) sends everything the replica should hold, then an
 [`envelope::EndSnapshot`]. On the end, the replica deletes every row of those
@@ -395,11 +403,11 @@ fixed:
 | Encoding a row, on the server | leaves the row out of what is sent and recorded, with every row that points at it there, and **quarantines** them for every replica that was owed them. A replica holding an older copy has it taken back, with what points at it | quarantined rows are noted again when the relay starts and on a timer, as of no transaction — so each goes only where it is missing; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
 | The transport, for one replica — unreachable, refusing a message for good, or not answering within `send_timeout` | that replica waits out a backoff (`sync.replicas`, the refusal in `last_error`); its outbox keeps the message and every one after it, in order; every other replica carries on. An outbox past its bound, or a message refused for good three times in a row, is dropped and the replica provisioned again, with an alarm | sent when its backoff ends |
 | A row larger than any message may be | left out at loading and **quarantined**, as one that does not encode | as above, once a fix makes it smaller or the limit larger |
-| A replica, taking a row or letting one go | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`), with the message that refused it, and reports it in an `Up` before it says it applied that message; the server records the row *refused* — still held for what takes rows back, so a delete still goes, not for progress or digests — and quarantines it. A rejection of a message older than the last that carried the row is ignored | a fix deployed on either side lets the retry through |
+| A replica, taking a row or letting one go | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`), with the message that refused it, and reports it in an `Up` before it says it applied that message; the server records the row *refused* — still held for what takes rows back, so a delete still goes, not for progress or digests — and quarantines it. A rejection of a message other than the last that carried the row is ignored | a fix deployed on either side lets the retry through |
 | The server, filing an uploaded row or delete | the row, or the delete, is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer, a page at a time beside the passes |
 | The server, filing an upload as a whole | the upload is kept whole in `sync.inbox` and answered, so the replica does not send it again for nothing | as above |
 | The server, with a replica's part of the inbox full (`Settings::inbox`) | that replica's uploads that would add to it fail as transient: they wait on the replica, unanswered, with an alarm | filed again, a page at a time beside the passes, once a fix files what is kept; what a sender the host no longer knows uploaded waits `prune_after`, then is dropped with an alarm |
-| The transport, losing the last messages it was sent | a replica that leaves them unconfirmed while nothing newer goes to it is provisioned again after `unconfirmed_after`, then after twice as long while it stays silent | by itself |
+| The transport, losing the last messages it was sent | a replica that leaves them unconfirmed while nothing is sent to it and nothing confirmed by it is provisioned again after `unconfirmed_after`, then after twice as long while it stays silent | by itself |
 | Anything nobody foresaw | see below | |
 
 ### The backstop: digests

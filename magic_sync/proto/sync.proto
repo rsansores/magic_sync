@@ -53,6 +53,16 @@ message Down {
   // epoch: a replica that did not apply that one missed it. 0 only on the
   // message that begins a snapshot, which follows nothing.
   uint64 previous = 5;
+  // A number of this message's own, drawn at random from 1 to 2^63 - 1: a
+  // server restored from an older copy numbers its messages again, and
+  // draws other nonces for them.
+  uint64 nonce = 6;
+  // The nonce of the message `previous` names: the one this follows is that
+  // sequence with that nonce. 0 when `previous` is 0.
+  uint64 previous_nonce = 7;
+  // The server's seal on this message for this replica, opaque to it: the
+  // replica gives it back as it came when it says it applied the message.
+  bytes mac = 8;
 }
 
 // Server to replica: a snapshot is complete. Every row of `tables` the
@@ -67,6 +77,10 @@ message EndSnapshot {
   string epoch = 4;
   // As Down's: 0 when it ends a snapshot of nothing, which it begins.
   uint64 previous = 5;
+  // As Down's.
+  uint64 nonce = 6;
+  uint64 previous_nonce = 7;
+  bytes mac = 8;
 }
 
 // Server to replica: these uploads are filed, or kept to be filed once they
@@ -85,11 +99,14 @@ message Up {
   // What the replica holds of each table sent down, to compare with what the
   // server records it holds.
   repeated Digest digests = 4;
-  // The last message the replica applied: its epoch and sequence. Set when
-  // the server has not heard of it, and always with digests, which are only
-  // comparable once the replica applied every message recorded for it.
+  // The last message the replica applied: its epoch, sequence, nonce and
+  // mac, as the message carried them. Set on the first lane when the server
+  // has not heard of it, and always with digests, which are only comparable
+  // once the replica applied every message recorded for it, and with a gap.
   string epoch = 5;
   uint64 sequence = 6;
+  uint64 nonce = 11;
+  bytes mac = 12;
   // The number of this upload, when it carries rows: a fresh one on every
   // send, drawn at random from 1 to 2^63 - 1, so no answer meant for another
   // replica, or for this one before a restore, names it. The server answers
@@ -100,10 +117,12 @@ message Up {
   // What the replica wrote that the server has not filed, when it says: on
   // the first lane, when it changed. Absent: it did not say this time.
   Backlog backlog = 9;
-  // It missed a message: one arrived whose `previous` is not the last it
-  // applied. Said, with epoch and sequence, until a snapshot begins; the
-  // server answers with one.
-  bool gap = 10;
+  // It missed a message: the sequence of the newest one that arrived not
+  // following the last it applied, and that it therefore did not apply. 0:
+  // none. Said on the first lane, with the last applied, until a snapshot
+  // begins, and told again whenever it grows; the server answers with a
+  // snapshot, unless one that began after this sequence is on its way.
+  uint64 gap = 10;
 }
 
 // What a replica wrote that the server has not filed yet.
@@ -131,7 +150,7 @@ message Rejected {
   Key key = 2;
   string reason = 3;
   // The message whose row, or delete, the replica refused: the server
-  // ignores a rejection of a message older than the last one that carried
+  // ignores a rejection of a message other than the last one that carried
   // the row, or of another epoch.
   string epoch = 4;
   uint64 sequence = 5;

@@ -41,6 +41,46 @@ impl Body {
     }
 }
 
+/// The server's seal on its message `sequence` of `epoch`, nonce `nonce`, to
+/// `replica`: HMAC-SHA256 under the epoch's secret, cut to 16 bytes. A
+/// replica gives it back as it came when it says it applied the message, so
+/// the server knows it sent that message — this installation, before or
+/// after a restore of its database — and no one made it up.
+#[cfg(feature = "postgres")]
+pub(crate) fn seal(
+    secret: &[u8],
+    replica: uuid::Uuid,
+    epoch: uuid::Uuid,
+    sequence: u64,
+    nonce: u64,
+) -> Vec<u8> {
+    use hmac::Mac as _;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
+    mac.update(replica.as_bytes());
+    mac.update(epoch.as_bytes());
+    mac.update(&sequence.to_be_bytes());
+    mac.update(&nonce.to_be_bytes());
+    mac.finalize().into_bytes()[..16].to_vec()
+}
+
+#[cfg(all(test, feature = "postgres"))]
+thread_local! {
+    /// The nonces a test pins, in order from this one, instead of drawing
+    /// them: so the same build sends the same bytes.
+    pub(crate) static PINNED_NONCES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A message's nonce, drawn at random from 1 to 2^63 - 1.
+#[cfg(feature = "postgres")]
+pub(crate) fn nonce() -> u64 {
+    #[cfg(test)]
+    if let Some(pinned) = PINNED_NONCES.with(|p| p.replace(p.get().map(|n| n + 1))) {
+        return pinned;
+    }
+    (rand::random::<u64>() >> 1).max(1)
+}
+
 /// A fingerprint of a set of keys, as text: the same on every side and every
 /// build (FNV-1a over the keys sorted, each ended by a newline).
 pub(crate) fn fingerprint(keys: impl IntoIterator<Item = String>) -> u64 {
@@ -184,9 +224,7 @@ impl Packer {
         Some(Down {
             snapshot_id: self.snapshot.clone(),
             tables: std::mem::take(&mut self.tables),
-            sequence: 0,
-            epoch: String::new(),
-            previous: 0,
+            ..Down::default()
         })
     }
 }
@@ -353,7 +391,9 @@ mod tests {
             let packed = pack(tables, &uuid::Uuid::now_v7().to_string(), limits);
             let mut carried = 0;
             for mut down in packed {
-                down.sequence = u64::MAX;
+                (down.sequence, down.previous) = (u64::MAX, u64::MAX);
+                (down.nonce, down.previous_nonce) = (u64::MAX, u64::MAX);
+                down.mac = vec![0xff; 16];
                 down.epoch = uuid::Uuid::now_v7().to_string();
                 let rows: usize = down
                     .tables

@@ -828,7 +828,7 @@ async fn a_replica_silent_on_what_it_was_sent_is_provisioned_again(pool: crate::
     let silent_for = |secs: i64| {
         sqlx::query(
             "UPDATE sync.replicas SET last_sent_at = now() - make_interval(secs => $1), \
-                    waiting_since = now() - make_interval(secs => $1) WHERE waiting_since IS NOT NULL",
+                    applied_at = now() - make_interval(secs => $1)",
         )
         .bind(secs as f64)
         .execute(&world.pool)
@@ -945,11 +945,11 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
     assert_eq!(world.count(refused).await, 0, "taken");
 }
 
-/// An acknowledgement past every message the server records sending a
-/// replica is not believed, nor one no message could have, nor one of another
-/// epoch.
+/// An acknowledgement the server did not seal is not believed — a replica
+/// that lies, or a bug: it resets nothing, whatever it names — nor one no
+/// message could have, nor one of another epoch.
 #[sqlx::test(migrations = false)]
-async fn an_acknowledgement_of_more_than_was_sent_changes_nothing(pool: crate::DbPool) {
+async fn an_acknowledgement_the_server_did_not_seal_changes_nothing(pool: crate::DbPool) {
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
@@ -973,10 +973,27 @@ async fn an_acknowledgement_of_more_than_was_sent_changes_nothing(pool: crate::D
         .unwrap()
     };
     let before = applied().await;
-    for sequence in [world.last_sent(b).await, u64::MAX, i64::MAX as u64 + 1] {
-        world.acknowledge(a, sequence).await;
+    let epoch = world.epoch().await;
+    let forged = |sequence: u64, epoch: Uuid| envelope::Up {
+        epoch: epoch.to_string(),
+        sequence,
+        nonce: 1,
+        mac: vec![0; 16],
+        protocol: envelope::PROTOCOL,
+        ..envelope::Up::default()
+    };
+    for (sequence, epoch) in [
+        (world.last_sent(b).await, epoch),
+        (last, epoch),
+        (u64::MAX, epoch),
+        (i64::MAX as u64 + 1, epoch),
+        (last, Uuid::now_v7()),
+    ] {
+        let up = forged(sequence, epoch);
+        crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
         assert_eq!(applied().await, before, "{sequence}");
     }
+    assert_eq!(world.epoch().await, epoch, "no new epoch");
     world.acknowledge(a, last).await;
     assert_eq!(applied().await, Some(last as i64));
 }
@@ -992,12 +1009,8 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
     world.item("poison").await;
     world.pass(&wire).await;
 
-    let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-        .fetch_one(&world.pool)
-        .await
-        .unwrap();
     let last = world.last_sent(a).await;
-    let digests_of = |tables: &[(&str, &[Uuid])], sequence: u64| Up {
+    let digests_of = |tables: &[(&str, &[Uuid])], confirmation: Up| Up {
         digests: tables
             .iter()
             .map(|(table, keys)| {
@@ -1009,9 +1022,7 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
                 }
             })
             .collect(),
-        epoch: epoch.to_string(),
-        sequence,
-        ..Up::default()
+        ..confirmation
     };
     let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
     let file = |up: Up| {
@@ -1021,43 +1032,52 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
         }
     };
 
-    // The row the server could not send it is not held there either.
-    file(digests_of(&[("items", &[one, two])], last)).await;
-    assert_eq!(world.count(resyncs).await, 0, "it holds what is recorded");
-
-    file(digests_of(&[("items", &[one])], last - 1)).await;
+    let confirming = |sequence: u64| crate::testkit::confirmation(&world.pool, a, sequence);
+    file(digests_of(&[("items", &[one])], confirming(last - 1).await)).await;
     assert_eq!(
         world.count(resyncs).await,
         0,
         "messages still on their way: not compared"
     );
 
+    // The row the server could not send it is not held there either.
+    file(digests_of(
+        &[("items", &[one, two])],
+        confirming(last).await,
+    ))
+    .await;
+    assert_eq!(world.count(resyncs).await, 0, "it holds what is recorded");
+
     // Digests of one table twice are no report.
     file(digests_of(
         &[("items", &[one, two]), ("items", &[one])],
-        last,
+        confirming(last).await,
     ))
     .await;
     assert_eq!(world.count(resyncs).await, 0, "malformed: not compared");
 
     // A digest of a table the server does not send is the replica's own
     // business, and the others are compared all the same.
-    file(digests_of(&[("readings", &[one]), ("items", &[one])], last)).await;
+    file(digests_of(
+        &[("readings", &[one]), ("items", &[one])],
+        confirming(last).await,
+    ))
+    .await;
     assert_eq!(world.count(resyncs).await, 1, "provisioned again");
-    file(digests_of(&[("items", &[one])], last)).await;
+    file(digests_of(&[("items", &[one])], confirming(last).await)).await;
     assert_eq!(world.count(resyncs).await, 1, "once, while one is pending");
 
     // Provisioned, and differing again the same day: a bug another
     // provisioning would not cure.
     world.pass(&wire).await;
     let last = world.last_sent(a).await;
-    file(digests_of(&[("items", &[one])], last)).await;
+    file(digests_of(&[("items", &[one])], confirming(last).await)).await;
     assert_eq!(world.count(resyncs).await, 0, "not again within the day");
     sqlx::query("UPDATE sync.replicas SET drifted_at = now() - interval '25 hours'")
         .execute(&world.pool)
         .await
         .unwrap();
-    file(digests_of(&[("items", &[one])], last)).await;
+    file(digests_of(&[("items", &[one])], confirming(last).await)).await;
     assert_eq!(world.count(resyncs).await, 1, "again the next day");
 }
 
@@ -1332,15 +1352,7 @@ impl World {
 
     /// `replica` says it applied every message up to `sequence`.
     async fn acknowledge(&self, replica: Uuid, sequence: u64) {
-        let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-            .fetch_one(&self.pool)
-            .await
-            .unwrap();
-        let ack = envelope::Up {
-            epoch: epoch.to_string(),
-            sequence,
-            ..envelope::Up::default()
-        };
+        let ack = crate::testkit::confirmation(&self.pool, replica, sequence).await;
         crate::testkit::file(&self.pool, &self.codecs, &ack, replica, &()).await;
     }
 
@@ -1825,9 +1837,167 @@ async fn a_replica_restored_from_an_older_copy_is_provisioned_again(pool: crate:
     world.item("three").await;
     world.settle(&wire, &mut models).await;
 
-    assert!(!models[&a].gap);
+    assert_eq!(models[&a].gap, 0);
     world.assert_converged(&models).await;
     assert_eq!(items_of(&models[&a]), names(&["one", "two", "three"]));
+}
+
+/// A server restored from a copy older than what its replicas applied, and
+/// already numbering past it before any replica speaks: the message it sent
+/// a replica carries a number that replica applied once, with other content.
+/// Its numbers alone cannot tell; the message's nonce can. The replica takes
+/// none of it, says what it applied, and the server — which never sent that
+/// — takes a new epoch: each replica ends holding what the server has, row
+/// for row and content for content.
+#[sqlx::test(migrations = false)]
+async fn a_server_restored_that_numbers_past_what_it_lost_still_provisions_again(
+    pool: crate::DbPool,
+) {
+    let world = world(pool).await;
+    let wire = Wire::new(17);
+    let mut models = world.models();
+    let one = world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let mut conn = world.pool.acquire().await.unwrap();
+    crate::testkit::back_up(&mut conn, &["fixture", "sync"]).await;
+    let drawn = "SELECT last_value FROM sync.messages";
+    let copied: i64 = world.count(drawn).await;
+    for n in 0..5 {
+        world.rename(one, &format!("lost {n}")).await;
+        world.settle(&wire, &mut models).await;
+    }
+    let lost = world.count(drawn).await - copied;
+    crate::testkit::restore(&mut conn, &["fixture", "sync"]).await;
+    let before = world.epoch().await;
+    world.rename(one, "after").await;
+    world.pass(&wire).await;
+    // Others' messages draw numbers too, before these replicas speak.
+    sqlx::query("SELECT nextval('sync.messages') FROM generate_series(1, $1)")
+        .bind(lost + 1)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    world.settle(&wire, &mut models).await;
+
+    world.assert_converged(&models).await;
+    for model in models.values() {
+        assert_eq!(items_of(model), names(&["after"]));
+    }
+    assert_ne!(before, world.epoch().await, "a new epoch");
+}
+
+/// A server restored from a copy, whose next message to a replica carries
+/// the very number of the last that replica applied: not a redelivery — its
+/// nonce is another — so the replica keeps it out, and the server, told of a
+/// message it never sent, takes a new epoch.
+#[sqlx::test(migrations = false)]
+async fn a_server_restored_that_numbers_a_message_again_is_not_taken_for_a_redelivery(
+    pool: crate::DbPool,
+) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(18);
+    let mut models = world.models();
+    let one = world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let mut conn = world.pool.acquire().await.unwrap();
+    crate::testkit::back_up(&mut conn, &["fixture", "sync"]).await;
+    world.rename(one, "lost").await;
+    world.settle(&wire, &mut models).await;
+    let applied = models[&a].applied.clone().unwrap().1;
+    crate::testkit::restore(&mut conn, &["fixture", "sync"]).await;
+    let before = world.epoch().await;
+    sqlx::query("SELECT setval('sync.messages', $1, false)")
+        .bind(i64::try_from(applied).unwrap())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    world.rename(one, "after").await;
+    world.settle(&wire, &mut models).await;
+
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["after"]));
+    assert_ne!(before, world.epoch().await, "a new epoch");
+}
+
+/// A replica restored from a copy older than its last provisioning: what
+/// it applied is older than the snapshot the server last wrote it, and that
+/// snapshot is no longer on its way — it is gone with what was restored
+/// over. The gap it says is past that snapshot's beginning, so it is
+/// provisioned again, and ends holding what it should.
+#[sqlx::test(migrations = false)]
+async fn a_replica_restored_from_before_its_last_snapshot_is_provisioned_again(
+    pool: crate::DbPool,
+) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(19);
+    let mut models = world.models();
+    world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let copy = models[&a].clone();
+    crate::relay::resync(&mut world.pool.acquire().await.unwrap(), a)
+        .await
+        .unwrap();
+    world.settle(&wire, &mut models).await;
+    world.item("two").await;
+    world.settle(&wire, &mut models).await;
+    models.insert(a, copy);
+    world.item("three").await;
+    world.settle(&wire, &mut models).await;
+
+    assert_eq!(models[&a].gap, 0);
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["one", "two", "three"]));
+}
+
+/// The first message of a snapshot, lost by the transport: the next one
+/// follows it, and the replica never had it — a gap past the snapshot's
+/// beginning, which is therefore not on its way. It is provisioned again.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_whose_first_message_is_lost_is_written_again(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(20);
+    let mut models = world.models();
+    world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    crate::relay::resync(&mut world.pool.acquire().await.unwrap(), a)
+        .await
+        .unwrap();
+    world.item("two").await;
+    world.pass(&wire).await;
+    assert!(wire.ids(a).len() > 1, "a snapshot of more than its end");
+    wire.acknowledge(a);
+    world.settle(&wire, &mut models).await;
+
+    assert_eq!(models[&a].gap, 0);
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["one", "two"]));
+}
+
+/// A replica restored from an older copy, on a server with nothing new to
+/// send it: no message follows, so no gap is ever said. What it says it
+/// applied — with its digests — is behind what it said before, which only a
+/// restore does: it is provisioned again.
+#[sqlx::test(migrations = false)]
+async fn a_replica_restored_on_a_quiet_server_is_provisioned_again(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(21);
+    let mut models = world.models();
+    world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let copy = models[&a].clone();
+    world.item("two").await;
+    world.settle(&wire, &mut models).await;
+    models.insert(a, copy);
+    let digests = models[&a].digests(&["items"]);
+    crate::testkit::file(&world.pool, &world.codecs, &digests, a, &()).await;
+    world.settle(&wire, &mut models).await;
+
+    world.assert_converged(&models).await;
+    assert_eq!(items_of(&models[&a]), names(&["one", "two"]));
 }
 
 /// A message the transport lost is a gap the replica says, and is answered
@@ -1995,4 +2165,119 @@ async fn replicas_are_sent_to_side_by_side_each_in_order(pool: crate::DbPool) {
             assert!(numbers.is_sorted(), "in order: {numbers:?}");
         }
     }
+}
+
+/// A transport that delivers at once, to a replica that confirms at once:
+/// the confirmation is filed before the send that carried it returns.
+struct Instant {
+    pool: crate::DbPool,
+    codecs: Vec<Codec<()>>,
+    models: Mutex<BTreeMap<Uuid, Model>>,
+}
+
+impl Transport for Instant {
+    async fn send(&self, replica: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
+        let up = {
+            let mut models = self.models.lock().unwrap();
+            let model = models.get_mut(&replica).expect("a model");
+            model.receive(&message, &Rules::ANY);
+            let up = model.up();
+            if let Some(up) = &up {
+                model.delivered(up);
+            }
+            up
+        };
+        if let Some(up) = up {
+            crate::testkit::file(&self.pool, &self.codecs, &up, replica, &()).await;
+        }
+        Ok(())
+    }
+}
+
+/// A replica that confirms what it was sent before the send is recorded as
+/// done is caught up, not silent: whatever order the two writers record in,
+/// nothing provisions it again for having said nothing.
+#[sqlx::test(migrations = false)]
+async fn a_confirmation_that_overtakes_its_send_leaves_no_replica_silent(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let transport = Instant {
+        pool: world.pool.clone(),
+        codecs: vec![Codec::new::<Item, ItemRow>(to_wire, from_wire, None)],
+        models: Mutex::new(world.models()),
+    };
+    world.item("one").await;
+    world.pass(&transport).await;
+    sqlx::query(
+        "UPDATE sync.replicas SET last_sent_at = now() - interval '1 day', \
+                applied_at = now() - interval '1 day'",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let mut conn = world.pool.acquire().await.unwrap();
+    let healed = heal(&mut conn, &world.engine, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(healed, 0, "every replica confirmed all it was sent");
+}
+
+/// Digests filed while a pass records more for their replica are compared
+/// with what the server recorded at the message they were read at, or not
+/// at all: a pass that commits between reading where the replica stands
+/// and reading what it holds makes no difference, and provisions nothing.
+#[sqlx::test(migrations = false)]
+async fn digests_filed_while_a_pass_records_compare_with_what_they_were_read_at(
+    pool: crate::DbPool,
+) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(23);
+    let mut model = world.follower(a);
+    let x = world.item("refused").await;
+    world.item("kept").await;
+    world.pass(&wire).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    world.say(a, &mut model).await;
+    assert_eq!(world.refused().await, 1);
+    // A pass, recording more for the replica — its refused row again among
+    // it — and not committed yet.
+    world.rename(x, "renamed").await;
+    world.item("new").await;
+    let relay = world.relay();
+    let mut pass = world.pool.begin_with(SNAPSHOT).await.unwrap();
+    relay.record(&mut pass).await.unwrap();
+    // The digests, and the refusal said again — the transport may have lost
+    // it — which waits on the row the pass is writing.
+    let mut digests = model.digests(&["items"]);
+    let refused = model.rejections.values().next().expect("its refusal");
+    digests.rejected.push(envelope::Rejected {
+        table: "items".into(),
+        key: Some(envelope::Key {
+            parts: vec![x.to_string()],
+        }),
+        reason: refused.reason.clone(),
+        epoch: refused.epoch.clone(),
+        sequence: refused.sequence,
+    });
+    let filing = crate::testkit::file(&world.pool, &world.codecs, &digests, a, &());
+    let commit = async {
+        // Once the filing waits on the pass's row, the pass commits.
+        for _ in 0..2000 {
+            let waiting = "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'";
+            if world.count(waiting).await > 0 {
+                return pass.commit().await.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the filing never waited on the pass");
+    };
+    tokio::join!(filing, commit);
+
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL")
+            .await,
+        0,
+        "nothing differs from what it was read at"
+    );
 }

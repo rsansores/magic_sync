@@ -133,10 +133,14 @@ CREATE SEQUENCE sync.messages;
 
 -- Which installation of this schema the numbers come from: a database
 -- installed again starts its sequence over, and a replica that sees a new
--- epoch takes its numbers from scratch.
+-- epoch takes its numbers from scratch. `secret` keys the seal on every
+-- message of the epoch, which a replica gives back with what it applied: it
+-- is in every copy of the database, so a restored one still knows its own
+-- seal, and a new epoch draws another.
 CREATE TABLE sync.epoch (
-    id    INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    epoch UUID    NOT NULL DEFAULT gen_random_uuid()
+    id     INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    epoch  UUID    NOT NULL DEFAULT gen_random_uuid(),
+    secret BYTEA   NOT NULL DEFAULT uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid())
 );
 INSERT INTO sync.epoch DEFAULT VALUES;
 
@@ -167,6 +171,7 @@ COMMENT ON COLUMN sync.outbox.snapshot IS
 CREATE TABLE sync.chains (
     replica_id        UUID        PRIMARY KEY,
     last_sequence     BIGINT,
+    last_nonce        BIGINT,
     snapshot_sequence BIGINT,
     snapshot_end      BIGINT,
     dropped           TEXT,
@@ -176,6 +181,10 @@ CREATE TABLE sync.chains (
 COMMENT ON COLUMN sync.chains.last_sequence IS
     'The last message written to its outbox in this epoch. NULL: none since it was last '
     'provisioned or the epoch began.';
+COMMENT ON COLUMN sync.chains.last_nonce IS
+    'Its nonce: what the next message names as the one it follows, and what a replica that '
+    'says it applied that sequence must say with it, or the database was restored from a copy '
+    'older than what it was sent.';
 COMMENT ON COLUMN sync.chains.snapshot_sequence IS
     'The first message of the last snapshot written to its outbox, in this epoch.';
 COMMENT ON COLUMN sync.chains.snapshot_end IS
@@ -197,8 +206,8 @@ CREATE TABLE sync.replicas (
     refusals         INTEGER     NOT NULL DEFAULT 0,
     applied_epoch    UUID,
     applied_sequence BIGINT,
+    applied_nonce    BIGINT,
     applied_at       TIMESTAMPTZ,
-    waiting_since    TIMESTAMPTZ,
     heals            INTEGER     NOT NULL DEFAULT 0,
     backlog          JSONB,
     backlog_at       TIMESTAMPTZ,
@@ -211,9 +220,6 @@ COMMENT ON TABLE sync.replicas IS
 COMMENT ON COLUMN sync.replicas.live IS
     'Whether the engine last saw it live, in partition_id: a replica that became live or moved '
     'is provisioned again, one that stopped being live is forgotten.';
-COMMENT ON COLUMN sync.replicas.waiting_since IS
-    'While it has messages it has not said it applied: since when it has not moved — the '
-    'first send it did not confirm, or the last confirmation that left it behind. NULL: caught up.';
 COMMENT ON COLUMN sync.replicas.heals IS
     'Times it was provisioned again for staying silent on what it was sent, since it last '
     'caught up: each waits twice as long as the one before, up to 32 times the first.';

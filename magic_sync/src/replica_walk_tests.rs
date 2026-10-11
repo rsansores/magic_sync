@@ -65,8 +65,13 @@ const RULES: Rules = Rules {
 /// transport between them.
 struct Server {
     epoch: String,
-    /// The last message it numbered for this replica.
+    /// The last message it numbered for this replica, and its nonce.
     last: u64,
+    nonce: u64,
+    /// What its nonces are drawn from: another after a restore.
+    salt: u64,
+    /// The message that began the last snapshot it wrote the replica.
+    began: u64,
     items: BTreeMap<Uuid, String>,
     prices: BTreeMap<Uuid, (i64, i64)>,
     /// What the transport holds for the replica, in order.
@@ -84,15 +89,33 @@ struct Server {
 }
 
 impl Server {
-    fn numbered(&mut self, snapshot: &str, tables: Vec<Table>, begins: bool) -> Vec<u8> {
-        let previous = if begins { 0 } else { self.last };
+    /// The next message's place in the chain: its sequence and nonce, and
+    /// what it follows — nothing, when it `begins` a snapshot.
+    fn next(&mut self, begins: bool) -> (u64, u64, u64, u64) {
+        let previous = if begins {
+            (0, 0)
+        } else {
+            (self.last, self.nonce)
+        };
         self.last += 1;
+        self.nonce = (nonce_of(self.last) ^ self.salt) & u64::try_from(i64::MAX).unwrap();
+        if begins {
+            self.began = self.last;
+        }
+        (self.last, self.nonce, previous.0, previous.1)
+    }
+
+    fn numbered(&mut self, snapshot: &str, tables: Vec<Table>, begins: bool) -> Vec<u8> {
+        let (sequence, nonce, previous, previous_nonce) = self.next(begins);
         Body::Down(Down {
             snapshot_id: snapshot.to_owned(),
             tables,
-            sequence: self.last,
+            sequence,
             epoch: self.epoch.clone(),
             previous,
+            nonce,
+            previous_nonce,
+            mac: Vec::new(),
         })
         .encoded()
     }
@@ -184,15 +207,18 @@ impl Server {
             self.queue.push_back(bytes);
             begins = false;
         }
+        let (sequence, nonce, previous, previous_nonce) = self.next(begins);
         let end = Body::EndSnapshot(EndSnapshot {
             snapshot_id: id.clone(),
             tables: vec!["prices".to_owned(), "items".to_owned()],
-            sequence: self.last + 1,
+            sequence,
             epoch: self.epoch.clone(),
-            previous: if begins { 0 } else { self.last },
+            previous,
+            nonce,
+            previous_nonce,
+            mac: Vec::new(),
         })
         .encoded();
-        self.last += 1;
         self.queue.push_back(end);
         self.owed = false;
     }
@@ -231,7 +257,9 @@ impl Server {
                 self.readings.remove(&key.parts.join("|"));
             }
         }
-        if up.gap {
+        // As a server files a gap: a snapshot is owed unless one that began
+        // after the message it could not follow is on its way.
+        if up.gap > 0 && self.began <= up.gap {
             self.owed = true;
         }
         if up.epoch == self.epoch {
@@ -353,14 +381,18 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
             .collect();
     let modelled: BTreeSet<model::Row> = model.rejections.keys().cloned().collect();
     assert_eq!(rejected, modelled, "{at}: the rows rejected");
-    let applied: (String, i64, bool) =
-        sqlx::query_as("SELECT epoch, sequence, gap = 1 FROM sync_applied")
+    let applied: (String, i64, i64) =
+        sqlx::query_as("SELECT epoch, sequence, gap FROM sync_applied")
             .fetch_one(pool)
             .await
             .unwrap();
     let modelled = model.applied.clone().expect("provisioned");
     assert_eq!(
-        (applied.0, u64::try_from(applied.1).unwrap(), applied.2),
+        (
+            applied.0,
+            u64::try_from(applied.1).unwrap(),
+            u64::try_from(applied.2).unwrap()
+        ),
         (modelled.0, modelled.1, model.gap),
         "{at}: where it stands"
     );
@@ -443,6 +475,9 @@ async fn walk(pool: SqlitePool, seed: u64) {
     let mut server = Server {
         epoch: EPOCH.to_owned(),
         last: BASE,
+        nonce: nonce_of(BASE),
+        salt: 0,
+        began: BASE,
         items: BTreeMap::new(),
         prices: BTreeMap::new(),
         queue: VecDeque::new(),
@@ -732,8 +767,12 @@ async fn walk(pool: SqlitePool, seed: u64) {
     assert_eq!(server.readings, latest, "{at}: every reading as it is");
     assert_eq!(server.events, host.events, "{at}: every event, once");
     let applied = model.applied.clone().unwrap();
+    assert_eq!(
+        model.gap, 0,
+        "{at}: it missed a message, and was never provisioned again"
+    );
     assert!(
-        model.gap || (server.epoch == applied.0 && server.confirmed == applied.1),
+        server.epoch == applied.0 && server.confirmed == applied.1,
         "{at}: confirmed {} of {:?}",
         server.confirmed,
         applied

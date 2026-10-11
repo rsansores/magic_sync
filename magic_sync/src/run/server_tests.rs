@@ -345,23 +345,13 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
     BUGGY.set(true);
     assert_eq!(wire.items(a), ["fine", "poison"]);
     // Out of the quarantine once each replica says it took it.
-    let (epoch, sent): (Uuid, Vec<(Uuid, i64)>) = (
-        sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+    let sent: Vec<(Uuid, i64)> =
         sqlx::query_as("SELECT replica_id, last_sequence FROM sync.chains")
             .fetch_all(&pool)
             .await
-            .unwrap(),
-    );
+            .unwrap();
     for (replica, last) in sent {
-        let ack = crate::envelope::Up {
-            epoch: epoch.to_string(),
-            sequence: last as u64,
-            protocol: crate::envelope::PROTOCOL,
-            ..crate::envelope::Up::default()
-        };
+        let ack = crate::testkit::confirmation(&pool, replica, last as u64).await;
         fixed.receive(replica, &ack.encode_to_vec()).await.unwrap();
     }
     assert_eq!(quarantined().await, 0);
@@ -885,7 +875,9 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         set_aside: 0,
                     }],
                 }),
-                gap: walk.below(4) == 0,
+                nonce: [0, 1, walk.next(), u64::MAX][walk.below(4)],
+                mac: (0..walk.below(20)).map(|_| walk.below(256) as u8).collect(),
+                gap: [0, 0, 1, walk.next(), u64::MAX][walk.below(5)],
             };
             came += up
                 .tables

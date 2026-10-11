@@ -229,3 +229,38 @@ pub async fn file<P: Sync + 'static>(
         .expect("filed");
     tx.commit().await.expect("committed");
 }
+
+/// What `replica` says once it applied every message the server sent it up
+/// to `sequence`, as a replica says it: the message's epoch, sequence, nonce
+/// and seal. The nonce is the one the server records at that sequence — the
+/// last it sent, or the last it was told of — and any other between them,
+/// where the server records none.
+#[cfg(feature = "postgres")]
+pub async fn confirmation(
+    pool: &crate::DbPool,
+    replica: Uuid,
+    sequence: u64,
+) -> crate::envelope::Up {
+    let (epoch, secret, nonce): (Uuid, Vec<u8>, Option<i64>) = sqlx::query_as(
+        "SELECT e.epoch, e.secret, \
+                (SELECT CASE WHEN c.last_sequence = $2 THEN c.last_nonce \
+                             WHEN r.applied_sequence = $2 THEN r.applied_nonce END \
+                   FROM sync.replicas r FULL JOIN sync.chains c USING (replica_id) \
+                  WHERE replica_id = $1) \
+           FROM sync.epoch e",
+    )
+    .bind(replica)
+    .bind(i64::try_from(sequence).expect("a sequence"))
+    .fetch_one(pool)
+    .await
+    .expect("the epoch");
+    let nonce = nonce.map_or(1, |n| u64::try_from(n).expect("a nonce"));
+    crate::envelope::Up {
+        protocol: crate::envelope::PROTOCOL,
+        epoch: epoch.to_string(),
+        sequence,
+        nonce,
+        mac: crate::envelope::seal(&secret, replica, epoch, sequence, nonce),
+        ..crate::envelope::Up::default()
+    }
+}

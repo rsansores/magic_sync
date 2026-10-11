@@ -9,7 +9,9 @@
 //! lanes that do not wait for one another.
 
 use super::*;
-use crate::conformance::{codecs, json, settled, Event, Price, Reading, Shelf, Task, Uplinked};
+use crate::conformance::{
+    codecs, json, nonce_of, settled, Event, Price, Reading, Shelf, Task, Uplinked,
+};
 use crate::envelope::{
     Backlog, Down, EndSnapshot, Filed, Key as WireKey, Limits, Table, ToReplica,
 };
@@ -179,6 +181,9 @@ fn numbered(sequence: u64, previous: u64, snapshot: &str, tables: Vec<Table>) ->
         sequence,
         epoch: EPOCH.to_owned(),
         previous,
+        nonce: nonce_of(sequence),
+        previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+        mac: vec![0x5e; 16],
     })
     .encoded()
 }
@@ -195,6 +200,9 @@ fn ending(sequence: u64, previous: u64, snapshot: &str, tables: &[&str]) -> Vec<
         sequence,
         epoch: EPOCH.to_owned(),
         previous,
+        nonce: nonce_of(sequence),
+        previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+        mac: vec![0x5e; 16],
     })
     .encoded()
 }
@@ -232,7 +240,7 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: 
     .unwrap();
     let messages = golden(&std::fs::read_to_string(GOLDEN).expect("the golden messages"));
     let mut steps: Vec<&str> = Vec::new();
-    for (step, _) in &messages {
+    for (step, _, _) in &messages {
         if steps.last() != Some(&step.as_str()) {
             steps.push(step);
         }
@@ -258,55 +266,35 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_it_holds(pool: 
         owned(&["recount 1"]),
     );
     for step in steps {
-        let received: Vec<Received> = {
-            let mut out = Vec::new();
-            for (_, bytes) in messages.iter().filter(|(s, _)| s == step) {
-                if step == "lost" {
-                    continue;
-                }
-                if step == "filed" {
-                    // The replica's own upload, sent under the golden number.
-                    w.exec(&format!(
-                        "INSERT INTO readings (replica_id, id, value, at) \
-                         VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
-                         UPDATE sync_notes SET upload = {}, sent = writes, \
-                           sent_at = '2000-01-01T00:00:00.000Z';",
-                        REPLICA.replace('-', ""),
-                        i64::try_from(UPLOAD).unwrap()
-                    ))
-                    .await
-                    .unwrap();
-                }
-                out.push(w.receive(bytes).await);
-                if step != "gap" {
-                    let again = w.receive(bytes).await;
-                    assert!(
-                        matches!(again, Received::AlreadyApplied | Received::Filed),
-                        "{step}, delivered again: {again:?}"
-                    );
-                }
+        for (_, expected, bytes) in messages.iter().filter(|(s, _, _)| s == step) {
+            if expected == "lost" {
+                continue;
             }
-            out
-        };
-        match step {
-            "gap" => assert!(
-                received.iter().all(|r| matches!(r, Received::Gap)),
-                "{step}: {received:?}"
-            ),
-            "filed" => {
+            if step == "filed" {
+                // The replica's own upload, sent under the golden number.
+                w.exec(&format!(
+                    "INSERT INTO readings (replica_id, id, value, at) \
+                     VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
+                     UPDATE sync_notes SET upload = {}, sent = writes, \
+                       sent_at = '2000-01-01T00:00:00.000Z';",
+                    REPLICA.replace('-', ""),
+                    i64::try_from(UPLOAD).unwrap()
+                ))
+                .await
+                .unwrap();
+            }
+            let got = w.receive(bytes).await;
+            assert_eq!(outcome(&got), expected, "{step}: {got:?}");
+            if expected != "gap" {
+                let again = w.receive(bytes).await;
                 assert!(
-                    matches!(received.as_slice(), [Received::Filed]),
-                    "{received:?}"
+                    matches!(again, Received::AlreadyApplied | Received::Filed),
+                    "{step}, delivered again: {again:?}"
                 );
-                assert_eq!(w.count("SELECT count(*) FROM sync_notes").await, 0, "filed");
             }
-            "lost" => {}
-            _ => assert!(
-                received
-                    .iter()
-                    .all(|r| matches!(r, Received::Applied(_) | Received::SnapshotEnded)),
-                "{step}: {received:?}"
-            ),
+        }
+        if step == "filed" {
+            assert_eq!(w.count("SELECT count(*) FROM sync_notes").await, 0, "filed");
         }
         let expected = match step {
             "rows" => Some((
@@ -399,20 +387,32 @@ async fn the_golden_upload_is_what_the_replica_sends(pool: SqlitePool) {
     let mut up = w.up(0, false).await.expect("the upload");
     assert_eq!(up.uploads.len(), 1);
     up.uploads = vec![UPLOAD];
-    let header = "# What a replica sends up: `name hex` per message. Generated by the replica's\n\
-                  # suite; filed by the server's (conformance::server), whose answer is the golden\n\
-                  # `filed` step.\n";
+    let header = "# What a replica sends up: `name outcome hex` per message. Generated by the\n\
+                  # replica's suite; filed by the server's (conformance::server), whose answer is\n\
+                  # the golden `filed` step.\n";
     matches_golden(
         GOLDEN_UP,
-        &format!("{header}upload {}\n", hex(&up.encode_to_vec())),
+        &format!("{header}upload filed {}\n", hex(&up.encode_to_vec())),
     );
 }
 
-/// Every message no server sends — the corpus in `tests/golden` — is
-/// malformed to the replica: acknowledged, nothing applied, and the replica
-/// goes on from where it was.
+/// What a replica made of a message, as the corpora name it.
+fn outcome(received: &Received) -> &'static str {
+    match received {
+        Received::Applied(_) => "applied",
+        Received::SnapshotEnded => "ended",
+        Received::Filed => "filed",
+        Received::AlreadyApplied => "already",
+        Received::Gap => "gap",
+        Received::Malformed(_) => "malformed",
+    }
+}
+
+/// Every message no server sends — the corpus in `tests/golden` — is what
+/// its line says to the replica: a malformed one acknowledged, nothing
+/// applied, and the replica goes on from where it was.
 #[sqlx::test(migrations = false)]
-async fn every_malformed_message_of_the_corpus_is_taken_as_such(pool: SqlitePool) {
+async fn every_message_of_the_malformed_corpus_is_what_its_line_says(pool: SqlitePool) {
     let pool = settled(pool).await;
     use crate::conformance::{golden, EPOCH as SERVER, MALFORMED};
     let w = world(pool).await;
@@ -420,26 +420,38 @@ async fn every_malformed_message_of_the_corpus_is_taken_as_such(pool: SqlitePool
         snapshot_id: "provisioned".to_owned(),
         sequence: 100,
         epoch: SERVER.to_owned(),
+        nonce: nonce_of(100),
         ..EndSnapshot::default()
     })
     .encoded();
     w.receive(&provisioned).await;
     let corpus = golden(&std::fs::read_to_string(MALFORMED).expect("the corpus"));
-    assert!(corpus.len() >= 10);
-    for (case, bytes) in corpus {
+    assert!(corpus.len() >= 20);
+    let mut last = 100;
+    for (case, expected, bytes) in corpus {
         let got = w.receive(&bytes).await;
-        assert!(matches!(got, Received::Malformed(_)), "{case}: {got:?}");
+        assert_eq!(outcome(&got), expected, "{case}: {got:?}");
+        let applied: (String, i64) = sqlx::query_as("SELECT epoch, sequence FROM sync_applied")
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+        if expected == "malformed" {
+            assert_eq!(
+                applied,
+                (SERVER.to_owned(), last),
+                "{case}: nothing applied"
+            );
+        }
+        last = applied.1;
     }
-    let applied: (String, i64) = sqlx::query_as("SELECT epoch, sequence FROM sync_applied")
-        .fetch_one(&w.pool)
-        .await
-        .unwrap();
-    assert_eq!(applied, (SERVER.to_owned(), 100));
+    let last = u64::try_from(last).unwrap();
     let next = Body::Down(Down {
         tables: vec![upserts("items", vec![item(Uuid::now_v7(), "after")])],
-        sequence: 101,
-        previous: 100,
+        sequence: last + 1,
+        previous: last,
         epoch: SERVER.to_owned(),
+        nonce: nonce_of(last + 1),
+        previous_nonce: nonce_of(last),
         ..Down::default()
     })
     .encoded();
@@ -606,9 +618,11 @@ async fn a_new_epoch_begins_with_a_snapshot(pool: SqlitePool) {
 }
 
 /// A message that follows one the replica never applied — lost on the way,
-/// or a replica restored from an older copy — is a gap: it applies nothing
-/// more, says so to the server once, and with every message up after, until
-/// a snapshot begins; then it follows that.
+/// or a replica restored from an older copy — is a gap, and so is every
+/// message after it until a snapshot begins, even one that follows the last
+/// applied: nothing is applied meanwhile. The replica says the newest
+/// message it could not follow, once, and again whenever that grows; then
+/// it follows the snapshot.
 #[sqlx::test(migrations = false)]
 async fn a_replica_that_missed_a_message_applies_nothing_until_a_snapshot(pool: SqlitePool) {
     let w = world(pool).await;
@@ -627,17 +641,72 @@ async fn a_replica_that_missed_a_message_applies_nothing_until_a_snapshot(pool: 
     assert!(matches!(next, Received::Gap), "{next:?}");
     assert_eq!(w.items().await, ["a"]);
     let told = w.up(0, false).await.expect("the gap said");
-    assert!(told.gap);
-    assert_eq!((told.epoch.as_str(), told.sequence), (EPOCH, BASE + 1));
+    assert_eq!(told.gap, BASE + 4, "the newest it could not follow");
+    assert_eq!(
+        (told.epoch.as_str(), told.sequence, told.nonce),
+        (EPOCH, BASE + 1, nonce_of(BASE + 1))
+    );
     assert!(w.up(0, false).await.is_none(), "said once");
-    let s = Uuid::now_v7().to_string();
-    w.receive(&begin(5, &s, vec![upserts("items", vec![item(c, "c")])]))
+    // One that follows the last applied: still nothing until a snapshot.
+    let chained = w
+        .receive(&numbered(
+            BASE + 5,
+            BASE + 1,
+            "",
+            vec![upserts("items", vec![item(c, "c")])],
+        ))
         .await;
-    w.receive(&end(6, &s, &["items"])).await;
+    assert!(matches!(chained, Received::Gap), "{chained:?}");
+    assert_eq!(w.items().await, ["a"]);
+    let grown = w.up(0, false).await.expect("said again: it grew");
+    assert_eq!(grown.gap, BASE + 5);
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(6, &s, vec![upserts("items", vec![item(c, "c")])]))
+        .await;
+    w.receive(&end(7, &s, &["items"])).await;
     assert_eq!(w.items().await, ["c"]);
     let up = w.up(0, false).await.expect("what it applied");
-    assert!(!up.gap);
-    assert_eq!(up.sequence, BASE + 6);
+    assert_eq!(up.gap, 0);
+    assert_eq!((up.sequence, up.nonce), (BASE + 7, nonce_of(BASE + 7)));
+}
+
+/// A message whose number is the last applied's, of the same epoch, and
+/// whose nonce is another — a server restored from an older copy, numbering
+/// again — is not taken: the replica says again what it applied, nonce and
+/// all, so the server finds out. And what follows it does not follow the
+/// last applied.
+#[sqlx::test(migrations = false)]
+async fn a_message_numbered_again_with_another_nonce_is_not_taken(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [a, b] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    w.up(0, false).await.expect("what it applied");
+    let again = Body::Down(Down {
+        tables: vec![upserts("items", vec![item(b, "restored")])],
+        sequence: BASE + 1,
+        epoch: EPOCH.to_owned(),
+        previous: BASE,
+        nonce: 7,
+        previous_nonce: nonce_of(BASE),
+        ..Down::default()
+    })
+    .encoded();
+    assert!(matches!(w.receive(&again).await, Received::AlreadyApplied));
+    let told = w.up(0, false).await.expect("said again");
+    assert_eq!((told.sequence, told.nonce), (BASE + 1, nonce_of(BASE + 1)));
+    let following = Body::Down(Down {
+        tables: vec![upserts("items", vec![item(b, "restored")])],
+        sequence: BASE + 2,
+        epoch: EPOCH.to_owned(),
+        previous: BASE + 1,
+        nonce: 8,
+        previous_nonce: 7,
+        ..Down::default()
+    })
+    .encoded();
+    assert!(matches!(w.receive(&following).await, Received::Gap));
+    assert_eq!(w.items().await, ["a"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3064,7 +3133,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::SCHEMA_VERSION as usize] = [0x4a56_e5e9_424c_7c19];
+    let released: [u64; crate::SCHEMA_VERSION as usize] = [0x7f10_e071_c3e4_898e];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

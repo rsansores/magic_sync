@@ -29,8 +29,8 @@ async fn pool(pool: SqlitePool) -> SqlitePool {
     pool
 }
 
-/// Message `sequence`, following `previous` — or, after none, beginning a
-/// snapshot.
+/// Message `sequence` of the snapshot `s`, following `previous` — or, after
+/// none, beginning it.
 fn rows(sequence: u64, previous: u64, name: &str) -> Vec<u8> {
     let id = Uuid::now_v7();
     Body::Down(Down {
@@ -49,12 +49,15 @@ fn rows(sequence: u64, previous: u64, name: &str) -> Vec<u8> {
         }],
         sequence,
         previous,
-        snapshot_id: if previous == 0 {
-            "s".to_owned()
-        } else {
-            String::new()
-        },
+        snapshot_id: "s".to_owned(),
         epoch: Uuid::nil().to_string(),
+        nonce: crate::conformance::nonce_of(sequence),
+        previous_nonce: if previous == 0 {
+            0
+        } else {
+            crate::conformance::nonce_of(previous)
+        },
+        mac: Vec::new(),
     })
     .encoded()
 }

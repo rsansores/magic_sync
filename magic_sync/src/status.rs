@@ -240,9 +240,9 @@ pub struct ReplicaOverview {
     pub sent_at: Option<DateTime<Utc>>,
     /// When it last said it applied one.
     pub applied_at: Option<DateTime<Utc>>,
-    /// While it has messages it has not said it applied: since when it has
-    /// not moved — the first one it did not confirm, or its last confirmation
-    /// that left it behind. How long a replica has not answered.
+    /// While it has messages it has not said it applied: since it last
+    /// moved — its last send or its last confirmation, whichever came later.
+    /// How long a replica has not answered.
     pub waiting_since: Option<DateTime<Utc>>,
     /// What it last said it wrote and the server has not filed, per table:
     /// `None` until it says.
@@ -1161,7 +1161,7 @@ impl Engine {
                              AND (r.applied_epoch IS DISTINCT FROM e.epoch \
                                   OR coalesce(r.applied_sequence, 0) < c.last_sequence), false) \
                       AS unconfirmed, \
-                    r.backlog, r.backlog_at, r.waiting_since, \
+                    r.backlog, r.backlog_at, greatest(r.last_sent_at, r.applied_at) AS waiting_since, \
                     coalesce(q.n, 0) AS quarantined, coalesce(i.n, 0) AS unfiled, \
                     coalesce(o.n, 0) AS owed \
                FROM unnest($1::uuid[]) AS s(id) \

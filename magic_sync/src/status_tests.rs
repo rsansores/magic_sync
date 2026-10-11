@@ -10,8 +10,6 @@ use crate::status::Page;
 /// on its way out.
 #[sqlx::test(migrations = false)]
 async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
-    use crate::envelope::Up;
-
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
@@ -39,18 +37,13 @@ async fn progress_counts_only_what_a_replica_confirmed(pool: crate::DbPool) {
     );
 
     // The replica says it applied everything it was sent.
-    let (epoch, last): (Uuid, i64) = sqlx::query_as(
-        "SELECT e.epoch, c.last_sequence FROM sync.epoch e, sync.chains c WHERE c.replica_id = $1",
-    )
-    .bind(a)
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap();
-    let ack = Up {
-        epoch: epoch.to_string(),
-        sequence: last as u64,
-        ..Up::default()
-    };
+    let last: i64 =
+        sqlx::query_scalar("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
+            .bind(a)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    let ack = crate::testkit::confirmation(&world.pool, a, last as u64).await;
     crate::testkit::file(&world.pool, &world.codecs, &ack, a, &()).await;
 
     world.exec("UPDATE fixture.items SET name = 'one, renamed' WHERE id = $1 AND partition_id = $2 AND $3 <> ''", one, "x").await;
@@ -782,15 +775,11 @@ async fn waiting_runs_from_when_a_replica_fell_behind(pool: crate::DbPool) {
     world.pass(&wire).await;
     let first = world.last_sent(a).await;
     let waiting = |replica: Uuid| {
-        let pool = world.pool.clone();
+        let world = &world;
         async move {
-            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
-                "SELECT waiting_since FROM sync.replicas WHERE replica_id = $1",
-            )
-            .bind(replica)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+            let replicas = [replica];
+            let overview = world.overview(Scope::Replicas(&replicas)).await;
+            overview.replicas.first[0].waiting_since
         }
     };
     assert!(waiting(a).await.is_some(), "sent, not confirmed");

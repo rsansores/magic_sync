@@ -19,6 +19,7 @@ use crate::wire::Codec;
 use crate::Conn;
 use crate::Error;
 use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// One table of an upload, as the server filed it: what
@@ -82,11 +83,17 @@ impl Unfiled {
 /// was sent is what the relay committed; a pass in flight has sent nothing.
 struct Standing {
     epoch: Uuid,
+    /// What seals the epoch's messages.
+    secret: Vec<u8>,
     /// The last number the server drew for any message: a replica that
     /// applied one past it saw a server this database no longer remembers.
     drawn: i64,
-    /// The last message written for it; `None` while none was.
-    last: Option<i64>,
+    /// The last message written for it, sequence and nonce; `None` while
+    /// none was since it was last provisioned.
+    last: Option<(i64, i64)>,
+    /// The last message it said it applied in this epoch, sequence and
+    /// nonce.
+    applied: Option<(i64, i64)>,
     /// The first message of the last snapshot written for it.
     snapshot: Option<i64>,
     /// And the one that ended it.
@@ -234,9 +241,12 @@ async fn file_tables<P: Sync + 'static>(
     Ok((filed, unfiled))
 }
 
-/// What `upload` says of its sender: what it refused — first, before what
-/// it applied, which counts as held what it did not refuse — what it
-/// applied, what it missed, what it holds, and what it has not sent.
+/// What `upload` says of its sender: whether the server sent the message
+/// it says it applied — or this database was restored from a copy that
+/// never did, which ends the filing of what it says — then what it refused,
+/// before what it applied, which counts as held what it did not refuse; what
+/// it applied, or that it was itself restored; what it missed, what it
+/// holds, and what it has not sent.
 async fn said<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -244,10 +254,21 @@ async fn said<P: Sync + 'static>(
     standing: &Standing,
     upload: &Up,
 ) -> Result<(), Error> {
+    let confirmed = confirmation(sender, standing, upload);
+    if let Confirmed::Unknown(sequence) = confirmed {
+        return restored(conn, sender, standing.epoch, sequence).await;
+    }
     rejected(conn, codecs, sender, standing, &upload.rejected).await?;
-    if acknowledge(conn, sender, standing, &upload.epoch, upload.sequence).await? {
-        gap(conn, sender, standing, upload).await?;
-        compare(conn, codecs, sender, standing, upload).await?;
+    match confirmed {
+        Confirmed::Applied(sequence, nonce) => {
+            acknowledge(conn, sender, standing, sequence, nonce).await?;
+        }
+        Confirmed::Behind(sequence) => replica_restored(conn, sender, standing, sequence).await?,
+        _ => {}
+    }
+    gap(conn, sender, standing, upload.gap).await?;
+    if let Confirmed::Applied(sequence, _) = confirmed {
+        compare(conn, codecs, sender, standing, upload, sequence).await?;
     }
     if let Some(told) = &upload.backlog {
         backlog(conn, sender, told).await?;
@@ -255,17 +276,84 @@ async fn said<P: Sync + 'static>(
     Ok(())
 }
 
+/// What the server makes of the last message a replica says it applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirmed {
+    /// It says nothing of one, or of one of another epoch, or one that does
+    /// not parse, or whose seal is not the server's: nothing to act on.
+    Nothing,
+    /// A message the server sent it, by sequence and nonce.
+    Applied(i64, i64),
+    /// One older than the last it said it applied: the replica was
+    /// restored from an older copy.
+    Behind(i64),
+    /// One the server sealed and has no record of sending it: past the last
+    /// it sent it, or past every number it drew, or the sequence of one it
+    /// sent with another nonce. This database is older than what the
+    /// replica applied.
+    Unknown(i64),
+}
+
+/// The last message `sender` says it applied, judged against what the
+/// server sent it (PROTOCOL.md 5.2). A seal that is not the server's is a
+/// replica that lies, or a bug: it is left out, and never resets anything.
+fn confirmation(sender: Uuid, standing: &Standing, upload: &Up) -> Confirmed {
+    if upload.sequence == 0 {
+        return Confirmed::Nothing;
+    }
+    let Ok(epoch) = Uuid::parse_str(&upload.epoch) else {
+        tracing::error!(%sender, epoch = stored(&upload.epoch), "upload: an epoch that is no UUID — malformed, left out");
+        return Confirmed::Nothing;
+    };
+    if epoch != standing.epoch {
+        return Confirmed::Nothing;
+    }
+    let (Ok(sequence), Ok(nonce)) = (i64::try_from(upload.sequence), i64::try_from(upload.nonce))
+    else {
+        tracing::error!(%sender, sequence = upload.sequence, "upload: a sequence or nonce no message has — malformed, left out");
+        return Confirmed::Nothing;
+    };
+    let seal = envelope::seal(
+        &standing.secret,
+        sender,
+        epoch,
+        upload.sequence,
+        upload.nonce,
+    );
+    if upload.mac != seal {
+        tracing::error!(%sender, sequence, "upload: it says it applied a message this server did not seal — left out");
+        return Confirmed::Nothing;
+    }
+    let other = |known: Option<(i64, i64)>| known.is_some_and(|(s, n)| s == sequence && n != nonce);
+    let past = standing
+        .last
+        .map_or(sequence > standing.drawn, |(last, _)| sequence > last);
+    if past || other(standing.last) || other(standing.applied) {
+        return Confirmed::Unknown(sequence);
+    }
+    if standing
+        .applied
+        .is_some_and(|(applied, _)| sequence < applied)
+    {
+        return Confirmed::Behind(sequence);
+    }
+    Confirmed::Applied(sequence, nonce)
+}
+
 /// What the server records of a sender.
 #[derive(Default, sqlx::FromRow)]
 struct Recorded {
     last: Option<i64>,
+    last_nonce: Option<i64>,
+    applied: Option<i64>,
+    applied_nonce: Option<i64>,
     snapshot: Option<i64>,
     snapshot_end: Option<i64>,
     drifted_at: Option<DateTime<Utc>>,
 }
 
 async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
-    let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+    let (epoch, secret): (Uuid, Vec<u8>) = sqlx::query_as("SELECT epoch, secret FROM sync.epoch")
         .fetch_one(&mut *conn)
         .await?;
     let drawn: i64 = sqlx::query_scalar(
@@ -280,19 +368,25 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
         .execute(&mut *conn)
         .await?;
     let recorded: Recorded = sqlx::query_as(
-        "SELECT c.last_sequence AS last, c.snapshot_sequence AS snapshot, \
-                c.snapshot_end, r.drifted_at \
+        "SELECT c.last_sequence AS last, c.last_nonce, \
+                CASE WHEN r.applied_epoch = $2 THEN r.applied_sequence END AS applied, \
+                CASE WHEN r.applied_epoch = $2 THEN r.applied_nonce END AS applied_nonce, \
+                c.snapshot_sequence AS snapshot, c.snapshot_end, r.drifted_at \
            FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
           WHERE r.replica_id = $1 FOR UPDATE OF r",
     )
     .bind(sender)
+    .bind(epoch)
     .fetch_optional(&mut *conn)
     .await?
     .unwrap_or_default();
+    let pair = |s: Option<i64>, n: Option<i64>| s.map(|s| (s, n.unwrap_or_default()));
     Ok(Standing {
         epoch,
+        secret,
         drawn,
-        last: recorded.last,
+        last: pair(recorded.last, recorded.last_nonce),
+        applied: pair(recorded.applied, recorded.applied_nonce),
         snapshot: recorded.snapshot,
         snapshot_end: recorded.snapshot_end,
         drifted_at: recorded.drifted_at,
@@ -387,7 +481,7 @@ async fn rejected<P: Sync + 'static>(
         }
         let Some(sequence) = i64::try_from(row.sequence)
             .ok()
-            .filter(|s| *s > 0 && standing.last.is_some_and(|last| *s <= last))
+            .filter(|s| *s > 0 && standing.last.is_some_and(|(last, _)| *s <= last))
         else {
             tracing::error!(%replica, table = row.table, key, sequence = row.sequence, "upload: a rejection of a message never sent it — malformed, left out");
             continue;
@@ -447,7 +541,7 @@ async fn refuse(
     .fetch_optional(&mut *conn)
     .await?;
     match held {
-        Some(carried) if carried > sequence => return Ok(false),
+        Some(carried) if carried != sequence => return Ok(false),
         Some(_) => {}
         None => {
             let taken = sqlx::query(
@@ -479,61 +573,29 @@ async fn refuse(
     Ok(true)
 }
 
-/// Records that `replica` applied every message up to `sequence` from the
-/// server installation `epoch`: the rows those messages carried are held from
-/// now on. Sequence 0 says nothing was applied yet. One from another epoch,
-/// or behind the last one, is outdated and changes nothing; one past every
-/// message the server records sending it is not believed — a replica that
-/// lies — and changes nothing either. One past every number the server ever
-/// drew, in its epoch, says this database was restored from a copy older
-/// than what the replicas applied: the server takes a new epoch and
-/// provisions every replica again. Answers whether the server is as the
-/// replica last knew it — not restored.
+/// Records that `replica` applied every message up to `sequence` — nonce
+/// `nonce` — of the server's epoch, as [`confirmation`] found it sent: the
+/// rows those messages carried are held from now on. Caught up, it has
+/// stayed silent no more.
 async fn acknowledge(
     conn: &mut Conn,
     replica: Uuid,
     standing: &Standing,
-    epoch: &str,
-    sequence: u64,
-) -> Result<bool, Error> {
-    if sequence == 0 {
-        return Ok(true);
-    }
-    let Ok(epoch) = Uuid::parse_str(epoch) else {
-        tracing::error!(%replica, epoch = stored(epoch), "upload: an epoch that is no UUID — malformed, left out");
-        return Ok(true);
-    };
-    if epoch != standing.epoch {
-        return Ok(true);
-    }
-    let Ok(sequence) = i64::try_from(sequence) else {
-        tracing::error!(%replica, sequence, "upload: a sequence no message has — malformed, left out");
-        return Ok(true);
-    };
-    if sequence > standing.drawn {
-        restored(conn, replica, epoch, sequence).await?;
-        return Ok(false);
-    }
-    if standing.last.is_none_or(|last| sequence > last) {
-        tracing::warn!(
-            %replica,
-            sequence,
-            last = standing.last,
-            "upload: it acknowledges a message the server does not record sending it — left out"
-        );
-        return Ok(true);
-    }
+    sequence: i64,
+    nonce: i64,
+) -> Result<(), Error> {
     sqlx::query(
-        "UPDATE sync.replicas SET applied_epoch = $2, applied_sequence = $3, applied_at = now(), \
-           waiting_since = CASE WHEN $3 >= $4 THEN NULL ELSE now() END, \
-           heals = CASE WHEN $3 >= $4 THEN 0 ELSE heals END \
+        "UPDATE sync.replicas SET applied_epoch = $2, applied_sequence = $3, applied_nonce = $4, \
+           applied_at = now(), \
+           heals = CASE WHEN $3 >= (SELECT last_sequence FROM sync.chains WHERE replica_id = $1) \
+                        THEN 0 ELSE heals END \
          WHERE replica_id = $1 AND (applied_epoch IS DISTINCT FROM $2 \
                                     OR applied_sequence IS NULL OR applied_sequence < $3)",
     )
     .bind(replica)
-    .bind(epoch)
+    .bind(standing.epoch)
     .bind(sequence)
-    .bind(standing.last)
+    .bind(nonce)
     .execute(&mut *conn)
     .await?;
     sqlx::query("DELETE FROM sync.gone WHERE replica_id = $1 AND sequence <= $2")
@@ -559,35 +621,41 @@ async fn acknowledge(
             AND q.carried <= r.applied_sequence",
     )
     .bind(replica)
-    .bind(epoch)
+    .bind(standing.epoch)
     .execute(&mut *conn)
     .await?;
-    Ok(true)
+    Ok(())
 }
 
 /// This database is older than what `replica` applied — restored from a
 /// copy — so what it records of every replica is too: it takes a new epoch,
-/// unless a filing at once took it already, drops every outbox, and
-/// provisions every replica again. Messages of the old epoch still on
-/// their way are a server's a replica no longer follows.
+/// and a new secret to seal it, unless a filing at once took it already;
+/// drops every outbox, and provisions every replica again. Messages of the
+/// old epoch still on their way are a server's a replica no longer follows.
 async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) -> Result<(), Error> {
-    let rotated = sqlx::query("UPDATE sync.epoch SET epoch = gen_random_uuid() WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&mut *conn)
-        .await?;
+    let rotated = sqlx::query(
+        "UPDATE sync.epoch SET epoch = gen_random_uuid(), \
+           secret = uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()) \
+         WHERE epoch = $1",
+    )
+    .bind(epoch)
+    .execute(&mut *conn)
+    .await?;
     if rotated.rows_affected() == 0 {
         return Ok(());
     }
     tracing::error!(
         %replica,
         sequence,
-        "sync ALARM: a replica applied a message this database never numbered — it was restored \
-         from an older copy; a new epoch begins and every replica is provisioned again"
+        "sync ALARM: a replica applied a message this database has no record of sending it — \
+         it was restored from an older copy; a new epoch begins and every replica is provisioned \
+         again"
     );
     for sql in [
         "DELETE FROM sync.outbox",
         "DELETE FROM sync.gone",
-        "UPDATE sync.chains SET last_sequence = NULL, snapshot_sequence = NULL, snapshot_end = NULL",
+        "UPDATE sync.chains SET last_sequence = NULL, last_nonce = NULL, snapshot_sequence = NULL, \
+           snapshot_end = NULL",
     ] {
         sqlx::query(sql).execute(&mut *conn).await?;
     }
@@ -601,28 +669,42 @@ async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) ->
     Ok(())
 }
 
-/// `replica` says it missed a message: it applies nothing more until a
-/// snapshot begins, so it is provisioned again — unless one is on its way,
-/// written for it since the last message it applied.
-async fn gap(
+/// `replica` says it applied `sequence`, older than what it said before: it
+/// was restored from an older copy, and holds less than the server records.
+/// It is provisioned again — unless a snapshot written for it since what it
+/// said before is on its way, which replaces whatever it holds.
+async fn replica_restored(
     conn: &mut Conn,
     replica: Uuid,
     standing: &Standing,
-    upload: &Up,
+    sequence: i64,
 ) -> Result<(), Error> {
-    if !upload.gap {
+    let applied = standing.applied.map_or(0, |(s, _)| s);
+    if standing.snapshot.is_some_and(|began| began > applied) {
+        tracing::debug!(%replica, sequence, "sync: a replica behind what it said has its snapshot on the way");
         return Ok(());
     }
-    let since = Uuid::parse_str(&upload.epoch).ok() == Some(standing.epoch);
-    let on_its_way = standing.snapshot.is_some_and(|began| {
-        !since || i64::try_from(upload.sequence).is_ok_and(|applied| applied < began)
-    });
-    if on_its_way {
+    if resync(conn, replica).await? {
+        tracing::warn!(%replica, sequence, applied, "sync: a replica says less than it said before — restored from an older copy, it is provisioned again");
+    }
+    Ok(())
+}
+
+/// `replica` says it missed a message — `gap`, the newest it could not
+/// follow, 0 for none: it applies nothing more until a snapshot begins, so
+/// it is provisioned again, unless one that began after that message is on
+/// its way.
+async fn gap(conn: &mut Conn, replica: Uuid, standing: &Standing, gap: u64) -> Result<(), Error> {
+    if gap == 0 {
+        return Ok(());
+    }
+    let missed = i64::try_from(gap).unwrap_or(i64::MAX);
+    if standing.snapshot.is_some_and(|began| began > missed) {
         tracing::debug!(%replica, "sync: a replica that missed a message has its snapshot on the way");
         return Ok(());
     }
     if resync(conn, replica).await? {
-        tracing::warn!(%replica, "sync: a replica missed a message — it is provisioned again");
+        tracing::warn!(%replica, missed, "sync: a replica missed a message — it is provisioned again");
     }
     Ok(())
 }
@@ -630,17 +712,20 @@ async fn gap(
 /// Compares what `replica` says it holds with what the server records it
 /// holds, and provisions it again from scratch where they differ: the
 /// backstop for whatever else went wrong. Only once the replica has applied
-/// every message recorded for it — before that, a difference is just a
-/// message on its way. Rows it refused are left out, as it leaves them out.
-/// Digests that differ again within a day of the last provisioning they
-/// caused are a bug another one would not cure: logged, not acted on.
-/// Answers the tables that differed.
+/// every message recorded for it — `applied`, the last it confirmed, is the
+/// last the server sent it — and as the server's record stood then: a pass
+/// that writes it more while this is read moves its chain, and the
+/// comparison waits for the next digests. Rows it refused are left out, as
+/// it leaves them out. Digests that differ again within a day of the last
+/// provisioning they caused are a bug another one would not cure: logged,
+/// not acted on. Answers the tables that differed.
 async fn compare<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     replica: Uuid,
     standing: &Standing,
     upload: &Up,
+    applied: i64,
 ) -> Result<Vec<String>, Error> {
     if upload.digests.is_empty() {
         return Ok(Vec::new());
@@ -659,23 +744,30 @@ async fn compare<P: Sync + 'static>(
         .iter()
         .filter(|d| codec_of(codecs, &d.table).is_some_and(Codec::sent_down))
         .collect();
-    let settled = Uuid::parse_str(&upload.epoch).ok() == Some(standing.epoch)
-        && standing.last.is_some()
-        && i64::try_from(upload.sequence).ok() == standing.last;
-    if !settled {
+    let names: Vec<&str> = digests.iter().map(|d| d.table.as_str()).collect();
+    // One statement, so the keys are those of the chain it reads.
+    let (last, held): (
+        Option<i64>,
+        sqlx::types::Json<BTreeMap<String, Vec<String>>>,
+    ) = sqlx::query_as(
+        "SELECT (SELECT last_sequence FROM sync.chains WHERE replica_id = $1), \
+                    coalesce((SELECT jsonb_object_agg(relation, keys) FROM ( \
+                       SELECT relation, jsonb_agg(row_key) AS keys FROM sync.held \
+                        WHERE replica_id = $1 AND relation = ANY($2) AND refused IS NULL \
+                        GROUP BY relation) t), '{}')",
+    )
+    .bind(replica)
+    .bind(&names)
+    .fetch_one(&mut *conn)
+    .await?;
+    if standing.last.map(|(last, _)| last) != Some(applied) || last != Some(applied) {
         tracing::debug!(%replica, "sync: digests taken with messages still on their way — not compared");
         return Ok(Vec::new());
     }
+    let mut held = held.0;
     let mut differ = Vec::new();
     for digest in digests {
-        let keys: Vec<String> = sqlx::query_scalar(
-            "SELECT row_key FROM sync.held \
-              WHERE replica_id = $1 AND relation = $2 AND refused IS NULL",
-        )
-        .bind(replica)
-        .bind(&digest.table)
-        .fetch_all(&mut *conn)
-        .await?;
+        let keys = held.remove(&digest.table).unwrap_or_default();
         let count = keys.len() as u64;
         if count != digest.count || envelope::fingerprint(keys) != digest.fingerprint {
             tracing::error!(

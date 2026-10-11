@@ -154,7 +154,9 @@ struct Writer {
     /// The snapshot the plan read: what the rows it sends are recorded as
     /// held from.
     snapshot: String,
-    epoch: String,
+    epoch: Uuid,
+    /// What seals the epoch's messages.
+    secret: Vec<u8>,
     packers: BTreeMap<Uuid, Packer>,
     /// The snapshot each replica provisioned is sent.
     snapshots: BTreeMap<Uuid, String>,
@@ -163,10 +165,10 @@ struct Writer {
     rows: usize,
     /// Bytes of rows in the messages being filled.
     buffered: usize,
-    /// Per replica, the last message written: what the next one follows.
-    /// A replica provisioned is absent until its snapshot's first message,
-    /// which follows nothing.
-    last: BTreeMap<Uuid, i64>,
+    /// Per replica, the last message written, its sequence and nonce: what
+    /// the next one follows. A replica provisioned is absent until its
+    /// snapshot's first message, which follows nothing.
+    last: BTreeMap<Uuid, (i64, i64)>,
     /// Per replica provisioned, its snapshot's first message, and its last.
     began: BTreeMap<Uuid, i64>,
     ended: BTreeMap<Uuid, i64>,
@@ -193,21 +195,26 @@ impl<P: Sync + 'static> Relay<'_, P> {
             parked,
             ..Outcome::default()
         };
-        let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-            .fetch_one(&mut *conn)
-            .await?;
+        // Shared: a filing that finds this database restored takes a new
+        // epoch only once this pass is done with the old one, or makes it
+        // fail to serialize.
+        let (epoch, secret): (Uuid, Vec<u8>) =
+            sqlx::query_as("SELECT epoch, secret FROM sync.epoch FOR SHARE")
+                .fetch_one(&mut *conn)
+                .await?;
         // A message follows the last one its replica was sent in this epoch;
         // a replica sent none since it was last provisioned can only begin
         // with a snapshot.
         let touched = self.engine.touched(conn).await?;
-        let chains: BTreeMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT replica_id, last_sequence FROM sync.chains \
+        let chains: BTreeMap<Uuid, (i64, i64)> = sqlx::query_as::<_, (Uuid, i64, i64)>(
+            "SELECT replica_id, last_sequence, last_nonce FROM sync.chains \
               WHERE replica_id = ANY($1) AND last_sequence IS NOT NULL",
         )
         .bind(touched.iter().copied().collect::<Vec<_>>())
         .fetch_all(&mut *conn)
         .await?
         .into_iter()
+        .map(|(replica, sequence, nonce)| (replica, (sequence, nonce)))
         .collect();
         let unchained: Vec<Uuid> = touched
             .into_iter()
@@ -229,9 +236,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             sqlx::query("SAVEPOINT sync_write")
                 .execute(&mut *conn)
                 .await?;
-            let written = self
-                .write(conn, &delta, &epoch.to_string(), &chains)
-                .await?;
+            let written = self.write(conn, &delta, (epoch, &secret), &chains).await?;
             let end = match written {
                 Ok(_) => "RELEASE SAVEPOINT sync_write",
                 Err(_) => "ROLLBACK TO SAVEPOINT sync_write",
@@ -351,8 +356,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
         &self,
         conn: &mut Conn,
         delta: &Delta,
-        epoch: &str,
-        chains: &BTreeMap<Uuid, i64>,
+        (epoch, secret): (Uuid, &[u8]),
+        chains: &BTreeMap<Uuid, (i64, i64)>,
     ) -> Result<Result<(usize, usize, usize), BTreeMap<(Uuid, usize, String), String>>, Error> {
         let snapshots: Vec<Uuid> = delta.snapshots.iter().copied().collect();
         if !snapshots.is_empty() {
@@ -374,7 +379,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
             .collect();
         let mut writer = Writer {
             snapshot: delta.snapshot.clone(),
-            epoch: epoch.to_owned(),
+            epoch,
+            secret: secret.to_vec(),
             packers: self
                 .engine
                 .touched(conn)
@@ -392,7 +398,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             last: chains
                 .iter()
                 .filter(|(r, _)| !delta.snapshots.contains(r))
-                .map(|(r, s)| (*r, *s))
+                .map(|(r, chain)| (*r, *chain))
                 .collect(),
             began: BTreeMap::new(),
             ended: BTreeMap::new(),
@@ -462,20 +468,23 @@ impl<P: Sync + 'static> Relay<'_, P> {
         }
         writer.end(&self.engine.snapshot_tables());
         writer.flush(conn, true).await?;
-        let (replicas, lasts): (Vec<Uuid>, Vec<i64>) =
-            writer.last.iter().map(|(r, s)| (*r, *s)).unzip();
+        let replicas: Vec<Uuid> = writer.last.keys().copied().collect();
+        let (lasts, nonces): (Vec<i64>, Vec<i64>) = writer.last.values().copied().unzip();
         let of = |map: &BTreeMap<Uuid, i64>| -> Vec<Option<i64>> {
             replicas.iter().map(|r| map.get(r).copied()).collect()
         };
         sqlx::query(
-            "INSERT INTO sync.chains AS c (replica_id, last_sequence, snapshot_sequence, snapshot_end) \
-             SELECT * FROM unnest($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[]) \
+            "INSERT INTO sync.chains AS c \
+               (replica_id, last_sequence, last_nonce, snapshot_sequence, snapshot_end) \
+             SELECT * FROM unnest($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) \
              ON CONFLICT (replica_id) DO UPDATE SET last_sequence = EXCLUDED.last_sequence, \
+               last_nonce = EXCLUDED.last_nonce, \
                snapshot_sequence = coalesce(EXCLUDED.snapshot_sequence, c.snapshot_sequence), \
                snapshot_end = coalesce(EXCLUDED.snapshot_end, c.snapshot_end)",
         )
         .bind(&replicas)
         .bind(&lasts)
+        .bind(&nonces)
         .bind(of(&writer.began))
         .bind(of(&writer.ended))
         .execute(&mut *conn)
@@ -558,10 +567,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let conn: &mut Conn = &mut conn;
         let Some(e) = failure else {
             sqlx::query(
-                "INSERT INTO sync.replicas AS r (replica_id, last_sent_at, waiting_since) \
-                 VALUES ($1, now(), now()) \
+                "INSERT INTO sync.replicas AS r (replica_id, last_sent_at) VALUES ($1, now()) \
                  ON CONFLICT (replica_id) DO UPDATE SET last_sent_at = now(), \
-                   waiting_since = coalesce(r.waiting_since, now()), \
                    failures = 0, retry_after = NULL, last_error = NULL, refusals = 0",
             )
             .bind(replica)
@@ -585,7 +592,6 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let refusals: i32 = sqlx::query_scalar(
             "UPDATE sync.replicas SET \
                last_sent_at = CASE WHEN $2 THEN now() ELSE last_sent_at END, \
-               waiting_since = CASE WHEN $2 THEN coalesce(waiting_since, now()) ELSE waiting_since END, \
                failures = failures + 1, last_error = $3, \
                refusals = CASE WHEN $4 THEN refusals + 1 ELSE refusals END, \
                retry_after = now() + make_interval(secs => \
@@ -797,14 +803,23 @@ impl Writer {
         for (Ready { replica, mut body }, sequence) in ready.into_iter().zip(drawn) {
             let number = u64::try_from(sequence)
                 .map_err(|_| Error::Misuse(format!("sync.messages drew {sequence}")))?;
-            let previous = self
-                .last
-                .get(&replica)
-                .map_or(0, |s| u64::try_from(*s).unwrap_or_default());
-            match &mut body {
+            let (previous, previous_nonce) = self.last.get(&replica).map_or((0, 0), |(s, n)| {
+                (
+                    u64::try_from(*s).unwrap_or_default(),
+                    u64::try_from(*n).unwrap_or_default(),
+                )
+            });
+            let nonce = envelope::nonce();
+            Place {
+                sequence: number,
+                epoch: self.epoch.to_string(),
+                nonce,
+                previous: (previous, previous_nonce),
+                mac: envelope::seal(&self.secret, replica, self.epoch, number, nonce),
+            }
+            .stamp(&mut body);
+            match &body {
                 Body::Down(down) => {
-                    (down.sequence, down.epoch, down.previous) =
-                        (number, self.epoch.clone(), previous);
                     for table in &down.tables {
                         for key in &table.keys {
                             held.0.push(replica);
@@ -823,15 +838,14 @@ impl Writer {
                         self.began.entry(replica).or_insert(sequence);
                     }
                 }
-                Body::EndSnapshot(end) => {
-                    (end.sequence, end.epoch, end.previous) =
-                        (number, self.epoch.clone(), previous);
+                Body::EndSnapshot(_) => {
                     self.began.entry(replica).or_insert(sequence);
                     self.ended.insert(replica, sequence);
                 }
                 Body::Filed(_) => {}
             }
-            self.last.insert(replica, sequence);
+            let nonce = i64::try_from(nonce).expect("a nonce is below 2^63");
+            self.last.insert(replica, (sequence, nonce));
             self.written += 1;
             outbox.0.push(replica);
             outbox.1.push(sequence);
@@ -907,6 +921,39 @@ impl Writer {
     }
 }
 
+/// Where a message stands in its replica's chain, and the seal on it.
+struct Place {
+    sequence: u64,
+    epoch: String,
+    nonce: u64,
+    previous: (u64, u64),
+    mac: Vec<u8>,
+}
+
+impl Place {
+    /// Writes itself into `body`'s fields, a `Down` or an `EndSnapshot`.
+    fn stamp(self, body: &mut Body) {
+        let Place {
+            sequence,
+            epoch,
+            nonce,
+            previous: (previous, previous_nonce),
+            mac,
+        } = self;
+        match body {
+            Body::Down(m) => {
+                (m.sequence, m.epoch, m.nonce, m.mac) = (sequence, epoch, nonce, mac);
+                (m.previous, m.previous_nonce) = (previous, previous_nonce);
+            }
+            Body::EndSnapshot(m) => {
+                (m.sequence, m.epoch, m.nonce, m.mac) = (sequence, epoch, nonce, mac);
+                (m.previous, m.previous_nonce) = (previous, previous_nonce);
+            }
+            Body::Filed(_) => {}
+        }
+    }
+}
+
 /// Drops `replica`'s outbox and forgets what it holds, and provisions it
 /// again from scratch — with an alarm, for `why`: what it was owed is sent
 /// whole instead.
@@ -921,8 +968,9 @@ async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error
     }
     sqlx::query(
         "INSERT INTO sync.chains (replica_id, dropped, dropped_at) VALUES ($1, $2, now()) \
-         ON CONFLICT (replica_id) DO UPDATE SET last_sequence = NULL, snapshot_sequence = NULL, \
-           snapshot_end = NULL, dropped = EXCLUDED.dropped, dropped_at = now()",
+         ON CONFLICT (replica_id) DO UPDATE SET last_sequence = NULL, last_nonce = NULL, \
+           snapshot_sequence = NULL, snapshot_end = NULL, dropped = EXCLUDED.dropped, \
+           dropped_at = now()",
     )
     .bind(replica)
     .bind(stored(why))
@@ -1032,20 +1080,33 @@ pub(crate) async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
     Ok(done.rows_affected())
 }
 
+/// Whether a replica of `sync.replicas` as `r`, chained as `sync.chains`
+/// as `c`, has a message it has not said it applied: one written for it in
+/// this epoch past the last it confirmed. Read from what each writer
+/// records of its own — the relay its chain, a filing what was confirmed —
+/// never from a flag the two would race to set.
+pub(crate) const UNCONFIRMED: &str = "(c.last_sequence IS NOT NULL \
+     AND (r.applied_epoch IS DISTINCT FROM (SELECT epoch FROM sync.epoch) \
+          OR coalesce(r.applied_sequence, 0) < c.last_sequence))";
+
 /// Provisions again every live replica that has left a message unconfirmed
-/// with nothing sent to it for `after`, and no send to it failing: a
-/// transport that lost the last messages it was sent leaves nothing else to
-/// bring them back, since nothing newer goes to it while nothing changes.
-/// While it stays silent, the next time waits twice as long as the last, up
-/// to 32 times `after`, so a replica that is merely away is not sent
-/// everything over and over. Answers how many.
+/// with nothing sent to it, and nothing confirmed by it, for `after`, and
+/// no send to it failing or waiting: a transport that lost the last messages
+/// it was sent leaves nothing else to bring them back, since nothing newer
+/// goes to it while nothing changes. While it stays silent, the next time
+/// waits twice as long as the last, up to 32 times `after`, so a replica
+/// that is merely away is not sent everything over and over; one that
+/// caught up since waits `after` again. Answers how many.
 pub(crate) async fn heal(conn: &mut Conn, engine: &Engine, after: Duration) -> Result<u64, Error> {
     let healed: i64 = sqlx::query_scalar(&format!(
         "WITH silent AS ( \
              SELECT r.replica_id AS id, s.partition FROM sync.replicas r \
+               JOIN sync.chains c USING (replica_id) \
                JOIN {} ON s.id = r.replica_id \
-              WHERE r.waiting_since IS NOT NULL AND r.failures = 0 \
-                AND r.last_sent_at < now() - make_interval(secs => $1 * power(2, least(r.heals, 5)))), \
+              WHERE {UNCONFIRMED} AND r.failures = 0 \
+                AND NOT EXISTS (SELECT 1 FROM sync.outbox o WHERE o.replica_id = r.replica_id) \
+                AND greatest(r.last_sent_at, r.applied_at) \
+                    < now() - make_interval(secs => $1 * power(2, least(r.heals, 5)))), \
          noted AS ({} RETURNING replica_id), \
          counted AS (UPDATE sync.replicas r SET heals = r.heals + 1 FROM noted n \
                       WHERE r.replica_id = n.replica_id) \
