@@ -1652,3 +1652,44 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
         ]
     );
 }
+
+/// The reads that ask whether a row, or a replica, has something pending
+/// find it by index however many other notes are pending, or done and
+/// waiting to be pruned: what a retry notes once, where a row stands, and a
+/// replica's provisioning noted once.
+#[sqlx::test(migrations = false)]
+async fn what_is_pending_is_found_by_index_among_many_notes(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    sqlx::raw_sql(
+        "INSERT INTO sync.notes (kind, relation, row_key, replica_id, done_at) \
+         SELECT CASE WHEN n % 2 = 0 THEN 'row' ELSE 'resync' END, 't_kinds', n::text, \
+                gen_random_uuid(), CASE WHEN n % 3 = 0 THEN now() END \
+           FROM generate_series(1, 50000) AS n; \
+         ANALYZE sync.notes;",
+    )
+    .execute(&mut *world.conn)
+    .await
+    .expect("done notes");
+    for (sql, index) in [
+        (
+            "SELECT 1 FROM sync.notes n WHERE n.done_at IS NULL AND n.kind = 'row' \
+              AND n.relation = 't_kinds' AND n.row_key = '7'",
+            "notes_rows",
+        ),
+        (
+            "SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
+              AND p.replica_id = gen_random_uuid() AND p.done_at IS NULL",
+            "notes_resync",
+        ),
+    ] {
+        let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {sql}"))
+            .fetch_all(&mut *world.conn)
+            .await
+            .expect("explained");
+        assert!(
+            plan.iter().any(|line| line.contains(index)),
+            "{sql}\n{}",
+            plan.join("\n")
+        );
+    }
+}

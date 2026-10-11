@@ -812,11 +812,6 @@ async fn a_replica_silent_on_what_it_was_sent_is_provisioned_again(pool: crate::
     let world = world(pool).await;
     let [a, b] = world.replicas;
     let wire = Fake::default();
-    // Its provisioning is long past.
-    sqlx::query("UPDATE sync.notes SET noted_at = now() - interval '1 day'")
-        .execute(&world.pool)
-        .await
-        .unwrap();
     world.item("lost").await;
     world.pass(&wire).await;
     wire.delivered();
@@ -852,16 +847,22 @@ async fn a_replica_silent_on_what_it_was_sent_is_provisioned_again(pool: crate::
 
     // Lost again: the next one waits twice as long.
     silent_for(90).await.unwrap();
-    sqlx::query(
-        "UPDATE sync.notes SET noted_at = now() - interval '80 seconds' \
-          WHERE kind = 'resync' AND noted_at > now() - interval '1 hour'",
-    )
-    .execute(&world.pool)
-    .await
-    .unwrap();
     assert_eq!(heal().await, 0, "within twice the wait");
     silent_for(121).await.unwrap();
     assert_eq!(heal().await, 1);
+
+    // Caught up since: silent again, it waits the first wait again.
+    world.pass(&wire).await;
+    for replica in [a, b] {
+        world
+            .acknowledge(replica, world.last_sent(replica).await)
+            .await;
+    }
+    world.item("lost again").await;
+    world.pass(&wire).await;
+    world.acknowledge(b, world.last_sent(b).await).await;
+    silent_for(61).await.unwrap();
+    assert_eq!(heal().await, 1, "the first wait again");
 }
 
 #[sqlx::test(migrations = false)]

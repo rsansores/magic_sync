@@ -520,7 +520,8 @@ async fn acknowledge(
     }
     sqlx::query(
         "UPDATE sync.replicas SET applied_epoch = $2, applied_sequence = $3, applied_at = now(), \
-           waiting_since = CASE WHEN $3 >= $4 THEN NULL ELSE now() END \
+           waiting_since = CASE WHEN $3 >= $4 THEN NULL ELSE now() END, \
+           heals = CASE WHEN $3 >= $4 THEN 0 ELSE heals END \
          WHERE replica_id = $1 AND (applied_epoch IS DISTINCT FROM $2 \
                                     OR applied_sequence IS NULL OR applied_sequence < $3)",
     )

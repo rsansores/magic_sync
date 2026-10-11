@@ -888,9 +888,8 @@ pub(crate) fn stored(text: &str) -> String {
 /// already: it is sent everything it should hold, and lets go of the rest.
 /// Answers whether it was noted now.
 pub(crate) async fn resync(conn: &mut Conn, replica: Uuid) -> Result<bool, Error> {
-    let noted = sqlx::query(&format!(
-        "INSERT INTO sync.notes (kind, replica_id) SELECT 'resync', $1 WHERE {}",
-        crate::plan::RESYNC_PENDING
+    let noted = sqlx::query(&crate::plan::resync_sql(
+        "SELECT $1::uuid, (SELECT partition_id FROM sync.replicas WHERE replica_id = $1)",
     ))
     .bind(replica)
     .execute(&mut *conn)
@@ -961,22 +960,23 @@ pub(crate) async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
 /// to 32 times `after`, so a replica that is merely away is not sent
 /// everything over and over. Answers how many.
 pub(crate) async fn heal(conn: &mut Conn, engine: &Engine, after: Duration) -> Result<u64, Error> {
-    let healed = sqlx::query(&format!(
-        "INSERT INTO sync.notes (kind, replica_id) \
-         SELECT 'resync', r.replica_id FROM sync.replicas r \
-           JOIN {} ON s.id = r.replica_id \
-          WHERE r.waiting_since IS NOT NULL AND r.failures = 0 \
-            AND r.last_sent_at < now() - make_interval(secs => $1 * power(2, least( \
-                  (SELECT count(*) FROM sync.notes n WHERE n.kind = 'resync' \
-                     AND n.replica_id = r.replica_id AND n.noted_at >= r.waiting_since), 5))) \
-            AND NOT EXISTS (SELECT 1 FROM sync.notes n WHERE n.kind = 'resync' \
-                             AND n.replica_id = r.replica_id AND n.done_at IS NULL)",
-        engine.replicas_sql()
+    let healed: i64 = sqlx::query_scalar(&format!(
+        "WITH silent AS ( \
+             SELECT r.replica_id AS id, s.partition FROM sync.replicas r \
+               JOIN {} ON s.id = r.replica_id \
+              WHERE r.waiting_since IS NOT NULL AND r.failures = 0 \
+                AND r.last_sent_at < now() - make_interval(secs => $1 * power(2, least(r.heals, 5)))), \
+         noted AS ({} RETURNING replica_id), \
+         counted AS (UPDATE sync.replicas r SET heals = r.heals + 1 FROM noted n \
+                      WHERE r.replica_id = n.replica_id) \
+         SELECT count(*) FROM noted",
+        engine.replicas_sql(),
+        crate::plan::resync_sql("SELECT id, partition FROM silent")
     ))
     .bind(after.as_secs_f64())
-    .execute(&mut *conn)
+    .fetch_one(&mut *conn)
     .await?;
-    Ok(healed.rows_affected())
+    Ok(u64::try_from(healed).unwrap_or_default())
 }
 
 #[cfg(test)]

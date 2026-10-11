@@ -711,12 +711,10 @@ impl Engine {
         if first_noted {
             // Rows written before their table was noted reached no replica:
             // every replica is provisioned again, and gets them.
-            sqlx::query(&format!(
-                "INSERT INTO sync.notes (kind, replica_id, partition_id) \
-                 SELECT 'resync', s.id, s.partition FROM {} WHERE {}",
-                engine.replicas_sql(),
-                RESYNC_PENDING.replace("$1", "s.id")
-            ))
+            sqlx::query(&resync_sql(&format!(
+                "SELECT s.id, s.partition FROM {}",
+                engine.replicas_sql()
+            )))
             .execute(&mut *conn)
             .await?;
         }
@@ -1125,8 +1123,7 @@ impl Engine {
                                               AND s.partition_id IS NOT DISTINCT FROM n.partition)), \
              gone AS (SELECT s.replica_id FROM seen s \
                        WHERE NOT EXISTS (SELECT 1 FROM now n WHERE n.id = s.replica_id)), \
-             provisioned AS (INSERT INTO sync.notes (kind, replica_id, partition_id) \
-                             SELECT 'resync', a.id, a.partition FROM arrived a WHERE {}), \
+             provisioned AS ({}), \
              forgotten AS (DELETE FROM sync.held h USING gone g WHERE h.replica_id = g.replica_id), \
              untaken AS (DELETE FROM sync.gone t USING gone g WHERE t.replica_id = g.replica_id), \
              dropped AS (DELETE FROM sync.outbox o USING gone g WHERE o.replica_id = g.replica_id), \
@@ -1137,7 +1134,7 @@ impl Engine {
              UPDATE sync.replicas r SET live = false, partition_id = NULL \
                FROM gone g WHERE r.replica_id = g.replica_id",
             self.replicas_sql(),
-            RESYNC_PENDING.replace("$1", "a.id")
+            resync_sql("SELECT id, partition FROM arrived")
         ))
         .execute(&mut *conn)
         .await?;
@@ -2301,12 +2298,19 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
         .collect())
 }
 
-/// No provisioning of the replica `$1` is pending: one is noted once, however
-/// many reasons ask for it. It is planned with the changes of its pass, so the
-/// snapshot carries them rather than a second message.
-pub(crate) const RESYNC_PENDING: &str =
-    "NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
-                              AND p.replica_id = $1 AND p.done_at IS NULL)";
+/// The statement that notes the provisioning from scratch of each replica
+/// `source` names — `(id, partition)` — unless one is pending for it: a
+/// replica is provisioned once, however many reasons ask for it, and its
+/// snapshot, planned with the changes of its pass, carries them rather than
+/// a second message. Every provisioning is noted through it.
+pub(crate) fn resync_sql(source: &str) -> String {
+    format!(
+        "INSERT INTO sync.notes (kind, replica_id, partition_id) \
+         SELECT DISTINCT ON (r.id) 'resync', r.id, r.partition FROM ({source}) AS r(id, partition) \
+          WHERE NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
+                               AND p.replica_id = r.id AND p.done_at IS NULL)"
+    )
+}
 
 /// Queues `replica`'s provisioning from scratch, in the caller's transaction,
 /// unless one is pending: it is sent everything it should hold and sweeps the
@@ -2320,14 +2324,11 @@ pub async fn note_resync(
     partition: Option<Uuid>,
     replica: Uuid,
 ) -> Result<(), Error> {
-    sqlx::query(&format!(
-        "INSERT INTO sync.notes (kind, replica_id, partition_id) \
-         SELECT 'resync', $1, $2 WHERE {RESYNC_PENDING}"
-    ))
-    .bind(replica)
-    .bind(partition)
-    .execute(&mut *conn)
-    .await?;
+    sqlx::query(&resync_sql("SELECT $1::uuid, $2::uuid"))
+        .bind(replica)
+        .bind(partition)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 

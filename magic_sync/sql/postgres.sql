@@ -44,6 +44,9 @@ CREATE INDEX notes_pending ON sync.notes (id) WHERE done_at IS NULL AND parked_a
 CREATE INDEX notes_done ON sync.notes (done_at) WHERE done_at IS NOT NULL;
 -- A replica's provisioning is noted once, however many reasons ask for it.
 CREATE INDEX notes_resync ON sync.notes (replica_id) WHERE kind = 'resync' AND done_at IS NULL;
+-- Whether a row has a change pending, by the row: what a retry notes once,
+-- where a row stands, and the pending changes of a table the planner reads.
+CREATE INDEX notes_rows ON sync.notes (relation, row_key) WHERE kind = 'row' AND done_at IS NULL;
 
 COMMENT ON TABLE sync.notes IS
     'Every change to a mirrored table or a group table, and every replica to provision '
@@ -190,6 +193,7 @@ CREATE TABLE sync.replicas (
     applied_sequence BIGINT,
     applied_at       TIMESTAMPTZ,
     waiting_since    TIMESTAMPTZ,
+    heals            INTEGER     NOT NULL DEFAULT 0,
     backlog          JSONB,
     backlog_at       TIMESTAMPTZ,
     drifted_at       TIMESTAMPTZ
@@ -204,6 +208,9 @@ COMMENT ON COLUMN sync.replicas.live IS
 COMMENT ON COLUMN sync.replicas.waiting_since IS
     'While it has messages it has not said it applied: since when it has not moved — the '
     'first send it did not confirm, or the last confirmation that left it behind. NULL: caught up.';
+COMMENT ON COLUMN sync.replicas.heals IS
+    'Times it was provisioned again for staying silent on what it was sent, since it last '
+    'caught up: each waits twice as long as the one before, up to 32 times the first.';
 COMMENT ON COLUMN sync.replicas.backlog IS
     'What the replica last said it wrote and the server has not filed, per table '
     '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
