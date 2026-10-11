@@ -57,7 +57,7 @@ use uuid::Uuid;
 /// backoff before it is tried again.
 ///
 /// [contract]: https://rsansores.github.io/magic_sync/protocol.html#2-what-the-transport-must-provide
-pub trait Transport: Sync {
+pub trait Transport: Send + Sync + 'static {
     /// Sends `message`, one message, encoded, to `replica` — or says why it
     /// could not. `Ok` means the transport took it, and will deliver it.
     ///

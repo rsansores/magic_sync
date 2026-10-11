@@ -43,7 +43,7 @@ Its size does not grow with the fleet. Every replica is counted in
 limit you pass — those waiting for a fix, then those out of reach, then those
 catching up, the longest silent first — with `total` uncut. The rest are a
 page away: `engine().listing(&mut conn, scope, Some(ReplicaState::Synced),
-offset, limit)` lists them in the same order, in one state or in all.
+Page { offset, limit })` lists them in the same order, in one state or in all.
 `overview.now` is the server's time when it read: every time in the answer is
 the server's, and how long ago one was is measured from it, never from the
 reader's clock.

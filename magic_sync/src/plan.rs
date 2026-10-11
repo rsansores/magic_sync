@@ -44,9 +44,13 @@ use uuid::Uuid;
 /// ```
 /// use magic_sync::plan::Replicas;
 ///
-/// pub const REGISTERS: Replicas = Replicas::new("shop.registers", "registers", "active");
-/// pub const DEVICES: Replicas =
-///     Replicas::new("fleet.devices", "devices", "enrolled_at IS NOT NULL").partitioned_by("company_id");
+/// pub const REGISTERS: Replicas = Replicas::relation("shop.registers")
+///     .table("registers")
+///     .live("active");
+/// pub const DEVICES: Replicas = Replicas::relation("fleet.devices")
+///     .table("devices")
+///     .live("enrolled_at IS NOT NULL")
+///     .partitioned_by("company_id");
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Replicas {
@@ -58,17 +62,31 @@ pub struct Replicas {
 
 impl Replicas {
     /// The replicas are the rows of `relation`, as SQL names it (a table or a
-    /// view, with an `id` uuid column); `table` is the table behind it, as a
-    /// foreign key names it; `live` is an SQL condition on the relation's
-    /// columns saying which of them receive anything. One partition: a
-    /// broadcast row goes to every live replica.
+    /// view, with an `id` uuid column) — every one live, in one partition,
+    /// until said otherwise; name the [table](Replicas::table) behind it.
     #[must_use]
-    pub const fn new(relation: &'static str, table: &'static str, live: &'static str) -> Self {
+    pub const fn relation(relation: &'static str) -> Self {
         Replicas {
             relation,
-            table,
-            live,
+            table: "",
+            live: "true",
             partition: None,
+        }
+    }
+
+    /// The table behind the relation, as a foreign key names it: required.
+    #[must_use]
+    pub const fn table(self, table: &'static str) -> Self {
+        Replicas { table, ..self }
+    }
+
+    /// Which replicas receive anything: an SQL condition on the relation's
+    /// columns.
+    #[must_use]
+    pub const fn live(self, condition: &'static str) -> Self {
+        Replicas {
+            live: condition,
+            ..self
         }
     }
 
@@ -694,7 +712,7 @@ impl Engine {
     /// # async fn print(pool: sqlx::PgPool, codecs: Vec<magic_sync::wire::Codec<()>>) -> Result<(), magic_sync::Error> {
     /// use magic_sync::plan::{Engine, Replicas};
     ///
-    /// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers", "active");
+    /// const REGISTERS: Replicas = Replicas::relation("shop.registers").table("registers").live("active");
     /// let mut conn = pool.acquire().await?;
     /// println!("{}", Engine::triggers(&mut conn, &codecs, REGISTERS).await?);
     /// # Ok(())
@@ -787,6 +805,12 @@ impl Engine {
     }
 
     async fn read(conn: &mut Conn, tables: &[&Table], replicas: Replicas) -> Result<Self, Error> {
+        if replicas.table.is_empty() {
+            return Err(Error::Misuse(format!(
+                "the replicas of `{}` name no table: `Replicas::table` says which is behind it",
+                replicas.relation
+            )));
+        }
         let needed = crate::SCHEMA_VERSION;
         match version(conn).await? {
             Some(v) if v == needed => {}

@@ -156,10 +156,17 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     ) -> Result<Self, Error> {
         replica::check_settings(&codecs, &settings.lanes)?;
         settings.backoff.check("backoff")?;
-        if settings.idle.is_zero() {
-            return Err(Error::Misuse(
-                "`idle` is zero: the replica would spin".into(),
-            ));
+        let zero = [
+            ("idle", settings.idle),
+            ("digests_first", settings.digests_first),
+            ("digests_every", settings.digests_every),
+            ("outbox.resend_after", settings.outbox.resend_after),
+            ("outbox.backlog_every", settings.outbox.backlog_every),
+        ];
+        if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
+            return Err(Error::Misuse(format!(
+                "`{what}` is zero: the replica would spin, or say the same thing without end"
+            )));
         }
         let mut conn = pool.acquire().await?;
         replica::check(&mut conn, &codecs).await?;
@@ -188,6 +195,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// ([`Error::Protocol`]). Nothing of it was applied.
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        replica::durable(&mut tx).await?;
         let received = replica::receive(&mut tx, &self.codecs, bytes).await?;
         tx.commit().await?;
         if matches!(

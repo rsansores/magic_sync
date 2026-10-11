@@ -109,8 +109,6 @@ pub fn magic_sync::replica::UpProgress::fmt(&self, &mut core::fmt::Formatter<'_>
 impl core::marker::StructuralPartialEq for magic_sync::replica::UpProgress
 impl serde_core::ser::Serialize for magic_sync::replica::UpProgress
 pub fn magic_sync::replica::UpProgress::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'a, R: sqlx_core::row::Row> sqlx_core::from_row::FromRow<'a, R> for magic_sync::replica::UpProgress where &'a str: sqlx_core::column::ColumnIndex<R>, alloc::string::String: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>, i64: sqlx_core::decode::Decode<'a, <R as sqlx_core::row::Row>::Database> + sqlx_core::types::Type<<R as sqlx_core::row::Row>::Database>
-pub fn magic_sync::replica::UpProgress::from_row(&'a R) -> sqlx_core::error::Result<Self>
 impl<'de> serde_core::de::Deserialize<'de> for magic_sync::replica::UpProgress
 pub fn magic_sync::replica::UpProgress::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for magic_sync::replica::UpProgress
@@ -387,13 +385,39 @@ impl<P, I, U> core::marker::Unpin for magic_sync::run::replica::Replica<P, I, U>
 impl<P, I, U> core::marker::UnsafeUnpin for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::UnsafeUnpin, I: core::marker::UnsafeUnpin, U: core::marker::UnsafeUnpin
 impl<P, I, U> !core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Replica<P, I, U>
 impl<P, I, U> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Replica<P, I, U>
+#[non_exhaustive] pub struct magic_sync::Settings
+pub magic_sync::Settings::backoff: magic_sync::run::Backoff
+pub magic_sync::Settings::digests_every: core::time::Duration
+pub magic_sync::Settings::digests_first: core::time::Duration
+pub magic_sync::Settings::idle: core::time::Duration
+pub magic_sync::Settings::lanes: alloc::vec::Vec<magic_sync::replica::Lane>
+pub magic_sync::Settings::outbox: magic_sync::replica::Outbox
+impl core::clone::Clone for magic_sync::run::replica::Settings
+pub fn magic_sync::run::replica::Settings::clone(&self) -> Self
+impl core::default::Default for magic_sync::run::replica::Settings
+pub fn magic_sync::run::replica::Settings::default() -> Self
+impl core::fmt::Debug for magic_sync::run::replica::Settings
+pub fn magic_sync::run::replica::Settings::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for magic_sync::run::replica::Settings
+impl core::marker::Send for magic_sync::run::replica::Settings
+impl core::marker::Sync for magic_sync::run::replica::Settings
+impl core::marker::Unpin for magic_sync::run::replica::Settings
+impl core::marker::UnsafeUnpin for magic_sync::run::replica::Settings
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Settings
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Settings
 pub const magic_sync::SCHEMA_VERSION: i32
 pub const magic_sync::SQLITE_SCHEMA: &str
 pub trait magic_sync::Columns: crate::__private::Sealed
+pub trait magic_sync::Identity: core::marker::Send + core::marker::Sync + 'static
+pub fn magic_sync::Identity::id(&self, &mut magic_sync::Conn) -> impl core::future::future::Future<Output = core::result::Result<core::option::Option<uuid::Uuid>, magic_sync::Error>> + core::marker::Send
+impl magic_sync::run::replica::Identity for uuid::Uuid
+pub async fn uuid::Uuid::id(&self, &mut magic_sync::Conn) -> core::result::Result<core::option::Option<uuid::Uuid>, magic_sync::Error>
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
 pub const magic_sync::Row::KEY: &'static [&'static str]
 pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::Row::SCHEMA: &'static str
 pub const magic_sync::Row::TABLE: &'static str
 pub fn magic_sync::Row::key(&self) -> magic_sync::row::Key
+pub trait magic_sync::Uplink: core::marker::Send + core::marker::Sync + 'static
+pub fn magic_sync::Uplink::send(&self, uuid::Uuid, &'static str, alloc::vec::Vec<u8>) -> impl core::future::future::Future<Output = core::result::Result<(), magic_sync::Error>> + core::marker::Send
 pub type magic_sync::Conn = sqlx_sqlite::connection::SqliteConnection

@@ -57,8 +57,21 @@ pub trait Senders: Send + Sync + 'static {
 }
 
 /// [`Senders`] for a host that knows nothing about its replicas: every one
-/// is known, and its uploads are filed in a plain transaction of the pool.
-pub struct Anyone(pub PgPool);
+/// is known, and its uploads are filed in a plain transaction of the pool —
+/// so any replica that reaches the transport files rows as itself. A host
+/// that authenticates its replicas says which it knows with [`Senders`].
+pub struct Anyone(PgPool);
+
+impl Anyone {
+    /// Every replica known, its uploads filed in a transaction of `pool`.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Anyone(pool)
+    }
+}
+
+/// The advisory lock only the running relay holds ("SYNCENGN").
+pub const LOCK_KEY: i64 = 0x5359_4e43_454e_474e;
 
 impl Senders for Anyone {
     type Known = ();
@@ -88,8 +101,6 @@ pub struct Settings {
     pub outbox_messages: NonZeroU32,
     /// Bytes its outbox may hold, likewise.
     pub outbox_bytes: NonZeroU64,
-    /// The advisory lock only the running relay holds.
-    pub lock_key: i64,
     /// The role every transaction of the engine's own assumes, when the
     /// database gives the connecting one less than the engine needs.
     pub role: Option<String>,
@@ -128,8 +139,6 @@ impl Default for Settings {
             batch: NonZeroU32::new(500).expect("not zero"),
             outbox_messages: NonZeroU32::new(10_000).expect("not zero"),
             outbox_bytes: NonZeroU64::new(256 << 20).expect("not zero"),
-            // "SYNCENGN"
-            lock_key: 0x5359_4e43_454e_474e,
             role: None,
             idle: Duration::from_secs(1),
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
@@ -153,13 +162,16 @@ impl Settings {
         let zero = [
             ("idle", self.idle),
             ("send_timeout", self.send_timeout),
+            ("unconfirmed_after", self.unconfirmed_after),
             ("standby", self.standby),
             ("retry_every", self.retry_every),
+            ("prune_after", self.prune_after),
             ("watch_every", self.watch_every),
+            ("stuck_after", self.stuck_after),
         ];
         if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
             return Err(Error::Misuse(format!(
-                "`{what}` is zero: the server would spin"
+                "`{what}` is zero: the server would spin, or give up on what it waits for at once"
             )));
         }
         Ok(())
@@ -188,10 +200,10 @@ impl Settings {
 /// }
 ///
 /// # async fn start(pool: sqlx::PgPool, codecs: Vec<Codec<()>>, upload: (Uuid, Vec<u8>)) -> Result<(), Error> {
-/// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers", "active");
+/// const REGISTERS: Replicas = Replicas::relation("shop.registers").table("registers").live("active");
 ///
 /// let server = Arc::new(
-///     Server::new(pool.clone(), codecs, REGISTERS, Queues, Anyone(pool), Settings::default())
+///     Server::new(pool.clone(), codecs, REGISTERS, Queues, Anyone::new(pool), Settings::default())
 ///         .await?,
 /// );
 /// let relay = server.clone();
@@ -212,7 +224,7 @@ pub struct Server<S: Senders, T: Transport> {
     settings: Settings,
 }
 
-impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
+impl<S: Senders, T: Transport> Server<S, T> {
     /// The server over a database its migrations set up: `codecs` are the
     /// tables that travel, parents first; `replicas` where it finds the
     /// replicas; `transport` how a message reaches one; `senders` what the
@@ -411,11 +423,11 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// What stopped the pass: the database or the transport away. What the
     /// pass sets aside is not an error.
     pub async fn pass_now(&self) -> Result<Option<usize>, Error> {
-        let Some(mut lock) = Lock::take(&self.pool, self.settings.lock_key).await? else {
+        let Some(mut lock) = Lock::take(&self.pool, LOCK_KEY).await? else {
             return Ok(None);
         };
         let done = self.pass(&mut lock).await;
-        lock.release(self.settings.lock_key).await;
+        lock.release(LOCK_KEY).await;
         done.map(Some)
     }
 
@@ -518,7 +530,7 @@ impl<S: Senders, T: Transport + Send + 'static> Server<S, T> {
     /// The lock, once this process gets it.
     async fn lock(&self) -> Lock {
         loop {
-            match Lock::take(&self.pool, self.settings.lock_key).await {
+            match Lock::take(&self.pool, LOCK_KEY).await {
                 Ok(Some(lock)) => return lock,
                 Ok(None) => tracing::debug!("sync: another process runs the relay — standing by"),
                 Err(e) => tracing::warn!("sync: the relay's lock could not be asked for: {e}"),

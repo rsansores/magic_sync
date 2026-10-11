@@ -152,3 +152,51 @@ async fn a_replica_does_not_start_over_a_database_it_cannot_run_against(pool: Sq
     let refused = Replica::new(pool, codecs(), Uuid::nil(), Uplinked::default(), settings()).await;
     assert!(refused.is_err());
 }
+
+/// Settings a replica cannot run with are refused when it is built: a wait
+/// of nothing, which would spin or say the same thing without end, and two
+/// lanes of one name.
+#[sqlx::test(migrations = false)]
+async fn a_replica_refuses_settings_it_cannot_run_with(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let mut cases: Vec<(&str, Settings)> = Vec::new();
+    for (what, set) in [
+        (
+            "idle",
+            (|s: &mut Settings| s.idle = Duration::ZERO) as fn(&mut Settings),
+        ),
+        ("digests_first", |s| s.digests_first = Duration::ZERO),
+        ("digests_every", |s| s.digests_every = Duration::ZERO),
+        ("outbox.resend_after", |s| {
+            s.outbox.resend_after = Duration::ZERO
+        }),
+        ("outbox.backlog_every", |s| {
+            s.outbox.backlog_every = Duration::ZERO
+        }),
+    ] {
+        let mut settings = settings();
+        set(&mut settings);
+        cases.push((what, settings));
+    }
+    let mut twice = settings();
+    twice.lanes = vec![
+        replica::Lane::new("main", &[]),
+        replica::Lane::new("main", &["events"]),
+    ];
+    cases.push(("main", twice));
+    for (what, settings) in cases {
+        let refused = Replica::new(
+            pool.clone(),
+            codecs(),
+            Uuid::nil(),
+            Uplinked::default(),
+            settings,
+        )
+        .await;
+        match refused {
+            Err(Error::Misuse(why)) => assert!(why.contains(what), "{what}: {why}"),
+            Err(e) => panic!("{what}: refused for another reason: {e}"),
+            Ok(_) => panic!("{what}: not refused"),
+        }
+    }
+}

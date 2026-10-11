@@ -171,9 +171,9 @@ pub use magic_sync_derive::Row;
 /// ```
 pub use magic_sync_derive::Columns;
 #[cfg(feature = "sqlite")]
-pub use run::replica::Replica;
+pub use run::replica::{Identity, Replica, Settings, Uplink};
 #[cfg(feature = "postgres")]
-pub use run::server::Server;
+pub use run::server::{Anyone, Senders, Server, Settings, Transport};
 
 // The derive's generated code names this crate, and sqlx through it.
 extern crate self as magic_sync;

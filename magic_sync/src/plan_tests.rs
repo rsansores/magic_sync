@@ -1302,7 +1302,9 @@ async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: crate:
     let printed = Engine::triggers(
         &mut conn,
         &[Codec::<()>::json::<Product>(None)],
-        Replicas::new("shop.registers", "registers", "active"),
+        Replicas::relation("shop.registers")
+            .table("registers")
+            .live("active"),
     )
     .await
     .expect("the triggers");

@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             codecs(),
             REGISTERS,
             deliveries.clone(),
-            Anyone(pool.clone()),
+            Anyone::new(pool.clone()),
             settings,
         )
         .await?,
@@ -306,7 +306,15 @@ async fn listing(
     let listing = app
         .server
         .engine()
-        .listing(&mut conn, Scope::All, page.state, page.offset, 20)
+        .listing(
+            &mut conn,
+            Scope::All,
+            page.state,
+            magic_sync::status::Page {
+                offset: page.offset,
+                limit: 20,
+            },
+        )
         .await?;
     Ok(Json(listing))
 }

@@ -322,6 +322,15 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
             "the trigger `{name}` is not one of the engine's: a table that no longer travels, or one written by hand — drop it"
         )));
     }
+    durable(conn).await?;
+    Ok(())
+}
+
+/// Refuses a connection whose commits are not durable (`synchronous` below
+/// `FULL`): a message is acknowledged once its commit returns. A setting of
+/// each connection, so each one a message is applied through is asked.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn durable(conn: &mut Conn) -> Result<(), Error> {
     let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
         .fetch_one(&mut *conn)
         .await?;
@@ -982,7 +991,7 @@ async fn filed<P: Sync + 'static>(
 /// How far this replica is from having sent the server what it wrote, per
 /// table: rows noted and not sent yet, rows sent the server has not said it
 /// filed, and rows that cannot go as they are.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct UpProgress {
@@ -1015,15 +1024,24 @@ impl From<&envelope::TableBacklog> for UpProgress {
 /// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
-    Ok(sqlx::query_as(
-        "SELECT relation AS \"table\", \
-                sum(set_aside IS NULL AND (sent_at IS NULL OR writes > sent)) AS unsent, \
-                sum(set_aside IS NULL AND sent_at IS NOT NULL AND writes = sent) AS unfiled, \
-                sum(set_aside IS NOT NULL) AS set_aside \
+    let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT relation, \
+                sum(set_aside IS NULL AND (sent_at IS NULL OR writes > sent)), \
+                sum(set_aside IS NULL AND sent_at IS NOT NULL AND writes = sent), \
+                sum(set_aside IS NOT NULL) \
            FROM sync_notes GROUP BY relation ORDER BY relation",
     )
     .fetch_all(&mut *conn)
-    .await?)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(table, unsent, unfiled, set_aside)| UpProgress {
+            table,
+            unsent,
+            unfiled,
+            set_aside,
+        })
+        .collect())
 }
 
 /// The backlog to tell the server, `now` being what it is: when it changed
@@ -1133,9 +1151,9 @@ impl Default for Outbox {
     }
 }
 
-/// Refuses lanes a replica cannot send up with: no lane, a table on two
-/// lanes or on none, a lane naming a table that does not go up, or two lanes
-/// for every other table.
+/// Refuses lanes a replica cannot send up with: no lane, two of one name, a
+/// table on two lanes or on none, a lane naming a table that does not go up,
+/// or two lanes for every other table.
 #[cfg(feature = "sqlite")]
 pub(crate) fn check_settings<P: Sync + 'static>(
     codecs: &[Codec<P>],
@@ -1147,6 +1165,10 @@ pub(crate) fn check_settings<P: Sync + 'static>(
     }
     if lanes.iter().filter(|l| l.tables.is_empty()).count() > 1 {
         return misuse("one lane at most carries every table no other lane names".into());
+    }
+    let mut names = HashSet::new();
+    if let Some(lane) = lanes.iter().find(|l| !names.insert(l.name)) {
+        return misuse(format!("two lanes are named `{}`", lane.name));
     }
     let mut named = HashSet::new();
     for table in lanes.iter().flat_map(|l| l.tables.iter()) {

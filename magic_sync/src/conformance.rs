@@ -453,7 +453,9 @@ mod server {
             .await
             .unwrap();
         drop(conn);
-        let replicas = Replicas::new("fixture.t_replicas", "t_replicas", "live");
+        let replicas = Replicas::relation("fixture.t_replicas")
+            .table("t_replicas")
+            .live("live");
         let kept = Kept::default();
         let settings = Settings {
             limits: Limits {
@@ -467,7 +469,7 @@ mod server {
             codecs(),
             replicas,
             kept.clone(),
-            Anyone(pool.clone()),
+            Anyone::new(pool.clone()),
             settings,
         )
         .await

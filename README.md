@@ -38,7 +38,7 @@ let server = Arc::new(
         codecs(),
         REGISTERS,
         transport,
-        Anyone(pool),
+        Anyone::new(pool),
         Settings::default(),
     )
     .await?,

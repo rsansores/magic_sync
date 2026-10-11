@@ -213,7 +213,7 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -274,7 +274,7 @@ async fn one_process_at_a_time_runs_the_relay(pool: PgPool) {
                 codecs(),
                 REPLICAS,
                 wire.clone(),
-                Anyone(pool.clone()),
+                Anyone::new(pool.clone()),
                 settings(),
             )
             .await
@@ -304,7 +304,7 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
             codecs(),
             REPLICAS,
             wire.clone(),
-            Anyone(pool.clone()),
+            Anyone::new(pool.clone()),
             settings(),
         )
     };
@@ -378,13 +378,13 @@ async fn a_relay_that_lost_its_lock_records_nothing(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
     .unwrap();
     item(&pool, partition, "one").await;
-    let mut lock = Lock::take(&pool, server.settings.lock_key)
+    let mut lock = Lock::take(&pool, LOCK_KEY)
         .await
         .unwrap()
         .expect("the lock");
@@ -453,7 +453,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await;
@@ -465,7 +465,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -475,7 +475,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -592,10 +592,7 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
 
     // b's sender is fixed, a's is not: a fails again, and b is filed.
     senders.failing.lock().unwrap().remove(&b);
-    let mut lock = Lock::take(&pool, server.settings.lock_key)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
     server
         .retry(&mut lock)
         .await
@@ -630,7 +627,7 @@ async fn a_delete_the_server_refuses_is_kept_and_the_rest_filed(pool: PgPool) {
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -701,7 +698,7 @@ async fn the_running_server_provisions_again_a_replica_silent_on_what_it_was_sen
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         Settings {
             watch_every: Duration::from_millis(20),
             unconfirmed_after: Duration::from_millis(100),
@@ -740,7 +737,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -968,7 +965,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -982,7 +979,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     ));
     spawnable(Server::install(
@@ -990,7 +987,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     ));
     let mut conn = pool.acquire().await.unwrap();
@@ -1002,8 +999,55 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
     let engine = server.engine();
     let scope = crate::status::Scope::All;
     spawnable(engine.overview(&mut conn, scope, 1));
-    spawnable(engine.listing(&mut conn, scope, None, 0, 1));
+    spawnable(engine.listing(
+        &mut conn,
+        scope,
+        None,
+        crate::status::Page {
+            offset: 0,
+            limit: 1,
+        },
+    ));
     spawnable(engine.health(&mut conn, scope, 1));
     spawnable(engine.progress(&mut conn, scope));
     spawnable(engine.row_progress(&mut conn, scope, "items", ""));
+}
+
+/// Settings a server cannot run with are refused when it is built: a wait
+/// of nothing, which would spin, or give up on what it waits for at once.
+#[sqlx::test(migrations = false)]
+async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
+    world(&pool).await;
+    /// A setting made zero.
+    type Zeroed = (&'static str, fn(&mut Settings));
+    let cases: [Zeroed; 8] = [
+        ("idle", |s| s.idle = Duration::ZERO),
+        ("send_timeout", |s| s.send_timeout = Duration::ZERO),
+        ("unconfirmed_after", |s| {
+            s.unconfirmed_after = Duration::ZERO
+        }),
+        ("standby", |s| s.standby = Duration::ZERO),
+        ("retry_every", |s| s.retry_every = Duration::ZERO),
+        ("prune_after", |s| s.prune_after = Duration::ZERO),
+        ("watch_every", |s| s.watch_every = Duration::ZERO),
+        ("stuck_after", |s| s.stuck_after = Duration::ZERO),
+    ];
+    for (what, set) in cases {
+        let mut wrong = settings();
+        set(&mut wrong);
+        let refused = Server::new(
+            pool.clone(),
+            codecs(),
+            REPLICAS,
+            Wire::default(),
+            Anyone::new(pool.clone()),
+            wrong,
+        )
+        .await;
+        match refused {
+            Err(Error::Misuse(why)) => assert!(why.contains(what), "{what}: {why}"),
+            Err(e) => panic!("{what}: refused for another reason: {e}"),
+            Ok(_) => panic!("{what}: not refused"),
+        }
+    }
 }

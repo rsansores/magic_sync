@@ -47,7 +47,7 @@ pub mod server {
                 codecs(),
                 REGISTERS,
                 transport,
-                Anyone(pool),
+                Anyone::new(pool),
                 Settings::default(),
             )
             .await?,

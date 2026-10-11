@@ -39,6 +39,14 @@ The first release: the engine extracted from the system it was built in.
   serializes as JSON of a versioned contract, with the server's time.
 - `Up.backlog`: a replica says what it wrote and the server has not filed,
   and the server shows it.
+- A pass records what each replica will hold, and writes the messages that
+  carry it to that replica's outbox, before anything is sent; the outbox is
+  sent in order, and a replica out of reach keeps its own while the others
+  are sent to. Messages are chained — each names the one before it — so a
+  replica that missed one says so and is provisioned again, and a server or
+  a replica restored from an older copy is found out. A row a replica
+  refuses stays recorded as refused, and a rejection names the message that
+  refused it.
 - `magic_sync_dashboard` (npm): the dashboard for Vue 3 — a ready-made
   component styled through CSS variables, and the same without its looks
   (`useSyncDashboard`) for a host with its own design system. English and

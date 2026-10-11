@@ -3,6 +3,7 @@
 //! what it should.
 
 use super::*;
+use crate::status::Page;
 
 /// The progress a replica shows counts only what it confirmed applying: sent
 /// is on its way, a change since makes a row outdated, a row no longer owed is
@@ -561,7 +562,15 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
     assert_eq!(kinds.len(), 4, "every kind of note: {:?}", overview.health);
     let listing = world
         .engine
-        .listing(&mut conn, Scope::All, Some(ReplicaState::CatchingUp), 0, 10)
+        .listing(
+            &mut conn,
+            Scope::All,
+            Some(ReplicaState::CatchingUp),
+            Page {
+                offset: 0,
+                limit: 10,
+            },
+        )
         .await
         .unwrap();
     let progress = world
@@ -1032,7 +1041,15 @@ async fn a_fleet_is_counted_whole_and_listed_a_page_at_a_time(pool: crate::DbPoo
     for page in 0..4 {
         let listing = world
             .engine
-            .listing(&mut conn, Scope::All, None, page * 100, 100)
+            .listing(
+                &mut conn,
+                Scope::All,
+                None,
+                Page {
+                    offset: page * 100,
+                    limit: 100,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(listing.replicas.total, 302);
@@ -1052,8 +1069,10 @@ async fn a_fleet_is_counted_whole_and_listed_a_page_at_a_time(pool: crate::DbPoo
             &mut conn,
             Scope::All,
             Some(ReplicaState::CatchingUp),
-            300,
-            100,
+            Page {
+                offset: 300,
+                limit: 100,
+            },
         )
         .await
         .unwrap();

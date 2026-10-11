@@ -115,9 +115,11 @@ fn is_transient_code(code: &str) -> bool {
 }
 
 /// SQLite: the database busy or locked by another connection, out of
-/// memory, read-only, interrupted, an I/O error, a full disk, a file it
-/// cannot open — each the machine's, not the rows'. The primary result code
-/// is the extended one's low byte.
+/// memory, interrupted, an I/O error, a full disk, a file it cannot open, or
+/// read-only for a while — recovering, or locked by another process — each
+/// the machine's, not the rows'. A database read-only for good (a file, a
+/// directory, a database moved) is not: retrying meets it again. The
+/// primary result code is the extended one's low byte.
 #[cfg(feature = "sqlite")]
 fn is_transient_code(code: &str) -> bool {
     const BUSY: i32 = 5;
@@ -128,11 +130,14 @@ fn is_transient_code(code: &str) -> bool {
     const IOERR: i32 = 10;
     const FULL: i32 = 13;
     const CANTOPEN: i32 = 14;
+    const READONLY_RECOVERY: i32 = READONLY | (1 << 8);
+    const READONLY_CANTLOCK: i32 = READONLY | (2 << 8);
+    const READONLY_ROLLBACK: i32 = READONLY | (3 << 8);
     code.parse::<i32>().is_ok_and(|c| {
         matches!(
             c & 0xff,
-            BUSY | LOCKED | NOMEM | READONLY | INTERRUPT | IOERR | FULL | CANTOPEN
-        )
+            BUSY | LOCKED | NOMEM | INTERRUPT | IOERR | FULL | CANTOPEN
+        ) || matches!(c, READONLY_RECOVERY | READONLY_CANTLOCK | READONLY_ROLLBACK)
     })
 }
 
@@ -166,6 +171,12 @@ mod tests {
             assert!(is_transient_code("6"));
             assert!(!is_transient_code("1811"));
             assert!(!is_transient_code("2067"));
+            // Read-only while recovering, or locked by another process, for
+            // a while; a read-only file, or one moved, for good.
+            assert!(is_transient_code("264"));
+            assert!(is_transient_code("520"));
+            assert!(!is_transient_code("8"));
+            assert!(!is_transient_code("1032"));
         }
         assert!(!Error::Transport {
             reason: "message too large".into(),
