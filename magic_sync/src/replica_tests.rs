@@ -3077,3 +3077,6 @@ async fn a_host_writes_whole_rows_only_of_a_record(pool: SqlitePool) {
         .unwrap();
     assert_eq!(written, [crate::row::Row::key(&event)]);
 }
+
+#[path = "replica_walk_tests.rs"]
+mod walk;

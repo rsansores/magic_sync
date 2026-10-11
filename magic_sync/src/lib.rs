@@ -51,7 +51,7 @@ pub mod envelope;
 mod error;
 #[cfg(feature = "postgres")]
 mod filing;
-#[cfg(all(test, feature = "postgres"))]
+#[cfg(test)]
 mod model;
 #[cfg(feature = "postgres")]
 pub mod plan;

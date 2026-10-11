@@ -4,15 +4,20 @@
 //! engine's replica (the other build): where the two disagree, one of them
 //! breaks the protocol, and the conformance suite says which.
 
-use crate::envelope::{Body, Rejected, ToReplica, Up};
-use crate::relay::Transport;
-use crate::testkit::Walk;
-use crate::Error;
+use crate::envelope::{Body, ToReplica};
 use prost::Message as _;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::future::Future;
-use std::sync::Mutex;
-use uuid::Uuid;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "postgres")]
+use {
+    crate::envelope::{Rejected, Up},
+    crate::relay::Transport,
+    crate::testkit::Walk,
+    crate::Error,
+    std::collections::VecDeque,
+    std::future::Future,
+    std::sync::Mutex,
+    uuid::Uuid,
+};
 
 /// A row, by its table and its key's text.
 pub(crate) type Row = (String, String);
@@ -28,6 +33,7 @@ pub(crate) struct Rules {
 
 impl Rules {
     /// A replica that takes everything, of rows that point at nothing.
+    #[cfg(feature = "postgres")]
     pub(crate) const ANY: Rules = Rules {
         refuses: |_, _| false,
         parents: |_, _| Vec::new(),
@@ -221,6 +227,7 @@ impl Model {
     /// heard of it — never before every rejection of it is reported, which
     /// one `Up` here always does — or always, while it has a gap to say.
     /// `None` when it has nothing to say.
+    #[cfg(feature = "postgres")]
     pub(crate) fn up(&self) -> Option<Up> {
         let rejected: Vec<Rejected> = self
             .rejections
@@ -252,6 +259,7 @@ impl Model {
     }
 
     /// The uplink took `up`.
+    #[cfg(feature = "postgres")]
     pub(crate) fn delivered(&mut self, up: &Up) {
         for rejected in &up.rejected {
             let key = rejected
@@ -270,6 +278,7 @@ impl Model {
     }
 
     /// Rows it holds that point at a row it neither holds nor refused.
+    #[cfg(feature = "postgres")]
     pub(crate) fn orphans(&self, rules: &Rules) -> Vec<(Row, Row)> {
         let mut out = Vec::new();
         for ((table, key), bytes) in &self.rows {
@@ -284,6 +293,7 @@ impl Model {
 }
 
 /// How the transport misbehaves, out of 100 sends.
+#[cfg(feature = "postgres")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Faults {
     /// Sends it does not take.
@@ -293,10 +303,12 @@ pub(crate) struct Faults {
 }
 
 /// The messages waiting for one replica, in order: each one's id and bytes.
+#[cfg(feature = "postgres")]
 type Queue = VecDeque<(String, Vec<u8>)>;
 
 /// A transport that keeps each replica's messages in a queue of its own, in
 /// the order it took them, and fails sends as `faults` says.
+#[cfg(feature = "postgres")]
 pub(crate) struct Wire {
     pub(crate) queues: Mutex<BTreeMap<Uuid, Queue>>,
     pub(crate) faults: Mutex<Faults>,
@@ -305,6 +317,7 @@ pub(crate) struct Wire {
     pub(crate) failed: Mutex<(usize, usize)>,
 }
 
+#[cfg(feature = "postgres")]
 impl Wire {
     pub(crate) fn new(seed: u64) -> Self {
         Wire {
@@ -349,6 +362,7 @@ impl Wire {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl Transport for Wire {
     fn send(
         &self,

@@ -55,10 +55,8 @@ pub fn from_wire(row: ItemRow) -> Result<Item, MapError> {
 }
 
 /// A deterministic walk: the same seed replays the same failure.
-#[cfg(feature = "postgres")]
 pub struct Walk(pub u64);
 
-#[cfg(feature = "postgres")]
 impl Walk {
     pub fn next(&mut self) -> u64 {
         // Xorshift stays at zero from zero: that seed walks from another.
