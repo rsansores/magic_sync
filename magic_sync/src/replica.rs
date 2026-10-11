@@ -736,7 +736,8 @@ struct Place<'m> {
 /// server may have lost what it was told, it is told again.
 #[cfg(feature = "sqlite")]
 async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Received>, Error> {
-    let Some(sequence) = i64::try_from(place.sequence).ok().filter(|s| *s > 0) else {
+    // 0 too is outside: nothing is before it.
+    let Ok(sequence) = i64::try_from(place.sequence) else {
         return Ok(Err(malformed(format!(
             "sequence {}, outside 1 to 2^63 - 1",
             place.sequence
@@ -1115,19 +1116,12 @@ async fn let_go_together<P: Sync + 'static>(
         .map(key_text)
         .collect();
     cleared(conn, codec.table.name, &gone).await?;
-    if retired.kept > 0 {
-        tracing::info!(
-            table = codec.table.name,
-            kept = retired.kept,
-            "sync: rows let go but still pointed at here, or with edits on their way — retired"
-        );
-    }
     tracing::debug!(
         table = codec.table.name,
         deleted = retired.deleted,
         kept = retired.kept,
         refused = retired.refused.len(),
-        "sync: rows let go of"
+        "sync: rows let go of — the kept ones retired, still pointed at here or with edits on their way"
     );
     Ok(())
 }

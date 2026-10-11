@@ -3076,6 +3076,26 @@ async fn a_host_writes_whole_rows_only_of_a_record(pool: SqlitePool) {
         .await
         .unwrap();
     assert_eq!(written, [crate::row::Row::key(&event)]);
+    let other = Event {
+        id: Uuid::now_v7(),
+        what: "other".into(),
+    };
+    let inserted = crate::row::insert_ignore(&mut conn, vec![event, other.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        inserted,
+        [crate::row::Row::key(&other)],
+        "the one it held left as it was"
+    );
+}
+
+/// A mapping's failure says why, as text and as debug output.
+#[test]
+fn a_mapping_that_fails_says_why() {
+    let failed = crate::wire::MapError::new("no such colour");
+    assert_eq!(failed.to_string(), "no such colour");
+    assert_eq!(format!("{failed:?}"), "MapError(\"no such colour\")");
 }
 
 /// A send the server has not answered goes again once `resend_after` has
@@ -3100,6 +3120,133 @@ async fn an_unanswered_send_goes_again_after_its_wait_and_not_before(pool: Sqlit
     assert_eq!(rows(w.up(0, false).await), 0, "not yet");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(rows(w.up(0, false).await), 1, "unanswered, again");
+}
+
+/// Of two-way rows let go of with their edits on the way, the one the
+/// database will not retire is rejected and kept as it is, and only the
+/// other waits, retired, to be let go of once filed.
+#[sqlx::test(migrations = false)]
+async fn a_two_way_row_that_cannot_be_held_for_its_edit_is_rejected_alone(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [stuck, held] = ids();
+    let task = |id: Uuid, title: &str| {
+        let row = Task {
+            id,
+            title: title.into(),
+            done: false,
+            updated_at: at(0),
+        };
+        (key(&[&id.to_string()]), json(&row))
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "tasks",
+            vec![task(stuck, "stuck"), task(held, "held")],
+        )],
+    ))
+    .await;
+    w.exec(
+        "CREATE TRIGGER unretired BEFORE UPDATE OF retired_at ON tasks WHEN OLD.title = 'stuck' \
+         BEGIN SELECT RAISE(ABORT, 'not this one'); END;
+         UPDATE tasks SET done = 1;",
+    )
+    .await
+    .unwrap();
+    let up = w.up(0, false).await.expect("the edits");
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes(
+            "tasks",
+            vec![key(&[&stuck.to_string()]), key(&[&held.to_string()])],
+        )],
+    ))
+    .await;
+    assert_eq!(w.rejected().await, [format!("tasks {stuck}")]);
+    assert_eq!(
+        w.texts("SELECT row_key FROM sync_leaving").await,
+        [held.to_string()]
+    );
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads,
+        })
+        .encoded(),
+    )
+    .await;
+    assert_eq!(
+        w.texts("SELECT title FROM tasks").await,
+        ["stuck"],
+        "the held one let go of once filed"
+    );
+}
+
+/// A full disk while a message is applied row by row — after a refusal
+/// rolled it back — still fails the message, whole, rather than rejecting
+/// the row it happened on.
+#[sqlx::test(migrations = false)]
+async fn a_disk_full_while_applying_row_by_row_fails_the_message(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec(
+        "CREATE TRIGGER doomed BEFORE INSERT ON items WHEN NEW.name = 'doom' \
+         BEGIN SELECT RAISE(ROLLBACK, 'doomed'); END",
+    )
+    .await
+    .unwrap();
+    let pages: i64 = w.count("PRAGMA page_count").await;
+    let options = (*w.pool.connect_options())
+        .clone()
+        .pragma("max_page_count", (pages + 2).to_string());
+    let full = SqlitePool::connect_with(options).await.unwrap();
+    let cramped = Replica::new(full, codecs(), w.me, w.uplink.clone(), Settings::default())
+        .await
+        .unwrap();
+    let mut rows: Vec<(WireKey, Vec<u8>)> = (0..2000)
+        .map(|n| item(Uuid::now_v7(), &format!("{n:0>200}")))
+        .collect();
+    rows.insert(0, item(Uuid::now_v7(), "doom"));
+    match cramped
+        .receive(&down(1, "", vec![upserts("items", rows)]))
+        .await
+    {
+        Err(e) => assert!(e.is_transient(), "{e}"),
+        Ok(received) => panic!("applied on a full disk: {received:?}"),
+    }
+    assert_eq!(w.count("SELECT count(*) FROM items").await, 0);
+    assert!(w.rejected().await.is_empty());
+}
+
+/// A table this build does not know is kept to report up to the cap, to
+/// the byte, and not past it.
+#[sqlx::test(migrations = false)]
+async fn an_unknown_tables_name_and_key_are_kept_to_the_byte(pool: SqlitePool) {
+    let w = world(pool).await;
+    let at_cap = "t".repeat(TEXT_CAP);
+    let past = "t".repeat(TEXT_CAP + 1);
+    let keyed = |table: &str, key_text: String| Table {
+        table: table.to_owned(),
+        upserts: vec![vec![1]],
+        keys: vec![key(&[&key_text])],
+        ..Table::default()
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            keyed(&at_cap, "k".into()),
+            keyed(&past, "k".into()),
+            keyed("u", "k".repeat(TEXT_CAP)),
+            keyed("v", "k".repeat(TEXT_CAP + 1)),
+        ],
+    ))
+    .await;
+    assert_eq!(
+        w.texts("SELECT table_name FROM sync_rejections ORDER BY 1")
+            .await,
+        [at_cap, "u".to_owned()]
+    );
 }
 
 #[path = "replica_walk_tests.rs"]
