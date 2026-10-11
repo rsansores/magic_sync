@@ -37,6 +37,19 @@ when the server is back.
 Each replica upgrades its own database when its new build starts, whenever
 that is: a fleet is never upgraded at once, and does not need to be.
 
+## Your declarations
+
+What decides which rows each replica holds is yours: the replicas'
+relation, and per table its key, its `sync` rule, the tables it points at,
+its groups and its columns. The relay remembers a digest of them
+(`sync.version.declared`); the first pass of a build whose declarations
+differ — a table routed otherwise, mirrored for the first time or no
+more, a column added — provisions every live replica again, and lets go of
+what it kept of a table it mirrors no more. That is an alarm in the log,
+and a deploy's worth of traffic: change declarations on purpose. A change
+to how a codec encodes a row that leaves its columns alone is not seen:
+provision the replicas yourself ([Provisioning](provisioning.md)).
+
 ## The protocol
 
 Every message carries the protocol it speaks, [`PROTOCOL`]: a new kind of

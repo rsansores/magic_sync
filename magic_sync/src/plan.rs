@@ -149,6 +149,8 @@ pub(crate) struct Plan {
     group: Option<Group>,
     /// The columns the replicas own: a write of only these is no change here.
     owned: Vec<&'static str>,
+    /// Every column a row of it carries.
+    columns: Vec<&'static str>,
 }
 
 /// The rows to send to, and take back from, each replica.
@@ -977,6 +979,7 @@ impl Engine {
                     .filter(|c| c.replica_owned)
                     .map(|c| c.name)
                     .collect(),
+                columns: t.columns.iter().map(|c| c.name).collect(),
             });
         }
 
@@ -1082,6 +1085,43 @@ impl Engine {
         })
     }
 
+    /// What decides which rows each replica holds and what a row carries,
+    /// as one text: the replicas, and per table, parents first, its key,
+    /// the rule that routes it, what it points at, its groups and its
+    /// columns. Two builds that write the same text place every row alike.
+    fn declared(&self) -> String {
+        use std::fmt::Write as _;
+        let r = &self.replicas;
+        let mut out = format!(
+            "replicas {} ({}) live {} partition {:?}\n",
+            r.relation, r.table, r.live, r.partition
+        );
+        for &i in &self.order {
+            let p = &self.plans[i];
+            let key: Vec<String> = p
+                .key
+                .iter()
+                .map(|c| format!("{} {}", c.name, KeyPart::sql_type(c.key)))
+                .collect();
+            let references: Vec<String> = p
+                .references
+                .iter()
+                .map(|r| format!("{} {:?}", self.plans[r.parent].table, r.columns))
+                .collect();
+            let _ = writeln!(
+                out,
+                "{} {} active {} key {key:?} {:?} references {references:?} group {:?} columns {:?}",
+                p.table,
+                p.relation.sql(),
+                p.active,
+                p.route,
+                p.group,
+                p.columns,
+            );
+        }
+        out
+    }
+
     pub(crate) fn index(&self, table: &str) -> Option<usize> {
         self.by_name.get(table).copied()
     }
@@ -1125,7 +1165,8 @@ impl Engine {
     /// another partition, is noted for provisioning from scratch; one that is
     /// no longer live, or gone, is forgotten — nothing is recorded as held by
     /// it, what waited in its outbox is dropped, and nothing is sent it until
-    /// it is live again. The relay runs it
+    /// it is live again. When what places the rows changed since the engine
+    /// last ran, every live replica is provisioned again. The relay runs it
     /// before every pass.
     pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
         sqlx::query(&format!(
@@ -1149,6 +1190,43 @@ impl Engine {
             self.replicas_sql(),
             resync_sql("SELECT id, partition FROM arrived")
         ))
+        .execute(&mut *conn)
+        .await?;
+        self.redeclared(conn).await
+    }
+
+    /// Compares what decides which rows each replica holds and what a row
+    /// carries with what the engine last ran with: when it changed — a
+    /// deploy that routes a table otherwise, mirrors one more or one less,
+    /// sends another column — every live replica is provisioned again, and
+    /// what the engine kept of a table it no longer mirrors is let go of.
+    async fn redeclared(&self, conn: &mut Conn) -> Result<(), Error> {
+        let declared = self.declared();
+        let before: Option<Option<String>> = sqlx::query_scalar(
+            "UPDATE sync.version v SET declared = md5($1) FROM sync.version was \
+              WHERE v.declared IS DISTINCT FROM md5($1) RETURNING was.declared",
+        )
+        .bind(&declared)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(Some(_)) = before else {
+            return Ok(());
+        };
+        tracing::warn!("sync: what places the rows changed since the engine last ran — every replica is provisioned again");
+        let tables: Vec<&str> = self.plans.iter().map(|p| p.table).collect();
+        for sql in [
+            "DELETE FROM sync.held WHERE relation <> ALL($1)",
+            "DELETE FROM sync.gone WHERE relation <> ALL($1)",
+            "DELETE FROM sync.quarantine WHERE relation <> ALL($1)",
+            "UPDATE sync.notes SET done_at = now() \
+              WHERE done_at IS NULL AND kind = 'row' AND relation <> ALL($1)",
+        ] {
+            sqlx::query(sql).bind(&tables).execute(&mut *conn).await?;
+        }
+        sqlx::query(&resync_sql(&format!(
+            "SELECT s.id, s.partition FROM {}",
+            self.replicas_sql()
+        )))
         .execute(&mut *conn)
         .await?;
         Ok(())

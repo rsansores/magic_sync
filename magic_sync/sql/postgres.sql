@@ -13,9 +13,15 @@ CREATE SCHEMA sync;
 -- later version is a script of its own, run after this one, that ends by
 -- writing its number here.
 CREATE TABLE sync.version (
-    id      INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    version INTEGER NOT NULL
+    id       INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    version  INTEGER NOT NULL,
+    declared TEXT
 );
+
+COMMENT ON COLUMN sync.version.declared IS
+    'A digest of what decided which rows each replica holds, and what a row carries, when the '
+    'relay last ran: the replicas, and per table its key, its rule, what it points at, its '
+    'groups and its columns. A relay that finds it different provisions every replica again.';
 
 -- What changed, in the writing transaction. Read and marked done by the one
 -- relay that holds the engine's lock.

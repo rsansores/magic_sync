@@ -1694,3 +1694,81 @@ async fn what_is_pending_is_found_by_index_among_many_notes(pool: crate::DbPool)
         );
     }
 }
+
+/// A deploy that changes what places the rows — here, a table mirrored no
+/// more — has every live replica provisioned again, once, and what the
+/// engine kept of that table let go of; the same declarations again change
+/// nothing.
+#[sqlx::test(migrations = false)]
+async fn a_changed_declaration_provisions_every_replica_again(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[0];
+    let task: i64 = 1 << 40;
+    let replica: Uuid = sqlx::query_scalar(
+        "SELECT id FROM fixture.t_replicas WHERE live AND partition_id = $1 LIMIT 1",
+    )
+    .bind(partition)
+    .fetch_one(&mut *world.conn)
+    .await
+    .expect("a replica");
+    sqlx::raw_sql(&format!(
+        "INSERT INTO fixture.t_tasks (id, partition_id, replica_id, name) \
+         VALUES ({task}, '{partition}', '{replica}', 't'); \
+         INSERT INTO fixture.t_task_lines (task_id, line, partition_id, name) \
+         VALUES ({task}, 1, '{partition}', 'l');"
+    ))
+    .execute(&mut *world.conn)
+    .await
+    .expect("a task and its line");
+    world.settle().await;
+    let held_lines = || "SELECT count(*) FROM sync.held WHERE relation = 't_task_lines'";
+    async fn resyncs(conn: &mut Conn) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL",
+        )
+        .fetch_one(conn)
+        .await
+    }
+    let held: i64 = sqlx::query_scalar(held_lines())
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("held");
+    assert_eq!(held, 1);
+
+    let mut tx = world.conn.begin().await.expect("a transaction");
+    world.engine.observe(&mut tx).await.expect("observed");
+    assert_eq!(
+        resyncs(&mut tx).await.expect("resyncs"),
+        0,
+        "nothing changed"
+    );
+    tx.commit().await.expect("commit");
+
+    let codecs = codecs();
+    let fewer: Vec<&Table> = codecs
+        .iter()
+        .map(|c| &c.table)
+        .filter(|t| t.name != "t_task_lines")
+        .collect();
+    let mut tx = world.conn.begin().await.expect("a transaction");
+    let engine = Engine::install(&mut tx, &fewer, REPLICAS)
+        .await
+        .expect("installed");
+    engine.observe(&mut tx).await.expect("observed");
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM t_replicas WHERE live")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("live");
+    assert_eq!(
+        resyncs(&mut tx).await.expect("resyncs"),
+        live,
+        "every live replica"
+    );
+    let held: i64 = sqlx::query_scalar(held_lines())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("held");
+    assert_eq!(held, 0, "what it kept of a table no longer mirrored");
+    engine.observe(&mut tx).await.expect("observed again");
+    assert_eq!(resyncs(&mut tx).await.expect("resyncs"), live, "once");
+}
