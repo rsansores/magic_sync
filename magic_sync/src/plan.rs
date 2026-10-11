@@ -363,6 +363,17 @@ impl Set {
     }
 }
 
+/// The rows of `f` — `replica_id` and `row_key`, a row of `table`, worked
+/// out apart — that their replica holds, as a join: looked up by the whole
+/// key, however many rows of the table it holds.
+fn held_by(f: &str, table: &str) -> String {
+    format!(
+        "JOIN sync_holds h ON h.replica_id = {f}.replica_id AND h.relation = {} \
+                          AND h.row_key = {f}.row_key",
+        literal(table)
+    )
+}
+
 /// Every one of `columns` of the row aliased `alias` holds a value.
 fn not_null(alias: &str, columns: &[String]) -> String {
     columns
@@ -1617,19 +1628,18 @@ impl Engine {
             {
                 let child = &self.plans[c];
                 let select = format!(
-                    "SELECT h.replica_id, {c}, h.row_key, \
-                            format('it points at `%s` %s, which cannot go: %s', {}, b.row_key, b.why) \
-                       FROM sync_blocked b \
-                       JOIN {} t ON {} \
-                       JOIN sync_holds h ON h.replica_id = b.replica_id AND h.relation = {} \
-                                        AND h.row_key = {} \
-                      WHERE b.rel = {} AND b.round = $1 - 1",
+                    "WITH f AS MATERIALIZED ( \
+                         SELECT b.replica_id, {} AS row_key, \
+                                format('it points at `%s` %s, which cannot go: %s', {}, b.row_key, b.why) AS why \
+                           FROM sync_blocked b JOIN {} t ON {} \
+                          WHERE b.rel = {} AND b.round = $1 - 1) \
+                     SELECT f.replica_id, {c}, f.row_key, f.why FROM f {}",
+                    self.key_of_row(c),
                     literal(self.plans[reference.parent].table),
                     child.relation.sql(),
                     self.points_at(reference, "b.row_key"),
-                    literal(child.table),
-                    self.key_of_row(c),
                     reference.parent,
+                    held_by("f", child.table),
                 );
                 self.add(conn, Set::Blocked, &select, round + 1).await?;
             }
@@ -1649,12 +1659,14 @@ impl Engine {
                 filters.push(self.key_among(
                     i,
                     &format!("SELECT row_key FROM sync_changed WHERE rel = {i}"),
+                    false,
                 ));
             }
             if asked.regrouped.contains(&i) {
                 filters.push(self.key_among(
                     i,
                     &format!("SELECT row_key FROM sync_regrouped WHERE rel = {i}"),
+                    false,
                 ));
             }
             if asked.reassigned.contains(&i) {
@@ -1727,45 +1739,39 @@ impl Engine {
             }
             for (c, reference) in self.references().filter(|(c, _)| from.contains(c)) {
                 let select = format!(
-                    "SELECT d.replica_id, {}, h.row_key, NULL FROM sync_suspect d \
-                       JOIN {} t ON {} \
-                       JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {} \
-                                        AND h.row_key = {} \
-                      WHERE d.rel = {c} AND d.round = $1 - 1 AND {}",
-                    reference.parent,
+                    "WITH f AS MATERIALIZED ( \
+                         SELECT d.replica_id, {} AS row_key FROM sync_suspect d JOIN {} t ON {} \
+                          WHERE d.rel = {c} AND d.round = $1 - 1 AND {}) \
+                     SELECT f.replica_id, {}, f.row_key, NULL FROM f {}",
+                    key_sql("t", &reference.columns),
                     self.plans[c].relation.sql(),
                     self.row_is(c, "d.row_key"),
-                    literal(self.plans[reference.parent].table),
-                    key_sql("t", &reference.columns),
                     not_null("t", &reference.columns),
+                    reference.parent,
+                    held_by("f", self.plans[reference.parent].table),
                 );
                 self.add(conn, Set::Suspect, &select, round + 1).await?;
             }
             for (f, column, p) in self.followers().filter(|(_, _, p)| from.contains(p)) {
                 let select = format!(
-                    "SELECT d.replica_id, {f}, h.row_key, NULL FROM sync_suspect d \
-                       JOIN {} t ON {} \
-                       JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {} \
-                                        AND h.row_key = {} \
-                      WHERE d.rel = {p} AND d.round = $1 - 1",
+                    "WITH f AS MATERIALIZED ( \
+                         SELECT d.replica_id, {} AS row_key FROM sync_suspect d JOIN {} t ON {} \
+                          WHERE d.rel = {p} AND d.round = $1 - 1) \
+                     SELECT f.replica_id, {f}, f.row_key, NULL FROM f {}",
+                    self.key_of_row(f),
                     self.plans[f].relation.sql(),
                     key_eq("t", &[column], &self.plans[p].key, "d.row_key"),
-                    literal(self.plans[f].table),
-                    self.key_of_row(f),
+                    held_by("f", self.plans[f].table),
                 );
                 self.add(conn, Set::Suspect, &select, round + 1).await?;
             }
             round += 1;
         }
         for i in self.present(conn, "sync_suspect").await? {
-            let filter = format!(
-                "{} AND EXISTS (SELECT 1 FROM sync_suspect d WHERE d.rel = {i} \
-                                   AND d.replica_id = s.id AND d.row_key = {})",
-                self.key_among(
-                    i,
-                    &format!("SELECT row_key FROM sync_suspect WHERE rel = {i}")
-                ),
-                self.key_of_row(i),
+            let filter = self.key_among(
+                i,
+                &format!("SELECT replica_id, row_key FROM sync_suspect WHERE rel = {i}"),
+                true,
             );
             self.want(conn, i, &filter).await?;
         }
@@ -1818,18 +1824,17 @@ impl Engine {
             .filter(|(_, r)| doubted.contains(&r.parent))
         {
             let source = format!(
-                "SELECT d.replica_id, d.row_key FROM sync_suspect d \
-                   JOIN {} t ON {} \
-                   JOIN sync_holds h ON h.replica_id = d.replica_id AND h.relation = {} \
-                                    AND h.row_key = {} \
-                  WHERE d.rel = {} \
-                    AND NOT EXISTS (SELECT 1 FROM sync_suspect x WHERE x.replica_id = h.replica_id \
-                                       AND x.rel = {c} AND x.row_key = h.row_key)",
+                "WITH f AS MATERIALIZED ( \
+                     SELECT d.replica_id, {} AS row_key, d.row_key AS parent FROM sync_suspect d \
+                       JOIN {} t ON {} WHERE d.rel = {}) \
+                 SELECT f.replica_id, f.parent FROM f {} \
+                  WHERE NOT EXISTS (SELECT 1 FROM sync_suspect x WHERE x.replica_id = f.replica_id \
+                                       AND x.rel = {c} AND x.row_key = f.row_key)",
+                self.key_of_row(c),
                 self.plans[c].relation.sql(),
                 self.points_at(reference, "d.row_key"),
-                literal(self.plans[c].table),
-                self.key_of_row(c),
                 reference.parent,
+                held_by("f", self.plans[c].table),
             );
             self.keep(conn, reference.parent, 0, &source).await?;
         }
@@ -1861,7 +1866,8 @@ impl Engine {
                     ident(column),
                     self.key_among(
                         f,
-                        &format!("SELECT row_key FROM sync_changed WHERE rel = {f}")
+                        &format!("SELECT row_key FROM sync_changed WHERE rel = {f}"),
+                        false,
                     ),
                 ));
             }
@@ -2148,16 +2154,17 @@ impl Engine {
         )
     }
 
-    /// The row of `i` aliased `t` is one of the keys `keys` — a query of one
-    /// text column, `row_key` — answers: what lets the table's key index serve.
-    fn key_among(&self, i: usize, keys: &str) -> String {
+    /// The row of `i` aliased `t` is one of the keys `keys` — a query of a
+    /// text column, after a replica's uuid `by_replica`, which the replica
+    /// aliased `s` is then — answers: what lets the table's key index serve.
+    fn key_among(&self, i: usize, keys: &str, by_replica: bool) -> String {
         let plan = &self.plans[i];
-        let row: Vec<String> = plan
+        let mut row: Vec<String> = plan
             .key
             .iter()
             .map(|c| format!("t.{}", ident(c.name)))
             .collect();
-        let typed: Vec<String> = plan
+        let mut typed: Vec<String> = plan
             .key
             .iter()
             .enumerate()
@@ -2170,8 +2177,15 @@ impl Engine {
                 format!("({part})::{}", KeyPart::sql_type(c.key))
             })
             .collect();
+        let columns = if by_replica {
+            row.insert(0, "s.id".to_owned());
+            typed.insert(0, "k.replica_id".to_owned());
+            "replica_id, row_key"
+        } else {
+            "row_key"
+        };
         format!(
-            "({}) IN (SELECT {} FROM ({keys}) AS k(row_key))",
+            "({}) IN (SELECT {} FROM ({keys}) AS k({columns}))",
             row.join(", "),
             typed.join(", ")
         )
