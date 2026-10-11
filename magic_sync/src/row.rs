@@ -800,16 +800,16 @@ async fn keys_where<R: Row>(exec: &mut Conn, filter: &str) -> Result<Vec<Key>, E
 }
 
 /// Every row, the incoming value winning on a known key for every column but
-/// `keep` — the columns the other side owns — unless the stored version is
-/// newer: a redelivered older version never rolls the row back. Answers the
-/// keys it wrote.
+/// `keep` — the columns the other side owns — whatever its version: what the
+/// server sends is ordered by the message that carries it, not by the row's
+/// version. Answers the keys it wrote.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn overwrite_except<R: Row>(
     exec: &mut Conn,
     rows: Vec<R>,
     keep: &[&str],
 ) -> Result<Vec<Key>, Error> {
-    let conflict = newest::<R>(update_clause_where::<R>(|c| !keep.contains(&c)));
+    let conflict = update_clause_where::<R>(|c| !keep.contains(&c));
     write_keys(exec, rows, &conflict).await
 }
 
@@ -1220,7 +1220,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             get::<Order>(&mut conn, &order.key()).await.unwrap(),
-            Some(newer)
+            Some(order.clone()),
+            "an older version, taken"
         );
         let table = Table::of::<Order>();
         assert_eq!(

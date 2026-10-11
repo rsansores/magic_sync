@@ -101,7 +101,7 @@ catalogue, so this needs no declaration: the schema already says it.
 | Declaration | What it is for |
 |---|---|
 | `table`, `schema`, `key` | where the table lives and its primary key (one or more uuid or integer columns) |
-| `#[row(version)]` | a column whose value only moves forward (an `updated_at`): a replica never overwrites a newer copy with an older one |
+| `#[row(version)]` | a column whose value only moves forward (an `updated_at`): the server never files a replica's older report over a newer one |
 | `#[row(created)]` | a column written once, never by an update |
 | `retired` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
 | `origin` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
@@ -301,8 +301,9 @@ instead — an alarm, in its `last_error`.
 
 The replica applies a message in one transaction ([`replica::apply`]):
 
-- Each row overwrites its copy, except the columns the replica owns, unless the
-  replica holds a newer version (`VERSION`).
+- Each row overwrites its copy, except the columns the replica owns, whatever
+  its version: the chain orders the server's messages, so the last applied is
+  the server's latest, even after a restore or a clock set back.
 - A row it had retired is offered again and becomes live.
 - A row it is told to let go of is deleted or, if a row of its own still points
   at it, retired (its `RETIRED` column set). A sale keeps its customer.

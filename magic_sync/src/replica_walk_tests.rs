@@ -137,8 +137,14 @@ impl Server {
                 self.prices.remove(&id);
                 unpriced.push(key(&[&id.to_string()]));
             } else {
-                // Newer every time, whatever was let go of meanwhile.
-                let version = i64::try_from(self.last).unwrap();
+                // Newer, whatever was let go of meanwhile; now and then
+                // older, as a server restored from a copy, or whose clock
+                // was set back, sends it.
+                let version = if walk.below(5) == 0 {
+                    i64::try_from(walk.below(10)).unwrap()
+                } else {
+                    i64::try_from(self.last).unwrap()
+                };
                 let cents = i64::try_from(walk.below(1000)).unwrap();
                 self.prices.insert(id, (cents, version));
                 prices.push(Self::price(id, cents, version));

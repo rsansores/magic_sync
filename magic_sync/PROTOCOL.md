@@ -177,12 +177,11 @@ their deletes ignored.
 1. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
    message; `keys[i]` is the key of `upserts[i]`, and there **must** be one
    key per upsert. For each row:
-   - insert it, or overwrite the stored row with the same key;
-   - **unless** the table has a version column (an `updated_at`) and the
-     stored row's version is **newer** than the incoming one: then keep the
-     stored row (an equal version is applied). Versions compare as what they
-     are — numbers as numbers, instants as instants, whatever text form each
-     was stored in;
+   - insert it, or overwrite the stored row with the same key, **whatever
+     its version**: the messages of an epoch are ordered by their chain
+     (4.1), so the one applied last is the server's latest, even when its
+     version is older than the stored one — a server restored from a copy,
+     or whose clock was set back, sends what it has;
    - columns the replica owns in a table written by both sides are **not**
      overwritten;
    - a row the replica had retired (4.3) becomes live again.
@@ -538,8 +537,7 @@ A replica implementation is complete when:
 - [ ] it applies a message only when it follows the last applied, or begins
       a snapshot; one that follows another is a gap, which it says with
       every `Up` until a snapshot begins (4.1, 5.2);
-- [ ] it keeps a newer stored version over an older incoming one, comparing
-      versions as what they are;
+- [ ] it overwrites a row with what the server sends, whatever its version;
 - [ ] it never overwrites the columns it owns;
 - [ ] it retires a row it cannot delete, and revives a retired row sent again;
 - [ ] it begins a snapshot with the message that follows nothing — an

@@ -232,8 +232,8 @@ impl<P: Sync + 'static> Codec<P> {
     }
 
     /// A replica writing what the server sent: every column the replica does
-    /// not own, unless it holds a newer version — and a row it had retired is
-    /// offered again. A record is refused. Answers the keys the replica now
+    /// not own, whatever the version — and a row it had retired is offered
+    /// again. A record is refused. Answers the keys the replica now
     /// holds, and the rows it could not take — that do not decode, or that the
     /// database refuses for their data — by their place in `rows`, with why.
     #[cfg(feature = "sqlite")]
@@ -631,7 +631,6 @@ where
             let offered: Vec<(usize, Key)> =
                 rows.iter().map(|(at, row)| (*at, row.key())).collect();
             let (_, refused) = self.guarded(conn, rows, How::AllButOwned).await?;
-            // Held, whether written now or already newer here.
             let held: Vec<Key> = offered
                 .into_iter()
                 .filter(|(at, _)| !refused.iter().any(|r| r.at == *at))

@@ -796,10 +796,12 @@ async fn no_bytes_make_receiving_an_error(pool: SqlitePool) {
     assert!(w.items().await.contains(&"after".to_owned()));
 }
 
-/// The newest version wins whichever arrives first, for an integer version
-/// and for an instant — and an equal one is applied.
+/// What the server sends is taken whatever its version, an older one
+/// included — a server restored from a copy, or whose clock was set back,
+/// sends what it has, and the chain already orders its messages — for an
+/// integer version and for an instant.
 #[sqlx::test(migrations = false)]
-async fn the_newest_version_wins_whatever_its_type_and_order(pool: SqlitePool) {
+async fn the_servers_version_is_taken_older_or_newer_whatever_its_type(pool: SqlitePool) {
     let w = world(pool).await;
     let [aisle, price] = ids();
     let shelf = |revision: i64, label: &str| {
@@ -834,7 +836,7 @@ async fn the_newest_version_wins_whatever_its_type_and_order(pool: SqlitePool) {
     let ms = 1_800_000_000_000;
     w.receive(&send(shelf(ms + 5, "five"))).await;
     w.receive(&send(shelf(ms + 3, "three"))).await;
-    assert_eq!(w.texts(label).await, ["five"], "older: kept the newer");
+    assert_eq!(w.texts(label).await, ["three"], "older: taken");
     w.receive(&send(shelf(ms + 10, "ten"))).await;
     assert_eq!(w.texts(label).await, ["ten"], "newer: taken");
     w.receive(&send(shelf(ms + 10, "ten again"))).await;
@@ -842,28 +844,8 @@ async fn the_newest_version_wins_whatever_its_type_and_order(pool: SqlitePool) {
 
     w.receive(&send(price_at(60, 600))).await;
     w.receive(&send(price_at(30, 300))).await;
-    assert_eq!(w.texts(cents).await, ["600"]);
+    assert_eq!(w.texts(cents).await, ["300"]);
     w.receive(&send(price_at(61, 610))).await;
-    assert_eq!(w.texts(cents).await, ["610"]);
-    // Stored by another writer in another form, the instant still compares.
-    w.exec(&format!(
-        "UPDATE prices SET updated_at = '{}'",
-        at(120).format("%Y-%m-%d %H:%M:%S+00:00")
-    ))
-    .await
-    .unwrap_err();
-    sqlx::raw_sql("INSERT INTO sync_applying VALUES (1)")
-        .execute(&w.pool)
-        .await
-        .unwrap();
-    w.exec(&format!(
-        "UPDATE prices SET updated_at = '{}'",
-        at(120).format("%Y-%m-%d %H:%M:%S+00:00")
-    ))
-    .await
-    .unwrap();
-    w.exec("DELETE FROM sync_applying").await.unwrap();
-    w.receive(&send(price_at(90, 900))).await;
     assert_eq!(w.texts(cents).await, ["610"]);
 }
 
