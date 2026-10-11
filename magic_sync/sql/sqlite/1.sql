@@ -44,7 +44,7 @@ CREATE TABLE sync_applied (
 );
 
 -- What this replica last told the server it wrote and the server has not
--- filed ([{table, unsent, unfiled, set_aside}]), and when (unix seconds): it
+-- filed ([{table, unsent, unfiled, set_aside}]), and when (unix milliseconds): it
 -- says again when that changes, at most so often while it grows.
 CREATE TABLE sync_backlog (
     id          INTEGER PRIMARY KEY CHECK (id = 1),

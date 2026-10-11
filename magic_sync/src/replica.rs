@@ -1382,8 +1382,8 @@ async fn backlog_due(
         Some((backlog, at)) => (Some(backlog.0), at),
         None => (None, 0),
     };
-    let every = i64::try_from(settings.backlog_every.as_secs()).unwrap_or(i64::MAX);
-    let clock = chrono::Utc::now().timestamp();
+    let every = i64::try_from(settings.backlog_every.as_millis()).unwrap_or(i64::MAX);
+    let clock = chrono::Utc::now().timestamp_millis();
     let stale = clock < at || clock - at >= every;
     let due = if before.as_ref() == Some(&now) {
         // Unchanged: said again now and then while not empty, should the
@@ -1735,10 +1735,10 @@ async fn unsent(
         "SELECT id, relation, row_key FROM sync_notes \
           WHERE set_aside IS NULL \
             AND (sent_at IS NULL OR writes > sent \
-                 OR sent_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{} seconds') \
+                 OR sent_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{:.3} seconds') \
                  OR sent_at > {now}) {filter} \
           ORDER BY id LIMIT $1",
-        settings.resend_after.as_secs()
+        settings.resend_after.as_secs_f64()
     ))
     .bind(i64::try_from(settings.limits.rows.min(most)).unwrap_or(i64::MAX))
     .fetch_all(&mut *conn)
@@ -1979,7 +1979,7 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
              ON CONFLICT (id) DO UPDATE SET backlog = EXCLUDED.backlog, reported_at = EXCLUDED.reported_at",
         )
         .bind(sqlx::types::Json(tables))
-        .bind(chrono::Utc::now().timestamp())
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&mut *conn)
         .await?;
     }

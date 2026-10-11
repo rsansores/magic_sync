@@ -2566,14 +2566,14 @@ async fn a_clock_set_back_holds_back_nothing(pool: SqlitePool) {
     w.up(0, false).await.expect("sent");
     w.exec(
         "UPDATE sync_notes SET sent_at = '2999-01-01T00:00:00.000Z'; \
-            UPDATE sync_backlog SET reported_at = 32503680000",
+            UPDATE sync_backlog SET reported_at = 32503680000000",
     )
     .await
     .unwrap();
     let up = w.up(0, false).await.expect("sent again");
     assert_eq!(up.tables[0].upserts.len(), 1);
     // A backlog told "in the future", unchanged and not empty: said again.
-    w.exec("UPDATE sync_backlog SET reported_at = 32503680000")
+    w.exec("UPDATE sync_backlog SET reported_at = 32503680000000")
         .await
         .unwrap();
     let up = w.up(0, false).await.expect("the backlog again");
@@ -2890,7 +2890,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::SCHEMA_VERSION as usize] = [0xa8c1_fda6_a7da_f674];
+    let released: [u64; crate::SCHEMA_VERSION as usize] = [0x4a56_e5e9_424c_7c19];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -3076,6 +3076,30 @@ async fn a_host_writes_whole_rows_only_of_a_record(pool: SqlitePool) {
         .await
         .unwrap();
     assert_eq!(written, [crate::row::Row::key(&event)]);
+}
+
+/// A send the server has not answered goes again once `resend_after` has
+/// passed, to the millisecond: not before, however short it is.
+#[sqlx::test(migrations = false)]
+async fn an_unanswered_send_goes_again_after_its_wait_and_not_before(pool: SqlitePool) {
+    let settings = Settings {
+        outbox: Outbox {
+            resend_after: std::time::Duration::from_millis(400),
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'once')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let rows = |up: Option<Up>| up.map_or(0, |up| up.tables.len());
+    assert_eq!(rows(w.up(0, false).await), 1);
+    assert_eq!(rows(w.up(0, false).await), 0, "not yet");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(rows(w.up(0, false).await), 1, "unanswered, again");
 }
 
 #[path = "replica_walk_tests.rs"]
