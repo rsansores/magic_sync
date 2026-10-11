@@ -831,22 +831,47 @@ pub(crate) async fn update_only<R: Row>(
 
 /// Writes every column of every row, the incoming value winning on a key the
 /// table holds — unless the row has a version and the stored one is newer,
-/// so a late write never rolls the row back. Answers the keys it wrote.
+/// so a late write never rolls the row back. Answers the keys it wrote. On
+/// a replica, of a table it writes whole: a record.
 ///
 /// # Errors
 ///
-/// [`Error::Database`] when the database fails or refuses a row.
+/// [`Error::Database`] when the database fails or refuses a row;
+/// [`Error::Misuse`] on a replica, for a table the server writes — a
+/// catalog, or one written on both sides, of which a replica edits only
+/// the columns it owns, with an `UPDATE` of those.
 pub async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
+    writes_whole::<R>()?;
     write_keys(exec, rows, &newest::<R>(update_clause_where::<R>(|_| true))).await
 }
 
+/// Refuses a host's write of whole rows of a table the server writes, on a
+/// replica: its triggers would refuse the rows one by one.
+fn writes_whole<R: Row>() -> Result<(), Error> {
+    let how = match R::MIRROR {
+        _ if crate::dialect::WRITES_ANY_TABLE => return Ok(()),
+        Mirror::Record => return Ok(()),
+        Mirror::Both => {
+            "a row of it begins on the server: a replica edits the columns it owns, with an UPDATE of those"
+        }
+        Mirror::Catalog | Mirror::ServerOnly => "it is the server's: a replica does not write it",
+    };
+    Err(Error::Misuse(format!(
+        "`{}` is not a replica's to write whole: {how}",
+        R::TABLE
+    )))
+}
+
 /// Inserts every row whose key is new; one the table holds is left as it
-/// was. Answers the keys it inserted.
+/// was. Answers the keys it inserted. On a replica, of a record only, as
+/// [`upsert`].
 ///
 /// # Errors
 ///
-/// [`Error::Database`] when the database fails or refuses a row.
+/// [`Error::Database`] when the database fails or refuses a row;
+/// [`Error::Misuse`] on a replica, for a table the server writes.
 pub async fn insert_ignore<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
+    writes_whole::<R>()?;
     let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(R::KEY));
     write_keys(exec, rows, &conflict).await
 }
@@ -1178,15 +1203,21 @@ mod tests {
             note: None,
             at: chrono::Utc::now(),
         };
-        let written = upsert(&mut conn, vec![order.clone()]).await.unwrap();
+        let written = overwrite_except(&mut conn, vec![order.clone()], &[])
+            .await
+            .unwrap();
         assert_eq!(written, [order.key()]);
         let newer = Order {
             total: 7,
             at: order.at + chrono::Duration::seconds(1),
             ..order.clone()
         };
-        upsert(&mut conn, vec![newer.clone()]).await.unwrap();
-        upsert(&mut conn, vec![order.clone()]).await.unwrap();
+        overwrite_except(&mut conn, vec![newer.clone()], &[])
+            .await
+            .unwrap();
+        overwrite_except(&mut conn, vec![order.clone()], &[])
+            .await
+            .unwrap();
         assert_eq!(
             get::<Order>(&mut conn, &order.key()).await.unwrap(),
             Some(newer)

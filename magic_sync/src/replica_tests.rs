@@ -2983,3 +2983,39 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
     ));
     spawnable(install(&mut conn, &codecs()));
 }
+
+/// A host writes whole rows on a replica only of a record: a table the
+/// server writes is refused before the database is asked, with how a
+/// replica edits a two-way row.
+#[sqlx::test(migrations = false)]
+async fn a_host_writes_whole_rows_only_of_a_record(pool: SqlitePool) {
+    let w = world(pool).await;
+    let mut conn = w.pool.acquire().await.unwrap();
+    let task = Task {
+        id: Uuid::now_v7(),
+        title: "t".into(),
+        done: false,
+        updated_at: at(0),
+    };
+    match crate::row::upsert(&mut conn, vec![task]).await {
+        Err(Error::Misuse(why)) => assert!(why.contains("UPDATE of those"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let price = Price {
+        id: Uuid::now_v7(),
+        cents: 1,
+        updated_at: at(0),
+    };
+    match crate::row::insert_ignore(&mut conn, vec![price]).await {
+        Err(Error::Misuse(why)) => assert!(why.contains("is the server's"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let event = Event {
+        id: Uuid::now_v7(),
+        what: "mine".into(),
+    };
+    let written = crate::row::upsert(&mut conn, vec![event.clone()])
+        .await
+        .unwrap();
+    assert_eq!(written, [crate::row::Row::key(&event)]);
+}

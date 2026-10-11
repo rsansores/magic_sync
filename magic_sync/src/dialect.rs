@@ -37,6 +37,9 @@ mod imp {
     /// Binds one statement may carry.
     pub(crate) const MAX_BINDS: usize = 65_535;
 
+    /// A host writes whole rows of any table here.
+    pub(crate) const WRITES_ANY_TABLE: bool = true;
+
     /// `(column, nullable, generated)` for every column of `schema.table`.
     /// Read from `pg_attribute`, which answers whatever the role may see.
     pub(crate) async fn columns(
@@ -157,6 +160,10 @@ mod imp {
 
     /// Binds one statement may carry (`SQLITE_MAX_VARIABLE_NUMBER`).
     pub(crate) const MAX_BINDS: usize = 32_766;
+
+    /// A host writes whole rows here only of a record: of a two-way row a
+    /// replica writes the columns it owns, and the rest are the server's.
+    pub(crate) const WRITES_ANY_TABLE: bool = false;
 
     /// `(column, nullable, generated)` for every column of `table`. A primary
     /// key is NOT NULL only when declared so: sqlite lets a non-INTEGER one
