@@ -316,19 +316,14 @@ async fn a_failing_lane_backs_off_whatever_nudges_it(pool_: SqlitePool) {
 }
 
 /// A second run of a replica that runs already returns at once: two would
-/// send the same rows under two numbers.
+/// send the same rows under two numbers. One that ended frees the next.
 #[sqlx::test(migrations = false)]
 async fn a_replica_runs_once_at_a_time(pool_: SqlitePool) {
     let pool = pool(pool_).await;
-    let replica = Replica::new(
-        pool,
-        codecs(),
-        Uuid::now_v7(),
-        Uplinked::default(),
-        settings(),
-    )
-    .await
-    .unwrap();
+    let uplink = Uplinked::default();
+    let replica = Replica::new(pool, codecs(), Uuid::now_v7(), uplink.clone(), settings())
+        .await
+        .unwrap();
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let first = replica.run(async move {
         let _ = stopped.wait_for(|stop| *stop).await;
@@ -341,12 +336,8 @@ async fn a_replica_runs_once_at_a_time(pool_: SqlitePool) {
         stop.send(true).unwrap();
     };
     tokio::join!(first, second);
-    tokio::time::timeout(
-        Duration::from_millis(100),
-        replica.run(std::future::ready(())),
-    )
-    .await
-    .expect("one that ended frees the next");
+    replica.receive(&rows(1, 0, "one")).await.unwrap();
+    until(&replica, || !uplink.sent.lock().unwrap().is_empty()).await;
 }
 
 /// Waits until `done` holds, or fails after five seconds.
@@ -391,4 +382,37 @@ async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
         (1, 0),
         "confirmed at once, without them"
     );
+}
+
+/// A row the uplink fails to take for a while is not set aside: it goes
+/// again once the uplink is back.
+#[sqlx::test(migrations = false)]
+async fn a_row_the_uplink_fails_for_a_while_goes_again(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let replica = Replica::new(
+        pool.clone(),
+        codecs(),
+        Uuid::now_v7(),
+        uplink.clone(),
+        settings(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+    *uplink.refusing.lock().unwrap() = Some(true);
+    assert!(replica.send_lane(0, false).await.is_err());
+    let aside: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sync_notes WHERE set_aside IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(aside, 0);
+    *uplink.refusing.lock().unwrap() = None;
+    assert!(replica.send_lane(0, false).await.unwrap().message);
+    assert_eq!(uplink.sent.lock().unwrap()[0].2.tables.len(), 1);
 }
