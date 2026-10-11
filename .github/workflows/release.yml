@@ -1,0 +1,104 @@
+name: Release
+
+# A tag `v<version>` on a commit of main releases it: CI runs on the tag, and
+# only once it is green, and the tag is the version everywhere, is anything
+# published — the derive, then the engine, then the dashboard, then the book.
+# The secrets live in the `release` environment, which may ask a maintainer
+# to approve before a job of it starts.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: scripts/check-versions.sh "${GITHUB_REF_NAME#v}"
+      - name: The tag is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  # crates.io: the engine pins the derive at its own version, so the derive
+  # goes first. `cargo publish` waits until a crate is in the index before it
+  # returns.
+  crates:
+    needs: [ci, versions]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --locked -p magic_sync_derive
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # A build of the engine is one side: the server's is the one verified.
+      - run: cargo publish --locked -p magic_sync --features postgres
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # npm: the dashboard reads the engine's JSON, and goes out at its version.
+  dashboard:
+    needs: crates
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: dashboard/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      # `prepack` copies the licenses in and builds.
+      - run: pnpm pack --pack-destination "$RUNNER_TEMP"
+      - run: npm publish "$RUNNER_TEMP"/magic_sync_dashboard-*.tgz --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # GitHub Pages (Settings → Pages → Source: GitHub Actions): the book and
+  # each side's API, as of the release.
+  pages:
+    needs: crates
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4,lychee@0.24.2
+      - run: scripts/site.sh
+      - run: scripts/check-links.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/site
+      - id: deploy
+        uses: actions/deploy-pages@v4

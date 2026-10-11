@@ -25,7 +25,12 @@ The first release: the engine extracted from the system it was built in.
 - The replica protocol (`PROTOCOL.md`, `proto/sync.proto`), version 1; the
   engine's messages are generated from `sync.proto`, and a replica
   conformance suite applies the server's own messages (`tests/golden`).
-- The shop example: a head office and its registers, each with a page.
+- The shop example: a head office and its registers, each with a page, over
+  a transport that keeps the protocol's contract (a queue per register in
+  the head office's database, each message acknowledged by its id).
+- The book: the shop, built step by step from an empty project; how the
+  engine works; the protocol; upgrading. It is published with each release,
+  with the API reference of both sides.
 - `status`: what the engine answers about itself, for a dashboard — the
   overview (replicas counted per state and the worst listed, each table's
   state, without counting what any replica should hold), a paged listing of

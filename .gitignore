@@ -1,5 +1,4 @@
 target/
 /book/book
-Cargo.lock.bak
 *.db
 *.db-*

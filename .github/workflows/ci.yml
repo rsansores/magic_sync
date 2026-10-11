@@ -4,11 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release runs it on the tag, and publishes only once it is green.
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Formatting, clippy and the docs, of each side — a build of magic_sync is
+  # one — and of what is built on it: the example's two programs and the
+  # book's code.
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -17,18 +25,46 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            examples/shop/server
+            examples/shop/register
+            book/snippets
       - run: cargo fmt --all --check
-      # A build is one side: each is linted on its own.
+      - run: |
+          for manifest in examples/shop/server examples/shop/register examples/shop/rows book/snippets; do
+            cargo fmt --manifest-path "$manifest/Cargo.toml" --check
+          done
       - run: cargo clippy --locked -p magic_sync --features postgres --all-targets -- -D warnings
       - run: cargo clippy --locked -p magic_sync -p magic_sync_derive --features sqlite --all-targets -- -D warnings
-      - run: cargo doc --locked --no-deps -p magic_sync --features postgres
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - run: cargo doc --locked --no-deps -p magic_sync --features sqlite
+      - run: cargo clippy --locked --manifest-path examples/shop/server/Cargo.toml --all-targets -- -D warnings
+      - run: cargo clippy --locked --manifest-path examples/shop/register/Cargo.toml --all-targets -- -D warnings
+      - run: cargo clippy --locked --manifest-path book/snippets/Cargo.toml --features server --all-targets -- -D warnings
+      - run: cargo clippy --locked --manifest-path book/snippets/Cargo.toml --features replica --all-targets -- -D warnings
+      # The engine's docs of each side are built with the book (`site`).
+      - run: cargo doc --locked --no-deps -p magic_sync_derive
         env:
           RUSTDOCFLAGS: -D warnings
 
-  test:
+  # What the crates depend on: advisories, licenses, sources, and nothing
+  # declared that nothing uses.
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - run: cargo machete . examples/shop/server examples/shop/register examples/shop/rows book/snippets
+
+  # The server's suite, against the oldest PostgreSQL it supports and the
+  # newest: each test creates a database of its own.
+  test-server:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -47,14 +83,27 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      # Each test creates a database of its own from this one.
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked -p magic_sync --features postgres
+
+  # A replica's suite, and the derive's cases built on a replica's side; the
+  # book's code, with the README it holds to what compiles.
+  test-replica:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            book/snippets
       - run: cargo test --locked -p magic_sync --features sqlite
+      - run: cargo test --locked --manifest-path book/snippets/Cargo.toml --features replica
 
   # What a host can name, on each side, is what magic_sync/public-api/ lists:
   # a change to it is made there too, on purpose, and reviewed as one. The
@@ -85,17 +134,11 @@ jobs:
       - run: cargo check --locked -p magic_sync --features postgres
       - run: cargo check --locked -p magic_sync --features sqlite
 
-  examples:
+  # The head office's page: a Vue app over the dashboard, built from source.
+  example-page:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            examples/shop/server
-            examples/shop/register
-      # The head office's page: a Vue app over the dashboard, built from source.
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: dashboard/package.json
@@ -106,8 +149,6 @@ jobs:
         working-directory: dashboard
       - run: pnpm install --frozen-lockfile --ignore-scripts && pnpm build
         working-directory: examples/shop/web
-      - run: cargo build --locked --manifest-path examples/shop/server/Cargo.toml
-      - run: cargo build --locked --manifest-path examples/shop/register/Cargo.toml
 
   dashboard:
     runs-on: ubuntu-latest
@@ -134,33 +175,32 @@ jobs:
       - run: pnpm type-check
       - run: pnpm knip
       - run: pnpm test
-      # Builds, then lints the packed tarball as npm and TypeScript read it.
+      # Builds, packs, and lints the tarball as npm and TypeScript read it.
       - run: pnpm check:pack
 
-  book:
+  # The book and the API reference of each side, as GitHub Pages serves them
+  # (the release publishes them), and every link they and the repository's
+  # documents make into the repository.
+  site:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: mdbook
-      - run: mdbook build book
-      - uses: actions/upload-pages-artifact@v3
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        with:
-          path: book/book
+          tool: mdbook@0.5.4,lychee@0.24.2
+      - run: scripts/site.sh
+      - run: scripts/check-links.sh
 
-  # The book on GitHub Pages: Settings → Pages → Source: GitHub Actions.
-  pages:
-    needs: book
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  # What a release publishes, packed and built from the tarballs as crates.io
+  # will, on each side; and one version everywhere.
+  package:
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - id: deploy
-        uses: actions/deploy-pages@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check-versions.sh
+      - run: cargo package --locked --workspace --features magic_sync/postgres
+      - run: cargo package --locked --workspace --features magic_sync/sqlite
