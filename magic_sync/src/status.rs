@@ -24,8 +24,12 @@ use uuid::Uuid;
 use crate::Conn;
 
 /// The version of the JSON the answers serialize as. A field added does not
-/// change it; a field removed or renamed, or a meaning changed, does — and a
-/// dashboard refuses an answer of a contract it does not read.
+/// change it, nor does a variant added to a value that is one of a few words
+/// (`ReplicaState`, `RowState`, `NoteKind`): a reader shows a word it does not
+/// know as unknown, and counts it. A field removed or renamed, a variant
+/// removed or renamed, or a meaning changed — a word that now stands for
+/// something else — does change it, and a dashboard refuses an answer of a
+/// contract it does not read.
 pub const CONTRACT: u32 = 1;
 
 /// Which replicas a read covers. Only live replicas are counted: a partition
@@ -274,7 +278,7 @@ pub struct TableOverview {
 /// What the engine is waiting on, over a scope: each entry is either the
 /// infrastructure (wait) or a bug (deploy a fix) — never data to repair by
 /// hand. Lists are cut at the limit the read was given; `total` is uncut.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Health {
@@ -295,6 +299,21 @@ pub struct Health {
     pub inbox: Listed<Unfiled>,
     /// Replicas sends keep failing to.
     pub failing: Listed<Failing>,
+}
+
+impl Default for Health {
+    /// Nothing waits, so nothing needs a fix.
+    fn default() -> Self {
+        Health {
+            healthy: true,
+            pending: 0,
+            oldest: None,
+            parked: Listed::default(),
+            quarantine: Listed::default(),
+            inbox: Listed::default(),
+            failing: Listed::default(),
+        }
+    }
 }
 
 /// The entries of a list a read asked for, and how many there are in all.
@@ -318,10 +337,9 @@ impl<T> Default for Listed<T> {
 }
 
 /// What a note asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum NoteKind {
     /// A row of `table` changed.
@@ -335,7 +353,7 @@ pub enum NoteKind {
 }
 
 /// A change the planner set aside.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Parked {
@@ -358,7 +376,7 @@ pub struct Parked {
 }
 
 /// A row set aside for one replica.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Quarantined {
@@ -380,7 +398,7 @@ pub struct Quarantined {
 
 /// What a replica sent that the server could not file: a row, a delete, or a
 /// whole upload.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Unfiled {
@@ -401,7 +419,7 @@ pub struct Unfiled {
 }
 
 /// A replica sends to keep failing to.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Failing {
@@ -413,6 +431,71 @@ pub struct Failing {
     pub last_error: Option<String>,
     /// When it is tried again.
     pub retry_at: Option<DateTime<Utc>>,
+}
+
+/// The stored forms of the answers' entries: the types are the contract's,
+/// and how a table's row becomes one stays out of the API.
+mod stored {
+    use super::{Failing, NoteKind, Parked, Quarantined, Unfiled};
+    use sqlx::postgres::PgRow;
+    use sqlx::Row as _;
+
+    pub(super) fn parked(row: PgRow) -> sqlx::Result<Parked> {
+        let kind = match row.try_get::<String, _>("kind")?.as_str() {
+            "row" => NoteKind::Row,
+            "members" => NoteKind::Members,
+            "assigned" => NoteKind::Assigned,
+            "resync" => NoteKind::Resync,
+            other => {
+                return Err(sqlx::Error::Decode(
+                    format!("`{other}` is no kind of note").into(),
+                ))
+            }
+        };
+        Ok(Parked {
+            id: row.try_get("id")?,
+            kind,
+            table: row.try_get("table")?,
+            key: row.try_get("key")?,
+            replica: row.try_get("replica")?,
+            attempts: row.try_get("attempts")?,
+            last_error: row.try_get("last_error")?,
+            parked_at: row.try_get("parked_at")?,
+        })
+    }
+
+    pub(super) fn quarantined(row: PgRow) -> sqlx::Result<Quarantined> {
+        Ok(Quarantined {
+            replica: row.try_get("replica")?,
+            table: row.try_get("table")?,
+            key: row.try_get("key")?,
+            reason: row.try_get("reason")?,
+            first_at: row.try_get("first_at")?,
+            last_at: row.try_get("last_at")?,
+            attempts: row.try_get("attempts")?,
+        })
+    }
+
+    pub(super) fn unfiled(row: PgRow) -> sqlx::Result<Unfiled> {
+        Ok(Unfiled {
+            id: row.try_get("id")?,
+            replica: row.try_get("replica")?,
+            table: row.try_get("table")?,
+            reason: row.try_get("reason")?,
+            first_at: row.try_get("first_at")?,
+            last_at: row.try_get("last_at")?,
+            attempts: row.try_get("attempts")?,
+        })
+    }
+
+    pub(super) fn failing(row: PgRow) -> sqlx::Result<Failing> {
+        Ok(Failing {
+            replica: row.try_get("replica")?,
+            failures: row.try_get("failures")?,
+            last_error: row.try_get("last_error")?,
+            retry_at: row.try_get("retry_at")?,
+        })
+    }
 }
 
 /// [`Engine::overview`]: everything a dashboard shows first, in one read.
@@ -983,7 +1066,7 @@ impl Engine {
         let oldest = waiting.filter(|n| !n.deferred).map(|n| n.oldest).min();
         let parked = Listed {
             total: notes.iter().filter(|n| n.parked).map(|n| n.count).sum(),
-            first: sqlx::query_as(&format!(
+            first: sqlx::query(&format!(
                 "SELECT n.id, n.kind, n.relation AS table, n.row_key AS key, \
                         n.replica_id AS replica, n.attempts, n.last_error, n.parked_at \
                    FROM sync.notes n WHERE {NOTES_IN_SCOPE} AND n.parked_at IS NOT NULL \
@@ -993,6 +1076,7 @@ impl Engine {
             .bind(&scoped.partitions)
             .bind(scoped.ids())
             .bind(limit)
+            .try_map(stored::parked)
             .fetch_all(&mut *conn)
             .await?,
         };
@@ -1007,7 +1091,7 @@ impl Engine {
             .bind(&ids)
             .fetch_one(&mut *conn)
             .await?,
-            first: sqlx::query_as(&format!(
+            first: sqlx::query(&format!(
                 "SELECT replica_id AS replica, relation AS table, row_key AS key, reason, \
                         first_at, last_at, attempts \
                    FROM sync.quarantine WHERE {mine} \
@@ -1015,6 +1099,7 @@ impl Engine {
             ))
             .bind(&ids)
             .bind(limit)
+            .try_map(stored::quarantined)
             .fetch_all(&mut *conn)
             .await?,
         };
@@ -1023,13 +1108,14 @@ impl Engine {
                 .bind(&ids)
                 .fetch_one(&mut *conn)
                 .await?,
-            first: sqlx::query_as(&format!(
+            first: sqlx::query(&format!(
                 "SELECT id, replica_id AS replica, coalesce(relation, '') AS table, reason, \
                         first_at, last_at, attempts \
                    FROM sync.inbox WHERE {mine} ORDER BY id LIMIT $2"
             ))
             .bind(&ids)
             .bind(limit)
+            .try_map(stored::unfiled)
             .fetch_all(&mut *conn)
             .await?,
         };
@@ -1040,13 +1126,14 @@ impl Engine {
             .bind(&ids)
             .fetch_one(&mut *conn)
             .await?,
-            first: sqlx::query_as(&format!(
+            first: sqlx::query(&format!(
                 "SELECT replica_id AS replica, failures, last_error, retry_after AS retry_at \
                    FROM sync.replicas WHERE failures > 0 AND {mine} \
                   ORDER BY failures DESC, replica_id LIMIT $2"
             ))
             .bind(&ids)
             .bind(limit)
+            .try_map(stored::failing)
             .fetch_all(&mut *conn)
             .await?,
         };
@@ -1279,12 +1366,29 @@ pub(crate) mod tests {
         );
         for (docs, decl) in decls {
             text.push('\n');
-            text.push_str(&docs.unwrap_or_default());
+            // Rust's intra-doc links read as plain code in TypeScript.
+            text.push_str(
+                &docs
+                    .unwrap_or_default()
+                    .replace("[`", "`")
+                    .replace("`]", "`"),
+            );
             text.push_str("export ");
             text.push_str(&decl);
             text.push('\n');
         }
         matches_contract("types.ts", &text);
+    }
+
+    /// An empty answer is one that waits for nothing.
+    #[test]
+    fn a_health_with_nothing_in_it_is_healthy() {
+        let health = Health::default();
+        assert!(health.healthy);
+        assert_eq!(
+            health.pending + health.parked.total + health.failing.total,
+            0
+        );
     }
 
     fn note(

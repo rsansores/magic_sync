@@ -366,9 +366,9 @@ inbox: Listed<Unfiled>,
 failing: Listed<Failing>, };
 
 /**
- * [`Engine::overview`]: everything a dashboard shows first, in one read.
+ * `Engine::overview`: everything a dashboard shows first, in one read.
  * Its size does not grow with the fleet: the replicas are counted per
- * state, and listed worst first up to the limit; [`Engine::listing`] pages
+ * state, and listed worst first up to the limit; `Engine::listing` pages
  * through the rest.
  */
 export type Overview = { 
@@ -399,7 +399,7 @@ replicas: Listed<ReplicaOverview>,
 tables: Array<TableOverview>, };
 
 /**
- * [`Engine::listing`]: one page of the replicas, worst first.
+ * `Engine::listing`: one page of the replicas, worst first.
  */
 export type Listing = { 
 /**
@@ -475,7 +475,7 @@ replica: string,
 tables: Array<TableProgress>, };
 
 /**
- * [`Engine::progress`]: how far each replica of a scope is from holding
+ * `Engine::progress`: how far each replica of a scope is from holding
  * what it should.
  */
 export type Progress = { 
@@ -502,7 +502,7 @@ replica: string,
 state: RowState, };
 
 /**
- * [`Engine::row_progress`]: where one row stands on each replica of a scope
+ * `Engine::row_progress`: where one row stands on each replica of a scope
  * that holds it, should, or is owed it.
  */
 export type RowProgress = { 
