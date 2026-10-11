@@ -263,7 +263,15 @@ async fn said<P: Sync + 'static>(
         Confirmed::Applied(sequence, nonce) => {
             acknowledge(conn, sender, standing, sequence, nonce).await?;
         }
-        Confirmed::Behind(sequence) => replica_restored(conn, sender, standing, sequence).await?,
+        Confirmed::Behind(sequence) => {
+            let why = format!("it says it applied {sequence}, less than it said before — restored from an older copy");
+            provision_again(conn, sender, standing, &why).await?;
+        }
+        Confirmed::Elsewhere => {
+            let why = "it follows an epoch this database never had — the database was restored \
+                       from a copy older than it";
+            provision_again(conn, sender, standing, why).await?;
+        }
         _ => {}
     }
     gap(conn, sender, standing, upload.gap).await?;
@@ -287,6 +295,11 @@ enum Confirmed {
     /// One older than the last it said it applied: the replica was
     /// restored from an older copy.
     Behind(i64),
+    /// One of another epoch, from a replica the server last heard apply one
+    /// of its own: a replica goes only forward, so it follows an epoch this
+    /// database never had — restored from a copy older than it. Unsealed by
+    /// any secret the server keeps, so it provisions that replica alone.
+    Elsewhere,
     /// One the server sealed and has no record of sending it: past the last
     /// it sent it, or past every number it drew, or the sequence of one it
     /// sent with another nonce. This database is older than what the
@@ -306,7 +319,11 @@ fn confirmation(sender: Uuid, standing: &Standing, upload: &Up) -> Confirmed {
         return Confirmed::Nothing;
     };
     if epoch != standing.epoch {
-        return Confirmed::Nothing;
+        return if standing.applied.is_some() {
+            Confirmed::Elsewhere
+        } else {
+            Confirmed::Nothing
+        };
     }
     let (Ok(sequence), Ok(nonce)) = (i64::try_from(upload.sequence), i64::try_from(upload.nonce))
     else {
@@ -669,23 +686,22 @@ async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) ->
     Ok(())
 }
 
-/// `replica` says it applied `sequence`, older than what it said before: it
-/// was restored from an older copy, and holds less than the server records.
-/// It is provisioned again — unless a snapshot written for it since what it
-/// said before is on its way, which replaces whatever it holds.
-async fn replica_restored(
+/// `replica` holds less than the server records — `why` — and is
+/// provisioned again, unless a snapshot written for it since the last it
+/// said it applied is on its way, which replaces whatever it holds.
+async fn provision_again(
     conn: &mut Conn,
     replica: Uuid,
     standing: &Standing,
-    sequence: i64,
+    why: &str,
 ) -> Result<(), Error> {
     let applied = standing.applied.map_or(0, |(s, _)| s);
     if standing.snapshot.is_some_and(|began| began > applied) {
-        tracing::debug!(%replica, sequence, "sync: a replica behind what it said has its snapshot on the way");
+        tracing::debug!(%replica, why, "sync: a replica that holds less has its snapshot on the way");
         return Ok(());
     }
     if resync(conn, replica).await? {
-        tracing::warn!(%replica, sequence, applied, "sync: a replica says less than it said before — restored from an older copy, it is provisioned again");
+        tracing::warn!(%replica, why, "sync: a replica holds less than recorded — it is provisioned again");
     }
     Ok(())
 }

@@ -272,7 +272,9 @@ server knows it sent that message. A server database restored from an
 older copy numbers again from where the copy left off, but draws other
 nonces: its replicas apply none of it, and say what they applied — a
 message the server sealed and has no record of sending. The server then
-takes a new epoch and provisions every replica again. A replica that says
+takes a new epoch and provisions every replica again; one restored from
+before its last new epoch hears of an epoch it never had, from replicas it
+last heard follow its own, and provisions each again. A replica that says
 it applied less than it said before was restored itself, and is
 provisioned again.
 

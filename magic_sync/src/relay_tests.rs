@@ -1920,6 +1920,48 @@ async fn a_server_restored_that_numbers_a_message_again_is_not_taken_for_a_redel
     assert_ne!(before, world.epoch().await, "a new epoch");
 }
 
+/// A server restored from a copy older than its last new epoch, with
+/// nothing new to send: its replicas follow an epoch it never had, and say
+/// so with what they hold. It last heard each apply a message of its own
+/// epoch, and a replica only goes forward: each is provisioned again, and
+/// holds what the restored server has.
+#[sqlx::test(migrations = false)]
+async fn a_server_restored_from_before_its_last_epoch_provisions_its_replicas_again(
+    pool: crate::DbPool,
+) {
+    let world = world(pool).await;
+    let wire = Wire::new(22);
+    let mut models = world.models();
+    world.item("one").await;
+    world.settle(&wire, &mut models).await;
+    let mut conn = world.pool.acquire().await.unwrap();
+    crate::testkit::back_up(&mut conn, &["fixture", "sync"]).await;
+    // Installed again: a new epoch, and every replica provisioned in it.
+    sqlx::raw_sql(
+        "UPDATE sync.epoch SET epoch = gen_random_uuid(); \
+         DELETE FROM sync.outbox; DELETE FROM sync.held; DELETE FROM sync.gone; \
+         UPDATE sync.chains SET last_sequence = NULL, last_nonce = NULL, \
+           snapshot_sequence = NULL, snapshot_end = NULL; \
+         INSERT INTO sync.notes (kind, replica_id) SELECT 'resync', id FROM fixture.t_replicas;",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    world.item("lost").await;
+    world.settle(&wire, &mut models).await;
+    crate::testkit::restore(&mut conn, &["fixture", "sync"]).await;
+    for (replica, model) in &models {
+        let digests = model.digests(&["items"]);
+        crate::testkit::file(&world.pool, &world.codecs, &digests, *replica, &()).await;
+    }
+    world.settle(&wire, &mut models).await;
+
+    world.assert_converged(&models).await;
+    for model in models.values() {
+        assert_eq!(items_of(model), names(&["one"]));
+    }
+}
+
 /// A replica restored from a copy older than its last provisioning: what
 /// it applied is older than the snapshot the server last wrote it, and that
 /// snapshot is no longer on its way — it is gone with what was restored

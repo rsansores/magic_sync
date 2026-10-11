@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, VecDeque};
 const ITEMS: u128 = 6;
 const PRICES: u128 = 3;
 const READINGS: u128 = 4;
+const TASKS: u128 = 3;
 
 /// What the replica's database refuses: an item named `bad…` (with `ABORT`)
 /// or `doom…` (with `ROLLBACK`, the whole message), and the let-go of one
@@ -39,6 +40,11 @@ fn name_of(bytes: &[u8]) -> String {
     ItemRow::decode(bytes)
         .map(|row| row.name)
         .unwrap_or_default()
+}
+
+fn title_of(bytes: &[u8]) -> String {
+    let value: serde_json::Value = serde_json::from_slice(bytes).expect("a task");
+    value["title"].as_str().expect("a title").to_owned()
 }
 
 fn cents_of(bytes: &[u8]) -> i64 {
@@ -63,6 +69,7 @@ const RULES: Rules = Rules {
 
 /// The walk's server: what it holds, what it sent this replica, and the
 /// transport between them.
+#[derive(Clone)]
 struct Server {
     epoch: String,
     /// The last message it numbered for this replica, and its nonce.
@@ -74,16 +81,26 @@ struct Server {
     began: u64,
     items: BTreeMap<Uuid, String>,
     prices: BTreeMap<Uuid, (i64, i64)>,
+    /// Tasks, written on both sides: their title and version, here.
+    tasks: BTreeMap<Uuid, (String, i64)>,
     /// What the transport holds for the replica, in order.
     queue: VecDeque<Vec<u8>>,
     /// Everything delivered of its epoch, to deliver again: one of an
     /// installation since replaced is no message a replica must follow.
     delivered: Vec<Vec<u8>>,
-    /// A snapshot is owed: the replica said it has a gap.
+    /// A snapshot is owed: the replica said it has a gap, or that it
+    /// applied less than it said before.
     owed: bool,
+    /// The replica said it applied a message this server has no record of
+    /// sending: it was restored from an older copy, and takes a new epoch.
+    restored: bool,
     /// What the replica filed here: its readings, newest wins, and events.
     readings: BTreeMap<String, (i64, i64)>,
     events: BTreeSet<String>,
+    /// What the replica sent of the tasks, as the server last received it —
+    /// filed, or kept to be filed once it has the task again: whether each
+    /// is done.
+    done: BTreeMap<Uuid, bool>,
     /// The last applied it was told, of its epoch.
     confirmed: u64,
 }
@@ -127,6 +144,16 @@ impl Server {
             updated_at: at(version),
         };
         (key(&[&id.to_string()]), json(&price))
+    }
+
+    fn task(id: Uuid, title: &str, version: i64) -> (WireKey, Vec<u8>) {
+        let task = Task {
+            id,
+            title: title.to_owned(),
+            done: false,
+            updated_at: at(version),
+        };
+        (key(&[&id.to_string()]), json(&task))
     }
 
     /// A message of changes, as a pass would send them.
@@ -173,9 +200,25 @@ impl Server {
                 prices.push(Self::price(id, cents, version));
             }
         }
+        let mut tasks = Vec::new();
+        let mut untasked = Vec::new();
+        if walk.below(3) == 0 {
+            let id = Uuid::from_u128(300 + walk.below(TASKS as usize) as u128);
+            if walk.below(4) == 0 {
+                self.tasks.remove(&id);
+                untasked.push(key(&[&id.to_string()]));
+            } else {
+                let version = i64::try_from(self.last).unwrap();
+                let title = format!("task{}", walk.below(100));
+                self.tasks.insert(id, (title.clone(), version));
+                tasks.push(Self::task(id, &title, version));
+            }
+        }
         let tables = vec![
             upserts("items", items),
             upserts("prices", prices),
+            upserts("tasks", tasks),
+            deletes("tasks", untasked),
             deletes("prices", unpriced),
             deletes("items", gone),
         ];
@@ -197,6 +240,11 @@ impl Server {
                     .iter()
                     .map(|(id, (c, v))| upserts("prices", vec![Self::price(*id, *c, *v)])),
             )
+            .chain(
+                self.tasks
+                    .iter()
+                    .map(|(id, (t, v))| upserts("tasks", vec![Self::task(*id, t, *v)])),
+            )
             .collect();
         // Prices before items, as a server lists its tables: here either
         // order holds, nothing points between them.
@@ -210,7 +258,7 @@ impl Server {
         let (sequence, nonce, previous, previous_nonce) = self.next(begins);
         let end = Body::EndSnapshot(EndSnapshot {
             snapshot_id: id.clone(),
-            tables: vec!["prices".to_owned(), "items".to_owned()],
+            tables: vec!["prices".to_owned(), "items".to_owned(), "tasks".to_owned()],
             sequence,
             epoch: self.epoch.clone(),
             previous,
@@ -221,6 +269,26 @@ impl Server {
         .encoded();
         self.queue.push_back(end);
         self.owed = false;
+    }
+
+    /// Installed again, or found restored: a new epoch, which begins with a
+    /// snapshot, and nothing of the old one sent any more.
+    fn anew(&mut self, walk: &mut Walk) {
+        self.epoch = walk.uuid().to_string();
+        self.queue.clear();
+        self.delivered.clear();
+        (self.confirmed, self.restored) = (0, false);
+        self.snapshot(walk);
+    }
+
+    /// Answers what the replica said: a new epoch if it found this server
+    /// restored, a snapshot if one is owed.
+    fn answer(&mut self, walk: &mut Walk) {
+        if self.restored {
+            self.anew(walk);
+        } else if self.owed {
+            self.snapshot(walk);
+        }
     }
 
     /// Files what the replica sent up: rows as a server files them, and
@@ -249,6 +317,12 @@ impl Server {
                     "events" => {
                         self.events.insert(value["id"].as_str().unwrap().to_owned());
                     }
+                    "tasks" => {
+                        // Only the replica's own column — of a task the
+                        // server let go of, kept until it has it again.
+                        let id: Uuid = value["id"].as_str().unwrap().parse().unwrap();
+                        self.done.insert(id, value["done"].as_bool().unwrap());
+                    }
                     other => panic!("an upload of `{other}`"),
                 }
             }
@@ -262,7 +336,24 @@ impl Server {
         if up.gap > 0 && self.began <= up.gap {
             self.owed = true;
         }
-        if up.epoch == self.epoch {
+        // As a server files what it applied: a message past the last it
+        // sent, or the last with another nonce, it has no record of — it was
+        // restored itself; less than it said before is a replica restored
+        // from an older copy, owed a snapshot unless one written since is on
+        // its way.
+        let unknown =
+            up.sequence > self.last || (up.sequence == self.last && up.nonce != self.nonce);
+        let behind = self.began <= self.confirmed;
+        if up.epoch != self.epoch && up.sequence > 0 && self.confirmed > 0 && behind {
+            // An epoch it never had, after one of its own: it was restored
+            // from a copy older than that epoch.
+            self.owed = true;
+        } else if up.epoch == self.epoch && up.sequence > 0 && unknown {
+            self.restored = true;
+        } else if up.epoch == self.epoch && up.sequence > 0 {
+            if up.sequence < self.confirmed && behind {
+                self.owed = true;
+            }
             self.confirmed = self.confirmed.max(up.sequence);
         }
         up.uploads.first().copied()
@@ -276,6 +367,8 @@ struct Host {
     readings: BTreeMap<String, Option<(i64, i64)>>,
     versions: BTreeMap<String, BTreeSet<(i64, i64)>>,
     events: BTreeSet<String>,
+    /// The latest the host set each task's own column to.
+    done: BTreeMap<Uuid, bool>,
     clock: i64,
 }
 
@@ -305,37 +398,64 @@ async fn boot(file: &sqlx::sqlite::SqliteConnectOptions, me: Uuid, uplink: &Upli
     Node { pool, replica }
 }
 
-fn same(model: &model::Received, real: &Received) -> bool {
-    matches!(
-        (model, real),
-        (model::Received::Applied, Received::Applied(_))
-            | (model::Received::Ended, Received::SnapshotEnded)
-            | (model::Received::Filed, Received::Filed)
-            | (model::Received::Already, Received::AlreadyApplied)
-            | (model::Received::Gap, Received::Gap)
-            | (model::Received::Malformed, Received::Malformed(_))
-    )
+/// Whether the replica made of a message what the model made of it — and
+/// when it applied it, took the same rows of each table.
+fn same(model: &Model, made: &model::Received, real: &Received) -> bool {
+    match (made, real) {
+        (model::Received::Applied, Received::Applied(applied)) => {
+            let real: Vec<(String, BTreeSet<String>)> = applied
+                .iter()
+                .map(|a| (a.table.clone(), a.keys.iter().map(key_text).collect()))
+                .collect();
+            let modelled: Vec<(String, BTreeSet<String>)> = model
+                .taken
+                .iter()
+                .map(|(table, keys)| (table.clone(), keys.iter().cloned().collect()))
+                .collect();
+            real == modelled
+        }
+        _ => matches!(
+            (made, real),
+            (model::Received::Ended, Received::SnapshotEnded)
+                | (model::Received::Filed, Received::Filed)
+                | (model::Received::Already, Received::AlreadyApplied)
+                | (model::Received::Gap, Received::Gap)
+                | (model::Received::Malformed, Received::Malformed(_))
+        ),
+    }
 }
 
-/// The rows the model says the replica pins: an item named `keep…`, a
-/// price a quote points at.
-async fn pinned(pool: &SqlitePool, model: &Model) -> BTreeSet<model::Row> {
-    let mut pinned: BTreeSet<model::Row> = model
+/// The rows the model says the replica pins — an item named `keep…`, which
+/// its database refuses to delete, a price a quote points at — and retires:
+/// an item a receipt points at, retired before it is ever deleted.
+async fn pins(pool: &SqlitePool, model: &mut Model) {
+    let ids = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, Uuid>(sql)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<BTreeSet<String>>()
+    };
+    model.pinned = model
         .rows
         .iter()
+        .chain(&model.retired)
         .filter(|((table, _), bytes)| table == "items" && name_of(bytes).starts_with("keep"))
         .map(|(row, _)| row.clone())
+        .chain(
+            ids("SELECT price_id FROM quotes")
+                .await
+                .into_iter()
+                .map(|id| ("prices".to_owned(), id)),
+        )
         .collect();
-    let quoted: Vec<Uuid> = sqlx::query_scalar("SELECT price_id FROM quotes")
-        .fetch_all(pool)
+    model.retiring = ids("SELECT item_id FROM receipts")
         .await
-        .unwrap();
-    pinned.extend(
-        quoted
-            .into_iter()
-            .map(|id| ("prices".to_owned(), id.to_string())),
-    );
-    pinned
+        .into_iter()
+        .map(|id| ("items".to_owned(), id))
+        .collect();
 }
 
 /// What the replica holds of the server's rows, its rejections, and where
@@ -350,6 +470,11 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
         .fetch_all(pool)
         .await
         .unwrap();
+    let tasks: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, title FROM tasks WHERE retired_at IS NULL")
+            .fetch_all(pool)
+            .await
+            .unwrap();
     let held: BTreeMap<model::Row, String> = items
         .into_iter()
         .map(|(id, name)| (("items".to_owned(), id.to_string()), name))
@@ -358,15 +483,20 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
                 .into_iter()
                 .map(|(id, cents)| (("prices".to_owned(), id.to_string()), cents.to_string())),
         )
+        .chain(
+            tasks
+                .into_iter()
+                .map(|(id, title)| (("tasks".to_owned(), id.to_string()), title)),
+        )
         .collect();
     let modelled: BTreeMap<model::Row, String> = model
         .rows
         .iter()
         .map(|(row, bytes)| {
-            let content = if row.0 == "items" {
-                name_of(bytes)
-            } else {
-                cents_of(bytes).to_string()
+            let content = match row.0.as_str() {
+                "items" => name_of(bytes),
+                "prices" => cents_of(bytes).to_string(),
+                _ => title_of(bytes),
             };
             (row.clone(), content)
         })
@@ -402,16 +532,20 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
 /// confirms nothing it has not told every refusal of.
 async fn keeps_its_word(pool: &SqlitePool, host: &Host, model: &Model, at: &str) {
     let notes = count(pool, "SELECT count(*) FROM sync_notes").await;
-    let rows = i64::try_from(host.readings.len() + host.events.len()).unwrap();
+    let rows = i64::try_from(host.readings.len() + host.events.len() + host.done.len()).unwrap();
     assert!(notes <= rows, "{at}: {notes} notes of {rows} rows");
     let rejections = count(pool, "SELECT count(*) FROM sync_rejections").await;
     assert!(rejections <= i64::try_from(model.rejections.len()).unwrap());
     let named = count(pool, "SELECT count(*) FROM sync_snapshot_keys").await;
     assert!(
-        named <= i64::try_from(ITEMS + PRICES).unwrap(),
+        named <= i64::try_from(ITEMS + PRICES + TASKS).unwrap(),
         "{at}: {named} named"
     );
-    assert_eq!(count(pool, "SELECT count(*) FROM sync_leaving").await, 0);
+    let leaving = count(pool, "SELECT count(*) FROM sync_leaving").await;
+    assert!(
+        leaving <= i64::try_from(TASKS).unwrap(),
+        "{at}: {leaving} leaving"
+    );
     let untold = count(
         pool,
         "SELECT count(*) FROM sync_rejections r JOIN sync_applied a ON r.epoch = a.epoch \
@@ -454,6 +588,20 @@ async fn loses_no_write(pool: &SqlitePool, host: &Host, server: &Server, at: &st
         server.events.is_subset(&host.events),
         "{at}: an event never written"
     );
+    let noted_tasks: BTreeSet<String> =
+        sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = 'tasks'")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    for (id, done) in &host.done {
+        assert!(
+            noted_tasks.contains(&id.to_string()) || server.done.get(id) == Some(done),
+            "{at}: task {id} set {done}, received {:?}, and no longer noted",
+            server.done.get(id)
+        );
+    }
 }
 
 async fn count(pool: &SqlitePool, sql: &str) -> i64 {
@@ -480,16 +628,27 @@ async fn walk(pool: SqlitePool, seed: u64) {
         began: BASE,
         items: BTreeMap::new(),
         prices: BTreeMap::new(),
+        tasks: BTreeMap::new(),
         queue: VecDeque::new(),
         delivered: vec![provisioned],
         owed: false,
+        restored: false,
         readings: BTreeMap::new(),
         events: BTreeSet::new(),
+        done: BTreeMap::new(),
         confirmed: 0,
     };
     let mut host = Host::default();
     // Answers the server owes, and may send late or never.
     let mut answers: Vec<u64> = Vec::new();
+    // A copy of the replica's database, and the model as it stood then: the
+    // host restores it now and then — never over writes of its own made
+    // since, which a restore would lose for good.
+    let copy_path = file.get_filename().with_extension("copy");
+    let mut copy: Option<Model> = None;
+    // A copy of the server's database: what it sends, and what it recorded
+    // sending — never what it filed, which a restore would lose for good.
+    let mut server_copy: Option<Server> = None;
     for step in 0..400 {
         let at = format!("seed {seed:#x}, step {step}");
         let quiet = step >= 300;
@@ -503,19 +662,17 @@ async fn walk(pool: SqlitePool, seed: u64) {
         let action = if quiet {
             20 + walk.below(4)
         } else {
-            walk.below(24)
+            walk.below(29)
         };
+        if matches!(action, 6..=9 | 24) {
+            copy = None;
+        }
         match action {
             // The server changes rows.
             0..=2 => server.changes(&mut walk),
             // It provisions the replica again; or, installed again, in a
             // new epoch, dropping what the transport held.
-            3 if walk.below(4) == 0 => {
-                server.epoch = walk.uuid().to_string();
-                server.queue.clear();
-                server.delivered.clear();
-                server.snapshot(&mut walk);
-            }
+            3 if walk.below(4) == 0 => server.anew(&mut walk),
             3 => server.snapshot(&mut walk),
             // The transport loses a message, or delivers an old one again.
             4 if walk.below(3) == 0 => {
@@ -682,8 +839,103 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 for (_, up) in uplink.taken() {
                     answers.extend(server.file(&up, me));
                 }
-                if server.owed {
-                    server.snapshot(&mut walk);
+                server.answer(&mut walk);
+            }
+            // The host edits its own column of a task.
+            24 => {
+                let held: Vec<Uuid> =
+                    sqlx::query_scalar("SELECT id FROM tasks WHERE retired_at IS NULL")
+                        .fetch_all(&node.pool)
+                        .await
+                        .unwrap();
+                if let Some(id) = walk.pick(&held) {
+                    let done = walk.below(2) == 0;
+                    sqlx::query("UPDATE tasks SET done = $2 WHERE id = $1")
+                        .bind(id)
+                        .bind(done)
+                        .execute(&node.pool)
+                        .await
+                        .unwrap();
+                    host.done.insert(id, done);
+                }
+            }
+            // A receipt of the replica's own points at an item, or goes.
+            25 => {
+                let held: Vec<Uuid> =
+                    sqlx::query_scalar("SELECT id FROM items WHERE retired_at IS NULL")
+                        .fetch_all(&node.pool)
+                        .await
+                        .unwrap();
+                if walk.below(2) == 0 {
+                    if let Some(id) = walk.pick(&held) {
+                        sqlx::query("INSERT INTO receipts (item_id) VALUES ($1)")
+                            .bind(id)
+                            .execute(&node.pool)
+                            .await
+                            .unwrap();
+                    }
+                } else {
+                    sqlx::query("DELETE FROM receipts WHERE id = (SELECT min(id) FROM receipts)")
+                        .execute(&node.pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            // The host copies the replica's database, or restores the copy
+            // over it: the replica holds, and applied, what it did then.
+            26 => match copy.take() {
+                Some(copied) if walk.below(2) == 0 => {
+                    node.pool.close().await;
+                    let path = file.get_filename();
+                    for suffix in ["-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                    }
+                    std::fs::copy(&copy_path, path).unwrap();
+                    node = boot(&file, me, &uplink).await;
+                    model = copied;
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&copy_path);
+                    sqlx::query("VACUUM INTO $1")
+                        .bind(copy_path.to_str().unwrap())
+                        .execute(&node.pool)
+                        .await
+                        .unwrap();
+                    copy = Some(model.clone());
+                }
+            },
+            // The server's database is copied, or restored from the copy:
+            // it numbers its messages again, with nonces of its own.
+            28 => match server_copy.take() {
+                Some(mut copied) if walk.below(2) == 0 => {
+                    copied.queue = std::mem::take(&mut server.queue);
+                    copied.delivered = std::mem::take(&mut server.delivered);
+                    copied.readings = std::mem::take(&mut server.readings);
+                    copied.events = std::mem::take(&mut server.events);
+                    copied.done = std::mem::take(&mut server.done);
+                    copied.salt = walk.below(1 << 20) as u64 + 1;
+                    server = copied;
+                }
+                // A copy with a snapshot on its way would send it again,
+                // which this server does not model.
+                _ if server.began <= server.confirmed => server_copy = Some(server.clone()),
+                _ => {}
+            },
+            // The transport loses the first message of a snapshot.
+            27 => {
+                let begins = |bytes: &Vec<u8>| match ToReplica::decode(bytes.as_slice()) {
+                    Ok(ToReplica {
+                        body: Some(Body::Down(d)),
+                        ..
+                    }) => d.previous == 0,
+                    Ok(ToReplica {
+                        body: Some(Body::EndSnapshot(e)),
+                        ..
+                    }) => e.previous == 0,
+                    _ => false,
+                };
+                if let Some(at) = server.queue.iter().position(begins) {
+                    server.queue.remove(at);
                 }
             }
             // The transport delivers the next message.
@@ -699,12 +951,13 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     }
                 }
                 if let Some(bytes) = server.queue.pop_front() {
-                    model.pinned = pinned(&node.pool, &model).await;
+                    pins(&node.pool, &mut model).await;
                     let expected = model.receive(&bytes, &RULES);
                     let received = node.replica.receive(&bytes).await.expect("applied");
                     assert!(
-                        same(&expected, &received),
-                        "{at}: {expected:?}, and the replica {received:?}"
+                        same(&model, &expected, &received),
+                        "{at}: {expected:?} of {:?}, and the replica {received:?}",
+                        model.taken
                     );
                     server.delivered.push(bytes);
                 }
@@ -717,20 +970,20 @@ async fn walk(pool: SqlitePool, seed: u64) {
     // Quiet: everything goes, and is answered, until nothing is left.
     for round in 0..200 {
         while let Some(bytes) = server.queue.pop_front() {
-            model.pinned = pinned(&node.pool, &model).await;
+            pins(&node.pool, &mut model).await;
             model.receive(&bytes, &RULES);
             node.replica.receive(&bytes).await.expect("applied");
         }
         let mut said = false;
         for lane in 0..2 {
-            said |= node.replica.send_lane(lane, false).await.unwrap().message;
+            // Digests now and then, as a replica says them hourly.
+            let digests = round % 10 == 5;
+            said |= node.replica.send_lane(lane, digests).await.unwrap().message;
         }
         for (_, up) in uplink.taken() {
             answers.extend(server.file(&up, me));
         }
-        if server.owed {
-            server.snapshot(&mut walk);
-        }
+        server.answer(&mut walk);
         for number in answers.drain(..) {
             server.queue.push_back(
                 Body::Filed(Filed {
@@ -752,6 +1005,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 .unwrap();
         }
     }
+    let _ = std::fs::remove_file(&copy_path);
     let at = format!("seed {seed:#x}, the end");
     holds_what_the_model_holds(&node.pool, &model, &at).await;
     assert_eq!(
@@ -766,6 +1020,14 @@ async fn walk(pool: SqlitePool, seed: u64) {
         .collect();
     assert_eq!(server.readings, latest, "{at}: every reading as it is");
     assert_eq!(server.events, host.events, "{at}: every event, once");
+    assert_eq!(
+        count(&node.pool, "SELECT count(*) FROM sync_leaving").await,
+        0,
+        "{at}: every task let go of"
+    );
+    for (id, done) in &host.done {
+        assert_eq!(server.done.get(id), Some(done), "{at}: task {id}");
+    }
     let applied = model.applied.clone().unwrap();
     assert_eq!(
         model.gap, 0,

@@ -101,8 +101,18 @@ pub(crate) struct Model {
     gap_told: u64,
     pub(crate) rejections: BTreeMap<Row, Rejection>,
     /// Rows a row of its own points at, in a table with nothing to retire
-    /// them by: it cannot let them go.
+    /// them by — or that its database refuses to delete: it cannot let them
+    /// go.
     pub(crate) pinned: BTreeSet<Row>,
+    /// Rows a row of its own points at, in a table it retires by: let go
+    /// of, they are retired — kept, and out of what it holds.
+    pub(crate) retiring: BTreeSet<Row>,
+    /// Rows it retired, as the bytes that carried them: sent again, they
+    /// are live again; let go of again, they go, or are refused.
+    pub(crate) retired: BTreeMap<Row, Vec<u8>>,
+    /// What the last message it applied took, per table entry: the keys of
+    /// the rows it holds from it.
+    pub(crate) taken: Vec<(String, Vec<String>)>,
 }
 
 /// The largest number a server sends: 2^63 - 1.
@@ -209,7 +219,9 @@ impl Model {
             Body::Filed(_) => Received::Filed,
             Body::Down(down) => {
                 let naming = !down.snapshot_id.is_empty();
+                self.taken.clear();
                 for table in down.tables {
+                    let mut taken = Vec::new();
                     for (bytes, key) in table.upserts.iter().zip(&table.keys) {
                         let row = (table.table.clone(), key.parts.join("|"));
                         if naming {
@@ -222,12 +234,15 @@ impl Model {
                             continue;
                         }
                         self.rejections.remove(&row);
+                        taken.push(row.1.clone());
+                        self.retired.remove(&row);
                         self.rows.insert(row, bytes.clone());
                     }
                     for key in &table.deletes {
                         let row = (table.table.clone(), key.parts.join("|"));
                         self.let_go(row, sequence, rules);
                     }
+                    self.taken.push((table.table, taken));
                 }
                 Received::Applied
             }
@@ -242,6 +257,7 @@ impl Model {
                     let stale: Vec<Row> = self
                         .rows
                         .keys()
+                        .chain(self.retired.keys())
                         .filter(|row| row.0 == *table && !snapshot.named.contains(*row))
                         .cloned()
                         .collect();
@@ -254,19 +270,28 @@ impl Model {
         }
     }
 
-    /// Lets go of `row`, unless a row it holds points at it: then it is
-    /// rejected, as a database's foreign key would refuse the delete.
+    /// Lets go of `row`: a row of the server's it holds that points at it,
+    /// or one of its own in a table with nothing to retire it by, or its
+    /// database refusing the delete, keeps it, rejected, as a foreign key or
+    /// a trigger would; one of its own in a table it retires by retires it.
     fn let_go(&mut self, row: Row, sequence: u64, rules: &Rules) {
-        let pointed = self.pinned.contains(&row)
-            || self
-                .rows
-                .iter()
-                .any(|((table, _), bytes)| (rules.parents)(table, bytes).contains(&row));
-        if pointed {
+        let held = self.rows.contains_key(&row) || self.retired.contains_key(&row);
+        let pointed = self
+            .rows
+            .iter()
+            .any(|((table, _), bytes)| (rules.parents)(table, bytes).contains(&row));
+        if pointed || (held && !self.retiring.contains(&row) && self.pinned.contains(&row)) {
             self.reject(row, "pointed at", sequence);
             return;
         }
-        self.rows.remove(&row);
+        let bytes = self.rows.remove(&row);
+        if held && self.retiring.contains(&row) {
+            if let Some(bytes) = bytes {
+                self.retired.insert(row.clone(), bytes);
+            }
+        } else {
+            self.retired.remove(&row);
+        }
         self.rejections.remove(&row);
     }
 

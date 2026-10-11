@@ -303,8 +303,12 @@ or was delivered a message at or below the last it applied. `sequence` 0
 says it has applied nothing yet.
 
 The server checks the seal: one it did not make — a replica that lies, or a
-bug — is ignored, and resets nothing. It ignores a report of another
-epoch, and one that does not parse. A sealed one it judges against what it
+bug — is ignored, and resets nothing. It ignores a report that does not
+parse, and one of another epoch — unless it last heard the replica apply a
+message of its own epoch: a replica only goes forward, so it follows an
+epoch this database never had, which was restored from a copy older than
+that epoch began. The server provisions that replica again, unless a
+snapshot written for it since is on its way. A sealed one it judges against what it
 recorded sending the replica:
 
 - a message past the last it recorded sending it — or, having recorded
