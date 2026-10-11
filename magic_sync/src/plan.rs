@@ -1095,16 +1095,29 @@ impl Engine {
         Ok(key_text(&parse_key(&self.plans[i].key, key)?))
     }
 
-    /// The live replicas, as a subquery `s(id, partition)`.
+    /// The live replicas, as a subquery `s(id, partition)`: each once, in
+    /// the first of its partitions should the relation repeat it.
     pub(crate) fn replicas_sql(&self) -> String {
         let partition = self
             .replicas
             .partition
             .map_or("NULL::uuid".to_owned(), ident);
         format!(
-            "(SELECT id, {partition} AS partition FROM {} WHERE {}) AS s",
+            "(SELECT DISTINCT ON (id) id, {partition} AS partition FROM {} WHERE {} \
+               ORDER BY id, {partition}) AS s",
             self.replicas.relation, self.replicas.live
         )
+    }
+
+    /// Whether `replica` is a row of the replicas' relation, live or not.
+    pub(crate) async fn is_replica(&self, conn: &mut Conn, replica: Uuid) -> Result<bool, Error> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {} WHERE id = $1)",
+            self.replicas.relation
+        ))
+        .bind(replica)
+        .fetch_one(&mut *conn)
+        .await?)
     }
 
     /// Compares the live replicas with what the engine saw of them last time,

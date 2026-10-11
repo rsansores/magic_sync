@@ -353,8 +353,17 @@ impl<S: Senders, T: Transport> Server<S, T> {
     ///
     /// Only an error that is [transient](Error::is_transient): the database,
     /// the host ([`Senders`]) or the transport away, or [`Error::Protocol`].
+    ///
+    /// An upload beyond the settings' [`Limits`] — more bytes, or more rows
+    /// or rejections — breaks the protocol: it is dropped unanswered, with an
+    /// error logged. A replica's limits are the server's, or less.
     pub async fn receive(&self, replica: Uuid, bytes: &[u8]) -> Result<Vec<filing::Filed>, Error> {
         use prost::Message as _;
+        let limits = self.settings.limits;
+        if bytes.len() > limits.bytes() {
+            tracing::error!(%replica, bytes = bytes.len(), limit = limits.bytes(), "sync: an upload larger than the server's limits — dropped, unanswered");
+            return Ok(Vec::new());
+        }
         let up = match Up::decode(bytes) {
             Ok(up) => up,
             Err(e) => {
@@ -370,6 +379,15 @@ impl<S: Senders, T: Transport> Server<S, T> {
         }
         if up.protocol == 0 {
             tracing::error!(%replica, "sync: an upload that names no protocol — dropped");
+            return Ok(Vec::new());
+        }
+        let rows: usize = up
+            .tables
+            .iter()
+            .map(|t| t.upserts.len() + t.deletes.len())
+            .sum();
+        if rows > limits.rows() || up.rejected.len() > limits.rows() {
+            tracing::error!(%replica, rows, rejected = up.rejected.len(), limit = limits.rows(), "sync: an upload of more rows than the server's limits — dropped, unanswered");
             return Ok(Vec::new());
         }
         let filed = match self.file(replica, &up).await {
@@ -391,7 +409,18 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 uploads: up.uploads.clone(),
             });
             let id = format!("filed-{replica}-{last}");
-            match self.transport.send(replica, answer.encoded(), &id).await {
+            let sent = tokio::time::timeout(
+                self.settings.send_timeout,
+                self.transport.send(replica, answer.encoded(), &id),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Transport {
+                    reason: format!("no answer within {:?}", self.settings.send_timeout),
+                    transient: true,
+                })
+            });
+            match sent {
                 Err(e) if e.is_transient() => return Err(e),
                 Err(e) => {
                     tracing::error!(%replica, "sync: the transport refuses an upload's answer — the replica sends it again: {e}")
@@ -403,12 +432,16 @@ impl<S: Senders, T: Transport> Server<S, T> {
     }
 
     /// Files `up` from `replica` in the transaction the host gives for it;
-    /// `None` for a replica the host does not know.
+    /// `None` for a replica the host does not know, or that is no row of
+    /// the replicas.
     async fn file(&self, replica: Uuid, up: &Up) -> Result<Option<Vec<filing::Filed>>, Error> {
         let Some(known) = self.senders.known(replica).await? else {
             return Ok(None);
         };
         let mut tx = self.senders.filing(&known).await?;
+        if !self.engine.is_replica(&mut tx, replica).await? {
+            return Ok(None);
+        }
         let filed = filing::file(&mut tx, &self.codecs, up, replica, &known).await?;
         tx.commit().await?;
         Ok(Some(filed))

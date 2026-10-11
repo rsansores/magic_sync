@@ -1051,3 +1051,157 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
         }
     }
 }
+
+/// An upload beyond the server's limits — more bytes, more rows or more
+/// rejections than a message carries — or from a sender that is no replica
+/// is dropped unanswered: nothing of it filed, nothing recorded of its
+/// sender. One within them is filed.
+#[sqlx::test(migrations = false)]
+async fn an_upload_beyond_the_limits_or_from_no_replica_is_dropped_unanswered(pool: PgPool) {
+    let (_, [a, _]) = world(&pool).await;
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        Settings {
+            limits: Limits::new(2, 8192).unwrap(),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    let rejected = |n: usize| envelope::Up {
+        rejected: (0..n)
+            .map(|_| envelope::Rejected {
+                table: "items".to_owned(),
+                ..envelope::Rejected::default()
+            })
+            .collect(),
+        uploads: vec![9],
+        protocol: envelope::PROTOCOL,
+        ..envelope::Up::default()
+    };
+    let stranger = Uuid::now_v7();
+    for (sender, bytes) in [
+        (
+            a,
+            upload(1, "readings", vec![reading(a, &"x".repeat(9000))]),
+        ),
+        (
+            a,
+            upload(
+                2,
+                "readings",
+                (0..3).map(|_| reading(a, "one of three")).collect(),
+            ),
+        ),
+        (a, rejected(3).encode_to_vec()),
+        (
+            stranger,
+            upload(4, "readings", vec![reading(stranger, "a stranger's")]),
+        ),
+    ] {
+        assert!(server.receive(sender, &bytes).await.unwrap().is_empty());
+    }
+    assert!(wire.filed(a).is_empty() && wire.filed(stranger).is_empty());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        0
+    );
+    assert_eq!(count(&pool, "SELECT count(*) FROM sync.inbox").await, 0);
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sync.replicas WHERE replica_id = $1")
+            .bind(stranger)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded, 0,
+        "nothing recorded of a sender that is no replica"
+    );
+
+    server
+        .receive(
+            a,
+            &upload(5, "readings", (0..2).map(|_| reading(a, "two")).collect()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wire.filed(a), [5]);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        2
+    );
+}
+
+/// A transport that never answers the server's answer to an upload: the
+/// upload comes again, rather than holding its handler for ever.
+#[sqlx::test(migrations = false)]
+async fn an_answer_the_transport_never_takes_has_the_upload_come_again(pool: PgPool) {
+    struct Silent;
+    impl Transport for Silent {
+        async fn send(&self, _: Uuid, _: Vec<u8>, _: &str) -> Result<(), Error> {
+            std::future::pending().await
+        }
+    }
+    let (_, [a, _]) = world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Silent,
+        Anyone::new(pool.clone()),
+        Settings {
+            send_timeout: Duration::from_millis(50),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    let answered = server
+        .receive(a, &upload(1, "readings", vec![reading(a, "kept")]))
+        .await;
+    assert!(
+        matches!(&answered, Err(e) if e.is_transient()),
+        "{answered:?}"
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+}
+
+/// A relation of replicas that names one twice — a view joining it to two
+/// rows — holds no pass back: the replica is one, provisioned once.
+#[sqlx::test(migrations = false)]
+async fn a_replica_named_twice_by_its_relation_is_one(pool: PgPool) {
+    let (partition, [a, b]) = world(&pool).await;
+    sqlx::raw_sql(
+        "CREATE VIEW fixture.twice AS SELECT * FROM fixture.t_replicas \
+         UNION ALL SELECT * FROM fixture.t_replicas",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        Replicas::relation("fixture.twice")
+            .table("t_replicas")
+            .live("live")
+            .partitioned_by("partition_id"),
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .unwrap();
+    item(&pool, partition, "one").await;
+    while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    assert_eq!(wire.items(a), ["one"]);
+    assert_eq!(wire.items(b), ["one"]);
+}
