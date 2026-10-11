@@ -358,8 +358,9 @@ delete. A row whose key cannot be told is logged and not reported.
   that does not name it): a digest (section 8) leaves rejected rows out, as
   the server leaves out the rows recorded refused. It reports only the
   rejections of the epoch it follows; a snapshot of a new epoch clears the
-  others. A rejection of a table it does not hold from the server, which no
-  snapshot clears, it **may** forget once reported.
+  others — those of the tables it names as it ends, and those of a table it
+  does not hold from the server, which no snapshot names. Such a rejection of
+  the epoch it follows it **may** forget once reported.
 - It keeps what the server said within bounds: a reason **may** be cut (to
   512 bytes), and rows of a table it does not know, named or keyed longer
   than that, are logged rather than kept — no server sends such a table. So
@@ -413,7 +414,11 @@ For a table the replica writes and the server mirrors:
      send it. An `Up` the transport refuses for good is sent again with half
      its rows and rejections, and so on, until what it refuses is alone: that
      row is set aside, that rejection taken as told (it must not hold back
-     the confirmation of what was applied), and nothing beside them.
+     the confirmation of what was applied), and nothing beside them — but only
+     if the transport took some other message of that stream meanwhile: a
+     transport that refuses every message says nothing of any one row, and
+     the replica sets nothing aside, raises the alarm and asks again after a
+     backoff.
 3. **Wait for `Filed`** (4.4) naming that upload, then forget its notes. An
    upload not answered after a while (minutes) should be sent again; the
    server files the same rows idempotently.

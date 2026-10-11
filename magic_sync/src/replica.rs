@@ -1336,6 +1336,21 @@ async fn end_snapshot<P: Sync + 'static>(
             .collect();
         let_go(conn, codec, &stale, Some(sequence), care).await?;
     }
+    // A table the replica holds from no server is in no snapshot, so none
+    // clears what a server since gone made it refuse of it, and nothing
+    // reports that: it goes with the server.
+    let held: Vec<&str> = codecs
+        .iter()
+        .filter(|c| c.sent_down())
+        .map(|c| c.table.name)
+        .collect();
+    sqlx::query(
+        "DELETE FROM sync_rejections WHERE table_name NOT IN (SELECT value FROM json_each($1)) \
+           AND epoch <> (SELECT epoch FROM sync_applied WHERE id = 1)",
+    )
+    .bind(json(&held))
+    .execute(&mut *conn)
+    .await?;
     sqlx::query("DELETE FROM sync_snapshot_keys")
         .execute(&mut *conn)
         .await?;

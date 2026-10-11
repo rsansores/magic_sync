@@ -642,6 +642,29 @@ async fn a_new_epoch_begins_with_a_snapshot(pool: SqlitePool) {
     assert_eq!(applied, (OTHER_EPOCH.to_owned(), 5));
 }
 
+/// What the replica refused of a table it holds from no server, under a
+/// server that is gone, is forgotten once a server installed again has
+/// provisioned it: nothing would ever report it, and no snapshot names the
+/// table to clear it.
+#[sqlx::test(migrations = false)]
+async fn a_rejection_of_an_unnamed_table_under_a_gone_server_is_cleared(pool: SqlitePool) {
+    let w = world(pool).await;
+    let a = Uuid::now_v7();
+    w.receive(&down(1, "", vec![upserts("mystery", vec![item(a, "x")])]))
+        .await;
+    assert_eq!(w.rejected().await, [format!("mystery {a}")]);
+    let mut provision =
+        ToReplica::decode(ending(5, 0, &Uuid::now_v7().to_string(), &["items"]).as_slice())
+            .unwrap();
+    let Some(Body::EndSnapshot(end)) = &mut provision.body else {
+        panic!("an end");
+    };
+    end.epoch = OTHER_EPOCH.to_owned();
+    let ended = w.receive(&provision.encode_to_vec()).await;
+    assert!(matches!(ended, Received::SnapshotEnded), "{ended:?}");
+    assert!(w.rejected().await.is_empty());
+}
+
 /// A message that follows one the replica never applied — lost on the way,
 /// or a replica restored from an older copy — is a gap, and so is every
 /// message after it until a snapshot begins, even one that follows the last
