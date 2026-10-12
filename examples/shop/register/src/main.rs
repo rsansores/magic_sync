@@ -52,21 +52,18 @@ impl Uplink for Http {
         }
         // A server error, or one that asks to come back later, may go
         // through next time; any other refusal is of this message, for good.
-        Err(Error::Transport {
-            reason: format!("the head office answered {status}"),
-            transient: status.is_server_error()
+        Err(Error::transport(
+            status.is_server_error()
                 || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 || status == reqwest::StatusCode::REQUEST_TIMEOUT,
-        })
+            format!("the head office answered {status}"),
+        ))
     }
 }
 
 /// The head office out of reach: a retry may get through.
 fn unreachable(e: impl std::fmt::Display) -> Error {
-    Error::Transport {
-        reason: e.to_string(),
-        transient: true,
-    }
+    Error::transport(true, e.to_string())
 }
 // ANCHOR_END: uplink
 

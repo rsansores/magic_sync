@@ -463,10 +463,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
             )
             .await
             .unwrap_or_else(|_| {
-                Err(Error::Transport {
-                    reason: format!("no answer within {:?}", self.settings.send_timeout),
-                    transient: true,
-                })
+                Err(Error::transport(
+                    true,
+                    format!("no answer within {:?}", self.settings.send_timeout),
+                ))
             });
             match sent {
                 Err(e) if e.is_transient() => return Err(e),

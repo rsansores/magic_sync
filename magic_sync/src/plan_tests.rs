@@ -3126,10 +3126,10 @@ async fn a_replica_is_provisioned_once_however_often_it_is_asked(pool: crate::Db
         .fetch_one(conn)
         .await
     }
-    note_resync(&mut world.conn, Some(partition), replica)
+    note_resync(&mut world.conn, replica, Some(partition))
         .await
         .expect("noted");
-    note_resync(&mut world.conn, Some(partition), replica)
+    note_resync(&mut world.conn, replica, Some(partition))
         .await
         .expect("noted again");
     assert!(
@@ -3297,7 +3297,7 @@ async fn a_row_written_last_by_the_older_transaction_goes_again(pool: crate::DbP
         .await
         .expect("the older transaction's id");
     let replica = live_in(&mut world.conn, partition).await[0];
-    note_resync(&mut world.conn, Some(partition), replica)
+    note_resync(&mut world.conn, replica, Some(partition))
         .await
         .expect("a provisioning");
     sqlx::query("UPDATE fixture.t_products SET name = 'newer' WHERE id = $1")

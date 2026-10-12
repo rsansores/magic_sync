@@ -16,7 +16,7 @@ To provision one again on demand, in any transaction of yours:
 {{#include ../../snippets/src/server.rs:resync}}
 ```
 
-The second argument of `note_resync` is the replica's partition, when you use
+The last argument of `note_resync` is the replica's partition, when you use
 partitions. A "send it everything again" button for an operator is that
 function.
 

@@ -191,10 +191,7 @@ impl crate::run::replica::Uplink for Uplinked {
         let lanes = self.refused_lanes.lock().unwrap().clone();
         if let Some(transient) = *self.refusing.lock().unwrap() {
             if lanes.is_empty() || lanes.contains(&lane) {
-                return Err(crate::Error::Transport {
-                    reason: "refused".into(),
-                    transient,
-                });
+                return Err(crate::Error::transport(transient, "refused"));
             }
         }
         if self
@@ -203,10 +200,7 @@ impl crate::run::replica::Uplink for Uplinked {
             .unwrap()
             .is_some_and(|cannot| cannot(&up))
         {
-            return Err(crate::Error::Transport {
-                reason: "cannot take it".into(),
-                transient: false,
-            });
+            return Err(crate::Error::transport(false, "cannot take it"));
         }
         self.sent.lock().unwrap().push((replica, lane, up));
         Ok(())
@@ -757,10 +751,7 @@ mod server {
         ) -> Result<(), crate::Error> {
             let mut takes = self.takes.lock().unwrap();
             if *takes == Some(0) {
-                return Err(crate::Error::Transport {
-                    reason: "cut".into(),
-                    transient: true,
-                });
+                return Err(crate::Error::transport(true, "cut"));
             }
             if let Some(n) = takes.as_mut() {
                 *n -= 1;

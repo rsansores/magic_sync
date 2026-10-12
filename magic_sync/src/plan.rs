@@ -3352,8 +3352,8 @@ pub(crate) fn resync_sql(source: &str) -> String {
 /// [`Error::Database`] when the database fails.
 pub async fn note_resync(
     conn: &mut Conn,
-    partition: Option<Uuid>,
     replica: Uuid,
+    partition: Option<Uuid>,
 ) -> Result<(), Error> {
     sqlx::query(&resync_sql("SELECT $1::uuid, $2::uuid"))
         .bind(replica)

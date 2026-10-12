@@ -464,10 +464,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                     "sync: the uplink refuses what this lane sends for good, and has no other \
                      row to try it with — nothing is set aside, and it goes again"
                 );
-                return Err(Error::Transport {
-                    reason: "the uplink refuses the only messages this lane has".to_owned(),
-                    transient: true,
-                });
+                return Err(Error::transport(
+                    true,
+                    "the uplink refuses the only messages this lane has".to_owned(),
+                ));
             }
             return Ok(Went::default());
         };
@@ -478,10 +478,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         )
         .await
         .unwrap_or_else(|_| {
-            Err(Error::Transport {
-                reason: format!("the uplink did not take the message within {timeout:?}"),
-                transient: true,
-            })
+            Err(Error::transport(
+                true,
+                format!("the uplink did not take the message within {timeout:?}"),
+            ))
         });
         let mut went = Went {
             message: true,

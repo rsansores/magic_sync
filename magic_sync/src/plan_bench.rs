@@ -275,7 +275,7 @@ async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {
     .expect("a catalog");
     drain(&pool, &engine).await;
 
-    note_resync(&mut conn, Some(partition), replicas[0])
+    note_resync(&mut conn, replicas[0], Some(partition))
         .await
         .expect("resync");
     let drained = drain(&pool, &engine).await;

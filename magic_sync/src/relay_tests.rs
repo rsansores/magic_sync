@@ -106,10 +106,10 @@ impl Transport for Fake {
             });
         let failing = self.failing.lock().unwrap().get(&replica).copied();
         let result = match failing.or(next.then_some(true)) {
-            Some(transient) => Err(Error::Transport {
-                reason: format!("{replica} unreachable"),
+            Some(transient) => Err(Error::transport(
                 transient,
-            }),
+                format!("{replica} unreachable"),
+            )),
             None => {
                 self.sent.lock().unwrap().push((replica, message));
                 self.ids.lock().unwrap().push(id.to_owned());
@@ -1367,10 +1367,7 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
             if replica == self.replica {
                 let mut left = self.left.lock().unwrap();
                 if *left == 0 {
-                    return Err(Error::Transport {
-                        reason: "cut".into(),
-                        transient: true,
-                    });
+                    return Err(Error::transport(true, "cut"));
                 }
                 *left -= 1;
             }

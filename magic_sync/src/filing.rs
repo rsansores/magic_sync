@@ -1224,14 +1224,14 @@ async fn keep(
             } => {
                 if *parts >= *bound || *bytes >= INBOX_BYTES {
                     tracing::error!(%replica, parts, bytes, "sync ALARM: a replica's inbox is full — its uploads wait on it until a fix files what is kept");
-                    return Err(Error::Host {
-                        reason: format!(
+                    return Err(Error::host(
+                        true,
+                        format!(
                             "the server keeps {parts} parts of this replica's uploads it could \
                              not file, {bytes} bytes, as many as it may: the upload comes again \
                              once a fix files them"
                         ),
-                        transient: true,
-                    });
+                    ));
                 }
                 *parts += 1;
                 *bytes += i64::try_from(upload.len()).unwrap_or(i64::MAX);

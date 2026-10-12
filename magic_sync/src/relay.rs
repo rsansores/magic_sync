@@ -707,10 +707,10 @@ impl<P: Sync + 'static> Relay<'_, P> {
                     tokio::time::timeout(self.timeout, transport.send(replica, message, &id))
                         .await
                         .unwrap_or_else(|_| {
-                            Err(Error::Transport {
-                                reason: format!("no answer within {:?}", self.timeout),
-                                transient: true,
-                            })
+                            Err(Error::transport(
+                                true,
+                                format!("no answer within {:?}", self.timeout),
+                            ))
                         });
                 if let Err(e) = went {
                     failure = Some(e);

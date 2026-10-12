@@ -788,15 +788,14 @@ impl Transport for Wire {
             } else {
                 failed.0 += 1;
             }
-            Err(Error::Transport {
-                reason: if refused {
+            Err(Error::transport(
+                !refused,
+                if refused {
                     "refused\0 for good"
                 } else {
                     "the network"
-                }
-                .into(),
-                transient: !refused,
-            })
+                },
+            ))
         } else {
             self.queues
                 .lock()
