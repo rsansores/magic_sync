@@ -390,8 +390,9 @@ missed: malformed, and left out.
 Neither a gap nor a message older than the last applied carries a seal the
 server can check, so what a replica says of itself provisions it again at
 most once a minute, and twice as long between each time while it keeps
-saying so, up to 32 minutes; one quiet for 64 minutes starts over. Until then
-the server leaves it as it is, and the replica's next `Up` says it again.
+saying so, up to 32 minutes; one quiet for 64 minutes starts over. One that
+says it sooner is provisioned again once it may: the server notes it for
+then.
 
 ---
 

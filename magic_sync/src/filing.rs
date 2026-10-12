@@ -861,26 +861,46 @@ async fn gap(conn: &mut Conn, replica: Uuid, standing: &Standing, gap: u64) -> R
 const ASKED: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Provisions `replica` again, `why` as it says it — it missed a message,
-/// or holds less than recorded — unless it asked for one too soon: what it
+/// or holds less than recorded — but not sooner than it may ask: what it
 /// says of itself is not sealed, and a replica that says it on every upload
-/// must not have the server send it everything on every round trip. Its
-/// next upload says it again.
+/// must not have the server send it everything on every round trip. One
+/// that asks too soon is provisioned once it may, its provisioning noted
+/// for then.
 async fn asked(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error> {
-    let due: bool = sqlx::query_scalar(
-        "SELECT asked_at IS NULL \
-             OR asked_at <= now() - make_interval(secs => $2 * power(2, least(asks - 1, 5))) \
+    let due: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+        "SELECT CASE WHEN asked_at > now() - make_interval(secs => $2 * power(2, least(asks - 1, 5))) \
+                     THEN asked_at + make_interval(secs => $2 * power(2, least(asks - 1, 5))) END \
            FROM sync.replicas WHERE replica_id = $1",
     )
     .bind(replica)
     .bind(ASKED.as_secs_f64())
     .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or(true);
-    if !due {
-        tracing::warn!(%replica, why, "sync: a replica asks to be provisioned again too soon after the last time — not yet");
-        return Ok(());
-    }
-    if !resync(conn, replica).await? {
+    .await?;
+    let noted = match due.flatten() {
+        None => resync(conn, replica).await?,
+        Some(at) => {
+            // Asked for then: what it asks after waits from then.
+            let deferred = sqlx::query(
+                "WITH noted AS ( \
+                     INSERT INTO sync.notes (kind, replica_id, partition_id, noted_at) \
+                     SELECT 'resync', $1, partition_id, $2 FROM sync.replicas WHERE replica_id = $1 \
+                        AND NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
+                                           AND p.replica_id = $1 AND p.done_at IS NULL) \
+                     RETURNING replica_id) \
+                 UPDATE sync.replicas r SET asked_at = $2, asks = r.asks + 1 \
+                   FROM noted n WHERE r.replica_id = n.replica_id",
+            )
+            .bind(replica)
+            .bind(at)
+            .execute(&mut *conn)
+            .await?;
+            if deferred.rows_affected() > 0 {
+                tracing::warn!(%replica, why, %at, "sync: a replica asks to be provisioned again too soon after the last time — it is, then");
+            }
+            return Ok(());
+        }
+    };
+    if !noted {
         return Ok(());
     }
     tracing::warn!(%replica, why, "sync: a replica holds less than recorded — it is provisioned again");

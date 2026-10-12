@@ -69,6 +69,9 @@ COMMENT ON COLUMN sync.notes.id IS
     'Rises with every note. Writers of one row take turns on its lock, so the notes of a row '
     'rise in the order their changes committed: a version of the row sent while its newest '
     'note was n holds every change noted up to n, and none after.';
+COMMENT ON COLUMN sync.notes.noted_at IS
+    'When it was noted — or, for a provisioning a replica asked for too soon, when it may be '
+    'carried out: no pass plans it before.';
 COMMENT ON COLUMN sync.notes.done_at IS
     'When the relay recorded what the note asked for and wrote its messages to the outbox. '
     'NULL: pending.';

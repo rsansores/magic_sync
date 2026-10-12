@@ -2649,45 +2649,60 @@ async fn a_replica_cannot_have_itself_provisioned_on_every_round_trip(pool: crat
     let [a, _] = world.replicas;
     world.item("one").await;
     world.pass(&Fake::default()).await;
-    let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
+    let due = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL \
+                 AND noted_at <= now()";
+    let deferred = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL \
+                      AND noted_at > now()";
     let missed = |gap: u64| envelope::Up {
         gap,
         protocol: envelope::PROTOCOL,
         ..envelope::Up::default()
     };
-    let earlier = |seconds: i32| {
+    // Time passes: what was asked, and what waits, a while ago.
+    let later = |seconds: i32| {
         let pool = world.pool.clone();
         async move {
-            sqlx::query("UPDATE sync.replicas SET asked_at = asked_at - make_interval(secs => $1)")
-                .bind(f64::from(seconds))
-                .execute(&pool)
-                .await
-                .unwrap();
+            for sql in [
+                "UPDATE sync.replicas SET asked_at = asked_at - make_interval(secs => $1)",
+                "UPDATE sync.notes SET noted_at = noted_at - make_interval(secs => $1)",
+            ] {
+                sqlx::query(sql)
+                    .bind(f64::from(seconds))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
         }
     };
     for past in [u64::MAX, world.last_sent(a).await + 1] {
         world.file(a, &missed(past)).await;
-        assert_eq!(world.count(resyncs).await, 0, "past every message sent it");
+        assert_eq!(world.count(due).await, 0, "past every message sent it");
     }
     world.file(a, &missed(world.last_sent(a).await)).await;
-    assert_eq!(world.count(resyncs).await, 1);
+    assert_eq!(world.count(due).await, 1);
     world.pass(&Fake::default()).await;
     world.file(a, &missed(world.last_sent(a).await)).await;
-    assert_eq!(world.count(resyncs).await, 0, "too soon");
-    earlier(61).await;
-    world.file(a, &missed(world.last_sent(a).await)).await;
-    assert_eq!(world.count(resyncs).await, 1, "a minute on");
-    world.pass(&Fake::default()).await;
-    earlier(61).await;
     world.file(a, &missed(world.last_sent(a).await)).await;
     assert_eq!(
-        world.count(resyncs).await,
-        0,
-        "asking again, it waits longer"
+        (world.count(due).await, world.count(deferred).await),
+        (0, 1),
+        "too soon: once, when it is due"
     );
-    earlier(60).await;
+    let last = world.last_sent(a).await;
+    world.pass(&Fake::default()).await;
+    assert_eq!(world.last_sent(a).await, last, "not before it is due");
+    later(61).await;
+    world.pass(&Fake::default()).await;
+    assert!(world.last_sent(a).await > last, "provisioned a minute on");
+    assert_eq!(world.count(deferred).await, 0);
     world.file(a, &missed(world.last_sent(a).await)).await;
-    assert_eq!(world.count(resyncs).await, 1, "two minutes on");
+    let wait: f64 = world
+        .count(
+            "SELECT extract(epoch FROM max(noted_at) - now())::int8 FROM sync.notes \
+              WHERE kind = 'resync' AND done_at IS NULL",
+        )
+        .await as f64;
+    assert!(wait > 61.0, "asking again, it waits longer: {wait} s");
 }
 
 /// A database restored from an older copy numbers its next messages again:

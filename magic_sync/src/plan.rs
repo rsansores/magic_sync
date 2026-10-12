@@ -3082,6 +3082,7 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
     let rows: Vec<Noted> = sqlx::query_as(&format!(
         "SELECT id, kind, relation, row_key, replica_id, previous \
            FROM sync.notes WHERE done_at IS NULL AND parked_at IS NULL AND {READABLE} \
+            AND noted_at <= now() \
           ORDER BY id LIMIT $1"
     ))
     .bind(limit)
@@ -3097,8 +3098,9 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
 }
 
 /// The statement that notes the provisioning from scratch of each replica
-/// `source` names — `(id, partition)` — unless one is pending for it: a
-/// replica is provisioned once, however many reasons ask for it, and its
+/// `source` names — `(id, partition)` — unless one is pending for it, and
+/// due: a replica is provisioned once, however many reasons ask for it (one
+/// noted for later is carried out with it), and its
 /// snapshot, planned with the changes of its pass, carries them rather than
 /// a second message. Every provisioning is noted through it.
 pub(crate) fn resync_sql(source: &str) -> String {
@@ -3106,7 +3108,8 @@ pub(crate) fn resync_sql(source: &str) -> String {
         "INSERT INTO sync.notes (kind, replica_id, partition_id) \
          SELECT DISTINCT ON (r.id) 'resync', r.id, r.partition FROM ({source}) AS r(id, partition) \
           WHERE NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
-                               AND p.replica_id = r.id AND p.done_at IS NULL)"
+                               AND p.replica_id = r.id AND p.done_at IS NULL \
+                               AND p.noted_at <= now())"
     )
 }
 
