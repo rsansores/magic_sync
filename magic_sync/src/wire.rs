@@ -5,7 +5,9 @@
 //! list — the host's, in the order the tables are sent, parents first — and
 //! dispatches on the table name. Nothing here names a table or a column.
 
-use crate::row::{self, Key, KeyPart, Mirror, Row, Table};
+#[cfg(feature = "postgres")]
+use crate::row::Mirror;
+use crate::row::{self, Key, KeyPart, Row, Table};
 use crate::{Conn, Error};
 use std::future::Future;
 use std::pin::Pin;
@@ -376,13 +378,13 @@ impl<P: Sync + 'static> Codec<P> {
 
     /// Whether the server sends this table's rows down.
     pub(crate) fn sent_down(&self) -> bool {
-        matches!(self.table.mirror, Mirror::Catalog | Mirror::Both)
+        self.table.mirror.sent_down()
     }
 
     /// Whether a replica's writes to this table go up.
     #[cfg(feature = "sqlite")]
     pub(crate) fn goes_up(&self) -> bool {
-        matches!(self.table.mirror, Mirror::Record | Mirror::Both)
+        self.table.mirror.goes_up()
     }
 
     /// Where the replica sits in this table's key: only a table keyed by it
@@ -407,7 +409,7 @@ impl<P: Sync + 'static> Codec<P> {
         keys: &[Key],
         sender: Uuid,
     ) -> Result<Vec<Key>, Error> {
-        if !matches!(self.table.mirror, Mirror::Record | Mirror::Both) {
+        if !self.table.mirror.goes_up() {
             return Err(Error::Misuse(format!(
                 "`{}` is the server's: a replica deletes none of it",
                 self.table.name
@@ -519,6 +521,11 @@ enum How {
     /// The server taking state a replica reports: newest wins.
     #[cfg(feature = "postgres")]
     Newest,
+    /// The server taking a setting: what the replica sent last wins,
+    /// whatever its version — a replica restored from an older copy holds
+    /// an older version, and that is what the setting is.
+    #[cfg(feature = "postgres")]
+    Latest,
     /// The server taking history a replica records: first delivery wins.
     #[cfg(feature = "postgres")]
     First,
@@ -648,6 +655,8 @@ where
             How::OnlyOwned(sender) => row::update_held(conn, rows, &self.owned, sender).await,
             #[cfg(feature = "postgres")]
             How::Newest => row::upsert(conn, rows).await,
+            #[cfg(feature = "postgres")]
+            How::Latest => row::overwrite(conn, rows).await,
             #[cfg(feature = "postgres")]
             How::First => row::insert_ignore(conn, rows).await,
         }
@@ -791,7 +800,7 @@ where
         rows: Vec<(Vec<u8>, Option<Key>)>,
     ) -> Fut<'a, Vec<Refused>> {
         Box::pin(async move {
-            if !matches!(R::MIRROR, Mirror::Catalog | Mirror::Both) {
+            if !R::MIRROR.sent_down() {
                 return Err(Error::Misuse(format!(
                     "`{}` is not sent down: a replica takes none of it",
                     R::TABLE
@@ -828,6 +837,7 @@ where
             let how = match R::MIRROR {
                 Mirror::Both => How::OnlyOwned(sender),
                 Mirror::Record if R::VERSION.is_some() => How::Newest,
+                Mirror::Setting => How::Latest,
                 Mirror::Record => How::First,
                 _ => {
                     return Err(Error::Misuse(format!(

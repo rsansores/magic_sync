@@ -16,6 +16,7 @@ and which says how it travels. The same struct serves both sides.
 | `catalog` | the server | down, to the replicas that should hold it |
 | `record` | a replica | up, to the server |
 | `both` | both, column by column | the columns replicas own go up, the rest come down |
+| `setting` | a replica | up; the server may wish its `#[row(desired)]` columns other values, and the replica carries the wish out |
 
 ## Which replicas hold it: `sync`
 

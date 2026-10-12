@@ -1,4 +1,4 @@
-error: expected `version`, `created`, `replica_owned` or `generated`
+error: expected `version`, `created`, `replica_owned`, `generated` or `desired`
  --> tests/derive/fail/unknown_flag.rs:5:11
   |
 5 |     #[row(versioned)]

@@ -125,6 +125,25 @@ pub fn magic_sync::replica::migration(i32) -> core::option::Option<alloc::string
 pub async fn magic_sync::replica::progress(&mut magic_sync::Conn) -> core::result::Result<alloc::vec::Vec<magic_sync::replica::UpProgress>, magic_sync::Error>
 pub fn magic_sync::replica::triggers<P: core::marker::Sync + 'static>(&[magic_sync::wire::Codec<P>]) -> alloc::string::String
 pub mod magic_sync::row
+#[non_exhaustive] pub enum magic_sync::row::Apply
+pub magic_sync::row::Apply::Always
+pub magic_sync::row::Apply::IfUnchanged
+impl core::clone::Clone for magic_sync::row::Apply
+pub fn magic_sync::row::Apply::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::row::Apply
+impl core::cmp::PartialEq for magic_sync::row::Apply
+pub fn magic_sync::row::Apply::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::row::Apply
+pub fn magic_sync::row::Apply::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::row::Apply
+impl core::marker::StructuralPartialEq for magic_sync::row::Apply
+impl core::marker::Freeze for magic_sync::row::Apply
+impl core::marker::Send for magic_sync::row::Apply
+impl core::marker::Sync for magic_sync::row::Apply
+impl core::marker::Unpin for magic_sync::row::Apply
+impl core::marker::UnsafeUnpin for magic_sync::row::Apply
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::row::Apply
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::Apply
 #[non_exhaustive] pub enum magic_sync::row::KeyKind
 pub magic_sync::row::KeyKind::Integer
 pub magic_sync::row::KeyKind::Uuid
@@ -175,6 +194,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::KeyPart
 pub magic_sync::row::Mirror::Both
 pub magic_sync::row::Mirror::Catalog
 pub magic_sync::row::Mirror::Record
+pub magic_sync::row::Mirror::Setting
 impl core::clone::Clone for magic_sync::row::Mirror
 pub fn magic_sync::row::Mirror::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::row::Mirror
@@ -233,18 +253,31 @@ pub const magic_sync::row::Row::SCHEMA: &'static str
 pub const magic_sync::row::Row::TABLE: &'static str
 pub fn magic_sync::row::Row::key(&self) -> magic_sync::row::Key
 pub fn magic_sync::row::Row::key_text(&self) -> alloc::string::String
-pub trait magic_sync::row::Version
+pub trait magic_sync::row::Setting: magic_sync::row::Row + core::clone::Clone + core::marker::Sync
+pub trait magic_sync::row::Version: core::marker::Sized
 pub const magic_sync::row::Version::KIND: magic_sync::row::VersionKind
+pub fn magic_sync::row::Version::raised(&self) -> Self
+pub fn magic_sync::row::Version::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for chrono::naive::datetime::NaiveDateTime
 pub const chrono::naive::datetime::NaiveDateTime::KIND: magic_sync::row::VersionKind
+pub fn chrono::naive::datetime::NaiveDateTime::raised(&self) -> Self
+pub fn chrono::naive::datetime::NaiveDateTime::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for i16
 pub const i16::KIND: magic_sync::row::VersionKind
+pub fn i16::raised(&self) -> Self
+pub fn i16::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for i32
 pub const i32::KIND: magic_sync::row::VersionKind
+pub fn i32::raised(&self) -> Self
+pub fn i32::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for i64
 pub const i64::KIND: magic_sync::row::VersionKind
+pub fn i64::raised(&self) -> Self
+pub fn i64::text(&self) -> alloc::string::String
 impl<Tz: chrono::offset::TimeZone> magic_sync::row::Version for chrono::datetime::DateTime<Tz>
 pub const chrono::datetime::DateTime<Tz>::KIND: magic_sync::row::VersionKind
+pub fn chrono::datetime::DateTime<Tz>::raised(&self) -> Self
+pub fn chrono::datetime::DateTime<Tz>::text(&self) -> alloc::string::String
 pub type magic_sync::row::Key = alloc::vec::Vec<magic_sync::row::KeyPart>
 pub mod magic_sync::run
 pub mod magic_sync::run::replica

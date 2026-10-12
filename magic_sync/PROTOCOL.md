@@ -448,7 +448,7 @@ For a table the replica writes and the server mirrors:
    only those edits go up: it **must** refuse an insert of one, an update
    of a column it does not own, and a delete of one but a row keyed by
    itself, in a table keyed by the replica. A record without a version is
-   history, written once.
+   history, written once. A setting is noted as a record with a version is.
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only
@@ -740,7 +740,11 @@ delete filed later, from what the server kept, leaves the row held the same
 way: a delete of a row a replica does not hold changes nothing there. The server
 keeps, of each row, the newest upload of it: a later upload of the row replaces
 what it kept, or drops it once filed, so what is filed later never rolls the row
-back. So it keeps a row only with its key in `keys`: one without is malformed,
+back. A record with a version is filed only over an older version of it; a
+**setting** — a value the replica holds and acts on — is filed as the replica
+last sent it, whatever its version: one replica writes it, its uploads arrive in
+order, and each carries the row as it is, so the last is the replica's present,
+even when a replica restored from an older copy sends an older version. So it keeps a row only with its key in `keys`: one without is malformed,
 and left out. What the upload says of the replica — rejections, the last applied
 message, a gap, digests, the backlog — is filed apart from its rows, so neither
 holds back the other. Deletes of a table not keyed by the replica, and keys that

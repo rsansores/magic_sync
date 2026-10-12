@@ -2201,6 +2201,78 @@ async fn an_uploaded_row_of_another_replica_is_left_out(pool: crate::DbPool) {
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
 
+/// A setting is what its replica last said it is: an upload of an older
+/// version — a replica restored from an older copy says what it holds — is
+/// filed over a newer one, as a record's would not be.
+#[sqlx::test(migrations = false)]
+async fn a_setting_is_filed_as_last_uploaded_whatever_its_version(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Table as WireTable, Up};
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
+    )]
+    #[row(
+        table = "brightness",
+        schema = "fixture",
+        mirror = "setting",
+        key = "replica_id, id",
+        origin = "replica_id"
+    )]
+    struct Brightness {
+        replica_id: Uuid,
+        id: Uuid,
+        #[row(desired)]
+        level: i64,
+        #[row(version)]
+        revision: i64,
+    }
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.brightness (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         level BIGINT NOT NULL, revision BIGINT NOT NULL, PRIMARY KEY (replica_id, id))",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let codecs = vec![Codec::<()>::json::<Brightness>(None)];
+    let id = Uuid::now_v7();
+    let upload = |level: i64, revision: i64| {
+        let row = Brightness {
+            replica_id: a,
+            id,
+            level,
+            revision,
+        };
+        let table = Table::of::<Brightness>();
+        Up {
+            tables: vec![WireTable {
+                table: "brightness".to_owned(),
+                upserts: vec![crate::wire::json_encode("brightness", &table.columns, &row).unwrap()],
+                keys: vec![WireKey {
+                    parts: vec![a.to_string(), id.to_string()],
+                }],
+                ..WireTable::default()
+            }],
+            protocol: envelope::PROTOCOL,
+            ..Up::default()
+        }
+    };
+    let filed = || async {
+        sqlx::query_as::<_, (i64, i64)>("SELECT level, revision FROM fixture.brightness")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap()
+    };
+    crate::testkit::file(&world.pool, &codecs, &upload(70, 9), a, &()).await;
+    assert_eq!(filed().await, [(70, 9)]);
+    crate::testkit::file(&world.pool, &codecs, &upload(40, 3), a, &()).await;
+    assert_eq!(
+        filed().await,
+        [(40, 3)],
+        "the replica's present, older or not"
+    );
+}
+
 /// What an upload said of its moment — what the replica refused, applied,
 /// held — is filed when it comes: an upload kept whole keeps only its rows.
 #[sqlx::test(migrations = false)]

@@ -1,0 +1,5 @@
+error: apply = "sometimes": expected "always" or "if_unchanged"
+ --> tests/derive/fail/apply_unknown.rs:2:101
+  |
+2 | #[row(table = "screens", mirror = "setting", key = "replica_id, id", origin = "replica_id", apply = "sometimes")]
+  |                                                                                                     ^^^^^^^^^^^

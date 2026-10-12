@@ -29,7 +29,7 @@
 //! replica again on demand.
 
 use crate::dialect::{ident, literal};
-use crate::row::{key_text, Column, Key, KeyPart, Mirror, Route, Table};
+use crate::row::{key_text, Column, Key, KeyPart, Route, Table};
 use crate::wire::Codec;
 use crate::Error;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1191,7 +1191,7 @@ impl Engine {
         let tables: Vec<&Table> = tables
             .iter()
             .copied()
-            .filter(|t| matches!(t.mirror, Mirror::Catalog | Mirror::Both))
+            .filter(|t| t.mirror.sent_down())
             .collect();
         let mut by_name: HashMap<&'static str, usize> = HashMap::new();
         for (i, t) in tables.iter().enumerate() {

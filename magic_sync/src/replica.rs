@@ -197,7 +197,7 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
                     out.push(refuse(event, QUIET, why));
                 }
             }
-            Mirror::Record => {
+            Mirror::Record | Mirror::Setting => {
                 out.push(noting("INSERT", "", "", format!("{guard}{}", note("NEW"))));
                 if codec.table.columns.iter().any(|c| c.version.is_some()) {
                     let body = format!("{guard}{}{gone}", note("NEW"));

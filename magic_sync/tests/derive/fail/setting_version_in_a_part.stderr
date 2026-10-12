@@ -1,0 +1,5 @@
+error: a setting needs a #[row(version)] field of its own: what a wish is based on, and what moves when one is carried out
+ --> tests/derive/fail/setting_version_in_a_part.rs:9:12
+  |
+9 | pub struct Screen {
+  |            ^^^^^^

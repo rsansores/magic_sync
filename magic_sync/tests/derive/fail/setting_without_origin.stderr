@@ -1,0 +1,5 @@
+error: a setting needs `origin = "…"`: the key column naming the replica it belongs to, which is where a wish of it goes
+ --> tests/derive/fail/setting_without_origin.rs:3:12
+  |
+3 | pub struct Screen {
+  |            ^^^^^^
