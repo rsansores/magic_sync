@@ -407,8 +407,7 @@ pub struct Quarantined {
     pub attempts: i32,
 }
 
-/// What a replica sent that the server could not file: a row, a delete, or a
-/// whole upload.
+/// What a replica sent that the server could not file: a row, or a delete.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
@@ -417,7 +416,7 @@ pub struct Unfiled {
     pub id: i64,
     /// The replica that sent it.
     pub replica: Uuid,
-    /// Empty for a whole upload kept as it came.
+    /// The table of the row, or of the delete.
     pub table: String,
     /// Why it could not be filed.
     pub reason: String,
@@ -1119,7 +1118,7 @@ impl Engine {
                 .fetch_one(&mut *conn)
                 .await?,
             first: sqlx::query(&format!(
-                "SELECT id, replica_id AS replica, coalesce(relation, '') AS table, reason, \
+                "SELECT id, replica_id AS replica, relation AS table, reason, \
                         first_at, last_at, attempts \
                    FROM sync.inbox WHERE {mine} ORDER BY id LIMIT $2"
             ))

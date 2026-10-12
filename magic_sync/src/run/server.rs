@@ -36,7 +36,7 @@ pub trait Senders: Send + Sync + 'static {
     /// # Errors
     ///
     /// Whatever kept the host from answering ([`Error::Host`], say). A
-    /// transient one has the upload come again; any other keeps it whole in
+    /// transient one has the upload come again; any other keeps its rows in
     /// the inbox, filed again after a deploy.
     fn known(
         &self,
@@ -353,8 +353,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// come again: the database or the transport is away, or the message
     /// speaks a later protocol than this build. Filing it again is harmless.
     /// Anything else that fails is no reason to send it again — the same
-    /// bytes would fail the same way — so the upload is kept whole in the
-    /// inbox, answered, and filed again after a deploy.
+    /// bytes would fail the same way — so its rows are kept in the inbox,
+    /// it is answered, and they are filed again after a deploy.
     ///
     /// Answers what was filed, per table, for the host to act on.
     ///
@@ -408,7 +408,15 @@ impl<S: Senders, T: Transport> Server<S, T> {
             Err(e) if e.is_transient() => return Err(e),
             Err(e) => {
                 let mut tx = self.begin().await?;
-                filing::keep_whole(&mut tx, replica, bytes, &e.to_string(), self.inbox()).await?;
+                filing::keep_whole(
+                    &mut tx,
+                    &self.codecs,
+                    replica,
+                    &up,
+                    &e.to_string(),
+                    self.inbox(),
+                )
+                .await?;
                 tx.commit().await?;
                 Vec::new()
             }

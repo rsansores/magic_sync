@@ -516,11 +516,19 @@ fn reading(replica: Uuid, value: &str) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// An upload of `rows` of `table`, readings each, with their keys.
 fn upload(number: u64, table: &str, rows: Vec<Vec<u8>>) -> Vec<u8> {
+    let keys = rows
+        .iter()
+        .map(|row| envelope::Key {
+            parts: vec![ReadingRow::decode(row.as_slice()).expect("a reading").id],
+        })
+        .collect();
     envelope::Up {
         tables: vec![WireTable {
             table: table.to_owned(),
             upserts: rows,
+            keys,
             ..WireTable::default()
         }],
         uploads: vec![number],
@@ -582,7 +590,7 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     assert_eq!(
         count(
             &pool,
-            "SELECT count(*) FROM sync.inbox WHERE relation IS NULL"
+            "SELECT count(*) FROM sync.inbox WHERE relation = 'readings'"
         )
         .await,
         2
@@ -931,7 +939,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         assert_eq!(
             count(
                 &pool,
-                "SELECT count(*) FROM sync.inbox WHERE relation IS NULL"
+                "SELECT count(*) FROM sync.inbox WHERE reason LIKE 'filing its upload failed%'"
             )
             .await,
             0,

@@ -275,8 +275,7 @@ last_at: string,
 attempts: number, };
 
 /**
- * What a replica sent that the server could not file: a row, a delete, or a
- * whole upload.
+ * What a replica sent that the server could not file: a row, or a delete.
  */
 export type Unfiled = { 
 /**
@@ -288,7 +287,7 @@ id: number,
  */
 replica: string, 
 /**
- * Empty for a whole upload kept as it came.
+ * The table of the row, or of the delete.
  */
 table: string, 
 /**

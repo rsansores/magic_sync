@@ -292,12 +292,15 @@ COMMENT ON COLUMN sync.quarantine.carried IS
     'applied it, the row leaves the quarantine. NULL: not carried since.';
 
 -- What replicas uploaded that the server could not file, kept as it came: the
--- replica may have let go of it since. Filed again on a timer and when the
--- relay starts, and gone once filed.
+-- replica may have let go of it since. One part per row, the newest the
+-- replica sent: an upload of the row takes its place, or drops it once filed,
+-- so what is filed again never rolls the row back. Filed again on a timer and
+-- when the relay starts, and gone once filed.
 CREATE TABLE sync.inbox (
     id         BIGSERIAL   PRIMARY KEY,
     replica_id UUID        NOT NULL,
-    relation   TEXT,
+    relation   TEXT        NOT NULL,
+    row_key    TEXT        NOT NULL,
     upload     BYTEA       NOT NULL,
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -305,19 +308,21 @@ CREATE TABLE sync.inbox (
     attempts   INTEGER     NOT NULL DEFAULT 1
 );
 
-CREATE INDEX inbox_replica ON sync.inbox (replica_id);
--- The same part of an upload kept twice — the replica sent it again — is one.
-CREATE UNIQUE INDEX inbox_once ON sync.inbox (replica_id, md5(upload));
+CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, relation, row_key);
 
 COMMENT ON TABLE sync.inbox IS
     'What replicas uploaded that the server could not file for a reason a retry cannot '
     'change: a table it does not mirror, a row that does not decode, a row or a delete its '
-    'database refuses — or a whole upload, when filing it failed as a whole. Never repaired '
-    'by hand: a deploy that fixes the cause lets the next retry file it.';
+    'database refuses, an edit of a two-way row it does not record the replica holding — or '
+    'every row of an upload whose filing failed as a whole. Never repaired by hand: a deploy '
+    'that fixes the cause lets the next retry file it.';
 COMMENT ON COLUMN sync.inbox.relation IS
-    'The table, for one row or one delete. NULL: a whole upload.';
+    'The table of the row, or of the delete.';
+COMMENT ON COLUMN sync.inbox.row_key IS
+    'Its key, as the table''s codec writes it, or as it came for a table the server does not '
+    'mirror: the replica''s newest upload of the row is the one kept.';
 COMMENT ON COLUMN sync.inbox.upload IS
-    'An Up, as protobuf: the upload as it came, or one table''s row or delete of it.';
+    'An Up, as protobuf: one table''s row or delete, as the upload carried it.';
 
 -- A truncate would take rows away without a note, and every replica would
 -- keep them.

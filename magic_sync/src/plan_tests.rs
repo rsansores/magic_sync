@@ -3078,15 +3078,27 @@ async fn a_replicas_inbox_is_bounded_by_its_bytes(pool: crate::DbPool) {
     let mut world = world(pool).await;
     let replica = live_in(&mut world.conn, world.partitions[0]).await[0];
     sqlx::query(
-        "INSERT INTO sync.inbox (replica_id, upload, reason) \
-         VALUES ($1, convert_to(repeat('x', 64 << 20), 'UTF8'), 'a bug')",
+        "INSERT INTO sync.inbox (replica_id, relation, row_key, upload, reason) \
+         VALUES ($1, 'large', '1', convert_to(repeat('x', 64 << 20), 'UTF8'), 'a bug')",
     )
     .bind(replica)
     .execute(&mut *world.conn)
     .await
     .expect("a large part kept");
     let mut tx = world.conn.begin().await.expect("a transaction");
-    let kept = crate::filing::keep_whole(&mut tx, replica, b"more", "a bug", i64::MAX).await;
+    let more = crate::envelope::Up {
+        tables: vec![crate::envelope::Table {
+            table: "more".to_owned(),
+            upserts: vec![b"more".to_vec()],
+            keys: vec![crate::envelope::Key {
+                parts: vec!["1".to_owned()],
+            }],
+            deletes: Vec::new(),
+        }],
+        ..crate::envelope::Up::default()
+    };
+    let kept =
+        crate::filing::keep_whole(&mut tx, &codecs(), replica, &more, "a bug", i64::MAX).await;
     assert!(matches!(&kept, Err(e) if e.is_transient()), "{kept:?}");
 }
 

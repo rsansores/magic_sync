@@ -480,7 +480,10 @@ later; one of a row it never sent the replica is malformed, and left out. A
 row the server cannot file, or a delete its database refuses, is kept on the
 server, not lost, and filed later; so are an upload's rows whose filing fails
 as a whole for a reason a resend cannot cure. Either still counts as filed
-for `Filed`. What the upload says of the replica — rejections, the last
+for `Filed`. The server keeps, of each row, the newest upload of it: a later
+upload of the row replaces what it kept, or drops it once filed, so what is
+filed later never rolls the row back. So it keeps a row only with its key in
+`keys`: one without is malformed, and left out. What the upload says of the replica — rejections, the last
 applied message, a gap, digests, the backlog — is filed apart from its rows,
 so neither holds back the other. Deletes of a table not keyed by the replica,
 and keys that are not the table's, are malformed and left out. An upload

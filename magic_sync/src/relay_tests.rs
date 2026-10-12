@@ -1137,25 +1137,27 @@ async fn an_uploaded_row_the_server_cannot_file_waits_in_the_inbox_until_a_fix(
         reading_from_wire,
         None,
     )];
-    let row = |value: &str| {
-        ReadingRow {
-            id: Uuid::now_v7().to_string(),
-            replica_id: a.to_string(),
-            value: value.to_owned(),
-        }
-        .encode_to_vec()
+    let row = |value: &str| ReadingRow {
+        id: Uuid::now_v7().to_string(),
+        replica_id: a.to_string(),
+        value: value.to_owned(),
     };
-    let poison = row("poison");
+    let key = |id: &str| crate::envelope::Key {
+        parts: vec![id.to_owned()],
+    };
+    let (fine, poison) = (row("fine"), row("poison"));
     let upload = Up {
         tables: vec![
             WireTable {
                 table: "readings".to_owned(),
-                upserts: vec![row("fine"), poison.clone()],
+                upserts: vec![fine.encode_to_vec(), poison.encode_to_vec()],
+                keys: vec![key(&fine.id), key(&poison.id)],
                 ..WireTable::default()
             },
             WireTable {
                 table: "from_a_newer_build\0".to_owned(),
                 upserts: vec![vec![1, 2, 3]],
+                keys: vec![key("1")],
                 ..WireTable::default()
             },
         ],
@@ -1194,7 +1196,7 @@ async fn an_uploaded_row_the_server_cannot_file_waits_in_the_inbox_until_a_fix(
         .fetch_one(&world.pool)
         .await
         .unwrap();
-    assert_eq!(left, ("from_a_newer_build\u{FFFD}".to_owned(), 3));
+    assert_eq!(left, ("from_a_newer_build\u{FFFD}".to_owned(), 2));
 }
 
 /// A transaction that began before a pass read and commits after it: what
@@ -2141,11 +2143,10 @@ async fn an_uploaded_row_of_another_replica_is_left_out(pool: crate::DbPool) {
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
 
-/// What an upload kept in the inbox said of its moment — what the replica
-/// refused, applied, held — was filed when it came: filed again, only its
-/// rows are.
+/// What an upload said of its moment — what the replica refused, applied,
+/// held — is filed when it comes: an upload kept whole keeps only its rows.
 #[sqlx::test(migrations = false)]
-async fn a_kept_upload_filed_again_files_only_its_rows(pool: crate::DbPool) {
+async fn an_upload_kept_whole_keeps_only_its_rows(pool: crate::DbPool) {
     use crate::envelope::{Key as WireKey, Rejected, Up};
     let world = world(pool).await;
     let [a, _] = world.replicas;
@@ -2165,13 +2166,7 @@ async fn a_kept_upload_filed_again_files_only_its_rows(pool: crate::DbPool) {
         ..Up::default()
     };
     let mut tx = world.pool.begin().await.unwrap();
-    crate::filing::keep_whole(&mut tx, a, &said.encode_to_vec(), "a bug", i64::MAX)
-        .await
-        .unwrap();
-    let kept = crate::filing::inbox(&mut tx, 0, i64::MAX, 10)
-        .await
-        .unwrap();
-    crate::filing::refile(&mut tx, &world.codecs, &kept[0], &())
+    crate::filing::keep_whole(&mut tx, &world.codecs, a, &said, "a bug", i64::MAX)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -2499,4 +2494,64 @@ async fn an_edit_of_a_two_way_row_the_server_forgot_is_held_waits_until_it_is(po
     world.pass(&Fake::default()).await;
     assert_eq!(world.refile_all().await, 1);
     assert_eq!(world.tallied(id).await, Some(("count".to_owned(), 3)));
+}
+
+/// Whatever of a replica's edits of a row waited in the inbox, and in
+/// whatever order the inbox is filed again, the row ends as the replica's
+/// newest edit: an edit filed supersedes every older one kept.
+#[sqlx::test(migrations = false)]
+async fn a_two_way_row_ends_as_its_newest_edit_whatever_waited_in_the_inbox(
+    pool: crate::DbPool,
+) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let id = world.tally("count").await;
+    world.pass(&Fake::default()).await;
+    let held: (i64, i64) = sqlx::query_as(
+        "SELECT noted, sequence FROM sync.held WHERE replica_id = $1 AND relation = 'tallies'",
+    )
+    .bind(a)
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    let hold = |holds: bool| {
+        let pool = world.pool.clone();
+        async move {
+            let sql = if holds {
+                "INSERT INTO sync.held (replica_id, relation, row_key, noted, sequence) \
+                 VALUES ($1, 'tallies', $2, $3, $4) ON CONFLICT DO NOTHING"
+            } else {
+                "DELETE FROM sync.held WHERE replica_id = $1 AND relation = 'tallies' \
+                   AND row_key = $2 AND $3 >= 0 AND $4 >= 0"
+            };
+            sqlx::query(sql)
+                .bind(a)
+                .bind(id.to_string())
+                .bind(held.0)
+                .bind(held.1)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    for seed in 0..16 {
+        let mut walk = crate::testkit::Walk(seed);
+        let mut newest = 0;
+        for seen in 1..=12 {
+            hold(walk.below(3) > 0).await;
+            world.file(a, &edit(world.partition, id, "count", seen)).await;
+            newest = seen;
+            if walk.below(3) == 0 {
+                world.refile_all().await;
+            }
+        }
+        hold(true).await;
+        world.refile_all().await;
+        assert_eq!(
+            world.tallied(id).await,
+            Some(("count".to_owned(), newest)),
+            "seed {seed}"
+        );
+        assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+    }
 }

@@ -136,8 +136,8 @@ without it. Change what you need of the defaults:
 
 An error means the message must come again (the database is away, or it
 speaks a later protocol than this build); filing it again is harmless. Any
-other failure is no reason to send it again: the upload is kept whole, it is
-answered, and it is filed again after a deploy. The shop answers an error
+other failure is no reason to send it again: its rows are kept, it is
+answered, and they are filed again after a deploy. The shop answers an error
 with the status that says whether to try again, which its registers read the
 same way:
 
