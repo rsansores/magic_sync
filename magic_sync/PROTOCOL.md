@@ -505,8 +505,9 @@ filed later never rolls the row back. So it keeps a row only with its key in
 applied message, a gap, digests, the backlog — is filed apart from its rows,
 so neither holds back the other. Deletes of a table not keyed by the replica,
 and keys that are not the table's, are malformed and left out. An upload
-beyond the server's limits — more bytes than a message takes, or more rows,
-or more rejections, than one carries — is malformed: dropped, unanswered,
+beyond the server's limits — more bytes than a message takes, or more rows
+and rejections together than one carries: a rejection counts as a row — is
+malformed: dropped, unanswered,
 so it waits on the replica until a server that takes it runs. A replica's
 limits are the server's, or less. So is an upload from a sender that is no
 replica of the server's.

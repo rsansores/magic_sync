@@ -1066,8 +1066,8 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
     }
 }
 
-/// An upload beyond the server's limits — more bytes, more rows or more
-/// rejections than a message carries — or from a sender that is no replica
+/// An upload beyond the server's limits — more bytes, or more rows and
+/// rejections together than a message carries — or from a sender that is no replica
 /// is dropped unanswered: nothing of it filed, nothing recorded of its
 /// sender. One within them is filed.
 #[sqlx::test(migrations = false)]
@@ -1113,6 +1113,14 @@ async fn an_upload_beyond_the_limits_or_from_no_replica_is_dropped_unanswered(po
             ),
         ),
         (a, rejected(3).encode_to_vec()),
+        (a, {
+            let mut up = envelope::Up::decode(
+                upload(3, "readings", vec![reading(a, "one, and two rejections")]).as_slice(),
+            )
+            .unwrap();
+            up.rejected = rejected(2).rejected;
+            up.encode_to_vec()
+        }),
         (
             stranger,
             upload(4, "readings", vec![reading(stranger, "a stranger's")]),

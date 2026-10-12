@@ -244,7 +244,8 @@ impl Limits {
         Ok(Limits { rows, bytes })
     }
 
-    /// Rows a message carries, at most.
+    /// Rows a message carries, at most — an upload's rejections counted
+    /// among them.
     #[must_use]
     pub fn rows(&self) -> usize {
         self.rows

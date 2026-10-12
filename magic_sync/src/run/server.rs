@@ -364,7 +364,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// the host ([`Senders`]) or the transport away, or [`Error::Protocol`].
     ///
     /// An upload beyond the settings' [`Limits`] — more bytes, or more rows
-    /// or rejections — breaks the protocol: it is dropped unanswered, with an
+    /// and rejections together — breaks the protocol: it is dropped unanswered, with an
     /// error logged. A replica's limits are the server's, or less.
     pub async fn receive(&self, replica: Uuid, bytes: &[u8]) -> Result<Vec<filing::Filed>, Error> {
         use prost::Message as _;
@@ -390,13 +390,15 @@ impl<S: Senders, T: Transport> Server<S, T> {
             tracing::error!(%replica, "sync: an upload that names no protocol — dropped");
             return Ok(Vec::new());
         }
+        // A rejection names a row: it counts as one.
         let rows: usize = up
             .tables
             .iter()
             .map(|t| t.upserts.len() + t.deletes.len())
-            .sum();
-        if rows > limits.rows() || up.rejected.len() > limits.rows() {
-            tracing::error!(%replica, rows, rejected = up.rejected.len(), limit = limits.rows(), "sync: an upload of more rows than the server's limits — dropped, unanswered");
+            .sum::<usize>()
+            + up.rejected.len();
+        if rows > limits.rows() {
+            tracing::error!(%replica, rows, rejected = up.rejected.len(), limit = limits.rows(), "sync: an upload of more rows and rejections than the server's limits — dropped, unanswered");
             return Ok(Vec::new());
         }
         let filed = match self.file(replica, &up).await {

@@ -755,6 +755,18 @@ mod server {
         )
         .await
         .unwrap();
+        // The uploads are a replica's of default limits: rows and
+        // rejections past the two a message down carries here.
+        let filer = Server::new(
+            pool.clone(),
+            codecs(),
+            replicas,
+            kept.clone(),
+            Anyone::new(pool.clone()),
+            Settings::default(),
+        )
+        .await
+        .unwrap();
         let uploads = std::fs::read_to_string(GOLDEN_UP).expect("the golden uploads");
         let mut snapshots: Vec<String> = Vec::new();
         let mut out = String::new();
@@ -783,7 +795,7 @@ mod server {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
             *kept.takes.lock().unwrap() = *takes;
             if *step == "filed" {
-                file_uploads(&server, &pool, &uploads).await;
+                file_uploads(&filer, &pool, &uploads).await;
             }
             loop {
                 sqlx::query("UPDATE sync.replicas SET retry_after = NULL")
