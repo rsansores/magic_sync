@@ -34,7 +34,7 @@ pub mod server {
 
     pub async fn start(
         pool: PgPool,
-        transport: impl Transport + Send + 'static,
+        transport: impl Transport,
         shutdown: impl Future<Output = ()> + Send + 'static,
         replica: Uuid,
         bytes: Vec<u8>,
