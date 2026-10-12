@@ -16,7 +16,6 @@ export default defineConfig(({ command }) => ({
               core: resolve(import.meta.dirname, 'src/core/index.ts'),
             },
             formats: ['es'],
-            cssFileName: 'dashboard',
           },
           rollupOptions: { external: ['vue'] },
         }

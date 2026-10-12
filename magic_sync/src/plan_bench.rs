@@ -4,8 +4,9 @@
 //! work of planning and recording — what the relay does besides encoding and
 //! publishing — and one what a dashboard's reads cost.
 
-use super::plan_tests::{tables, REPLICAS, SCHEMA};
+use super::plan_tests::{codecs, REPLICAS, SCHEMA};
 use super::*;
+use sqlx::Connection as _;
 use std::time::{Duration, Instant};
 
 /// Notes the relay drains per plan (`BATCH` in the server's relay).
@@ -15,54 +16,63 @@ struct Drained {
     notes: usize,
     upserts: usize,
     deletes: usize,
-    plan: Duration,
-    record: Duration,
+    took: Duration,
 }
 
 impl std::fmt::Display for Drained {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} notes → {} upserts, {} deletes; plan {:?}, record {:?}, total {:?}",
-            self.notes,
-            self.upserts,
-            self.deletes,
-            self.plan,
-            self.record,
-            self.plan + self.record
+            "{} notes → {} upserts, {} deletes; planned, loaded and recorded in {:?}",
+            self.notes, self.upserts, self.deletes, self.took
         )
     }
 }
 
-/// Drains the outbox as the relay would, timing the plans and the records.
-async fn drain(conn: &mut Conn, engine: &Engine) -> Drained {
+/// Drains the notes as the relay would — planned, loaded, recorded and
+/// written to the outboxes, never sent — timing it.
+async fn drain(pool: &crate::DbPool, engine: &Engine) -> Drained {
+    let codecs = codecs();
+    let relay = crate::relay::Relay {
+        engine,
+        codecs: &codecs,
+        limits: crate::envelope::Limits {
+            rows: 500,
+            bytes: 512 * 1024,
+        },
+        batch: BATCH,
+        timeout: Duration::from_secs(30),
+        backoff: crate::run::Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
+        bound: crate::relay::Bound {
+            messages: i64::MAX,
+            bytes: i64::MAX,
+        },
+        concurrency: 4,
+    };
     let mut out = Drained {
         notes: 0,
         upserts: 0,
         deletes: 0,
-        plan: Duration::ZERO,
-        record: Duration::ZERO,
+        took: Duration::ZERO,
     };
     loop {
-        let noted = pending(conn, BATCH).await.expect("pending");
-        if noted.is_empty() {
+        let started = Instant::now();
+        let mut tx = pool.begin().await.expect("a transaction");
+        engine.observe(&mut tx).await.expect("observed");
+        tx.commit().await.expect("commit");
+        let mut tx = pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .expect("a transaction");
+        let outcome = relay.record(&mut tx).await.expect("recorded");
+        tx.commit().await.expect("commit");
+        out.took += started.elapsed();
+        if outcome.done == 0 {
             return out;
         }
-        let (ids, changes): (Vec<i64>, Vec<Change>) =
-            noted.into_iter().map(|n| (n.id, n.change)).unzip();
-        out.notes += ids.len();
-        let started = Instant::now();
-        let delta = engine.plan(conn, &changes).await.expect("plan");
-        out.plan += started.elapsed();
-        let count = |m: &BTreeMap<Uuid, BTreeMap<usize, BTreeSet<String>>>| -> usize {
-            m.values().flat_map(|t| t.values()).map(BTreeSet::len).sum()
-        };
-        out.upserts += count(&delta.upserts);
-        out.deletes += count(&delta.deletes);
-        let started = Instant::now();
-        engine.record(conn, &delta).await.expect("record");
-        mark_done(conn, &ids).await.expect("mark");
-        out.record += started.elapsed();
+        out.notes += outcome.done;
+        out.upserts += outcome.upserts;
+        out.deletes += outcome.deletes;
     }
 }
 
@@ -96,11 +106,13 @@ async fn fleet(
         .expect("a replica");
         replicas.push(id);
     }
-    let tables = tables();
-    let refs: Vec<&Table> = tables.iter().collect();
-    let engine = Engine::new(&mut conn, &refs, REPLICAS)
+    let codecs = codecs();
+    let refs: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = conn.begin().await.expect("a transaction");
+    let engine = Engine::install(&mut tx, &refs, REPLICAS)
         .await
         .expect("engine");
+    tx.commit().await.expect("installed");
     (conn, engine, partition, replicas)
 }
 
@@ -155,10 +167,10 @@ async fn assign(conn: &mut Conn, partition: Uuid, list: Uuid, replica: Uuid) {
 async fn bench_a_list_of_20k_given_to_a_unit(pool: crate::DbPool) {
     let (mut conn, engine, partition, replicas) = fleet(&pool, 1).await;
     let list = list_of(&mut conn, partition, 20_000).await;
-    drain(&mut conn, &engine).await;
+    drain(&pool, &engine).await;
 
     assign(&mut conn, partition, list, replicas[0]).await;
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("20k-customer list given to a replica: {drained}");
     assert_eq!(drained.upserts, 40_000, "each customer and its email");
 }
@@ -170,7 +182,7 @@ async fn bench_a_list_of_10k_swapped_for_one_of_8k(pool: crate::DbPool) {
     let old = list_of(&mut conn, partition, 10_000).await;
     let new = list_of(&mut conn, partition, 8_000).await;
     assign(&mut conn, partition, old, replicas[0]).await;
-    drain(&mut conn, &engine).await;
+    drain(&pool, &engine).await;
 
     exec(
         &mut conn,
@@ -179,7 +191,7 @@ async fn bench_a_list_of_10k_swapped_for_one_of_8k(pool: crate::DbPool) {
     )
     .await;
     assign(&mut conn, partition, new, replicas[0]).await;
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("10k-customer list swapped for an 8k one: {drained}");
     assert_eq!((drained.upserts, drained.deletes), (16_000, 20_000));
 }
@@ -196,7 +208,7 @@ async fn bench_10k_products_imported_for_100_units(pool: crate::DbPool) {
     .execute(&mut *conn)
     .await
     .expect("an import");
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("10k products imported, 100 replicas: {drained}");
     assert_eq!(drained.upserts, 1_000_000);
 }
@@ -215,12 +227,12 @@ async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {
     .execute(&mut *conn)
     .await
     .expect("a catalog");
-    drain(&mut conn, &engine).await;
+    drain(&pool, &engine).await;
 
     note_resync(&mut conn, Some(partition), replicas[0])
         .await
         .expect("resync");
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("a replica provisioned from scratch: {drained}");
     assert_eq!(drained.upserts, 30_000);
 }
@@ -239,7 +251,7 @@ async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbP
     for replica in &replicas {
         assign(&mut conn, partition, list, *replica).await;
     }
-    drain(&mut conn, &engine).await;
+    drain(&pool, &engine).await;
 
     sqlx::query(
         "WITH made AS (
@@ -254,7 +266,7 @@ async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbP
     .execute(&mut *conn)
     .await
     .expect("an import");
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("10k customers imported into a list 10 replicas hold: {drained}");
     assert_eq!(drained.upserts, 100_000);
 }
@@ -271,7 +283,7 @@ async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
     .execute(&mut *conn)
     .await
     .expect("an import");
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("1k products imported, 4000 replicas: {drained}");
     assert_eq!(drained.upserts, 4_000_000);
 }
@@ -295,7 +307,7 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
     for replica in &replicas {
         assign(&mut conn, partition, list, *replica).await;
     }
-    let drained = drain(&mut conn, &engine).await;
+    let drained = drain(&pool, &engine).await;
     println!("set up: {drained}");
     // Every replica confirmed all of it.
     sqlx::query("UPDATE sync.held SET sequence = 1")
@@ -303,13 +315,19 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
         .await
         .expect("sent");
     sqlx::query(
-        "INSERT INTO sync.replicas (replica_id, last_sent_at, last_sequence, applied_epoch, applied_sequence, applied_at)
-         SELECT r, now(), 1, (SELECT epoch FROM sync.epoch), 1, now() FROM unnest($1::uuid[]) r",
+        "INSERT INTO sync.replicas AS x (replica_id, last_sent_at, applied_epoch, applied_sequence, applied_at)
+         SELECT r, now(), (SELECT epoch FROM sync.epoch), 1, now() FROM unnest($1::uuid[]) r
+         ON CONFLICT (replica_id) DO UPDATE SET last_sent_at = now(), applied_epoch = EXCLUDED.applied_epoch,
+           applied_sequence = 1, applied_at = now()",
     )
     .bind(&replicas)
     .execute(&mut *conn)
     .await
     .expect("applied");
+    sqlx::query("UPDATE sync.chains SET last_sequence = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("sent");
     sqlx::query("ANALYZE")
         .execute(&mut *conn)
         .await
@@ -331,13 +349,7 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
             .await
             .expect("overview");
         time(&format!("{round}: overview of 200"), started);
-        println!(
-            "  states: {:?}",
-            overview.replicas.iter().fold(BTreeMap::new(), |mut m, r| {
-                *m.entry(format!("{:?}", r.state)).or_insert(0) += 1;
-                m
-            })
-        );
+        println!("  states: {:?}", overview.states);
         let started = Instant::now();
         engine
             .health(&mut conn, Scope::Partition(partition), 20)

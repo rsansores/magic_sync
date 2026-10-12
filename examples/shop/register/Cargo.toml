@@ -4,12 +4,14 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-# Its own workspace: a build is either the server's side (postgres) or a
-# replica's (sqlite), never both.
+# A workspace of its own: a build is the server's side or a replica's, never
+# both, and Cargo builds a workspace's members together.
 [workspace]
 
 [dependencies]
-magic_sync = { path = "../../../magic_sync", features = ["sqlite"] }
+# A replica's side. Outside this repository, leave `path` out.
+magic_sync = { version = "0.1.0", path = "../../../magic_sync", features = ["sqlite"] }
+# The rows both sides share, built for a replica.
 shop_rows = { path = "../rows", features = ["register"] }
 axum = "0.8"
 chrono = "0.4"

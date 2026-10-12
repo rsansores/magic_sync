@@ -1,0 +1,5 @@
+error: the column `label` is already the field `label`
+ --> tests/derive/fail/column_named_twice.rs:6:21
+  |
+6 |     #[sqlx(rename = "label")]
+  |                     ^^^^^^^

@@ -1,7 +1,7 @@
 // What the page asks the head office. The sync reads answer the engine's
 // JSON as it is, so their types are the dashboard's.
 
-import type { Overview, ReplicaProgress, RowPlace } from 'magic_sync_dashboard'
+import type { Listing, Overview, Progress, ReplicaState, RowProgress } from 'magic_sync_dashboard'
 
 export interface Product {
   id: string
@@ -42,13 +42,16 @@ async function ask<T>(method: string, url: string, body?: unknown): Promise<T> {
 
 export const api = {
   state: () => ask<ShopState>('GET', '/api/state'),
-  addProduct: (name: string, price_cents: number) => ask<void>('POST', '/api/products', { name, price_cents }),
+  addProduct: (name: string, price_cents: number) =>
+    ask<void>('POST', '/api/products', { name, price_cents }),
   editProduct: (id: string, name: string, price_cents: number) =>
     ask<void>('PUT', `/api/products/${id}`, { name, price_cents }),
   deleteProduct: (id: string) => ask<void>('DELETE', `/api/products/${id}`),
   line: (register: string) => ask<void>('POST', `/api/registers/${register}/line`),
   overview: () => ask<Overview>('GET', '/api/sync/overview'),
-  progress: (register: string) => ask<ReplicaProgress>('GET', `/api/sync/progress/${register}`),
+  listing: (state: ReplicaState | null, offset: number) =>
+    ask<Listing>('GET', `/api/sync/replicas?offset=${offset}${state ? `&state=${state}` : ''}`),
+  progress: (register: string) => ask<Progress>('GET', `/api/sync/progress/${register}`),
   row: (table: string, key: string) =>
-    ask<RowPlace[]>('GET', `/api/sync/rows/${encodeURIComponent(table)}/${encodeURIComponent(key)}`),
+    ask<RowProgress>('GET', `/api/sync/rows/${encodeURIComponent(table)}/${encodeURIComponent(key)}`),
 }

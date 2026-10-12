@@ -1,0 +1,5 @@
+error: the key column `id` is not a field of the row itself: a key is not flattened in
+ --> tests/derive/fail/key_in_a_flattened_part.rs:8:12
+  |
+8 | pub struct Thing {
+  |            ^^^^^

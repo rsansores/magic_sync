@@ -5,9 +5,9 @@
 The server plans in PostgreSQL and a replica applies in SQLite: the two halves
 share the row types and the codecs, and almost nothing else. Building the
 crate for one side keeps every query in it checked against the database it
-runs on. Your server binary enables `postgres`, your replica binary `sqlite`;
-crates shared by both (your row types) enable neither and get the feature from
-the binary that uses them.
+runs on. Your server enables `postgres`, your replica `sqlite`, each in a
+workspace of its own, and the crate of rows both share picks neither
+([Set up a project](guide/setup.md)).
 
 ## Can two sides write the same row?
 
@@ -25,10 +25,14 @@ the replica wrote meanwhile goes up as it is then.
 
 ## What if my transport loses a message?
 
-The replica's progress counts nothing it did not confirm, so the server keeps
-counting those rows as on their way. A replica that acknowledged to the
-transport but lost what it applied (it should not — it acknowledges after the
-commit) is caught by the hourly fingerprint, and provisioned again by itself.
+It must not: [the protocol](protocol.md#2-what-the-transport-must-provide)
+asks a transport to lose nothing it took. If one does anyway, the engine
+heals, late rather than never. The server counts nothing as held that the
+replica did not confirm, so the rows stay *on their way*; a replica that
+leaves its last messages unconfirmed while nothing newer goes to it is
+provisioned again after `unconfirmed_after`; an upload the server never
+answered is sent again; and the hourly fingerprint catches whatever else
+went missing, and provisions the replica again.
 
 ## Does the replica have to be written in Rust?
 
@@ -47,5 +51,7 @@ rows. Every number the engine reports means *wait* or *deploy a fix*.
 
 The planner works on sets in SQL, not row by row: giving a list of 10,000
 customers to a register is one row written, and one plan. The engine's
-benchmarks (`cargo test -p magic_sync --features postgres bench_ -- --ignored`)
-measure the operations that move many rows at once.
+benchmarks measure the operations that move many rows at once, and the
+dashboard's reads over 200 replicas holding 3 million rows;
+[CONTRIBUTING.md](https://github.com/rsansores/magic_sync/blob/main/CONTRIBUTING.md#the-benchmarks)
+says how to run them on your own hardware.

@@ -1,0 +1,7 @@
+error: #[derive(Row)] needs #[row(mirror = "…")]
+ --> tests/derive/fail/no_mirror.rs:1:32
+  |
+1 | #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+  |                                ^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the derive macro `magic_sync::Row` (in Nightly builds, run with -Z macro-backtrace for more info)

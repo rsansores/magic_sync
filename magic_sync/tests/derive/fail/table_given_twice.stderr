@@ -1,0 +1,5 @@
+error: `table` is given twice
+ --> tests/derive/fail/table_given_twice.rs:2:25
+  |
+2 | #[row(table = "things", table = "other", mirror = "catalog")]
+  |                         ^^^^^

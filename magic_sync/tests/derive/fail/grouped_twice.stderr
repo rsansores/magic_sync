@@ -1,0 +1,5 @@
+error: sync = "grouped(members = a, members = b, assigned = c)": `members` is given twice
+ --> tests/derive/fail/grouped_twice.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "grouped(members = a, members = b, assigned = c)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

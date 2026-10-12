@@ -5,6 +5,7 @@
 
 # Build your own
 
+- [Set up a project](guide/setup.md)
 - [The tables](guide/tables.md)
 - [The rows](guide/rows.md)
 - [How a row travels: codecs](guide/codecs.md)
@@ -14,6 +15,7 @@
 - [Progress and health](guide/progress.md)
 - [The dashboard](guide/dashboard.md)
 - [Recipes](guide/recipes.md)
+- [Upgrading](guide/upgrading.md)
 
 # Under the hood
 
@@ -23,3 +25,4 @@
 ---
 
 [Questions](faq.md)
+[The API](api.md)

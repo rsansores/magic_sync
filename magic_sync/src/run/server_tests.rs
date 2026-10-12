@@ -6,6 +6,7 @@ use super::*;
 use crate::envelope::{self, Body, Table as WireTable, ToReplica};
 use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
+use crate::wire::MapError;
 use prost::Message as _;
 use std::sync::{Arc, Mutex};
 
@@ -15,8 +16,11 @@ CREATE TABLE fixture.t_replicas (id UUID PRIMARY KEY, partition_id UUID NOT NULL
 CREATE TABLE fixture.items (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL, retired_at TIMESTAMPTZ);
 CREATE VIEW items AS SELECT * FROM fixture.items WHERE retired_at IS NULL;
-SELECT sync.mirror_table('fixture', 'items', '{}', 'partition_id');
 CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL);
+CREATE TABLE fixture.logs (replica_id UUID NOT NULL, id UUID NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (replica_id, id));
+CREATE TABLE fixture.log_refs (replica_id UUID NOT NULL, log_id UUID NOT NULL,
+    FOREIGN KEY (replica_id, log_id) REFERENCES fixture.logs (replica_id, id));
 ";
 
 const REPLICAS: Replicas = Replicas {
@@ -74,11 +78,54 @@ impl Wire {
     }
 }
 
-fn codecs() -> &'static [Codec<()>] {
-    Box::leak(Box::new([
+/// A record each replica keeps by its own key, and deletes: the server
+/// lets go of it with it, unless a row of the server's still points at it.
+#[derive(sqlx::FromRow, Clone, Debug, crate::Row)]
+#[row(
+    table = "logs",
+    schema = "fixture",
+    mirror = "record",
+    key = "replica_id, id",
+    origin = "replica_id"
+)]
+struct Log {
+    replica_id: Uuid,
+    id: Uuid,
+    value: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LogRow {
+    #[prost(string, tag = "1")]
+    replica_id: String,
+    #[prost(string, tag = "2")]
+    id: String,
+    #[prost(string, tag = "3")]
+    value: String,
+}
+
+fn log_to_wire(log: Log) -> Result<LogRow, MapError> {
+    Ok(LogRow {
+        replica_id: log.replica_id.to_string(),
+        id: log.id.to_string(),
+        value: log.value,
+    })
+}
+
+fn log_from_wire(row: LogRow) -> Result<Log, MapError> {
+    Ok(Log {
+        replica_id: row.replica_id.parse()?,
+        id: row.id.parse()?,
+        value: row.value,
+    })
+}
+
+fn codecs() -> Vec<Codec<()>> {
+    vec![
         Codec::new::<Item, ItemRow>(to_wire, from_wire, None),
         Codec::new::<Reading, ReadingRow>(reading_to_wire, reading_from_wire, None),
-    ]))
+        Codec::new::<Log, LogRow>(log_to_wire, log_from_wire, None),
+    ]
 }
 
 fn settings() -> Settings {
@@ -104,6 +151,11 @@ async fn world(pool: &PgPool) -> (Uuid, [Uuid; 2]) {
             .await
             .unwrap();
     }
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = conn.begin().await.unwrap();
+    Engine::install(&mut tx, &tables, REPLICAS).await.unwrap();
+    tx.commit().await.unwrap();
     (partition, replicas)
 }
 
@@ -161,7 +213,7 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -174,7 +226,6 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
     .await;
 
     let upload = Up {
-        replica_id: a.to_string(),
         tables: vec![WireTable {
             table: "readings".to_owned(),
             upserts: vec![ReadingRow {
@@ -223,7 +274,7 @@ async fn one_process_at_a_time_runs_the_relay(pool: PgPool) {
                 codecs(),
                 REPLICAS,
                 wire.clone(),
-                Anyone(pool.clone()),
+                Anyone::new(pool.clone()),
                 settings(),
             )
             .await
@@ -253,7 +304,7 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
             codecs(),
             REPLICAS,
             wire.clone(),
-            Anyone(pool.clone()),
+            Anyone::new(pool.clone()),
             settings(),
         )
     };
@@ -267,40 +318,40 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
     };
 
     let before = server().await.unwrap();
-    until(&[&before], || async { quarantined().await == 2 }).await;
+    until(&[&before], || async {
+        quarantined().await == 2 && wire.items(a) == ["fine"]
+    })
+    .await;
     assert_eq!(wire.items(a), ["fine"]);
     drop(before);
 
     BUGGY.set(false);
     let fixed = server().await.unwrap();
-    // Sent and recorded, to both replicas.
-    let held = || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sync.held")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+    // Recorded and sent, to both replicas.
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
     };
-    until(&[&fixed], || async { held().await == 4 }).await;
+    until(&[&fixed], || async {
+        count("SELECT count(*) FROM sync.held").await == 4
+            && count("SELECT count(*) FROM sync.outbox").await == 0
+    })
+    .await;
     BUGGY.set(true);
     assert_eq!(wire.items(a), ["fine", "poison"]);
     // Out of the quarantine once each replica says it took it.
-    let (epoch, sent): (Uuid, Vec<(Uuid, i64)>) = (
-        sqlx::query_scalar("SELECT epoch FROM sync.epoch")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        sqlx::query_as("SELECT replica_id, last_sequence FROM sync.replicas")
+    let sent: Vec<(Uuid, i64)> =
+        sqlx::query_as("SELECT replica_id, last_sequence FROM sync.chains")
             .fetch_all(&pool)
             .await
-            .unwrap(),
-    );
+            .unwrap();
     for (replica, last) in sent {
-        let ack = crate::envelope::Up {
-            replica_id: replica.to_string(),
-            epoch: epoch.to_string(),
-            sequence: last as u64,
-            ..crate::envelope::Up::default()
-        };
+        let ack = crate::testkit::confirmation(&pool, replica, last as u64).await;
         fixed.receive(replica, &ack.encode_to_vec()).await.unwrap();
     }
     assert_eq!(quarantined().await, 0);
@@ -317,13 +368,13 @@ async fn a_relay_that_lost_its_lock_records_nothing(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
     .unwrap();
     item(&pool, partition, "one").await;
-    let mut lock = Lock::take(&pool, server.settings.lock_key)
+    let mut lock = Lock::take(&pool, LOCK_KEY)
         .await
         .unwrap()
         .expect("the lock");
@@ -350,8 +401,9 @@ async fn a_relay_that_lost_its_lock_records_nothing(pool: PgPool) {
     assert!(count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL").await > 0);
     assert_eq!(
         server.pass_now().await.unwrap(),
-        Some(1),
-        "the next relay does it"
+        Some(7),
+        "the next relay plans the three notes, provisioning the two replicas it sees for the \
+         first time, and sends each its snapshot's two messages"
     );
 }
 
@@ -370,7 +422,9 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
          CREATE TABLE fixture.items (
              id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL, retired_at TIMESTAMPTZ);
          CREATE VIEW items AS SELECT * FROM fixture.items WHERE retired_at IS NULL;
-         CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL);",
+         CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL);
+         CREATE TABLE fixture.logs (replica_id UUID NOT NULL, id UUID NOT NULL, value TEXT NOT NULL,
+             PRIMARY KEY (replica_id, id));",
     )
     .execute(&pool)
     .await
@@ -389,7 +443,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await;
@@ -401,7 +455,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         codecs(),
         REPLICAS,
         wire.clone(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -411,7 +465,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         codecs(),
         REPLICAS,
         Wire::default(),
-        Anyone(pool.clone()),
+        Anyone::new(pool.clone()),
         settings(),
     )
     .await
@@ -425,4 +479,859 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
         names == ["after", "before"]
     })
     .await;
+}
+
+/// Files as [`Anyone`] does, except for the replicas told to fail: the
+/// host's own bug, which no number of resends cures.
+#[derive(Clone)]
+struct Broken {
+    pool: PgPool,
+    failing: Arc<Mutex<std::collections::BTreeSet<Uuid>>>,
+}
+
+impl Senders for Broken {
+    type Known = ();
+
+    async fn known(&self, replica: Uuid) -> Result<Option<()>, Error> {
+        if self.failing.lock().unwrap().contains(&replica) {
+            return Err(Error::Host {
+                reason: format!("{replica}: a bug in the host"),
+                transient: false,
+            });
+        }
+        Ok(Some(()))
+    }
+
+    async fn filing(&self, _known: &()) -> Result<Transaction<'static, Postgres>, Error> {
+        Ok(self.pool.begin().await?)
+    }
+}
+
+fn reading(replica: Uuid, value: &str) -> Vec<u8> {
+    ReadingRow {
+        id: Uuid::now_v7().to_string(),
+        replica_id: replica.to_string(),
+        value: value.to_owned(),
+    }
+    .encode_to_vec()
+}
+
+fn upload(number: u64, table: &str, rows: Vec<Vec<u8>>) -> Vec<u8> {
+    envelope::Up {
+        tables: vec![WireTable {
+            table: table.to_owned(),
+            upserts: rows,
+            ..WireTable::default()
+        }],
+        uploads: vec![number],
+        protocol: envelope::PROTOCOL,
+        ..envelope::Up::default()
+    }
+    .encode_to_vec()
+}
+
+/// What the relay does with the inbox once it is due: every page of it
+/// filed again. A failure set aside is no error.
+async fn refile<S: Senders, T: Transport>(server: &Server<S, T>, lock: &mut Lock) -> usize {
+    let mut walk = server.retry(lock).await.unwrap();
+    let mut pages = 0;
+    while let Some(next) = server.refile_page(walk).await.unwrap() {
+        walk = next;
+        pages += 1;
+    }
+    pages
+}
+
+async fn count(pool: &PgPool, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+/// An upload whose filing fails for a reason no resend cures is kept whole,
+/// answered so the replica stops sending it, and filed after a fix; an
+/// upload that fails again holds back no other.
+#[sqlx::test(migrations = false)]
+async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool: PgPool) {
+    let (_, [a, b]) = world(&pool).await;
+    let wire = Wire::default();
+    let senders = Broken {
+        pool: pool.clone(),
+        failing: Arc::new(Mutex::new([a, b].into())),
+    };
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        senders.clone(),
+        settings(),
+    )
+    .await
+    .unwrap();
+
+    for (replica, number) in [(a, 7), (b, 8)] {
+        let filed = server
+            .receive(
+                replica,
+                &upload(number, "readings", vec![reading(replica, "kept")]),
+            )
+            .await
+            .expect("no reason to send it again");
+        assert!(filed.is_empty());
+        assert_eq!(wire.filed(replica), [number], "answered");
+    }
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM sync.inbox WHERE relation IS NULL"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        0
+    );
+
+    // b's sender is fixed, a's is not: a fails again, and b is filed.
+    senders.failing.lock().unwrap().remove(&b);
+    let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
+    refile(&server, &mut lock).await;
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+    let left: (Uuid, i32) = sqlx::query_as("SELECT replica_id, attempts FROM sync.inbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, (a, 2));
+
+    senders.failing.lock().unwrap().clear();
+    refile(&server, &mut lock).await;
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        2
+    );
+    assert_eq!(count(&pool, "SELECT count(*) FROM sync.inbox").await, 0);
+}
+
+/// A delete the server's database refuses — a row of its own still points at
+/// the replica's — is kept for a fix, and the rest of the upload is filed.
+#[sqlx::test(migrations = false)]
+async fn a_delete_the_server_refuses_is_kept_and_the_rest_filed(pool: PgPool) {
+    let (_, [a, _]) = world(&pool).await;
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .unwrap();
+    let (pointed, free) = (Uuid::now_v7(), Uuid::now_v7());
+    for id in [pointed, free] {
+        sqlx::query("INSERT INTO fixture.logs VALUES ($1, $2, 'x')")
+            .bind(a)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO fixture.log_refs VALUES ($1, $2)")
+        .bind(a)
+        .bind(pointed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let key = |id: Uuid| envelope::Key {
+        parts: vec![a.to_string(), id.to_string()],
+    };
+    let up = envelope::Up {
+        tables: vec![
+            WireTable {
+                table: "logs".to_owned(),
+                deletes: vec![key(pointed), key(free)],
+                ..WireTable::default()
+            },
+            WireTable {
+                table: "readings".to_owned(),
+                upserts: vec![reading(a, "fine")],
+                ..WireTable::default()
+            },
+        ],
+        uploads: vec![3],
+        protocol: envelope::PROTOCOL,
+        ..envelope::Up::default()
+    };
+
+    server.receive(a, &up.encode_to_vec()).await.unwrap();
+
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+    assert_eq!(count(&pool, "SELECT count(*) FROM fixture.logs").await, 1);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM sync.inbox WHERE relation = 'logs'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(wire.filed(a), [3]);
+}
+
+/// A replica that leaves what it was sent unconfirmed while nothing new goes
+/// to it is provisioned again by the running server: the transport may have
+/// lost it.
+#[sqlx::test(migrations = false)]
+async fn the_running_server_provisions_again_a_replica_silent_on_what_it_was_sent(pool: PgPool) {
+    let (partition, [a, _]) = world(&pool).await;
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        Settings {
+            watch_every: Duration::from_millis(20),
+            unconfirmed_after: Duration::from_millis(100),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    item(&pool, partition, "lost on the way").await;
+    until(&[&server], || async {
+        wire.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(to, body)| *to == a && matches!(body, Body::EndSnapshot(_)))
+    })
+    .await;
+}
+
+/// Whatever a replica sends up — bytes that are no message, keys that are
+/// none, sequences no message has, tables nobody mirrors, text with NUL in
+/// it, from replicas it holds rows for or one it never heard of, with the
+/// relay running in between — the server answers `Ok` or an error worth a
+/// resend, answers an upload that names no protocol with nothing, and what
+/// it keeps for the replica stays bounded by what it sent it: quarantined
+/// rows are rows of a table it sends, no note but one provisioning per
+/// replica, an inbox no larger than the rows and deletes that came, nothing
+/// kept whole, and no acknowledgement past the last message sent.
+#[sqlx::test(migrations = false)]
+async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) {
+    use crate::envelope::{Backlog, Digest, Key, Rejected, TableBacklog, Up};
+    let (partition, [a, b]) = world(&pool).await;
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .unwrap();
+    for n in 0..4 {
+        item(&pool, partition, &format!("item {n}")).await;
+    }
+    item(&pool, partition, "poison").await;
+    while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    let items: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM fixture.items")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let epoch: Uuid = sqlx::query_scalar("SELECT epoch FROM sync.epoch")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let last: i64 = sqlx::query_scalar("SELECT max(last_sequence) FROM sync.chains")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let mut walk = crate::testkit::Walk(0x0BAD_5EED);
+    let pick =
+        |walk: &mut crate::testkit::Walk, from: &[String]| from[walk.below(from.len())].clone();
+    let mut parts: Vec<String> = items.iter().map(Uuid::to_string).collect();
+    parts.extend(items.iter().map(|i| i.to_string().to_uppercase()));
+    parts.extend(items.iter().map(|i| i.simple().to_string()));
+    parts.extend(
+        [
+            a,
+            b,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        ]
+        .iter()
+        .map(Uuid::to_string)
+        .chain(
+            [
+                "",
+                "not-a-key",
+                "a\0b",
+                "1",
+                "-1",
+                "99999999999999999999",
+                "x|y",
+            ]
+            .map(str::to_owned),
+        ),
+    );
+    let tables: Vec<String> = ["items", "readings", "logs", "nope", "", "it\0ems"]
+        .map(str::to_owned)
+        .to_vec();
+    let epochs = [
+        epoch.to_string(),
+        epoch.to_string().to_uppercase(),
+        Uuid::now_v7().to_string(),
+        "junk\0".to_owned(),
+        String::new(),
+    ];
+    let sequences = [
+        0,
+        1,
+        last as u64,
+        last as u64 + 1,
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX,
+    ];
+    let mut came = 0i64;
+    let stranger = Uuid::now_v7();
+    for step in 0..300 {
+        let sender = [a, b, stranger][walk.below(3)];
+        if step % 20 == 19 {
+            server.pass_now().await.unwrap();
+        }
+        let answers = wire.0.lock().unwrap().len();
+        let bytes = if step % 10 == 0 {
+            (0..walk.below(64)).map(|_| walk.below(256) as u8).collect()
+        } else {
+            let key = |walk: &mut crate::testkit::Walk| Key {
+                parts: (0..[1, 1, 0, 2][walk.below(4)])
+                    .map(|_| pick(walk, &parts))
+                    .collect(),
+            };
+            let row = |walk: &mut crate::testkit::Walk| -> Vec<u8> {
+                match walk.below(5) {
+                    0 => reading(sender, "fine"),
+                    1 => reading(sender, "poison"),
+                    2 => reading(sender, "nul\0"),
+                    3 => ItemRow {
+                        id: Uuid::now_v7().to_string(),
+                        partition_id: partition.to_string(),
+                        name: "from below".into(),
+                    }
+                    .encode_to_vec(),
+                    _ => (0..walk.below(16)).map(|_| walk.below(256) as u8).collect(),
+                }
+            };
+            let up = Up {
+                tables: (0..walk.below(3))
+                    .map(|_| WireTable {
+                        table: pick(&mut walk, &tables),
+                        upserts: (0..walk.below(3)).map(|_| row(&mut walk)).collect(),
+                        deletes: (0..walk.below(3)).map(|_| key(&mut walk)).collect(),
+                        keys: (0..walk.below(3)).map(|_| key(&mut walk)).collect(),
+                    })
+                    .collect(),
+                rejected: (0..walk.below(3))
+                    .map(|_| Rejected {
+                        table: pick(&mut walk, &tables),
+                        key: (walk.below(4) > 0).then(|| key(&mut walk)),
+                        reason: "refused\0".into(),
+                        epoch: epochs[walk.below(epochs.len())].clone(),
+                        sequence: sequences[walk.below(sequences.len())],
+                    })
+                    .collect(),
+                digests: (0..walk.below(3))
+                    .map(|_| Digest {
+                        table: pick(&mut walk, &tables),
+                        count: [0, 1, u64::MAX][walk.below(3)],
+                        fingerprint: walk.next(),
+                    })
+                    .collect(),
+                epoch: epochs[walk.below(epochs.len())].clone(),
+                sequence: sequences[walk.below(sequences.len())],
+                uploads: (0..walk.below(3)).map(|_| walk.next()).collect(),
+                protocol: [0, 1, 1, 1, 2, u32::MAX][walk.below(6)],
+                backlog: (walk.below(3) == 0).then(|| Backlog {
+                    tables: vec![TableBacklog {
+                        table: pick(&mut walk, &tables),
+                        unsent: [0, 5, u64::MAX][walk.below(3)],
+                        unfiled: 1,
+                        set_aside: 0,
+                    }],
+                }),
+                nonce: [0, 1, walk.next(), u64::MAX][walk.below(4)],
+                mac: (0..walk.below(20)).map(|_| walk.below(256) as u8).collect(),
+                gap: [0, 0, 1, walk.next(), u64::MAX][walk.below(5)],
+            };
+            came += up
+                .tables
+                .iter()
+                .map(|t| (t.upserts.len() + t.deletes.len()) as i64)
+                .sum::<i64>();
+            up.encode_to_vec()
+        };
+
+        match server.receive(sender, &bytes).await {
+            Ok(_) => {}
+            Err(e) => assert!(
+                matches!(e, Error::Protocol { .. }),
+                "step {step}: an error that is no reason to resend: {e}"
+            ),
+        }
+        if Up::decode(bytes.as_slice()).is_ok_and(|up| up.protocol == 0) {
+            assert_eq!(
+                wire.0.lock().unwrap().len(),
+                answers,
+                "step {step}: an upload that names no protocol is answered"
+            );
+        }
+
+        let quarantined: Vec<(Uuid, String, String)> =
+            sqlx::query_as("SELECT replica_id, relation, row_key FROM sync.quarantine")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for (replica, table, key) in quarantined {
+            assert!(
+                [a, b, stranger].contains(&replica)
+                    && table == "items"
+                    && Uuid::parse_str(&key).is_ok_and(|k| k.to_string() == key),
+                "step {step}: quarantined what is no row it is sent: {replica} {table} {key:?}"
+            );
+        }
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM sync.notes WHERE done_at IS NULL AND kind <> 'resync'"
+            )
+            .await,
+            0,
+            "step {step}"
+        );
+        assert!(
+            count(&pool, "SELECT coalesce(max(n), 0) FROM (SELECT count(*) AS n FROM sync.notes WHERE done_at IS NULL GROUP BY replica_id) c").await <= 1,
+            "step {step}: one provisioning per replica at most"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM sync.inbox WHERE relation IS NULL"
+            )
+            .await,
+            0,
+            "step {step}: an upload kept whole: filing failed on what it should set aside"
+        );
+        assert!(
+            count(&pool, "SELECT count(*) FROM sync.inbox").await <= came,
+            "step {step}: the inbox holds more than came"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
+                  WHERE r.applied_sequence > c.last_sequence \
+                     OR (r.applied_sequence IS NOT NULL AND c.last_sequence IS NULL)"
+            )
+            .await,
+            0,
+            "step {step}: acknowledged past what was sent"
+        );
+    }
+}
+
+/// A host spawns what the server runs, and answers from handlers whose
+/// futures must be `Send`: every future a host gets from the server is.
+#[sqlx::test(migrations = false)]
+async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
+    fn spawnable<T: Send>(_: T) {}
+    world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the server");
+    spawnable(server.run(std::future::pending()));
+    spawnable(server.receive(Uuid::nil(), &[]));
+    spawnable(server.pass_now());
+    spawnable(server.begin());
+    spawnable(Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    ));
+    spawnable(Server::install(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    ));
+    let mut conn = pool.acquire().await.unwrap();
+    spawnable(crate::plan::note_resync(&mut conn, None, Uuid::nil()));
+
+    spawnable(Engine::triggers(&mut conn, &codecs(), REPLICAS));
+    spawnable(crate::row::upsert::<Item>(&mut conn, Vec::new()));
+    spawnable(crate::row::get::<Item>(&mut conn, &Vec::new()));
+    let engine = server.engine();
+    let scope = crate::status::Scope::All;
+    spawnable(engine.overview(&mut conn, scope, 1));
+    spawnable(engine.listing(
+        &mut conn,
+        scope,
+        None,
+        crate::status::Page {
+            offset: 0,
+            limit: 1,
+        },
+    ));
+    spawnable(engine.health(&mut conn, scope, 1));
+    spawnable(engine.progress(&mut conn, scope));
+    spawnable(engine.row_progress(&mut conn, scope, "items", ""));
+}
+
+/// Settings a server cannot run with are refused when it is built: a wait
+/// of nothing, which would spin, or give up on what it waits for at once.
+#[sqlx::test(migrations = false)]
+async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
+    world(&pool).await;
+    /// A setting made zero.
+    type Zeroed = (&'static str, fn(&mut Settings));
+    let cases: [Zeroed; 8] = [
+        ("idle", |s| s.idle = Duration::ZERO),
+        ("send_timeout", |s| s.send_timeout = Duration::ZERO),
+        ("unconfirmed_after", |s| {
+            s.unconfirmed_after = Duration::ZERO
+        }),
+        ("standby", |s| s.standby = Duration::ZERO),
+        ("retry_every", |s| s.retry_every = Duration::ZERO),
+        ("prune_after", |s| s.prune_after = Duration::ZERO),
+        ("watch_every", |s| s.watch_every = Duration::ZERO),
+        ("stuck_after", |s| s.stuck_after = Duration::ZERO),
+    ];
+    for (what, set) in cases {
+        let mut wrong = settings();
+        set(&mut wrong);
+        let refused = Server::new(
+            pool.clone(),
+            codecs(),
+            REPLICAS,
+            Wire::default(),
+            Anyone::new(pool.clone()),
+            wrong,
+        )
+        .await;
+        match refused {
+            Err(Error::Misuse(why)) => assert!(why.contains(what), "{what}: {why}"),
+            Err(e) => panic!("{what}: refused for another reason: {e}"),
+            Ok(_) => panic!("{what}: not refused"),
+        }
+    }
+}
+
+/// An upload beyond the server's limits — more bytes, more rows or more
+/// rejections than a message carries — or from a sender that is no replica
+/// is dropped unanswered: nothing of it filed, nothing recorded of its
+/// sender. One within them is filed.
+#[sqlx::test(migrations = false)]
+async fn an_upload_beyond_the_limits_or_from_no_replica_is_dropped_unanswered(pool: PgPool) {
+    let (_, [a, _]) = world(&pool).await;
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        Settings {
+            limits: Limits::new(2, 8192).unwrap(),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    let rejected = |n: usize| envelope::Up {
+        rejected: (0..n)
+            .map(|_| envelope::Rejected {
+                table: "items".to_owned(),
+                ..envelope::Rejected::default()
+            })
+            .collect(),
+        uploads: vec![9],
+        protocol: envelope::PROTOCOL,
+        ..envelope::Up::default()
+    };
+    let stranger = Uuid::now_v7();
+    for (sender, bytes) in [
+        (
+            a,
+            upload(1, "readings", vec![reading(a, &"x".repeat(9000))]),
+        ),
+        (
+            a,
+            upload(
+                2,
+                "readings",
+                (0..3).map(|_| reading(a, "one of three")).collect(),
+            ),
+        ),
+        (a, rejected(3).encode_to_vec()),
+        (
+            stranger,
+            upload(4, "readings", vec![reading(stranger, "a stranger's")]),
+        ),
+    ] {
+        assert!(server.receive(sender, &bytes).await.unwrap().is_empty());
+    }
+    assert!(wire.filed(a).is_empty() && wire.filed(stranger).is_empty());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        0
+    );
+    assert_eq!(count(&pool, "SELECT count(*) FROM sync.inbox").await, 0);
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sync.replicas WHERE replica_id = $1")
+            .bind(stranger)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded, 0,
+        "nothing recorded of a sender that is no replica"
+    );
+
+    server
+        .receive(
+            a,
+            &upload(5, "readings", (0..2).map(|_| reading(a, "two")).collect()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wire.filed(a), [5]);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        2
+    );
+}
+
+/// A transport that never answers the server's answer to an upload: the
+/// upload comes again, rather than holding its handler for ever.
+#[sqlx::test(migrations = false)]
+async fn an_answer_the_transport_never_takes_has_the_upload_come_again(pool: PgPool) {
+    struct Silent;
+    impl Transport for Silent {
+        async fn send(&self, _: Uuid, _: Vec<u8>, _: &str) -> Result<(), Error> {
+            std::future::pending().await
+        }
+    }
+    let (_, [a, _]) = world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Silent,
+        Anyone::new(pool.clone()),
+        Settings {
+            send_timeout: Duration::from_millis(50),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    let answered = server
+        .receive(a, &upload(1, "readings", vec![reading(a, "kept")]))
+        .await;
+    assert!(
+        matches!(&answered, Err(e) if e.is_transient()),
+        "{answered:?}"
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+}
+
+/// A relation of replicas that names one twice — a view joining it to two
+/// rows — holds no pass back: the replica is one, provisioned once.
+#[sqlx::test(migrations = false)]
+async fn a_replica_named_twice_by_its_relation_is_one(pool: PgPool) {
+    let (partition, [a, b]) = world(&pool).await;
+    sqlx::raw_sql(
+        "CREATE VIEW fixture.twice AS SELECT * FROM fixture.t_replicas \
+         UNION ALL SELECT * FROM fixture.t_replicas",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let wire = Wire::default();
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        Replicas::relation("fixture.twice")
+            .table("t_replicas")
+            .live("live")
+            .partitioned_by("partition_id"),
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .unwrap();
+    item(&pool, partition, "one").await;
+    while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    assert_eq!(wire.items(a), ["one"]);
+    assert_eq!(wire.items(b), ["one"]);
+}
+
+/// Senders the host knows as the test says: the rest are no one it knows.
+#[derive(Clone)]
+struct Known {
+    pool: PgPool,
+    known: Arc<Mutex<std::collections::BTreeSet<Uuid>>>,
+}
+
+impl Senders for Known {
+    type Known = ();
+
+    async fn known(&self, replica: Uuid) -> Result<Option<()>, Error> {
+        Ok(self.known.lock().unwrap().contains(&replica).then_some(()))
+    }
+
+    async fn filing(&self, _known: &()) -> Result<Transaction<'static, Postgres>, Error> {
+        Ok(self.pool.begin().await?)
+    }
+}
+
+/// A replica whose uploads the server cannot file keeps at most so many of
+/// them in the inbox: past that its uploads come again, waiting on it. The
+/// inbox is filed again a page at a time, beside the passes; what a sender
+/// the host no longer knows uploaded waits, and is dropped once it waited
+/// `prune_after`.
+#[sqlx::test(migrations = false)]
+async fn the_inbox_is_bounded_per_replica_filed_a_page_at_a_time_and_pruned_of_strangers(
+    pool: PgPool,
+) {
+    let (_, [a, b]) = world(&pool).await;
+    let wire = Wire::default();
+    let senders = Known {
+        pool: pool.clone(),
+        known: Arc::new(Mutex::new([a, b].into())),
+    };
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        wire.clone(),
+        senders.clone(),
+        Settings {
+            inbox: NonZeroU32::new(2).unwrap(),
+            batch: NonZeroU32::new(1).unwrap(),
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    for number in 1..=2 {
+        server
+            .receive(a, &upload(number, "readings", vec![reading(a, "poison")]))
+            .await
+            .unwrap();
+    }
+    server
+        .receive(b, &upload(9, "readings", vec![reading(b, "poison")]))
+        .await
+        .unwrap();
+    let full = server
+        .receive(a, &upload(3, "readings", vec![reading(a, "poison")]))
+        .await;
+    assert!(matches!(&full, Err(e) if e.is_transient()), "{full:?}");
+    assert_eq!(wire.filed(a), [1, 2], "the third is not answered");
+    let kept = |replica: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sync.inbox WHERE replica_id = $1")
+                .bind(replica)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        (kept(a).await, kept(b).await),
+        (2, 1),
+        "a's part is full, b's is not"
+    );
+
+    BUGGY.set(false);
+    senders.known.lock().unwrap().remove(&b);
+    let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
+    assert_eq!(refile(&server, &mut lock).await, 3, "one upload a page");
+    assert_eq!(
+        (kept(a).await, kept(b).await),
+        (0, 1),
+        "a's filed, and b's waits for the host to know b again"
+    );
+    sqlx::query("UPDATE sync.inbox SET first_at = now() - interval '31 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    refile(&server, &mut lock).await;
+    assert_eq!(kept(b).await, 0, "waited too long: dropped");
+    BUGGY.set(true);
+}
+
+/// A server left at its defaults takes every upload a replica left at its
+/// own builds: both take the one default.
+#[test]
+fn a_servers_default_limits_are_the_replicas() {
+    assert_eq!(Settings::default().limits, Limits::default());
+}
+
+/// Through a pooler in transaction mode a relay's transaction can run on a
+/// server process that does not hold its lock: it is refused, rather than
+/// recording beside the process that does.
+#[sqlx::test(migrations = false)]
+async fn a_transaction_on_a_connection_without_the_lock_is_refused(pool: PgPool) {
+    world(&pool).await;
+    let held = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
+    let mut elsewhere = Lock {
+        conn: pool.acquire().await.unwrap().detach(),
+    };
+    let refused = elsewhere
+        .fenced("BEGIN", None)
+        .await
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|why| why.contains("session pooling")),
+        "{refused:?}"
+    );
+    assert!(!elsewhere.still_held().await, "nor counts as held");
+    held.release(LOCK_KEY).await;
 }

@@ -4,6 +4,12 @@ authors = ["Ricardo Sansores"]
 language = "en"
 src = "src"
 
+[build]
+# A chapter the summary names and nobody wrote fails the build.
+create-missing = false
+
 [output.html]
+# Where GitHub Pages serves the book: its 404 page links from there.
+site-url = "/magic_sync/"
 git-repository-url = "https://github.com/rsansores/magic_sync"
 edit-url-template = "https://github.com/rsansores/magic_sync/edit/main/book/{path}"

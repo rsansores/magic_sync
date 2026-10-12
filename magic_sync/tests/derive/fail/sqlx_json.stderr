@@ -1,0 +1,5 @@
+error: #[derive(Row)] does not support #[sqlx(json)]
+ --> tests/derive/fail/sqlx_json.rs:5:12
+  |
+5 |     #[sqlx(json)]
+  |            ^^^^

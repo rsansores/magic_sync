@@ -1,0 +1,5 @@
+error: one column at most is #[row(created)]
+ --> tests/derive/fail/two_created.rs:7:11
+  |
+7 |     #[row(created)]
+  |           ^^^^^^^

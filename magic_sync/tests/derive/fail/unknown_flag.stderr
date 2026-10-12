@@ -1,0 +1,5 @@
+error: expected `version`, `created`, `replica_owned` or `generated`
+ --> tests/derive/fail/unknown_flag.rs:5:11
+  |
+5 |     #[row(versioned)]
+  |           ^^^^^^^^^

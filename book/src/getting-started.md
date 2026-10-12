@@ -5,18 +5,26 @@ The example is two small programs: the **head office** (PostgreSQL) and a
 head office and two registers, edit the catalog, unplug a register, sell
 while it is unplugged, and plug it back in.
 
-## 1. A database for the head office
-
-Any PostgreSQL 14 or later will do. With Docker:
+You need [Rust](https://rustup.rs) 1.85 or later, Node 22.13 or later with
+[pnpm](https://pnpm.io), and PostgreSQL 14 or later (Docker brings one).
+Every command below runs from the root of a clone:
 
 ```sh
-cd examples/shop
-docker compose up -d
+git clone https://github.com/rsansores/magic_sync
+cd magic_sync
 ```
 
-That starts one on port 5433 with the user, password and database `shop`,
-which is what the head office connects to unless you set `DATABASE_URL`.
-Without Docker Compose, the same with plain Docker:
+## 1. A database for the head office
+
+With Docker:
+
+```sh
+docker compose -f examples/shop/docker-compose.yml up -d
+```
+
+That starts PostgreSQL on port 5433 with the user, password and database
+`shop`, which is what the head office connects to unless you set
+`DATABASE_URL`. Without Docker Compose, the same with plain Docker:
 
 ```sh
 docker run -d --name shop-postgres -p 5433:5432 \
@@ -25,19 +33,20 @@ docker run -d --name shop-postgres -p 5433:5432 \
 
 ## 2. The head office
 
-Its page is a Vue app (`examples/shop/web`) over the engine's dashboard, so it
-is built once, with Node 20 or later and [pnpm](https://pnpm.io):
+Its page is a Vue app (`examples/shop/web`) over the engine's dashboard, which
+is built from this repository first:
 
 ```sh
-(cd dashboard && pnpm install && pnpm build)
-(cd examples/shop/web && pnpm install && pnpm build)
+pnpm --dir dashboard install
+pnpm --dir dashboard build
+pnpm --dir examples/shop/web install
+pnpm --dir examples/shop/web build
 ```
 
 Then the head office itself:
 
 ```sh
-cd examples/shop/server
-cargo run
+cargo run --manifest-path examples/shop/server/Cargo.toml
 ```
 
 Open <http://127.0.0.1:8080>. The first time, it installs everything it needs
@@ -45,24 +54,30 @@ in the database: its own tables, and the engine's.
 
 ## 3. Two registers
 
-In two more terminals:
+Each in a terminal of its own, from the root of the clone:
 
 ```sh
-cd examples/shop/register
-cargo run -- --name "Register 1" --port 8081
-cargo run -- --name "Register 2" --port 8082
+cargo run --manifest-path examples/shop/register/Cargo.toml -- --name "Register 1" --port 8081
+```
+
+```sh
+cargo run --manifest-path examples/shop/register/Cargo.toml -- --name "Register 2" --port 8082
 ```
 
 Each introduces itself to the head office, which provisions it, and appears on
-the head office's page with its own page inside.
+the head office's page with its own page inside. A register keeps its
+database in the directory it was started from (`register-8081.db`): started
+there again, it is the same register.
 
-Both listen on `127.0.0.1` only: the example has no login. To open it from
-another machine (over a VPN, say), bind them to every interface:
+Both programs listen on `127.0.0.1` only: the example has no login. To open it
+from another machine (over a VPN, say), bind them to every interface:
 
 ```sh
-cargo run -- --bind 0.0.0.0:8080                                  # the head office
-cargo run -- --name "Register 1" --port 8081 --bind 0.0.0.0       # a register
+cargo run --manifest-path examples/shop/server/Cargo.toml -- --bind 0.0.0.0:8080
+cargo run --manifest-path examples/shop/register/Cargo.toml -- --name "Register 1" --port 8081 --bind 0.0.0.0
 ```
+
+Ctrl-C stops either one, and loses nothing it was doing.
 
 ## 4. Things to try
 
@@ -75,13 +90,16 @@ cargo run -- --name "Register 1" --port 8081 --bind 0.0.0.0       # a register
   answering. Click it to see how far along it is, table by table.
 - **Plug it back in.** Its receipts reach the head office, it catches up
   with the catalog, in order, and the dashboard turns green again.
+- **Restart the head office** while a register is unplugged and a product
+  has changed. What the head office queued for the register is in its
+  database: plugged back in, the register gets it.
 - **Ask where a product is.** *who holds it?* next to a product lists each
   register and where that product stands on it: holds it, on its way, set
   aside. That is the question to answer next to a row, in your own listings.
 - **Break something.** Start a register with a bug that refuses one product:
 
   ```sh
-  cargo run -- --name "Register 3" --port 8083 --refuse "Tea"
+  cargo run --manifest-path examples/shop/register/Cargo.toml -- --name "Register 3" --port 8083 --refuse "Tea"
   ```
 
   Add *Tea* at the head office: Register 3 turns red, *needs a fix*, the

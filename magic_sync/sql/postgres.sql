@@ -1,31 +1,38 @@
--- The sync engine: the server's side, in its own schema.
+-- The sync engine: the server's side, in its own schema. Version 1.
 --
 -- A trigger on every mirrored table notes each change in the writing
 -- transaction, so no write path can forget one; the planner reads the notes,
 -- compares what each replica should hold with what it is known to hold, sends
--- the difference and records it.
+-- the difference and records it. The triggers are the engine's to write:
+-- `Engine::triggers` prints them for a host's migrations, `Engine::install`
+-- creates them, and `Engine::new` refuses to start while one differs.
 
 CREATE SCHEMA sync;
 
--- The version of this schema: the engine refuses to run against another.
+-- The version of this schema: the engine refuses to run against another. A
+-- later version is a script of its own, run after this one, that ends by
+-- writing its number here.
 CREATE TABLE sync.version (
-    id      INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    version INTEGER NOT NULL
+    id       INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    version  INTEGER NOT NULL,
+    declared TEXT
 );
-INSERT INTO sync.version (version) VALUES (1);
+
+COMMENT ON COLUMN sync.version.declared IS
+    'A digest of what decided which rows each replica holds, and what a row carries, when the '
+    'relay last ran: the replicas, and per table its key, its rule, what it points at, its '
+    'groups and its columns. A relay that finds it different provisions every replica again.';
 
 -- What changed, in the writing transaction. Read and marked done by the one
 -- relay that holds the engine's lock.
 CREATE TABLE sync.notes (
     id           BIGSERIAL   PRIMARY KEY,
-    kind         TEXT        NOT NULL CHECK (kind IN ('row', 'members', 'assigned', 'resync')),
+    kind         TEXT        NOT NULL CHECK (kind IN ('row', 'retry', 'members', 'assigned', 'resync')),
     relation     TEXT,
     row_key      TEXT,
     replica_id   UUID,
     partition_id UUID,
     previous     JSONB,
-    scope        UUID,
-    xid          XID8        NOT NULL DEFAULT pg_current_xact_id(),
     noted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     done_at      TIMESTAMPTZ,
     parked_at    TIMESTAMPTZ,
@@ -36,27 +43,35 @@ CREATE TABLE sync.notes (
 -- Every read of what is not done yet — the relay's, and a dashboard's, parked
 -- notes included — stays among those, however many done ones wait to be pruned.
 CREATE INDEX notes_undone ON sync.notes (id) WHERE done_at IS NULL;
+-- The relay's read: what is pending, however many parked notes lead it.
+CREATE INDEX notes_pending ON sync.notes (id) WHERE done_at IS NULL AND parked_at IS NULL;
+-- The prune: what is done, oldest first.
+CREATE INDEX notes_done ON sync.notes (done_at) WHERE done_at IS NOT NULL;
+-- A replica's provisioning is noted once, however many reasons ask for it.
+CREATE INDEX notes_resync ON sync.notes (replica_id) WHERE kind = 'resync' AND done_at IS NULL;
+-- A row's notes, by the row, newest last: the newest a version sent saw,
+-- whether a change is pending, what a retry notes once.
+CREATE INDEX notes_rows ON sync.notes (relation, row_key, id) WHERE kind IN ('row', 'retry');
 
 COMMENT ON TABLE sync.notes IS
     'Every change to a mirrored table or a group table, and every replica to provision '
     'again, noted in the transaction that made it. It says what changed, never who receives '
     'it: the planner works that out when it reads the note.';
 COMMENT ON COLUMN sync.notes.kind IS
-    'row: a row of relation changed. members: a row joined or left a group. assigned: a '
-    'group was given to or taken from replica_id. resync: replica_id is provisioned again.';
+    'row: a row of relation changed. retry: a row set aside is tried again where it was set '
+    'aside, and nothing else. members: a row joined or left a group. assigned: a group was '
+    'given to or taken from replica_id. resync: replica_id is provisioned again.';
 COMMENT ON COLUMN sync.notes.row_key IS
     'The changed row''s primary key, its parts joined by |, in key order.';
 COMMENT ON COLUMN sync.notes.previous IS
-    'For a row: the row before an update or a delete, which says what it pointed at, so a '
-    'parent it no longer points at can be let go. For a member: the member row.';
-COMMENT ON COLUMN sync.notes.xid IS
-    'The transaction that noted it. A replica sent a row from a snapshot whose horizon is past '
-    'it already holds this change.';
-COMMENT ON COLUMN sync.notes.scope IS
-    'The one replica the note is still owed to, after a send to it failed: what it asks is '
-    'planned for that replica alone. NULL: every replica.';
+    'For a member: the member row.';
+COMMENT ON COLUMN sync.notes.id IS
+    'Rises with every note. Writers of one row take turns on its lock, so the notes of a row '
+    'rise in the order their changes committed: a version of the row sent while its newest '
+    'note was n holds every change noted up to n, and none after.';
 COMMENT ON COLUMN sync.notes.done_at IS
-    'When the relay sent what the note asked for and recorded it. NULL: pending.';
+    'When the relay recorded what the note asked for and wrote its messages to the outbox. '
+    'NULL: pending.';
 COMMENT ON COLUMN sync.notes.parked_at IS
     'When the planner set the note aside because planning it fails for a reason a retry '
     'cannot change (a bug, data no declaration allows). Parked notes are tried again when '
@@ -64,30 +79,74 @@ COMMENT ON COLUMN sync.notes.parked_at IS
 COMMENT ON COLUMN sync.notes.attempts IS
     'Passes that failed on this note.';
 
+-- What a row pointed at before it changed, one row per mirrored row, kept
+-- with the note of the row's key as it was: a replica holding that version
+-- still points there until the note is planned. By the row pointed at, so
+-- what still points at a row is found however many notes wait.
+CREATE TABLE sync.pointed (
+    note     BIGINT NOT NULL REFERENCES sync.notes (id) ON DELETE CASCADE,
+    relation TEXT   NOT NULL,
+    row_key  TEXT   NOT NULL,
+    PRIMARY KEY (note, relation, row_key)
+);
+
+CREATE INDEX pointed_row ON sync.pointed (relation, row_key);
+
+COMMENT ON TABLE sync.pointed IS
+    'The mirrored rows a row pointed at before an update or a delete, by the note of its key '
+    'as it was: a parent it no longer points at is let go of, and only once no replica holds '
+    'a version that points there. Gone with the note.';
+
 -- What each replica holds, as the engine sent it: the other half of every
 -- decision the planner takes.
 CREATE TABLE sync.held (
     replica_id   UUID        NOT NULL,
     relation     TEXT        NOT NULL,
     row_key      TEXT        NOT NULL,
-    partition_id UUID,
-    held_since   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    horizon      XID8        NOT NULL,
-    sequence     BIGINT,
+    sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    noted        BIGINT      NOT NULL,
+    sequence     BIGINT      NOT NULL,
+    refused      BIGINT,
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
 CREATE INDEX held_row ON sync.held (relation, row_key);
+-- What a replica has on its way: the rows past the last message it
+-- confirmed, however many it holds.
+CREATE INDEX held_sent ON sync.held (replica_id, sequence);
+-- What it refused, read on every acknowledgement: few, among all it holds.
+CREATE INDEX held_refused ON sync.held (replica_id) WHERE refused IS NOT NULL;
 
 COMMENT ON TABLE sync.held IS
-    'Every mirrored row each replica holds, as the engine sent it. What a replica should '
-    'hold, less what it holds, is sent; what it holds and should no longer is taken back.';
+    'Every mirrored row each replica holds, as the engine sent it — recorded with the message '
+    'that carries it before that message goes. What a replica should hold, less what it holds, '
+    'is sent; what it holds and should no longer is taken back.';
+COMMENT ON COLUMN sync.held.sent_at IS
+    'When the version the replica holds was sent.';
 COMMENT ON COLUMN sync.held.sequence IS
     'The message that carried the row: the replica holds it once it has acknowledged a '
     'message at or past this one. Until then the row is on its way.';
-COMMENT ON COLUMN sync.held.horizon IS
-    'The xmin of the snapshot the row was last sent from: every transaction before it had '
-    'finished, so a change it noted is in what the replica holds.';
+COMMENT ON COLUMN sync.held.refused IS
+    'The message whose version of the row — or whose delete of it — the replica refused: it '
+    'keeps what it had, or nothing. Held for every decision that takes rows back, so a delete '
+    'still goes, and a refused delete is sent again; not held for progress, closure shown to '
+    'users, or digests. Cleared once the replica applies a later message that carries the row. '
+    'NULL: taken.';
+COMMENT ON COLUMN sync.held.noted IS
+    'The newest note of the row when the version the replica holds was read: a note of it '
+    'past this one is a change the replica does not hold. 0: none.';
+
+-- Rows taken back from a replica, until it says it applied the message that
+-- took them: a refusal of that message is a delete it could not carry out,
+-- and the row is held again, refused; a refusal of an older one is of a
+-- version it no longer matters it did not take.
+CREATE TABLE sync.gone (
+    replica_id UUID   NOT NULL,
+    relation   TEXT   NOT NULL,
+    row_key    TEXT   NOT NULL,
+    sequence   BIGINT NOT NULL,
+    PRIMARY KEY (replica_id, relation, row_key)
+);
 
 -- Every message the engine sends carries a number from this sequence: it
 -- only rises, whichever relay draws it, so a replica can drop a message older
@@ -96,48 +155,120 @@ CREATE SEQUENCE sync.messages;
 
 -- Which installation of this schema the numbers come from: a database
 -- installed again starts its sequence over, and a replica that sees a new
--- epoch takes its numbers from scratch.
+-- epoch takes its numbers from scratch. `secret` keys the seal on every
+-- message of the epoch, which a replica gives back with what it applied: it
+-- is in every copy of the database, so a restored one still knows its own
+-- seal, and a new epoch draws another.
 CREATE TABLE sync.epoch (
-    id    INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    epoch UUID    NOT NULL DEFAULT gen_random_uuid()
+    id     INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    epoch  UUID    NOT NULL DEFAULT gen_random_uuid(),
+    secret BYTEA   NOT NULL DEFAULT uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid())
 );
 INSERT INTO sync.epoch DEFAULT VALUES;
 
--- A replica the relay could not send to: it is left out of passes until
--- retry_after, while every other replica carries on.
+-- The messages each replica is owed, written in the transaction that
+-- records what they carry, and sent after it commits, in order: a message
+-- leaves once the transport took it. A replica the transport cannot reach
+-- keeps its own here, while every other is sent to.
+CREATE TABLE sync.outbox (
+    replica_id UUID        NOT NULL,
+    sequence   BIGINT      NOT NULL,
+    message    BYTEA       NOT NULL,
+    snapshot   BOOLEAN     NOT NULL,
+    written_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (replica_id, sequence)
+);
+
+COMMENT ON TABLE sync.outbox IS
+    'Messages written for a replica and not yet taken by the transport, as the bytes it '
+    'carries. Sent in sequence order once the pass that wrote them commits, by whichever '
+    'process runs the relay: a crash or a lost lock loses none of them.';
+COMMENT ON COLUMN sync.outbox.snapshot IS
+    'Part of a snapshot: what the replica should hold, whole. A snapshot written for a replica '
+    'replaces its outbox, so these lead it; what follows them counts against its bound.';
+
+-- The messages written for each replica, as the relay alone writes them: a
+-- pass records in one REPEATABLE READ snapshot, and nothing else updates
+-- these rows under it.
+CREATE TABLE sync.chains (
+    replica_id        UUID        PRIMARY KEY,
+    last_sequence     BIGINT,
+    last_nonce        BIGINT,
+    snapshot_sequence BIGINT,
+    snapshot_end      BIGINT,
+    dropped           TEXT,
+    dropped_at        TIMESTAMPTZ
+);
+
+COMMENT ON COLUMN sync.chains.last_sequence IS
+    'The last message written to its outbox in this epoch. NULL: none since it was last '
+    'provisioned or the epoch began.';
+COMMENT ON COLUMN sync.chains.last_nonce IS
+    'Its nonce: what the next message names as the one it follows, and what a replica that '
+    'says it applied that sequence must say with it, or the database was restored from a copy '
+    'older than what it was sent.';
+COMMENT ON COLUMN sync.chains.snapshot_sequence IS
+    'The first message of the last snapshot written to its outbox, in this epoch.';
+COMMENT ON COLUMN sync.chains.snapshot_end IS
+    'The message that ended that snapshot: a row it refused to let go of at the sweep is held '
+    'again, refused.';
+COMMENT ON COLUMN sync.chains.dropped IS
+    'Why its outbox was last dropped and it provisioned again, an alarm: it outgrew its bound, '
+    'or the transport refused its next message for good again and again.';
+
+-- How sending to each replica is going, and what the engine last saw of it.
 CREATE TABLE sync.replicas (
     replica_id   UUID        PRIMARY KEY,
+    live         BOOLEAN     NOT NULL DEFAULT false,
+    partition_id UUID,
     failures     INTEGER     NOT NULL DEFAULT 0,
     retry_after  TIMESTAMPTZ,
     last_error       TEXT,
     last_sent_at     TIMESTAMPTZ,
-    last_sequence    BIGINT,
+    refusals         INTEGER     NOT NULL DEFAULT 0,
     applied_epoch    UUID,
     applied_sequence BIGINT,
+    applied_nonce    BIGINT,
     applied_at       TIMESTAMPTZ,
-    waiting_since    TIMESTAMPTZ,
+    heals            INTEGER     NOT NULL DEFAULT 0,
     backlog          JSONB,
-    backlog_at       TIMESTAMPTZ
+    backlog_at       TIMESTAMPTZ,
+    drifted_at       TIMESTAMPTZ
 );
 
 COMMENT ON TABLE sync.replicas IS
     'How sending to each replica is going: consecutive failures, when it is tried again, '
     'when it was last sent to, and the last message it acknowledged applying.';
-COMMENT ON COLUMN sync.replicas.waiting_since IS
-    'While it has messages it has not said it applied: since when it has not moved — the '
-    'first send it did not confirm, or the last confirmation that left it behind. NULL: caught up.';
+COMMENT ON COLUMN sync.replicas.live IS
+    'Whether the engine last saw it live, in partition_id: a replica that became live or moved '
+    'is provisioned again, one that stopped being live is forgotten.';
+COMMENT ON COLUMN sync.replicas.heals IS
+    'Times it was provisioned again for staying silent on what it was sent, since it last '
+    'caught up: each waits twice as long as the one before, up to 32 times the first.';
 COMMENT ON COLUMN sync.replicas.backlog IS
     'What the replica last said it wrote and the server has not filed, per table '
     '([{table, unsent, unfiled}]), as of backlog_at. NULL until it says.';
+COMMENT ON COLUMN sync.replicas.last_error IS
+    'Why the last send to it failed — the network, or a message the transport refuses for '
+    'good — while failures counts on, or why it was provisioned again. NULL once a send gets '
+    'through.';
+COMMENT ON COLUMN sync.replicas.refusals IS
+    'Times in a row the transport refused its next message for good: past a few it is '
+    'provisioned again, and that is an alarm.';
+COMMENT ON COLUMN sync.replicas.drifted_at IS
+    'When its digests last differed from what the server records and it was provisioned '
+    'again for it. Digests that differ again within a day are a bug no provisioning cures: '
+    'they are logged, and it is not provisioned again before the day is out.';
 
 -- Rows a replica should hold that the engine could not get to it for a reason
--- a retry cannot change: a row that does not encode, a message the transport
--- refuses, a row the replica refused. Each is tried again on a timer and when
--- the relay starts, and leaves when the replica holds it.
+-- a retry cannot change: a row that does not encode or fits no message, a row
+-- the replica refused. Each is tried again on a timer and when the relay
+-- starts, and leaves when the replica holds it.
 CREATE TABLE sync.quarantine (
     replica_id UUID        NOT NULL,
     relation   TEXT        NOT NULL,
     row_key    TEXT        NOT NULL,
+    cause      TEXT        NOT NULL CHECK (cause IN ('server', 'replica')),
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -146,21 +277,28 @@ CREATE TABLE sync.quarantine (
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
+-- Where one row stands reads its quarantine by the row, over every replica.
+CREATE INDEX quarantine_row ON sync.quarantine (relation, row_key);
+
 COMMENT ON TABLE sync.quarantine IS
     'Rows a replica should hold and does not, for a reason a retry cannot change. Never '
     'repaired by hand: a deploy that fixes the cause lets the next retry through.';
+COMMENT ON COLUMN sync.quarantine.cause IS
+    'server: the server could not send the row — or a row it points at — and the replica '
+    'does not hold it: an older version it had is taken back. replica: the replica refused it, and leaves it out of its digests, as the server '
+    'does when it compares them.';
 COMMENT ON COLUMN sync.quarantine.carried IS
     'The message that carried the row again since it was set aside: once the replica says it '
     'applied it, the row leaves the quarantine. NULL: not carried since.';
 
--- Rows a replica uploaded that the server could not file, kept as they came:
--- the replica may have let go of them since. Filed again on a timer and when
--- the relay starts, and gone once filed.
+-- What replicas uploaded that the server could not file, kept as it came: the
+-- replica may have let go of it since. Filed again on a timer and when the
+-- relay starts, and gone once filed.
 CREATE TABLE sync.inbox (
     id         BIGSERIAL   PRIMARY KEY,
     replica_id UUID        NOT NULL,
-    relation   TEXT        NOT NULL,
-    row_bytes  BYTEA       NOT NULL,
+    relation   TEXT,
+    upload     BYTEA       NOT NULL,
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -168,11 +306,18 @@ CREATE TABLE sync.inbox (
 );
 
 CREATE INDEX inbox_replica ON sync.inbox (replica_id);
+-- The same part of an upload kept twice — the replica sent it again — is one.
+CREATE UNIQUE INDEX inbox_once ON sync.inbox (replica_id, md5(upload));
 
 COMMENT ON TABLE sync.inbox IS
-    'Rows replicas uploaded that the server could not file for a reason a retry cannot '
-    'change: a table it does not mirror, a row that does not decode, one its database '
-    'refuses. Never repaired by hand: a deploy that fixes the cause lets the next retry file it.';
+    'What replicas uploaded that the server could not file for a reason a retry cannot '
+    'change: a table it does not mirror, a row that does not decode, a row or a delete its '
+    'database refuses — or a whole upload, when filing it failed as a whole. Never repaired '
+    'by hand: a deploy that fixes the cause lets the next retry file it.';
+COMMENT ON COLUMN sync.inbox.relation IS
+    'The table, for one row or one delete. NULL: a whole upload.';
+COMMENT ON COLUMN sync.inbox.upload IS
+    'An Up, as protobuf: the upload as it came, or one table''s row or delete of it.';
 
 -- A truncate would take rows away without a note, and every replica would
 -- keep them.
@@ -182,43 +327,87 @@ BEGIN
 END;
 $$;
 
--- Arguments: the partition column ('' for none), then the primary key's
--- columns in order.
+-- Arguments: the table's name as the engine knows it, its partition column
+-- ('' for none), the number of key columns and the key's columns in key
+-- order, the number of mirrored tables it points at and, for each, that
+-- table's name as the engine knows it, the number of columns that point
+-- there and those columns, in that table's key order; then the columns the
+-- replicas own. An update that changes only those is no change here.
 CREATE FUNCTION sync.note_row() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
-    v_row       JSONB := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
-    v_partition UUID  := CASE WHEN TG_ARGV[0] = '' THEN NULL ELSE (v_row ->> TG_ARGV[0])::UUID END;
-    v_key       TEXT;
-    v_old_key   TEXT;
+    v_keys    INTEGER := TG_ARGV[2]::INTEGER;
+    v_key     TEXT[]  := TG_ARGV[3:2 + v_keys];
+    v_refs    INTEGER := TG_ARGV[3 + v_keys]::INTEGER;
+    v_at      INTEGER := 4 + v_keys;
+    v_owned   TEXT[];
+    v_columns INTEGER;
+    v_new     JSONB;
+    v_old     JSONB;
+    v_new_key TEXT;
+    v_old_key TEXT;
+    v_note    BIGINT;
+    v_parent  TEXT;
+    v_parts   INTEGER;
 BEGIN
-    SELECT string_agg(v_row ->> k, '|' ORDER BY n) INTO v_key
-      FROM unnest(TG_ARGV[1:]) WITH ORDINALITY AS a(k, n);
-    INSERT INTO sync.notes (kind, relation, row_key, partition_id, previous)
-    VALUES ('row', TG_TABLE_NAME, v_key, v_partition,
-            CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END);
-    IF TG_OP = 'UPDATE' THEN
-        SELECT string_agg(to_jsonb(OLD) ->> k, '|' ORDER BY n) INTO v_old_key
-          FROM unnest(TG_ARGV[1:]) WITH ORDINALITY AS a(k, n);
-        -- A key that changed: the old one is gone.
-        IF v_old_key IS DISTINCT FROM v_key THEN
-            INSERT INTO sync.notes (kind, relation, row_key, partition_id, previous)
-            VALUES ('row', TG_TABLE_NAME, v_old_key, v_partition, to_jsonb(OLD));
-        END IF;
+    FOR i IN 1..v_refs LOOP
+        v_at := v_at + 2 + TG_ARGV[v_at + 1]::INTEGER;
+    END LOOP;
+    v_owned := coalesce(TG_ARGV[v_at:], '{}');
+    IF TG_OP <> 'DELETE' THEN
+        v_new := to_jsonb(NEW);
+        SELECT string_agg(v_new ->> k, '|' ORDER BY n) INTO v_new_key
+          FROM unnest(v_key) WITH ORDINALITY AS a(k, n);
     END IF;
+    IF TG_OP <> 'INSERT' THEN
+        v_old := to_jsonb(OLD);
+        -- As text: a number written at another scale (1.0, 1.00) is equal
+        -- as jsonb, and reads otherwise on a replica.
+        IF TG_OP = 'UPDATE' AND (v_old - v_owned)::text = (v_new - v_owned)::text THEN
+            RETURN NULL;
+        END IF;
+        SELECT string_agg(v_old ->> k, '|' ORDER BY n) INTO v_old_key
+          FROM unnest(v_key) WITH ORDINALITY AS a(k, n);
+    END IF;
+    IF v_new_key IS NOT NULL THEN
+        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
+        VALUES ('row', TG_ARGV[0], v_new_key,
+                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_new ->> TG_ARGV[1])::UUID END)
+        RETURNING id INTO v_note;
+    END IF;
+    -- A row deleted, or whose key changed: the old key is gone.
+    IF v_old_key IS DISTINCT FROM v_new_key AND v_old_key IS NOT NULL THEN
+        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
+        VALUES ('row', TG_ARGV[0], v_old_key,
+                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_old ->> TG_ARGV[1])::UUID END)
+        RETURNING id INTO v_note;
+    END IF;
+    -- What the version before pointed at, with the note of its key.
+    v_at := 4 + v_keys;
+    FOR i IN 1..CASE WHEN v_old IS NULL THEN 0 ELSE v_refs END LOOP
+        v_columns := TG_ARGV[v_at + 1]::INTEGER;
+        SELECT string_agg(v_old ->> c, '|' ORDER BY n), count(v_old ->> c) INTO v_parent, v_parts
+          FROM unnest(TG_ARGV[v_at + 2:v_at + 1 + v_columns]) WITH ORDINALITY AS a(c, n);
+        IF v_parts = v_columns THEN
+            INSERT INTO sync.pointed (note, relation, row_key) VALUES (v_note, TG_ARGV[v_at], v_parent)
+            ON CONFLICT DO NOTHING;
+        END IF;
+        v_at := v_at + 2 + v_columns;
+    END LOOP;
     RETURN NULL;
 END;
 $$;
 
--- Arguments: the column to note, members or assigned, then the partition
--- column ('' for none). Each version of the row is noted: a member moving
--- between groups leaves one and joins the other.
+-- Arguments: the table's name as the engine knows it, the column to note,
+-- members or assigned, then the partition column ('' for none). Each version
+-- of the row is noted: a member moving between groups leaves one and joins
+-- the other.
 CREATE FUNCTION sync.note_group() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
     INSERT INTO sync.notes (kind, relation, row_key, replica_id, partition_id, previous)
-    SELECT TG_ARGV[1], TG_TABLE_NAME, r ->> TG_ARGV[0],
-           CASE WHEN TG_ARGV[1] = 'assigned' THEN (r ->> TG_ARGV[0])::UUID END,
-           CASE WHEN TG_ARGV[2] = '' THEN NULL ELSE (r ->> TG_ARGV[2])::UUID END,
-           CASE WHEN TG_ARGV[1] = 'members' THEN r END
+    SELECT TG_ARGV[2], TG_ARGV[0], r ->> TG_ARGV[1],
+           CASE WHEN TG_ARGV[2] = 'assigned' THEN (r ->> TG_ARGV[1])::UUID END,
+           CASE WHEN TG_ARGV[3] = '' THEN NULL ELSE (r ->> TG_ARGV[3])::UUID END,
+           CASE WHEN TG_ARGV[2] = 'members' THEN r END
       FROM (SELECT DISTINCT r
               FROM unnest(ARRAY[
                        CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE to_jsonb(NEW) END,
@@ -228,54 +417,4 @@ BEGIN
 END;
 $$;
 
--- Mirrors p_schema.p_table: every insert, delete, and update that changes the
--- row is noted, keyed by its primary key; an update that changes only the
--- p_ignore columns (the ones its replicas own) is not. p_partition names the
--- column that partitions it, when the engine runs with partitions.
-CREATE FUNCTION sync.mirror_table(
-    p_schema TEXT, p_table TEXT, p_ignore TEXT[] DEFAULT '{}', p_partition TEXT DEFAULT ''
-)
-RETURNS VOID LANGUAGE plpgsql AS $$
-DECLARE
-    v_args TEXT;
-BEGIN
-    SELECT string_agg(quote_literal(a.attname), ', ' ORDER BY k.n) INTO v_args
-      FROM pg_index i
-      CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n)
-      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-     WHERE i.indrelid = format('%I.%I', p_schema, p_table)::regclass AND i.indisprimary;
-    IF v_args IS NULL THEN
-        RAISE EXCEPTION 'mirror_table: %.% has no primary key to note its rows by', p_schema, p_table;
-    END IF;
-    v_args := quote_literal(p_partition) || ', ' || v_args;
-    EXECUTE format(
-        'CREATE TRIGGER sync_note_written AFTER INSERT OR DELETE ON %I.%I '
-        'FOR EACH ROW EXECUTE FUNCTION sync.note_row(%s)', p_schema, p_table, v_args);
-    EXECUTE format(
-        'CREATE TRIGGER sync_note_changed AFTER UPDATE ON %I.%I '
-        'FOR EACH ROW WHEN ((to_jsonb(OLD) - %L::text[]) IS DISTINCT FROM (to_jsonb(NEW) - %L::text[])) '
-        'EXECUTE FUNCTION sync.note_row(%s)',
-        p_schema, p_table, p_ignore, p_ignore, v_args);
-    EXECUTE format(
-        'CREATE TRIGGER sync_refuse_truncate BEFORE TRUNCATE ON %I.%I '
-        'FOR EACH STATEMENT EXECUTE FUNCTION sync.refuse_truncate()', p_schema, p_table);
-END;
-$$;
-
--- A table that assigns mirrored rows by group: p_role is members (a row joins
--- or leaves a group; p_column is the group) or assigned (a group is given to
--- or taken from a replica; p_column is the replica).
-CREATE FUNCTION sync.mirror_group(
-    p_schema TEXT, p_table TEXT, p_column TEXT, p_role TEXT, p_partition TEXT DEFAULT ''
-)
-RETURNS VOID LANGUAGE plpgsql AS $$
-BEGIN
-    IF p_role NOT IN ('members', 'assigned') THEN
-        RAISE EXCEPTION 'mirror_group: role is members or assigned, not %', p_role;
-    END IF;
-    EXECUTE format(
-        'CREATE TRIGGER sync_note_group AFTER INSERT OR UPDATE OR DELETE ON %I.%I '
-        'FOR EACH ROW EXECUTE FUNCTION sync.note_group(%L, %L, %L)',
-        p_schema, p_table, p_column, p_role, p_partition);
-END;
-$$;
+INSERT INTO sync.version (version) VALUES (1);

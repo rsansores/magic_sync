@@ -1,0 +1,5 @@
+error: a #[row(…)] field names a column; a skipped or flattened field is none
+ --> tests/derive/fail/flag_on_a_skipped_field.rs:5:11
+  |
+5 |     #[row(created)]
+  |           ^^^^^^^

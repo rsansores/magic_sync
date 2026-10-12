@@ -1,0 +1,5 @@
+error: #[derive(Row)] reads column names off the fields: rename them one by one
+ --> tests/derive/fail/rename_all.rs:2:8
+  |
+2 | #[sqlx(rename_all = "camelCase")]
+  |        ^^^^^^^^^^

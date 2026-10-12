@@ -1,0 +1,5 @@
+error: sync = "grouped(members = a)": expected `members = …, assigned = …`
+ --> tests/derive/fail/grouped_without_assigned.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "grouped(members = a)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^

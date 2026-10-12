@@ -7,88 +7,92 @@ system gets its partition, an operator gets everything, and a user who may see
 some replicas gets the list of those. The engine knows replicas only by id;
 put your own names on them.
 
+Each read is one snapshot: every figure in an answer was true at the same
+moment. Called on a connection outside a transaction, a read opens a
+`REPEATABLE READ` one of its own; called inside yours, yours must be
+`REPEATABLE READ` (or `SERIALIZABLE`), and a read refuses a `READ COMMITTED`
+one, which would see each statement's own moment.
+
 Every answer derives `serde::Serialize`: return it from a handler as it is, and
-a dashboard reads the JSON.
+a dashboard reads the JSON. Each carries `contract`, the version of that JSON
+(`status::CONTRACT`), and a dashboard refuses an answer of a contract it does
+not read.
 
 ## The overview: is everything where it should be?
 
-> **You write:**
+> **You write** (`server.engine()` hands out the engine):
 
-```rust
-use magic_sync::status::{ReplicaState, Scope};
-
-let mut tx = server.begin().await?;
-let overview = server.engine().overview(&mut tx, Scope::Partition(customer), 20).await?;
-if overview.health.healthy {
-    // the green banner: nothing waits for a fix, every replica can be reached
-}
-for r in &overview.replicas {
-    match r.state {
-        ReplicaState::Synced => {}       // holds what it should; everything it wrote is filed
-        ReplicaState::CatchingUp => {}   // r.pending, r.unconfirmed, r.backlog
-        ReplicaState::Unreachable => {}  // r.failures, r.last_error, r.retry_at
-        ReplicaState::AwaitingFix => {}  // r.quarantined, r.parked, r.unfiled
-    }
-}
-for t in &overview.tables {
-    // t.synced: every replica of the scope holds it as it should; else
-    // t.pending, t.in_flight, t.quarantined, t.unfiled say what it waits on
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:overview}}
 ```
 
 > **What happens:** the overview never counts the rows a replica should hold.
 > It reads what the engine records — the changes not yet planned, the messages
 > a replica has not confirmed, what is set aside — so it costs a few
 > milliseconds for 200 replicas holding 3 million rows while they are caught
-> up, and about a fifth of a second at worst, when every row is on its way. Whether a replica is synced is exact all the same: a
-> change it lacks is either noted and not yet planned, or in a message it has
-> not said it applied, or set aside. A test holds the engine to it under a
-> failing network: a replica called synced holds exactly what it should.
+> up, and about a fifth of a second at worst, when every row is on its way
+> (the engine's `bench_the_dashboard_over_200_units_holding_3m_rows`, on a
+> 32-core workstation).
+> Whether a replica is synced is exact all the same: a change it lacks is
+> either noted and not yet planned, or in a message it has not said it
+> applied, or set aside. A test holds the engine to it under a failing
+> network: a replica called synced holds exactly what it should.
+
+Its size does not grow with the fleet. Every replica is counted in
+`overview.states`, and `overview.replicas` lists the worst of them up to the
+limit you pass — those waiting for a fix, then those out of reach, then those
+catching up, the longest silent first — with `total` uncut. The rest are a
+page away: `engine().listing(&mut conn, scope, Some(ReplicaState::Synced),
+Page { offset, limit })` lists them in the same order, in one state or in all.
+`overview.now` is the server's time when it read: every time in the answer is
+the server's, and how long ago one was is measured from it, never from the
+reader's clock.
+
+A replica is waiting for a fix (`AwaitingFix`) only for what is its own: a
+row set aside for it, an upload of its that waits in the inbox, a change of it
+alone (its provisioning, say) that the planner set aside. A change the planner set aside that
+may concern every replica is one problem, listed once in the health; each
+replica it may concern is catching up on it.
 
 `overview.health` lists what the engine waits on over the scope, cut at the
 limit you pass (`total` is uncut): parked notes, rows in quarantine and why,
 uploads in the inbox and why, replicas a send keeps failing to. Each means one
 of two things — *wait* (the network) or *deploy a fix* (a bug) — and none of
-them ever means *go fix the data by hand*. `engine().health(&mut tx, scope,
-limit)` answers it alone; the server's runner logs it every few minutes.
+them ever means *go fix the data by hand*. `healthy` is whether nothing waits
+for a fix: a replica out of reach is the network's to settle, listed in
+`failing` but not unhealthy; what waits for it waits in its outbox (`owed`
+on its overview), not on the planner, so `oldest`, the age of the oldest
+change not yet planned, does not grow while it is away.
+`engine().health(&mut conn, scope, limit)` answers it alone; the server's
+runner logs it every few minutes.
 
 ## How far along one replica is
 
 The overview says *whether*; progress says *how far*: "holds 480 of 500".
 
-```rust
-for register in server.engine().progress(&mut tx, Scope::Replicas(&[register])).await? {
-    for t in register.tables {
-        println!("{}: {} of {} ({} on their way, {} set aside)",
-            t.table, t.up_to_date(), t.should, t.in_flight, t.quarantined);
-    }
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:progress}}
 ```
 
 > **What happens:** a row counts as held only once the replica *confirmed* it
-> applied the message that carried it. Until then it is `in_flight`. So the
+> applied the message that carried it. Until then it is `in_flight`; a row it
+> was sent and should no longer hold is `to_remove`, confirmed or not. So the
 > numbers never run ahead of the replica: "holds 480 of 500" means 480 are on
 > it, now. Counting what a replica should hold reads its rules over the
 > tables: ask it of a few replicas at a time, not of a fleet.
 
 Where is one row?
 
-```rust
-for place in server.engine()
-    .row_progress(&mut tx, Scope::All, "products", &id.to_string()).await?
-{
-    // place.replica, place.state: RowState::Holds, Outdated, OnItsWay, Missing, Leaving, Quarantined
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:row}}
 ```
 
 ## The other direction
 
 On a replica:
 
-```rust
-for t in magic_sync::replica::progress(&mut conn).await? {
-    println!("{}: {} not sent, {} not filed yet", t.table, t.unsent, t.unfiled);
-}
+```rust,ignore
+{{#include ../../../examples/shop/register/src/main.rs:progress}}
 ```
 
 That is the shop register's "2 receipts not at the head office yet". The

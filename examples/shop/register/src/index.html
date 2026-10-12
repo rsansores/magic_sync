@@ -18,7 +18,7 @@
 <body>
 <div class="top">
   <strong><span class="dot" id="dot"></span><span id="name"></span></strong>
-  <button class="plug" id="plug" onclick="plug()"></button>
+  <button class="plug" id="plug"></button>
 </div>
 <ul id="products"></ul>
 <p class="note" id="note"></p>
@@ -29,18 +29,37 @@ async function sell(id) {
   refresh();
 }
 async function plug() { await fetch('/api/plug', { method: 'POST' }); refresh(); }
+function item(className, text) {
+  const li = document.createElement('li');
+  li.className = className;
+  li.textContent = text;
+  return li;
+}
+function product(p) {
+  const li = item('', '');
+  const label = document.createElement('span');
+  label.textContent = `${p.name} · ${money(p.price_cents)}`;
+  const button = document.createElement('button');
+  button.textContent = 'Sell';
+  button.addEventListener('click', () => sell(p.id));
+  li.append(label, button);
+  return li;
+}
 async function refresh() {
   const s = await (await fetch('/api/state')).json();
   document.getElementById('name').textContent = s.name;
   document.getElementById('dot').style.background = s.online ? 'var(--ok)' : 'var(--off)';
   document.getElementById('plug').textContent = s.online ? 'Unplug' : 'Plug in';
-  document.getElementById('products').innerHTML = s.products.map(p =>
-    `<li><span>${p.name} · ${money(p.price_cents)}</span><button onclick="sell('${p.id}')">Sell</button></li>`).join('')
-    || '<li class="note">Holds no product yet.</li>';
+  // Built as elements, never as HTML: a product's name is the head office's
+  // text, and stays text.
+  document.getElementById('products').replaceChildren(...(s.products.length
+    ? s.products.map(product)
+    : [item('note', 'Holds no product yet.')]));
   const waiting = s.unsent + s.unfiled;
   document.getElementById('note').textContent = `${s.sold} sold` +
     (waiting ? ` · ${waiting} receipt${waiting > 1 ? 's' : ''} not at the head office yet` : ' · all at the head office');
 }
+document.getElementById('plug').addEventListener('click', plug);
 refresh(); setInterval(refresh, 700);
 </script>
 </body>

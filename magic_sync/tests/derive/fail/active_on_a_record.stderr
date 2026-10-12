@@ -1,0 +1,5 @@
+error: only a table the server sends down (`catalog` or `both`) has an `active` relation
+ --> tests/derive/fail/active_on_a_record.rs:2:53
+  |
+2 | #[row(table = "things", mirror = "record", active = "live")]
+  |                                                     ^^^^^^

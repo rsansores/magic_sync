@@ -1,0 +1,5 @@
+error: `id` is listed twice
+ --> tests/derive/fail/key_listed_twice.rs:2:51
+  |
+2 | #[row(table = "things", mirror = "catalog", key = "id, id")]
+  |                                                   ^^^^^^^^

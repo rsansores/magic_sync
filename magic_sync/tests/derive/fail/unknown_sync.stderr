@@ -1,0 +1,5 @@
+error: sync = "everyone": expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)` or `follows(col)`
+ --> tests/derive/fail/unknown_sync.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "everyone")]
+  |                                                    ^^^^^^^^^^

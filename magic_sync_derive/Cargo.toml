@@ -9,6 +9,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../README.md"
+homepage = "https://rsansores.github.io/magic_sync/"
+documentation = "https://docs.rs/magic_sync"
 
 [lib]
 proc-macro = true

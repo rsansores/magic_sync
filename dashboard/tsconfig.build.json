@@ -11,5 +11,5 @@
     "rootDir": "src"
   },
   "include": ["src/**/*.ts", "src/**/*.vue"],
-  "exclude": ["src/**/*.test.ts"]
+  "exclude": ["src/**/*.test.ts", "src/core/contract/fixtures"]
 }

@@ -1,0 +1,5 @@
+error: sync = "grouped(members = a, assigned = b, owner = c)": expected `members = …, assigned = …`
+ --> tests/derive/fail/grouped_unknown_key.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "grouped(members = a, assigned = b, owner = c)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

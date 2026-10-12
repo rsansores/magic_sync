@@ -1,0 +1,5 @@
+error: `version` is given twice
+ --> tests/derive/fail/flag_given_twice.rs:6:11
+  |
+6 |     #[row(version)]
+  |           ^^^^^^^

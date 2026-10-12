@@ -58,7 +58,7 @@ content of a change, only *that* something changed.
 | **mirrored table** | a table that exists on both sides with the same columns |
 | **note** | a record, written in the same transaction as a change, that a row (or a group, or a replica) changed |
 | **held set** | `sync.held`: which rows each replica holds, according to the server |
-| **horizon** | the point in time (a PostgreSQL transaction id) a held row was last sent from |
+| **noted** | the newest note of a row when the version a replica holds was read: which of its changes that version holds |
 | **retired** | a row the replica let go of but kept, because a row of its own still points at it |
 | **relay** | the server process that turns notes into messages, one at a time per server |
 | **transport** | whatever carries messages between server and replicas |
@@ -76,12 +76,12 @@ A table is declared once, as the Rust struct that is its row, implementing
 |---|---|---|
 | `Catalog` | the server | down to the replicas that should hold its rows |
 | `Record` | a replica | up to the server |
-| `Both` | both, column by column | the columns the replicas own (`Column::replica_owned`) go up; the rest go down |
+| `Both` | both, column by column | the columns the replicas own (`#[row(replica_owned)]`) go up; the rest go down |
 | `ServerOnly` | the server | nowhere |
 
-### Which replicas hold which rows? (`Sync`, for tables that go down)
+### Which replicas hold which rows? (`sync`, for tables that go down)
 
-| `Sync` | A replica holds a row when |
+| `sync` | A replica holds a row when |
 |---|---|
 | `Broadcast` | the row is in the replica's partition |
 | `Assigned(column)` | `column` names the replica |
@@ -98,22 +98,24 @@ catalogue, so this needs no declaration: the schema already says it.
 
 ### The rest of a declaration
 
-| `Row` constant | What it is for |
+| Declaration | What it is for |
 |---|---|
-| `TABLE`, `SCHEMA`, `KEY` | where the table lives and its primary key (one or more uuid or integer columns) |
-| `VERSION` | a column whose value only moves forward (an `updated_at`): a replica never overwrites a newer copy with an older one |
-| `CREATED` | a column written once, never by an update |
-| `RETIRED` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
-| `ORIGIN` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
-| `UNMIRRORED` | columns one side has that the row leaves out |
-| `ACTIVE` | a relation (a view) the rows replicas should hold are read through, leaving the others out; the table itself when there is none |
+| `table`, `schema`, `key` | where the table lives and its primary key (one or more uuid or integer columns) |
+| `#[row(version)]` | a column whose value only moves forward (an `updated_at`): the server never files a replica's older report over a newer one |
+| `#[row(created)]` | a column written once, never by an update |
+| `retired` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
+| `origin` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
+| `unmirrored` | columns one side has that the row leaves out |
+| `active` | a relation (a view) the rows replicas should hold are read through, leaving the others out; the table itself when there is none |
 
-`#[derive(Row)]` writes all of them from the struct and its attributes
-([The rows](guide/rows.md)); a host can implement the trait by hand too.
+`#[derive(Row)]` turns them into the row's implementation of [`row::Row`]
+([The rows](guide/rows.md)), and is the only way to implement it: what it
+writes is checked where it is written, and again against the database when
+either side starts.
 
 ### The codec
 
-A table travels in its own encoding: the row's serde shape as JSON
+A table travels in its own encoding: JSON, an object of its columns
 (`Codec::json`), or a protobuf message of its own with a mapping each way
 (`Codec::new`). A [`wire::Codec`] erases the row type so the engine can hold
 every table in one list. The engine never names a table; it dispatches on the
@@ -131,12 +133,13 @@ until every replica that should hold it holds the new name.
    └─ trigger: INSERT INTO sync.notes        (same transaction: atomic)
 
  relay pass
-   1. prepare  (a read transaction)
-        read pending notes ──▶ plan ──▶ load and encode rows
+   0. observe  (what became of the replicas: live, moved, gone)
+   1. record   (one REPEATABLE READ transaction on the relay lock's connection)
+        read pending notes ──▶ plan ──▶ load and encode rows, a chunk at a time
+        ──▶ per replica: pack into messages, number them
+        ──▶ sync.outbox ← the messages;  sync.held ← what they carry;  notes ← done
    2. publish  (no transaction open)
-        per replica: pack into messages ──▶ number them ──▶ transport.send
-   3. record   (a transaction on the relay lock's connection)
-        sync.held ← what was sent;  notes ← done
+        per replica: its outbox, in order ──▶ transport.send ──▶ out of the outbox
 
  replica
    apply the message in one transaction ──▶ ack
@@ -144,56 +147,105 @@ until every replica that should hold it holds the new name.
 
 ### 4.1 Noting
 
-`sync.mirror_table('schema', 'table', ignore, 'partition_column')` installs
-triggers on a table. Every insert, delete, and update that changes something
-writes a row to `sync.notes`: the table, the row's key, the row as it was
-before (which says what it pointed at), and the id of the transaction. Because
+Every mirrored table has the engine's triggers, as `Engine::triggers` writes
+them ([The tables](guide/tables.md)). Every insert, delete, and update that
+changes a column the replicas do not own writes a row to `sync.notes`: the
+table as the engine knows it (a partitioned table by its own name, not its
+partition's), the row's key in the order the row declares it, the columns it
+pointed at other mirrored rows with before the change, and the id of the
+transaction. A key that changed notes the old key too, in the partition it
+was in. Because
 the note is written by a trigger in the same transaction, **no write path can
 forget to note**, and a rolled-back change leaves no note. `TRUNCATE` is
 refused on a mirrored table, because it would remove rows without a note.
 
-Group tables get `sync.mirror_group`: a member joining or leaving a group, or a
-group given to or taken from a replica, is noted the same way.
+Group tables get a trigger too: a member joining or leaving a group, or a
+group given to or taken from a replica, is noted the same way. The server
+refuses to start while a trigger is missing, disabled, or not as it would
+write it.
 
 ### 4.2 Planning
 
-The relay reads up to a batch of pending notes, oldest first. It reads every
+Before each pass the relay compares the replicas (`Replicas::relation` and
+`live`) with what it saw last (`sync.replicas.live`, `partition_id`): a
+replica that became live, or moved to another partition, is provisioned again
+from scratch; one that stopped being live, or is gone, is forgotten — nothing
+recorded as held by it, nothing sent it.
+
+The relay reads up to a batch of pending notes, oldest first, in a
+`REPEATABLE READ` transaction: the notes, the plan, the rows it loads and
+what it records are one snapshot, so a row is never sent as it is after a write the plan did not
+see — a parent it now points at left behind. A note this build cannot read (a
+later build's) is skipped by the query, and holds back nothing. It reads every
 note that is not done, instead of "every note after the last one I read",
 because PostgreSQL assigns ids before commit: a transaction that started first
 can commit last with a lower id. A cursor would skip it; a "not done" query
 never does.
 
-For the notes it read, the planner computes, per replica:
+What a replica should hold is the least set of rows closed under three
+rules: the rows its tables' rules send it; every row one of those points at
+(a parent goes with its child); every row that follows one of those. For the
+notes it read, the planner works out how that set moved, around what changed
+— never the whole of it but for a replica provisioned from scratch:
 
-1. **The changed rows**: who should hold each one now (by its table's `Sync`
-   rule) against who holds it (`sync.held`). New holders get it, holders that
-   should not hold it any more lose it.
-2. **Parents**: every row being sent brings along each row it points at that
-   the replica lacks.
-3. **Release**: a row taken back, or one a changed row no longer points at,
-   releases what it pointed at, and a parent goes only once nothing the
-   replica keeps points at it.
-4. **Followers**: rows that `Follow` a parent go wherever the parent goes.
+1. **Rows in question.** Of the rows a replica holds, those a change may
+   have taken out of its set: a changed row its rules no longer send it (a
+   `Referenced` or following row: any that changed), the parents a changed
+   row pointed at before, rows that cannot go. Then, closed over what they
+   point at and what follows them, the rows of its that leaned on those.
+   Every row it holds outside them stays as recorded.
+2. **What it keeps.** The rows its rules send it; the rows in question that
+   a row it holds outside them points at, or that follow one it holds; then,
+   a round at a time from the rows the last round added, what those need:
+   the parents of a row it lacks or that is in question (a follower points
+   at its parent too), and the followers of one it lacks or that is in
+   question.
+3. **The difference.** What it keeps and lacks — or holds as a version
+   older than a change of the batch, or refused — is sent; the rows in
+   question it does not keep are taken back.
 
-These steps feed each other, so they repeat until nothing changes. The result
-is a `Delta`: per replica, rows to send and rows to take back.
+A row a replica holds that a change not yet planned pointed at before stays
+too — beyond the batch, or parked, that change's older version is what the
+replica holds, and it still points there. Rows that cannot go (section 4.3)
+are never kept, nor any row that points at one; a plan that would send such
+a row runs again with it among them.
 
-**The horizon.** Planning starts by reading the oldest transaction still
-running (`pg_snapshot_xmin`). Every transaction older than that has finished,
-so anything it changed is in the rows the plan reads. When a replica is
-recorded as holding a row, the horizon is recorded with it. Later, a note for
-that row is only acted on if its transaction is at or past the recorded
-horizon. That is how a change the replica already received is not sent twice,
-while a change committed *after* the plan read (by a transaction that started
-earlier) is never missed.
+The plan is worked out in the database, in temporary tables of the relay's
+connection, set by set, and read a page at a time by what records it: a
+plan, however many rows it sends — a snapshot of a large replica, a group of
+thousands given to many replicas — is never in the relay's memory whole.
+Every note of the batch is planned together, in one plan: a part planned
+apart could undo what another sends — take back a parent a child planned
+elsewhere still needs.
+
+**What a replica's version holds.** Every plan reads one snapshot of the
+database. When a replica is recorded as holding a row, the newest note of
+that row the snapshot sees is recorded with it. Writers of one row take
+turns on its lock, so a row's notes are numbered in the order its changes
+committed: a later note of it is a change the replica lacks, and sends the
+row again; an earlier one is a change it holds, and sends nothing. A change
+committed *after* the plan read — by a transaction that started earlier,
+or took its transaction id first — is never missed, and a change the
+replica already received is never sent twice. The numbers are a sequence's,
+so a database dumped and restored, or moved to another cluster, keeps
+them: its transaction ids start over, and nothing depends on them. (Logical
+replication carries no sequences: a database moved by it has them set, as
+for every serial column, before its relay runs.)
 
 ### 4.3 Loading
 
 Every row the delta sends is read once and encoded once by its codec, however
-many replicas get it. A row that is gone by now (deleted since the plan read
-it) is taken back instead of sent.
+many replicas get it, in the plan's snapshot, a chunk of rows at a time: what
+the relay holds in memory is a chunk, and one message being filled per
+replica, however much it sends. A row that cannot go — it does
+not encode, or no message could carry it — is planned around: the plan runs
+again with it blocked, so it is not sent, what points at it is not sent
+either, and a replica holding an older version of it has that version taken
+back with whatever points at it there. A replica never keeps a version the
+planner can no longer reason about; each of those rows is quarantined and
+comes back once a fix lets it through.
 
-### 4.4 Publishing
+### 4.4 Recording, then publishing
 
 Each replica's rows are packed into messages ([`envelope::Down`]) under the
 transport's size limits: parents' rows first, then deletes, children first.
@@ -203,46 +255,77 @@ message is set aside at loading, like one that does not encode (section 6).
 Each row travels with its key, so a replica that cannot even decode a row can
 still say which one it was.
 
-**Every message is numbered.** The relay draws a number from a PostgreSQL
-sequence at the start of each pass and numbers the pass's messages from it. A
-sequence never goes backwards, whichever relay draws from it, and is not
-rolled back with a transaction. A replica applies nothing at or below the last
-number it applied. That protects against a message delivered twice, and
-against a relay that lost its lock and sends a stale message late: its numbers
-are lower than the new relay's, so the replica drops them. Messages also carry
-the *epoch*, a random id made when the server's schema was installed: a server
-installed again numbers from scratch, and a replica that sees a new epoch
-starts counting again.
+**Every message is numbered, and chained.** The relay draws one number per
+message from a PostgreSQL sequence, and gives them out in the order the
+messages go. A sequence never goes backwards and is not rolled back with a
+transaction, so no two messages ever share a number. A replica applies
+nothing at or below the last number it applied: a message delivered twice
+changes nothing. Each message also carries a random *nonce*, and names the
+one sent the replica before it, by number and nonce (`previous`,
+`previous_nonce`); a replica applies a message only when it follows the last
+one it applied, so one that follows a message it never got — lost on the
+way, or the replica's database restored from an older copy — is a *gap*: it
+applies nothing more until a snapshot begins, tells the server the newest
+message it could not follow, and is provisioned again, unless a snapshot
+that began after that message is already on its way. Messages carry the
+*epoch* too, a random id of the server's installation: a new epoch always
+begins with a snapshot.
+
+Every message is sealed for its replica: an HMAC of its replica, epoch,
+number and nonce under a secret of the epoch (`sync.epoch`). The replica
+gives the seal back, as it came, when it says what it applied, so the
+server knows it sent that message. A server database restored from an
+older copy numbers again from where the copy left off, but draws other
+nonces: its replicas apply none of it, and say what they applied — a
+message the server sealed and has no record of sending. The server then
+takes a new epoch and provisions every replica again; one restored from
+before its last new epoch hears of an epoch it never had, from replicas it
+last heard follow its own, and provisions each again. A replica that says
+it applied less than it said before was restored itself, and is
+provisioned again.
 
 A provisioning (a *snapshot*) sends everything the replica should hold, then an
 [`envelope::EndSnapshot`]. On the end, the replica deletes every row of those
-tables the snapshot did not name.
+tables the snapshot did not name. A snapshot replaces what the replica was
+owed: its outbox is dropped when the snapshot is written.
 
-### 4.5 Recording
-
-Only after the messages are out does the relay record what each replica now
-holds and mark the notes done. If the relay dies between publishing and
-recording, the next pass sends the same rows again, numbered higher, and the
-replica applies them again with the same result. **A row is never recorded as
-held that was not sent**; at worst, it is sent twice.
+**Recorded before it is sent.** Each message is written to its replica's
+outbox (`sync.outbox`) as it is filled, and what it carries is recorded in
+`sync.held` with its number, in the same transaction that marks the notes
+done. Only once that commits does the relay publish: each replica's outbox,
+in order, a message leaving it once the transport took it — up to
+`Settings::concurrency` replicas at once, so one slow to take its messages
+holds back no other. So the server
+decides what a replica will hold before anything goes, and nothing goes that
+is not recorded: a relay that dies after the commit loses nothing — whoever
+runs the relay next sends the outbox — and one that dies before it sent
+nothing. A message keeps its number, and its transport id, however often it
+goes.
 
 The record transaction runs on the connection that holds the relay's lock. If
 that connection is lost, PostgreSQL releases the lock and rolls back the
 record together. So a relay that lost its lock can never commit over the one
 that took it.
 
+A replica the transport cannot reach keeps its messages in its outbox, in
+order, while every other one is sent to: nothing is planned again for it.
+Should its outbox outgrow `outbox_messages` or `outbox_bytes` behind any
+snapshot it begins with, it is dropped and the replica provisioned again
+instead — an alarm, in its `last_error`.
+
 ### 4.6 Applying, on the replica, and saying so
 
 The replica applies a message in one transaction ([`replica::apply`]):
 
-- Each row overwrites its copy, except the columns the replica owns, unless the
-  replica holds a newer version (`VERSION`).
+- Each row overwrites its copy, except the columns the replica owns, whatever
+  its version: the chain orders the server's messages, so the last applied is
+  the server's latest, even after a restore or a clock set back.
 - A row it had retired is offered again and becomes live.
 - A row it is told to let go of is deleted or, if a row of its own still points
   at it, retired (its `RETIRED` column set). A sale keeps its customer.
 
 Then it tells the server the number of the last message it applied. Until it
-does, what the server recorded in 4.5 is only *on its way*: every held row
+does, what the server recorded in 4.4 is only *on its way*: every held row
 remembers the message that carried it, and counts as held once the replica
 has acknowledged that message. This is what keeps the progress figures
 (section 6) honest: they count what the replica confirmed, never what was
@@ -253,19 +336,31 @@ merely sent.
 ## 5. The life of a change, replica to server
 
 A replica writes its own rows (records, and its columns of two-way tables).
-A trigger notes each write in the writing transaction (`sync_notes`: the table
-and the key), so no write path can forget. The replica's upward loop gathers
+A trigger notes each write in the writing transaction (`sync_notes`: one
+note per row — the table and the key — counting its writes), so no write path
+can forget, and a row written a thousand times is one note. The replica's upward loop gathers
 the noted rows **as they are now** — a row edited twice goes up once, with its
 last version — into an [`envelope::Up`], and hands it to the host's uplink. A
 row that is gone by then goes as its key, but only for a table keyed by its
 replica (`ORIGIN`): history a replica pruned before it went up is not the
 server's to delete.
 
-Each upload is numbered by the highest note it carries. The server answers
+Every send of an upload draws a random number of its own, a resend included,
+stamped on its notes in the transaction that makes it. The server answers
 every upload it filed with a `Filed` message, after its transaction commits,
-and the replica lets go of those notes. An upload the server does not answer
-goes again after a while. So the replica always knows what it wrote that has
-not reached the server yet.
+and the replica lets go of the notes that send carried — a note sent again
+since waits for the answer to that send, and a row written since goes up
+again, so a late answer never forgets a write it did not carry. An answer
+that arrives before the replica recorded the send counts all the same; one
+meant for another replica, or for this one before it was restored, names
+nothing of its. An upload the server does not answer
+goes again after a while. An upload stays within the transport's size; a row
+that can never fit, or that the transport refuses for good, is set aside and
+counted in the backlog until the replica runs again — found by sending half of
+what was refused, and half again, and blamed only when the transport took some
+other message meanwhile; a transport that refuses everything sets nothing aside
+and is asked again after a backoff. So the replica always
+knows what it wrote that has not reached the server yet.
 
 The same `Up` carries everything else a replica has to tell the server: the
 rows it could not take, the last message it applied, and, hourly, its
@@ -316,12 +411,14 @@ fixed:
 | What fails | What the engine does | How it heals |
 |---|---|---|
 | Planning, on one note | halves the batch until the failing note is alone, parks it (`parked_at`), and plans the rest | parked notes are unparked when the relay starts (usually after a deploy) and on a timer |
-| Encoding a row, on the server | leaves the row out of what is sent and recorded, and **quarantines** it for every replica that was owed it. A replica keeps whatever copy it has | quarantined rows are noted again, for their replica alone, when the relay starts and on a timer; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
-| The transport, for one replica | that replica waits out a backoff (`sync.replicas`); what it is owed is noted again **for it alone**, as of the transactions that first noted it; every other replica carries on | sent when its backoff ends |
+| Encoding a row, on the server | leaves the row out of what is sent and recorded, with every row that points at it there, and **quarantines** them for every replica that was owed them. A replica holding an older copy has it taken back, with what points at it | quarantined rows are noted again when the relay starts and on a timer, as of no transaction — so each goes only where it is missing; a row leaves the quarantine once its replica confirms it holds it, or once it is owed to no one |
+| The transport, for one replica — unreachable, refusing a message for good, or not answering within `send_timeout` | that replica waits out a backoff (`sync.replicas`, the refusal in `last_error`); its outbox keeps the message and every one after it, in order; every other replica carries on. An outbox past its bound, or a message refused for good three times in a row, is dropped and the replica provisioned again, with an alarm | sent when its backoff ends |
 | A row larger than any message may be | left out at loading and **quarantined**, as one that does not encode | as above, once a fix makes it smaller or the limit larger |
-| The transport, refusing a message for good | what the message carried is quarantined for that replica | as above |
-| A replica, taking a row | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`) and reports it in an `Up`; the server stops counting it as held and quarantines it | a fix deployed on either side lets the retry through |
-| The server, filing an uploaded row | the row is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer |
+| A replica, taking a row or letting one go | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`), with the message that refused it, and reports it in an `Up` before it says it applied that message; the server records the row *refused* — still held for what takes rows back, so a delete still goes, not for progress or digests — and quarantines it. A rejection of a message other than the last that carried the row is ignored | a fix deployed on either side lets the retry through |
+| The server, filing an uploaded row or delete | the row, or the delete, is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer, a page at a time beside the passes |
+| The server, filing an upload as a whole | the upload is kept whole in `sync.inbox` and answered, so the replica does not send it again for nothing | as above |
+| The server, with a replica's part of the inbox full (`Settings::inbox`) | that replica's uploads that would add to it fail as transient: they wait on the replica, unanswered, with an alarm | filed again, a page at a time beside the passes, once a fix files what is kept; what a sender the host no longer knows uploaded waits `prune_after`, then is dropped with an alarm |
+| The transport, losing the last messages it was sent | a replica that leaves them unconfirmed while nothing is sent to it and nothing confirmed by it is provisioned again after `unconfirmed_after`, then after twice as long while it stays silent | by itself |
 | Anything nobody foresaw | see below | |
 
 ### The backstop: digests
@@ -329,8 +426,8 @@ fixed:
 Every so often, each replica reports a **digest** of what it holds of every
 table: how many rows, and a fingerprint of their keys (FNV-1a over the sorted
 keys; rows it retired or could not take are left out). The server compares it
-with what it records the replica holds (leaving out the rows it quarantined
-for it). It only compares once the replica has applied every message recorded
+with what it records the replica holds (leaving out the rows the replica
+refused, as it does). It only compares once the replica has applied every message recorded
 for it, so a message on its way is never mistaken for drift. If they differ,
 the replica is provisioned again from scratch.
 
@@ -348,18 +445,21 @@ should be. Per replica, one state:
 | State | Means |
 |---|---|
 | `synced` | it holds what it should, and the server filed everything it last said it wrote |
-| `catching_up` | changes are on their way to it (noted and not yet planned, or in a message it has not confirmed) or from it (its backlog) |
+| `catching_up` | changes are on their way to it (noted and not yet planned, held back by a parked note that may concern it, or in a message it has not confirmed) or from it (its backlog) |
 | `unreachable` | sends to it fail; it is tried again after a backoff |
-| `awaiting_fix` | something is set aside for it until a fix: a row in quarantine, a parked note, an upload in the inbox |
+| `awaiting_fix` | something of its own is set aside until a fix: a row in quarantine, a parked note owed to it alone, an upload of its in the inbox |
 
 It never counts the rows a replica should hold: it reads only what the engine
 records, so it costs little for a fleet — a few milliseconds for 200 replicas
 holding 3 million rows, while they are caught up; the rows still on their way
 are counted one by one, about a fifth of a second when every replica has all
-of them unconfirmed — and it is exact all the same. A change a replica lacks is in one of three places — a note not
+of them unconfirmed (`bench_the_dashboard_over_200_units_holding_3m_rows`, on
+a 32-core workstation) — and it is exact all the same. A change a replica lacks is in one of three places — a note not
 yet planned, a message it has not confirmed, or set aside — and each is
-recorded. Per table, the same figures over the scope's replicas say which
-tables are not where they should be yet.
+recorded. It counts every replica per state and lists the worst up to a
+limit; [`plan::Engine::listing`] pages through the rest. Per table, the same
+figures over the scope's replicas say which tables are not where they should
+be yet. Every read is one snapshot, and carries the server's `now`.
 
 [`plan::Engine::progress`] answers how far along: for a few replicas, per
 table:
@@ -369,8 +469,8 @@ table:
 | `should` | rows its rules say it should hold |
 | `holds` | rows it should hold and **confirmed** it holds |
 | `outdated` | of those, rows changed since (a newer version is on its way or owed) |
-| `in_flight` | rows sent and not confirmed yet |
-| `to_remove` | rows it holds and should no longer |
+| `in_flight` | rows it should hold, sent and not confirmed yet |
+| `to_remove` | rows it was sent and should no longer hold |
 | `quarantined` | rows set aside for it until a fix |
 
 `holds - outdated` of `should` is the replica's progress bar, the way a music
@@ -392,7 +492,8 @@ many notes are pending and since when, the parked notes, the rows in
 quarantine and why, the uploads in the inbox and why, and the replicas a send
 keeps failing to. Each of these means one of two things: wait (the
 infrastructure is down), or deploy a fix (a bug). Never "go fix the data".
-When there are none, the engine is healthy — the normal state.
+When nothing waits for a fix, the engine is healthy — the normal state; a
+replica out of reach is listed, and waited for.
 
 ---
 
@@ -401,7 +502,9 @@ When there are none, the engine is healthy — the normal state.
 The engine guarantees that:
 
 1. **No committed change is lost.** It is noted in the same transaction, and a
-   note is only done once what it asked for was sent and recorded.
+   note is only done in the transaction that records what it asked for and
+   writes the messages that carry it, which are sent until the transport
+   takes them.
 2. **A replica converges to what it should hold.** At-least-once delivery,
    idempotent application, and the digest backstop.
 3. **A replica never holds a row without the rows it points at.**
@@ -413,13 +516,11 @@ They rest on:
 
 - **One relay at a time.** The server's runner holds a PostgreSQL advisory
   lock while it relays, and records each pass on that lock's connection.
-- **One message in flight per replica.** The transport delivers a replica's
-  messages in order and does not deliver the next one until the previous one
-  is acknowledged. With NATS JetStream, that is a durable pull consumer with
-  `max_ack_pending = 1`. Without this, a failed message could be retried after
-  the ones behind it. The way up is the same, per lane: a replica's uploads
-  reach the server in the order it sent them.
-- **Transactions.** `prepare` and `file` run in a transaction (they use
+- **A transport that keeps its contract**
+  ([the protocol, section 2](protocol.md#2-what-the-transport-must-provide)).
+  Without it, a failed message could be retried after the ones behind it, or
+  lost until the safety net of section 6 catches it.
+- **Transactions.** `record` and `file` run in a transaction (they use
   savepoints); `apply` runs in one so a message applies whole or not at all.
 - **A monotonic version column**, if tables have one: the server must stamp it
   with the clock at the write, never behind the value it replaces (not
@@ -430,7 +531,7 @@ They rest on:
 ## 8. What is the host's, and what is the engine's
 
 The host writes its tables, a struct per table, the codec list, where the
-replicas are, how bytes travel each way (a [`relay::Transport`] and a
+replicas are, how bytes travel each way (a [`run::server::Transport`] and a
 [`run::replica::Uplink`]), and, when it needs to, what it knows about a
 sender ([`run::server::Senders`]). [Build your own](guide/tables.md) walks
 through each.
@@ -439,8 +540,9 @@ Everything else is the runners' ([`run`]): on the server, the lock, the
 passes and their backoff, retrying what was set aside, pruning, the alarms,
 filing uploads and answering them; on a replica, applying each message in one
 transaction, and the upward loop. The step functions they are built on —
-`Relay::prepare`/`publish`/`record`, `replica::apply`, `replica::outbox` and
-the rest — stay public, for a host that needs to drive the engine itself.
+`Relay::record`/`publish`, `replica::apply`, `replica::outbox` and
+the rest — are the engine's own: a host drives the engine through the
+runners.
 
 ---
 
@@ -448,20 +550,21 @@ the rest — stay public, for a host that needs to drive the engine itself.
 
 | Module | What it holds |
 |---|---|
-| [`row`] | a table's declaration (`Row`, `Mirror`, `Sync`, `Column`), and the writes both sides make: upsert with the version guard, insert-first-wins, retire |
+| [`row`] | a table's declaration (`Row`, `Mirror`, the key and version types), the check of a table against its row, and the writes both sides make: upsert with the version guard, insert-first-wins, retire |
 | [`wire`] | the codec: a table's rows encoded as its own message, and applied by the rules its row declares |
-| [`envelope`] | the messages between server and replica, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
+| [`envelope`] | the messages between server and replica, their limits, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
 | [`plan`] | the planner and the notes (server) |
-| [`relay`] | one pass (prepare, publish, record), the transport trait, parking, quarantine, the inbox (server) |
+| [`relay`] | one pass (record, then publish), the outbox, parking, quarantine, provisioning a silent replica again (server) |
+| [`filing`] | what a replica sends up, filed: its rows, its rejections, its acknowledgement, its digests, its backlog; the inbox (server) |
 | [`status`] | what the engine answers about itself: the overview, health, progress, where a row is (server) |
-| [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica), and filing uploads (server) |
+| [`replica`] | applying, sweeping a snapshot, uploading, rejecting, digests (replica) |
 | [`dialect`] | the few things PostgreSQL and SQLite spell differently |
-| [`run`] | the runners: [`Server`] (the relay under its lock, retries, filing and answering uploads) and [`Replica`] (receiving, and the way up) |
+| [`run`] | the runners: [`Server`] (the relay under its lock, retries, filing and answering uploads, and the transport it sends through) and [`Replica`] (receiving, and the way up) |
 
 | File | What it is |
 |---|---|
 | `sql/postgres.sql` | the server's schema |
-| `sql/sqlite.sql` | a replica's schema |
+| `sql/sqlite/` | a replica's schema, one step per version |
 | `proto/sync.proto` | the engine's messages, for a replica in another language |
 
 The derive lives in its own crate, `magic_sync_derive`, re-exported as
@@ -479,14 +582,18 @@ The crate is compiled for one backend at a time: `postgres` for the server,
   exactly what its strategies say, and never a row without its parent.
 - **Each failure** in section 6 has its own test, against a fake transport and
   a codec with a deliberate bug that a "deploy" fixes.
-- **A chaos test** runs storms of random writes (inserts, renames, rows retired
-  and deleted, a tenth of them rows the encoding refuses) while the transport
-  fails a third of the sends at random. Replicas are modelled as real ones
-  behave: they only apply messages numbered above the last one. Then the
-  network comes back and the fix is deployed. Every replica must end up holding
-  exactly the live rows, with nothing pending and nothing in quarantine.
-- **Races**: a transaction that commits after a plan read past it, and a relay
-  that sent but died before recording.
+- **A storm** runs the same walk through the real relay while the transport
+  fails a fifth of the sends — some for good — and loses messages; the relay
+  dies between its record and its sends, or loses its lock mid-pass; replicas
+  take part of what waits for them, die before acknowledging, or are not
+  heard. Replicas are modelled from the protocol (`src/model.rs`): epochs,
+  chaining and gaps, snapshots, rejections. Each time the system settles,
+  every replica holds exactly what the engine records; once the faults stop
+  and the fix is deployed, exactly what it should, with provisionings rare.
+- **Races and restores**: a transaction that commits after a plan read past
+  it, a pass recorded and never sent, a lock lost mid-pass, a send cut short
+  before a row leaves the replica's scope, a message lost, a server or a
+  replica restored from an older copy.
 - **The replica side** runs on SQLite: messages from the past, rows it cannot
   decode, tables it does not have, digests.
 
@@ -494,33 +601,34 @@ Run them with `cargo test -p magic_sync --features postgres` (PostgreSQL
 through `DATABASE_URL`; each test gets a database of its own) and
 `cargo test -p magic_sync --features sqlite`.
 
-[`row::Row`]: https://docs.rs/magic_sync/latest/magic_sync/row/trait.Row.html
-[`wire::Codec`]: https://docs.rs/magic_sync/latest/magic_sync/wire/struct.Codec.html
-[`envelope::Down`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Down.html
-[`envelope::EndSnapshot`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.EndSnapshot.html
-[`envelope::ToReplica`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.ToReplica.html
-[`envelope::Up`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/struct.Up.html
-[`replica::apply`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.apply.html
-[`replica::file`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.file.html
-[`Error::is_transient`]: https://docs.rs/magic_sync/latest/magic_sync/enum.Error.html#method.is_transient
-[`plan::Engine::overview`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.overview
-[`plan::Engine::health`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.health
-[`plan::Engine::progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.progress
-[`plan::Engine::row_progress`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.row_progress
-[`plan::Engine::new`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Engine.html#method.new
-[`plan::Replicas`]: https://docs.rs/magic_sync/latest/magic_sync/plan/struct.Replicas.html
-[`replica::progress`]: https://docs.rs/magic_sync/latest/magic_sync/replica/fn.progress.html
-[`relay::Transport`]: https://docs.rs/magic_sync/latest/magic_sync/relay/trait.Transport.html
-[`run::replica::Uplink`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/trait.Uplink.html
-[`run::server::Senders`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/trait.Senders.html
-[`run`]: https://docs.rs/magic_sync/latest/magic_sync/run/index.html
-[`row`]: https://docs.rs/magic_sync/latest/magic_sync/row/index.html
-[`wire`]: https://docs.rs/magic_sync/latest/magic_sync/wire/index.html
-[`envelope`]: https://docs.rs/magic_sync/latest/magic_sync/envelope/index.html
-[`plan`]: https://docs.rs/magic_sync/latest/magic_sync/plan/index.html
-[`relay`]: https://docs.rs/magic_sync/latest/magic_sync/relay/index.html
-[`status`]: https://docs.rs/magic_sync/latest/magic_sync/status/index.html
-[`replica`]: https://docs.rs/magic_sync/latest/magic_sync/replica/index.html
-[`dialect`]: https://docs.rs/magic_sync/latest/magic_sync/dialect/index.html
-[`Server`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html
-[`Replica`]: https://docs.rs/magic_sync/latest/magic_sync/run/replica/struct.Replica.html
+[`row::Row`]: api/server/magic_sync/row/trait.Row.html
+[`wire::Codec`]: api/server/magic_sync/wire/struct.Codec.html
+[`envelope::Down`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`envelope::EndSnapshot`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`envelope::ToReplica`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`envelope::Up`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto
+[`replica::apply`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/replica.rs
+[`filing::file`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/filing.rs
+[`Error::is_transient`]: api/server/magic_sync/enum.Error.html#method.is_transient
+[`plan::Engine::overview`]: api/server/magic_sync/plan/struct.Engine.html#method.overview
+[`plan::Engine::health`]: api/server/magic_sync/plan/struct.Engine.html#method.health
+[`plan::Engine::progress`]: api/server/magic_sync/plan/struct.Engine.html#method.progress
+[`plan::Engine::listing`]: api/server/magic_sync/plan/struct.Engine.html#method.listing
+[`plan::Engine::row_progress`]: api/server/magic_sync/plan/struct.Engine.html#method.row_progress
+[`plan::Replicas`]: api/server/magic_sync/plan/struct.Replicas.html
+[`replica::progress`]: api/replica/magic_sync/replica/fn.progress.html
+[`run::server::Transport`]: api/server/magic_sync/run/server/trait.Transport.html
+[`run::replica::Uplink`]: api/replica/magic_sync/run/replica/trait.Uplink.html
+[`run::server::Senders`]: api/server/magic_sync/run/server/trait.Senders.html
+[`run`]: api/server/magic_sync/run/index.html
+[`row`]: api/server/magic_sync/row/index.html
+[`wire`]: api/server/magic_sync/wire/index.html
+[`envelope`]: api/server/magic_sync/envelope/index.html
+[`plan`]: api/server/magic_sync/plan/index.html
+[`relay`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/relay.rs
+[`filing`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/filing.rs
+[`status`]: api/server/magic_sync/status/index.html
+[`replica`]: api/replica/magic_sync/replica/index.html
+[`dialect`]: https://github.com/rsansores/magic_sync/blob/main/magic_sync/src/dialect.rs
+[`Server`]: api/server/magic_sync/run/server/struct.Server.html
+[`Replica`]: api/replica/magic_sync/run/replica/struct.Replica.html

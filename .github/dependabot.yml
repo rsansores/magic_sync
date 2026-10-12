@@ -1,0 +1,9 @@
+# The actions are pinned to commits; this moves the pins to the releases.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

@@ -1,0 +1,5 @@
+error: a #[row(generated)] column is computed by the database: nothing writes it
+ --> tests/derive/fail/generated_and_replica_owned.rs:5:22
+  |
+5 |     #[row(generated, replica_owned)]
+  |                      ^^^^^^^^^^^^^

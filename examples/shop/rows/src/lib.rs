@@ -6,6 +6,7 @@ use magic_sync::wire::Codec;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// ANCHOR: rows
 /// A product: written at the head office, held by every register.
 #[derive(sqlx::FromRow, Clone, Debug, Serialize, Deserialize, magic_sync::Row)]
 #[row(
@@ -35,28 +36,28 @@ pub struct Receipt {
     #[row(created)]
     pub created_at: DateTime<Utc>,
 }
+// ANCHOR_END: rows
 
+// ANCHOR: registers
 /// The registers, as the engine finds them on the server.
 #[cfg(feature = "server")]
-pub const REGISTERS: magic_sync::plan::Replicas = magic_sync::plan::Replicas {
-    relation: "shop.registers",
-    table: "registers",
-    live: "active",
-    partition: None,
-};
+pub const REGISTERS: magic_sync::plan::Replicas =
+    magic_sync::plan::Replicas::relation("shop.registers")
+        .table("registers")
+        .live("active");
+// ANCHOR_END: registers
 
+// ANCHOR: codecs
 /// A receipt is filed under the register that sent it, whatever it says.
 fn place_receipt(receipt: &mut Receipt, register: Uuid, _: &()) {
     receipt.register_id = register;
 }
 
 /// Every table that travels, parents first.
-pub fn codecs() -> &'static [Codec<()>] {
-    static CODECS: std::sync::OnceLock<Vec<Codec<()>>> = std::sync::OnceLock::new();
-    CODECS.get_or_init(|| {
-        vec![
-            Codec::json::<Product>(None),
-            Codec::json::<Receipt>(Some(place_receipt)),
-        ]
-    })
+pub fn codecs() -> Vec<Codec<()>> {
+    vec![
+        Codec::json::<Product>(None),
+        Codec::json::<Receipt>(Some(place_receipt)),
+    ]
 }
+// ANCHOR_END: codecs

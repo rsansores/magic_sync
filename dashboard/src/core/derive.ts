@@ -1,36 +1,39 @@
 // What the dashboard shows, worked out from what the engine answers: pure
-// functions of the answers, the host's names, and the time.
+// functions of the answers, the host's names, and the server's time.
 
+import { CONTRACT } from './contract/types.js'
 import type {
+  Listing,
   Overview,
-  ReplicaId,
+  ReplicaCounts,
   ReplicaOverview,
   ReplicaProgress,
   ReplicaState,
+  RowState,
   TableOverview,
-  Timestamp,
-} from './types'
+} from './contract/types.js'
+import { timeOf } from './time.js'
 
 /** The page in one word: the banner's colour. */
-export type Mood = 'healthy' | 'catching_up' | 'attention'
+export type Mood = 'healthy' | 'catching_up' | 'attention' | 'empty'
 
 export interface SummaryOptions {
-  /** The host's name for a replica; its id's first characters otherwise. */
-  name?: (replica: ReplicaId) => string | undefined
+  /** The host's name for a replica; the end of its id otherwise. */
+  name?: (replica: string) => string | undefined
   /** The host's name for a table; the table's own otherwise. */
   label?: (table: string) => string | undefined
-  /** Now, in milliseconds. */
+  /** The server's time now, in milliseconds (see `serverNow`). */
   now: number
   /** A replica that has not moved on what it was sent for this long is not
    * answering (it is off, or out of reach). Default 15 minutes. */
   silentAfter?: number
   /** A change waiting this long to be sent means the engine is stuck.
-   * Default 10 minutes. */
+   * Default 15 minutes: the server's own alarm (`Settings::stuck_after`). */
   stuckAfter?: number
 }
 
 export interface ReplicaRow {
-  id: ReplicaId
+  id: string
   name: string
   state: ReplicaState
   /** How long it has not answered, when that is longer than `silentAfter`. */
@@ -38,6 +41,8 @@ export interface ReplicaRow {
   /** When it last said it applied a message. */
   heardAt: number | null
   pending: number
+  /** Messages written for it that the transport has not taken yet. */
+  owed: number
   unconfirmed: boolean
   quarantined: number
   parked: number
@@ -46,8 +51,19 @@ export interface ReplicaRow {
   lastError: string | null
   retryAt: number | null
   /** What it last said it wrote and the server has not filed, summed. */
-  backlog: { unsent: number; unfiled: number; at: number } | null
+  backlog: { unsent: number; unfiled: number; at: number | null } | null
   source: ReplicaOverview
+}
+
+/** The replicas a list shows: a page the host fetched, or the overview's
+ * worst when it fetched none. */
+export interface ReplicaPage {
+  rows: ReplicaRow[]
+  /** Where in the list the rows begin, and how many it holds in all. */
+  offset: number
+  total: number
+  /** The overview's worst, not a page: the rows are what needs attention most. */
+  worst: boolean
 }
 
 export interface TableRow {
@@ -68,7 +84,7 @@ export type ProblemKind = 'parked' | 'quarantined' | 'unfiled' | 'unreachable'
 /** One thing waiting for a fix (or, for `unreachable`, for the network). */
 export interface Problem {
   kind: ProblemKind
-  replica: ReplicaId | null
+  replica: string | null
   replicaName: string | null
   table: string | null
   tableLabel: string | null
@@ -81,16 +97,20 @@ export interface Problem {
 
 export interface Summary {
   mood: Mood
+  /** Every replica, and how many are in each state. */
   total: number
-  counts: Record<ReplicaState, number>
-  /** Replicas not answering, among the ones catching up. */
+  counts: ReplicaCounts
+  /** Things set aside until a fix is deployed. */
+  fixes: number
+  /** Replicas not answering, among the overview's worst. */
   silent: number
   /** Changes noted and not yet sent, and since when the oldest waits. */
   pending: number
   waitingSince: number | null
   /** The oldest has waited longer than `stuckAfter`. */
   stuck: boolean
-  replicas: ReplicaRow[]
+  /** The replicas that need attention most, worst first. */
+  worst: ReplicaRow[]
   tables: TableRow[]
   problems: Problem[]
   /** Problems the engine counted and did not list. */
@@ -99,18 +119,49 @@ export interface Summary {
 
 const MINUTE = 60_000
 
-const severity: Record<ReplicaState, number> = {
-  awaiting_fix: 0,
-  unreachable: 1,
-  catching_up: 2,
-  synced: 3,
+// Every replica, including those in a state an engine newer than this
+// dashboard added: they are counted, and are not settled.
+const everyone = (states: ReplicaCounts) => Object.values(states).reduce((n, count) => n + count, 0)
+
+/** Where a row is on a replica, in one word: settled, on its way, set aside,
+ * or `unknown` for a state this dashboard was not written for. */
+export type PlaceMood = 'holds' | 'moving' | 'set_aside' | 'unknown'
+
+const placeMoods: Record<RowState, PlaceMood> = {
+  holds: 'holds',
+  outdated: 'moving',
+  on_its_way: 'moving',
+  missing: 'moving',
+  leaving: 'moving',
+  quarantined: 'set_aside',
 }
 
-const at = (t: Timestamp | null): number | null => (t == null ? null : Date.parse(t))
+/** The mood of a row's state, whatever the engine answered. */
+export function placeMoodOf(state: string): PlaceMood {
+  return Object.hasOwn(placeMoods, state) ? placeMoods[state as RowState] : 'unknown'
+}
 
-/** A replica's name: the host's, or the first characters of its id. */
-export function nameOf(options: Pick<SummaryOptions, 'name'>, replica: ReplicaId): string {
-  return options.name?.(replica) ?? replica.slice(0, 8)
+const replicaStates: Record<ReplicaState, true> = {
+  awaiting_fix: true,
+  unreachable: true,
+  catching_up: true,
+  synced: true,
+}
+
+/** Whether this dashboard has a word for a replica's state. */
+export function knowsReplicaState(state: string): state is ReplicaState {
+  return Object.hasOwn(replicaStates, state)
+}
+
+/** Whether an answer is of the contract this dashboard reads. */
+export function readsContract(answer: { contract: number }): boolean {
+  return answer.contract === CONTRACT
+}
+
+/** A replica's name: the host's, or the end of its id — an id's start is
+ * its creation time, the same for a fleet made in one go. */
+export function nameOf(options: Pick<SummaryOptions, 'name'>, replica: string): string {
+  return options.name?.(replica) ?? replica.slice(-12)
 }
 
 function labelOf(options: Pick<SummaryOptions, 'label'>, table: string): string {
@@ -118,107 +169,99 @@ function labelOf(options: Pick<SummaryOptions, 'label'>, table: string): string 
 }
 
 function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
-  const heardAt = at(r.applied_at)
-  const waiting = at(r.waiting_since)
+  const waiting = timeOf(r.waiting_since)
   const quiet = waiting == null ? null : options.now - waiting
   const silentFor = quiet != null && quiet > (options.silentAfter ?? 15 * MINUTE) ? quiet : null
-  const backlog = r.backlog && {
-    unsent: r.backlog.tables.reduce((n, t) => n + t.unsent, 0),
-    unfiled: r.backlog.tables.reduce((n, t) => n + t.unfiled, 0),
-    at: Date.parse(r.backlog.at),
-  }
+  const unsent = r.backlog?.tables.reduce((n, t) => n + t.unsent, 0) ?? 0
+  const unfiled = r.backlog?.tables.reduce((n, t) => n + t.unfiled, 0) ?? 0
   return {
     id: r.replica,
     name: nameOf(options, r.replica),
     state: r.state,
     silentFor,
-    heardAt,
+    heardAt: timeOf(r.applied_at),
     pending: r.pending,
+    owed: r.owed,
     unconfirmed: r.unconfirmed,
     quarantined: r.quarantined,
     parked: r.parked,
     unfiled: r.unfiled,
     failures: r.failures,
     lastError: r.last_error,
-    retryAt: at(r.retry_at),
-    backlog: backlog && (backlog.unsent > 0 || backlog.unfiled > 0) ? backlog : null,
+    retryAt: timeOf(r.retry_at),
+    backlog: unsent + unfiled > 0 ? { unsent, unfiled, at: timeOf(r.backlog?.at ?? null) } : null,
     source: r,
   }
 }
 
-/** Worse first; among the ones catching up, the silent first; then by name. */
-function byConcern(a: ReplicaRow, b: ReplicaRow): number {
-  return (
-    severity[a.state] - severity[b.state] ||
-    Number(b.silentFor != null) - Number(a.silentFor != null) ||
-    a.name.localeCompare(b.name, undefined, { numeric: true })
-  )
-}
-
 function problems(overview: Overview, options: SummaryOptions): Problem[] {
   const { health } = overview
-  const name = (r: ReplicaId | null) => (r == null ? null : nameOf(options, r))
+  const name = (r: string | null) => (r == null ? null : nameOf(options, r))
   const label = (t: string | null) => (t == null ? null : labelOf(options, t))
+  const problem = (p: Omit<Problem, 'replicaName' | 'tableLabel'>): Problem => ({
+    ...p,
+    replicaName: name(p.replica),
+    tableLabel: label(p.table),
+  })
   return [
-    ...health.quarantine.first.map((q): Problem => ({
-      kind: 'quarantined',
-      replica: q.replica,
-      replicaName: name(q.replica),
-      table: q.table,
-      tableLabel: label(q.table),
-      key: q.key,
-      reason: q.reason,
-      since: Date.parse(q.first_at),
-      attempts: q.attempts,
-      retryAt: null,
-    })),
-    ...health.inbox.first.map((u): Problem => ({
-      kind: 'unfiled',
-      replica: u.replica,
-      replicaName: name(u.replica),
-      table: u.table,
-      tableLabel: label(u.table),
-      key: null,
-      reason: u.reason,
-      since: Date.parse(u.first_at),
-      attempts: u.attempts,
-      retryAt: null,
-    })),
-    ...health.parked.first.map((p): Problem => ({
-      kind: 'parked',
-      replica: p.replica,
-      replicaName: name(p.replica),
-      table: p.table,
-      tableLabel: label(p.table),
-      key: p.key,
-      reason: p.last_error,
-      since: at(p.parked_at),
-      attempts: p.attempts,
-      retryAt: null,
-    })),
-    ...health.failing.first.map((f): Problem => ({
-      kind: 'unreachable',
-      replica: f.replica,
-      replicaName: name(f.replica),
-      table: null,
-      tableLabel: null,
-      key: null,
-      reason: f.last_error,
-      since: null,
-      attempts: f.failures,
-      retryAt: at(f.retry_at),
-    })),
+    ...health.quarantine.first.map((q) =>
+      problem({
+        kind: 'quarantined',
+        replica: q.replica,
+        table: q.table,
+        key: q.key,
+        reason: q.reason,
+        since: timeOf(q.first_at),
+        attempts: q.attempts,
+        retryAt: null,
+      }),
+    ),
+    ...health.inbox.first.map((u) =>
+      problem({
+        kind: 'unfiled',
+        replica: u.replica,
+        table: u.table,
+        key: null,
+        reason: u.reason,
+        since: timeOf(u.first_at),
+        attempts: u.attempts,
+        retryAt: null,
+      }),
+    ),
+    ...health.parked.first.map((p) =>
+      problem({
+        kind: 'parked',
+        replica: p.replica,
+        table: p.table,
+        key: p.key,
+        reason: p.last_error,
+        since: timeOf(p.parked_at),
+        attempts: p.attempts,
+        retryAt: null,
+      }),
+    ),
+    ...health.failing.first.map((f) =>
+      problem({
+        kind: 'unreachable',
+        replica: f.replica,
+        table: null,
+        key: null,
+        reason: f.last_error,
+        since: null,
+        attempts: f.failures,
+        retryAt: timeOf(f.retry_at),
+      }),
+    ),
   ]
 }
 
 /** Everything the dashboard's first screen shows. */
 export function summarize(overview: Overview, options: SummaryOptions): Summary {
-  const { health } = overview
-  const replicas = overview.replicas.map((r) => replicaRow(r, options)).sort(byConcern)
-  const counts: Record<ReplicaState, number> = { awaiting_fix: 0, unreachable: 0, catching_up: 0, synced: 0 }
-  for (const r of replicas) counts[r.state] += 1
-  const waitingSince = at(health.oldest)
-  const stuck = waitingSince != null && options.now - waitingSince > (options.stuckAfter ?? 10 * MINUTE)
+  const { health, states } = overview
+  const total = everyone(states)
+  const worst = overview.replicas.first.map((r) => replicaRow(r, options))
+  const waitingSince = timeOf(health.oldest)
+  const stuck = waitingSince != null && options.now - waitingSince > (options.stuckAfter ?? 15 * MINUTE)
   const tables = overview.tables
     .map((t): TableRow => ({
       table: t.table,
@@ -235,20 +278,48 @@ export function summarize(overview: Overview, options: SummaryOptions): Summary 
     // Not synced first; otherwise in the engine's order, parents first.
     .sort((a, b) => Number(a.synced) - Number(b.synced))
   const listed = problems(overview, options)
-  const total = health.parked.total + health.quarantine.total + health.inbox.total + health.failing.total
-  const settled = counts.synced === replicas.length && health.pending === 0
+  const fixes = health.parked.total + health.quarantine.total + health.inbox.total
+  const settled = states.synced === total && health.pending === 0
   return {
-    mood: !health.healthy || stuck ? 'attention' : settled ? 'healthy' : 'catching_up',
-    total: replicas.length,
-    counts,
-    silent: replicas.filter((r) => r.silentFor != null).length,
+    mood:
+      !health.healthy || stuck ? 'attention' : total === 0 ? 'empty' : settled ? 'healthy' : 'catching_up',
+    total,
+    counts: states,
+    fixes,
+    silent: worst.filter((r) => r.silentFor != null).length,
     pending: health.pending,
     waitingSince,
     stuck,
-    replicas,
+    worst,
     tables,
     problems: listed,
-    more: total - listed.length,
+    more: fixes + health.failing.total - listed.length,
+  }
+}
+
+/** The replicas to list for `filter` (every state, when `null`): the host's
+ * page when it fetched one for that filter, else the overview's worst in it. */
+export function pageOf(
+  overview: Overview,
+  listing: Listing | null | undefined,
+  filter: ReplicaState | null,
+  options: SummaryOptions,
+): ReplicaPage {
+  if (listing && readsContract(listing) && listing.state === filter)
+    return {
+      rows: listing.replicas.first.map((r) => replicaRow(r, options)),
+      offset: listing.offset,
+      total: listing.replicas.total,
+      worst: false,
+    }
+  const { states } = overview
+  return {
+    rows: overview.replicas.first
+      .filter((r) => filter == null || r.state === filter)
+      .map((r) => replicaRow(r, options)),
+    offset: 0,
+    total: filter == null ? everyone(states) : states[filter],
+    worst: true,
   }
 }
 

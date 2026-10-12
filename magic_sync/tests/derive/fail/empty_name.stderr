@@ -1,0 +1,5 @@
+error: an empty name
+ --> tests/derive/fail/empty_name.rs:2:34
+  |
+2 | #[row(table = "things", schema = "", mirror = "catalog")]
+  |                                  ^^

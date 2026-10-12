@@ -1,0 +1,5 @@
+error: only a table the server sends down (`catalog` or `both`) takes a `sync` strategy
+ --> tests/derive/fail/sync_on_a_server_table.rs:2:51
+  |
+2 | #[row(table = "things", mirror = "server", sync = "broadcast")]
+  |                                                   ^^^^^^^^^^^

@@ -48,19 +48,21 @@
   },
   "scripts": {
     "dev": "vite --host --port 5199",
-    "build": "vite build && vue-tsc -p tsconfig.build.json",
+    "build": "vite build && vue-tsc -p tsconfig.build.json && node scripts/finish-build.js",
+    "check:pack": "pnpm run build && publint --strict --pack pnpm && attw --pack . --profile esm-only --exclude-entrypoints styles.css",
     "prepack": "cp ../LICENSE-MIT ../LICENSE-APACHE . && pnpm run build",
     "test": "vitest run",
     "type-check": "vue-tsc --noEmit",
-    "lint": "eslint --max-warnings 0 \"src/**/*.{ts,vue}\" \"demo/**/*.{ts,vue}\"",
-    "format": "prettier --write \"src/**/*.{ts,vue,css,json}\" \"demo/**/*.{ts,vue}\" \"*.{json,js,ts,md}\"",
-    "format:check": "prettier --check \"src/**/*.{ts,vue,css,json}\" \"demo/**/*.{ts,vue}\" \"*.{json,js,ts,md}\"",
+    "lint": "eslint --max-warnings 0 \"src/**/*.{ts,vue}\" \"demo/**/*.{ts,vue}\" \"scripts/*.js\"",
+    "format": "prettier --write \"src/**/*.{ts,vue,css,json}\" \"demo/**/*.{ts,vue}\" \"scripts/*.js\" \"*.{json,js,ts,md}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,vue,css,json}\" \"demo/**/*.{ts,vue}\" \"scripts/*.js\" \"*.{json,js,ts,md}\"",
     "knip": "knip"
   },
   "peerDependencies": {
-    "vue": "^3.4.0"
+    "vue": "^3.5.0"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.6.4",
     "@vitejs/plugin-vue": "^6.0.9",
@@ -69,6 +71,7 @@
     "globals": "^17.13.0",
     "knip": "^6.40.0",
     "prettier": "^3.9.9",
+    "publint": "^0.3.25",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.71.1",
     "vite": "^8.3.3",
@@ -76,8 +79,5 @@
     "vue": "^3.5.43",
     "vue-eslint-parser": "^10.4.1",
     "vue-tsc": "^3.3.12"
-  },
-  "engines": {
-    "node": ">=20.19"
   }
 }

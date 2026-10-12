@@ -1,0 +1,24 @@
+[package]
+name = "book_snippets"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The book's code that is not the shop's, compiled so that it cannot drift from the engine"
+
+# A workspace of its own, built once per side: `--features server`, then
+# `--features replica`.
+[workspace]
+
+[features]
+server = ["magic_sync/postgres", "shop_rows/server"]
+replica = ["magic_sync/sqlite", "shop_rows/register"]
+
+[dependencies]
+magic_sync = { path = "../../magic_sync" }
+shop_rows = { path = "../../examples/shop/rows" }
+chrono = { version = "0.4", features = ["serde"] }
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "uuid", "chrono"] }
+tokio = { version = "1", features = ["rt"] }
+uuid = { version = "1", features = ["serde", "v7"] }

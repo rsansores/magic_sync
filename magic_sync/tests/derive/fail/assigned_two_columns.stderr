@@ -1,0 +1,5 @@
+error: sync = "assigned(a, b)": expected one column name
+ --> tests/derive/fail/assigned_two_columns.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "assigned(a, b)")]
+  |                                                    ^^^^^^^^^^^^^^^^

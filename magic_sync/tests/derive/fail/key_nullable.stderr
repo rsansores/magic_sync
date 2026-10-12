@@ -1,0 +1,5 @@
+error: a key column cannot be NULL
+ --> tests/derive/fail/key_nullable.rs:4:9
+  |
+4 |     pub id: Option<uuid::Uuid>,
+  |         ^^

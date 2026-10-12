@@ -1,0 +1,5 @@
+error: origin = "replica_id": the replica a record belongs to is a key column
+ --> tests/derive/fail/origin_not_a_key.rs:2:53
+  |
+2 | #[row(table = "things", mirror = "record", origin = "replica_id")]
+  |                                                     ^^^^^^^^^^^^

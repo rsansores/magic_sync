@@ -7,96 +7,100 @@ something up.
 
 ## Where the replicas are
 
-> **You write:**
+> **You write** (`examples/shop/rows/src/lib.rs`):
 
-```rust
-pub const REGISTERS: magic_sync::plan::Replicas = magic_sync::plan::Replicas {
-    relation: "shop.registers",   // a table or view with an `id` column
-    table: "registers",           // its name, as foreign keys name it
-    live: "active",               // which of them receive anything
-    partition: None,
-};
+```rust,ignore
+{{#include ../../../examples/shop/rows/src/lib.rs:registers}}
 ```
 
-`partition` names a column that splits rows and replicas into groups no row
-crosses — one per customer of a multi-customer system, say: a `broadcast` row
-reaches every live replica *of its partition*. The shop has one company, so
-none.
+`shop.registers` is a table or a view with an `id` column; `registers` is its
+name as foreign keys name it; `active` is the condition a register that
+should receive anything meets. A register that becomes active is provisioned
+([Provisioning](provisioning.md)); one that stops being active is forgotten.
+
+`Replicas::partitioned_by("company_id")` names a column that splits rows and
+replicas into groups no row crosses — one per customer of a multi-customer
+system, say: a `broadcast` row reaches every live replica *of its partition*
+([Recipes](recipes.md#several-companies-on-one-server)). The shop has one
+company, so none.
 
 ## How bytes reach a replica: the transport
 
-> **You write** one method: send these bytes to that replica.
+The engine hands you each message as bytes, for one replica, and you deliver
+it. How is yours — a broker, HTTP, a queue of your own — but a transport must
+provide what [the replica protocol requires of it](../protocol.md#2-what-the-transport-must-provide):
+nothing it took is lost, a replica's messages arrive in order and one at a
+time, a message comes again until it is acknowledged, and an acknowledgement
+names its message. The engine's guarantees rest on it.
 
-```rust
-use magic_sync::{relay::Transport, Error};
+> **You write** one method: send these bytes to that replica. The shop's
+> transport is a queue per register in the head office's own database,
+> which a register reads over HTTP (`examples/shop/server/src/main.rs`):
 
-#[derive(Clone, Default)]
-struct Queues(Arc<Mutex<HashMap<Uuid, VecDeque<Vec<u8>>>>>);
-
-impl Transport for Queues {
-    async fn send(&self, register: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
-        self.0.lock().unwrap().entry(register).or_default().push_back(message);
-        Ok(())
-    }
-}
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:transport}}
 ```
 
-The shop's transport is a queue per register, read over HTTP: a register asks
-for the message at the head of its queue, applies it, and only then
-acknowledges it, which removes it. That keeps the **one rule** the engine
-needs from a transport:
+`id` names the message: the shop gives it to the register with the message,
+and the register acknowledges it by that name, which takes that message —
+and no other — out of the queue:
 
-> A replica gets its messages **in order, one at a time**: the next one only
-> after it acknowledged the previous one.
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:next}}
+```
 
-With NATS JetStream, that is a durable pull consumer per replica with
-`max_ack_pending = 1`. `id` is the same for the same message sent again, for a
-transport that deduplicates.
+With NATS JetStream, the stream is the queue, and a durable pull consumer per
+replica with `max_ack_pending = 1` hands out one message at a time.
 
 When sending fails, say whether a retry may help:
 
-```rust
-Err(Error::Transport { reason: e.to_string(), transient: true })   // the network
-Err(Error::Transport { reason: e.to_string(), transient: false })  // this message, never
+```rust,ignore
+{{#include ../../snippets/src/server.rs:transport_errors}}
 ```
 
-> **What happens:** a transient failure leaves that replica waiting out a
-> backoff while every other replica carries on; what it is owed is noted
-> again for it alone. A permanent one sets the message's rows aside for that
-> replica until a fix is deployed. The engine never hands a transport a
-> message larger than its limit: a row too big for any message is set aside
-> instead.
+> **What happens:** either way, that replica waits out a backoff while every
+> other replica carries on; the message stays first in its outbox, with
+> everything after it, and goes again, in order, when the backoff ends. A
+> refusal shows in its `last_error`; a message refused for good again and
+> again, or an outbox grown past its bound, is dropped and the replica
+> provisioned again — an alarm. The same message always goes under the same
+> `id`. A send that does not answer
+> within `send_timeout` is a transient failure. The engine never hands a
+> transport a message larger than its limit: a row too big for any message is
+> set aside instead.
 
 ## Building and running it
 
 > **You write:**
 
-```rust
-use magic_sync::run::server::{Anyone, Settings};
-use magic_sync::Server;
-
-let server = Arc::new(
-    Server::install(pool.clone(), codecs(), REGISTERS, queues.clone(), Anyone(pool.clone()), Settings::default())
-        .await?,
-);
-let relay = server.clone();
-tokio::spawn(async move { relay.run(std::future::pending()).await });
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:build}}
 ```
 
 `Server::install` sets up what the database lacks ([The tables](tables.md));
 with migrations of your own, use `Server::new` with the same arguments, which
-refuses to start on a database that is not set up.
+refuses to start on a database that is not set up. `run` returns as soon as
+the future it is given resolves — the shop's, on Ctrl-C. A pass it cuts short
+is planned and sent again by the next relay, as after a crash:
+
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:shutdown}}
+```
 
 > **What happens** in `run`, for as long as your process lives:
 >
 > - It takes a PostgreSQL advisory lock. Run as many server processes as you
 >   like: one of them runs the relay, the others stand by and take over if it
->   goes away.
+>   goes away. The lock is a session's, so the pool you hand it reaches
+>   PostgreSQL directly or through a pooler in session mode: through one in
+>   transaction mode (PgBouncer's default) a pass would run on a server
+>   process that does not hold the lock, and the relay refuses to.
 > - While it holds the lock, it reads the noted changes, plans what each
->   replica should hold against what it holds, sends the difference through
->   your transport, and records what each replica now holds — on the lock's own
->   connection, so a process that lost the lock cannot record over the one
->   that took it.
+>   replica should hold against what it holds, and — in one transaction on the
+>   lock's own connection, so a process that lost the lock cannot record over
+>   the one that took it — records what each replica will hold and writes the
+>   messages that carry the difference to the replica's outbox. Then it sends
+>   every outbox through your transport.
 > - When it takes the lock — usually after a deploy — and every hour, it tries
 >   again whatever it set aside: notes it could not plan, rows it could not
 >   send, uploads it could not file. A deploy that fixed the cause lets them
@@ -106,8 +110,19 @@ refuses to start on a database that is not set up.
 >   *deploy a fix* (a bug), never *go fix the data*.
 
 `Settings` holds the knobs: message size limits, notes per pass, the lock's
-key, how often it retries and prunes, and `role` — a role every transaction of
-the engine's own assumes, when your connecting role has less than it needs.
+key, how often it retries and prunes, how long a send may take and how long
+a replica it failed to waits, how long a replica may leave what it was sent
+unconfirmed before it is provisioned again, and `role` — a role every
+transaction of the engine's own assumes, when your connecting role has less
+than it needs. Besides the `sync` schema, the engine needs to create
+temporary tables (the database's `TEMPORARY` privilege, which every role
+has unless revoked): the relay works out each pass's plan in them, so a
+large one is never in its memory whole. `Server::new` refuses to start
+without it. Change what you need of the defaults:
+
+```rust,ignore
+{{#include ../../snippets/src/server.rs:settings}}
+```
 
 ## What replicas send up
 
@@ -115,15 +130,20 @@ the engine's own assumes, when your connecting role has less than it needs.
 > saying which replica it came from — from your transport, never from the
 > message itself:
 
-```rust
-async fn up(State(app): State<App>, Path(register): Path<Uuid>, body: Bytes) -> Result<StatusCode, …> {
-    app.server.receive(register, &body).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:up}}
 ```
 
 An error means the message must come again (the database is away, or it
-speaks a later protocol than this build); filing it again is harmless.
+speaks a later protocol than this build); filing it again is harmless. Any
+other failure is no reason to send it again: the upload is kept whole, it is
+answered, and it is filed again after a deploy. The shop answers an error
+with the status that says whether to try again, which its registers read the
+same way:
+
+```rust,ignore
+{{#include ../../../examples/shop/server/src/main.rs:failure}}
+```
 
 > **What happens:** the rows are filed in a transaction, each by its codec's
 > rules — a record kept from its first delivery, the replica's columns of a
@@ -141,22 +161,11 @@ speaks a later protocol than this build); filing it again is harmless.
 > setting your row policies read — or you want to stamp uploads with what you
 > know of the sender:
 
-```rust
-use magic_sync::run::server::Senders;
-
-struct Companies(PgPool);
-
-impl Senders for Companies {
-    type Known = Company;   // the `P` of `Codec<P>`
-
-    async fn known(&self, register: Uuid) -> Result<Option<Company>, magic_sync::Error> {
-        // the register's company, or None for a register you do not know
-    }
-
-    async fn filing(&self, company: &Company) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, magic_sync::Error> {
-        // a transaction set up to write as that company
-    }
-}
+```rust,ignore
+{{#include ../../snippets/src/server.rs:senders}}
 ```
 
-[`Server`]: https://docs.rs/magic_sync/latest/magic_sync/run/server/struct.Server.html
+A register for which `known` answers `None` is one the server does not know:
+its messages are dropped, with a log.
+
+[`Server`]: ../api/server/magic_sync/run/server/struct.Server.html
