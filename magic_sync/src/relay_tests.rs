@@ -2926,3 +2926,111 @@ async fn a_part_kept_again_while_the_inbox_is_filed_files_its_newest_edit(pool: 
     assert_eq!(world.tallied(id).await, Some(("count".to_owned(), 2)));
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
+
+impl World {
+    /// A two-way row of `replica`'s own, titled `title`; answers its row as
+    /// a replica holds it.
+    async fn pad(&self, replica: Uuid, title: &str) -> (String, String) {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO fixture.pads (replica_id, id, partition_id, title, seen) \
+             VALUES ($1, $2, $3, $4, 0)",
+        )
+        .bind(replica)
+        .bind(id)
+        .bind(self.partition)
+        .bind(title)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        ("pads".to_owned(), format!("{replica}|{id}"))
+    }
+
+    /// `model` of `replica` deletes `pad`, and says so, with the last
+    /// message it applied.
+    async fn delete_pad(&self, replica: Uuid, model: &mut Model, pad: &(String, String)) {
+        model.rows.remove(pad);
+        let applied = model.applied.as_ref().map_or(0, |(_, sequence)| *sequence);
+        let mut up = crate::testkit::confirmation(&self.pool, replica, applied).await;
+        up.tables = vec![envelope::Table {
+            table: pad.0.clone(),
+            deletes: vec![envelope::Key {
+                parts: pad.1.split('|').map(str::to_owned).collect(),
+            }],
+            ..envelope::Table::default()
+        }];
+        self.file(replica, &up).await;
+    }
+
+    /// `replica`'s digests, as `model` holds, filed: answers how many
+    /// provisionings they left owed.
+    async fn digests_of(&self, replica: Uuid, model: &Model) -> i64 {
+        self.file(replica, &model.digests(&["items", "tallies", "pads"]))
+            .await;
+        self.count("SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL")
+            .await
+    }
+}
+
+/// A replica deletes a two-way row of its own while a newer version of it,
+/// recorded before the delete came, is on its way: taking that version, it
+/// holds the row again, so the server still counts it held, and its own
+/// delete of the row reaches the replica after the version did.
+#[sqlx::test(migrations = false)]
+async fn a_replica_that_deletes_its_own_row_with_a_version_on_its_way_is_sent_the_delete(
+    pool: crate::DbPool,
+) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    assert!(models[&a].rows.contains_key(&pad));
+    sqlx::query("UPDATE fixture.pads SET title = 'theirs'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass(&wire).await;
+    let mut model = models.remove(&a).unwrap();
+    world.delete_pad(a, &mut model, &pad).await;
+    assert_eq!(world.count("SELECT count(*) FROM fixture.pads").await, 0);
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    assert!(
+        model.rows.contains_key(&pad),
+        "the version on its way, taken"
+    );
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    assert!(!models[&a].rows.contains_key(&pad), "the delete reached it");
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+}
+
+/// A replica's delete of its own row the server refuses is a fact all the
+/// same: the replica no longer holds the row, the server records it so, and
+/// sends it the row again.
+#[sqlx::test(migrations = false)]
+async fn a_replica_delete_the_server_refuses_has_the_row_sent_again(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION fixture.kept() RETURNS trigger LANGUAGE plpgsql AS \
+           $$BEGIN RAISE EXCEPTION 'kept'; END$$; \
+         CREATE TRIGGER kept BEFORE DELETE ON fixture.pads \
+           FOR EACH ROW EXECUTE FUNCTION fixture.kept();",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let mut model = models.remove(&a).unwrap();
+    world.delete_pad(a, &mut model, &pad).await;
+    assert_eq!(world.count("SELECT count(*) FROM fixture.pads").await, 1);
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    assert!(models[&a].rows.contains_key(&pad), "sent again");
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+}

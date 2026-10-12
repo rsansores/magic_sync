@@ -719,7 +719,16 @@ deleted it, or is taking it back — is left out: the server's wins. One of a ro
 it never sent the replica is malformed, and left out. A row the server cannot
 file, or a delete its database refuses, is kept on the server, not lost, and
 filed later; so are an upload's rows whose filing fails as a whole for a reason
-a resend cannot cure. Either still counts as filed for `Filed`. The server
+a resend cannot cure. Either still counts as filed for `Filed`. A replica's
+delete of a row of its own is a fact whether the server's database lets the
+row go or refuses to: the server records the replica holding it no more, and
+sends it again a row it kept — but for a row that a message the replica had
+not applied when it sent the delete carries (the last it says it applied, or
+else the last the server heard it apply). The replica may take that
+message's version of it, so the server still records it held, and its own
+delete of the row follows. A delete filed later, from what the server kept,
+leaves the row held the same way: a delete of a row a replica does not hold
+changes nothing there. The server
 keeps, of each row, the newest upload of it: a later upload of the row replaces
 what it kept, or drops it once filed, so what is filed later never rolls the row
 back. So it keeps a row only with its key in `keys`: one without is malformed,
