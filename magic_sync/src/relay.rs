@@ -85,6 +85,9 @@ const PAGE: usize = 20_000;
 /// them all early.
 const BUFFERED: usize = 64 << 20;
 
+/// Bytes of messages one replica's sending reads from its outbox at a time.
+const SENT_AT_ONCE: usize = 8 << 20;
+
 /// How much a replica's outbox may hold before it is provisioned again
 /// instead: then what it is owed is cheaper sent whole than in order.
 #[derive(Clone, Copy, Debug)]
@@ -158,8 +161,9 @@ struct Writer {
     /// The snapshot each replica provisioned is sent.
     snapshots: BTreeMap<Uuid, String>,
     ready: Vec<Ready>,
-    /// Rows the ready messages carry.
+    /// Rows the ready messages carry, and their bytes.
     rows: usize,
+    ready_bytes: usize,
     /// Bytes of rows in the messages being filled.
     buffered: usize,
     /// Per replica, the last message written, its sequence and nonce: what
@@ -390,6 +394,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             snapshots: ids.clone(),
             ready: Vec::new(),
             rows: 0,
+            ready_bytes: 0,
             buffered: 0,
             last: chains
                 .iter()
@@ -413,22 +418,32 @@ impl<P: Sync + 'static> Relay<'_, P> {
             }
             let mut rest = page.as_slice();
             while let Some((i, _, _)) = rest.first() {
-                let mut keys: Vec<String> = Vec::new();
-                let end = rest
-                    .iter()
-                    .position(|(t, key, _)| {
-                        if t != i {
-                            return true;
-                        }
-                        if keys.last() != Some(key) {
-                            if keys.len() == RECORD_CHUNK {
+                // The next keys of the table, as many as a chunk holds and
+                // as the bytes a chunk may hold hold.
+                let chunk_of = |limit: usize| {
+                    let mut keys: Vec<String> = Vec::new();
+                    let end = rest
+                        .iter()
+                        .position(|(t, key, _)| {
+                            if t != i {
                                 return true;
                             }
-                            keys.push(key.clone());
-                        }
-                        false
-                    })
-                    .unwrap_or(rest.len());
+                            if keys.last() != Some(key) {
+                                if keys.len() == limit {
+                                    return true;
+                                }
+                                keys.push(key.clone());
+                            }
+                            false
+                        })
+                        .unwrap_or(rest.len());
+                    (keys, end)
+                };
+                let (mut keys, mut end) = chunk_of(RECORD_CHUNK);
+                let fit = self.engine.fitting(conn, *i, &keys, BUFFERED).await?;
+                if fit < keys.len() {
+                    (keys, end) = chunk_of(fit);
+                }
                 let (chunk, after) = rest.split_at(end);
                 rest = after;
                 let encoded = self
@@ -632,12 +647,19 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let mut sent = 0;
         let mut after = 0_i64;
         loop {
+            // A page of messages, and of bytes: what replicas sent to side
+            // by side hold at once stays bounded however large each is.
             let page: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-                "SELECT sequence, message FROM sync.outbox \
-                  WHERE replica_id = $1 AND sequence > $2 ORDER BY sequence LIMIT 64",
+                "SELECT sequence, message FROM ( \
+                     SELECT sequence, message, \
+                            sum(length(message)) OVER (ORDER BY sequence) - length(message) AS before \
+                       FROM sync.outbox WHERE replica_id = $1 AND sequence > $2 \
+                      ORDER BY sequence LIMIT 64) AS page \
+                  WHERE before < $3 ORDER BY sequence",
             )
             .bind(replica)
             .bind(after)
+            .bind(i64::try_from(SENT_AT_ONCE).unwrap_or(i64::MAX))
             .fetch_all(&mut **conn.lock().await)
             .await?;
             if page.is_empty() {
@@ -750,6 +772,7 @@ impl Writer {
                 .map(Vec::len)
                 .sum();
             self.buffered = self.buffered.saturating_sub(carried);
+            self.ready_bytes += carried;
         }
         self.ready.push(Ready { replica, body });
     }
@@ -778,13 +801,16 @@ impl Writer {
 
     /// Numbers the ready messages, rising in the order they were made, and
     /// writes each to its replica's outbox with the rows it carries recorded
-    /// as held at that message — when they carry a chunk's worth, or `all`.
+    /// as held at that message — when they carry a chunk's worth of rows or
+    /// of bytes, or `all`.
     async fn flush(&mut self, conn: &mut Conn, all: bool) -> Result<(), Error> {
-        if self.ready.is_empty() || (!all && self.rows < RECORD_CHUNK) {
+        if self.ready.is_empty()
+            || (!all && self.rows < RECORD_CHUNK && self.ready_bytes < BUFFERED)
+        {
             return Ok(());
         }
         let ready = std::mem::take(&mut self.ready);
-        self.rows = 0;
+        (self.rows, self.ready_bytes) = (0, 0);
         let count = i64::try_from(ready.len())
             .map_err(|_| Error::Misuse("more messages than a sequence holds".into()))?;
         let mut drawn: Vec<i64> =

@@ -2685,6 +2685,39 @@ impl Engine {
             .collect()
     }
 
+    /// How many of `keys` of table `i`, from the first, hold no more than
+    /// `budget` bytes between them as the database stores them — one at
+    /// least: what a pass loads and encodes at once stays bounded however
+    /// large the rows.
+    pub(crate) async fn fitting(
+        &self,
+        conn: &mut Conn,
+        i: usize,
+        keys: &[String],
+        budget: usize,
+    ) -> Result<usize, Error> {
+        let plan = &self.plans[i];
+        let sizes: Vec<i64> = sqlx::query_scalar(&format!(
+            "SELECT coalesce(pg_column_size(t.*), 0)::int8 \
+               FROM unnest($1::text[]) WITH ORDINALITY AS k(row_key, n) \
+               LEFT JOIN {} t ON {} ORDER BY k.n",
+            plan.relation.sql(),
+            self.row_is(i, "k.row_key"),
+        ))
+        .bind(keys)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut total = 0;
+        let fit = sizes
+            .iter()
+            .take_while(|size| {
+                total += usize::try_from(**size).unwrap_or(usize::MAX);
+                total <= budget
+            })
+            .count();
+        Ok(fit.max(1))
+    }
+
     /// The rows of `keys` of table `i`, encoded in the plan's snapshot, by
     /// key text: the ones that cannot go — that do not encode, are larger
     /// than `largest_row` bytes, which no message could carry, or are not in
@@ -2911,13 +2944,22 @@ pub(crate) async fn mark_done(conn: &mut Conn, ids: &[i64]) -> Result<(), Error>
     Ok(())
 }
 
-/// Deletes the notes done longer ago than `age`; answers how many.
-pub(crate) async fn prune(conn: &mut Conn, age: std::time::Duration) -> Result<u64, Error> {
-    let done =
-        sqlx::query("DELETE FROM sync.notes WHERE done_at < now() - make_interval(secs => $1)")
-            .bind(age.as_secs_f64())
-            .execute(&mut *conn)
-            .await?;
+/// Deletes the notes done longer ago than `age`, the oldest first, at most
+/// `limit` of them; answers how many: a backlog of them is pruned a
+/// statement — and a transaction — at a time, never in one.
+pub(crate) async fn prune(
+    conn: &mut Conn,
+    age: std::time::Duration,
+    limit: i64,
+) -> Result<u64, Error> {
+    let done = sqlx::query(
+        "DELETE FROM sync.notes WHERE id IN (SELECT id FROM sync.notes \
+           WHERE done_at < now() - make_interval(secs => $1) ORDER BY done_at LIMIT $2)",
+    )
+    .bind(age.as_secs_f64())
+    .bind(limit)
+    .execute(&mut *conn)
+    .await?;
     Ok(done.rows_affected())
 }
 

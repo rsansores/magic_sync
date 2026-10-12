@@ -2613,10 +2613,12 @@ async fn done_notes_are_pruned_once_older_than_kept(pool: crate::DbPool) {
     .execute(&mut *world.conn)
     .await
     .expect("notes");
-    let pruned = prune(&mut world.conn, Duration::from_secs(3600))
-        .await
-        .expect("pruned");
-    assert_eq!(pruned, 2);
+    for left in [1, 1, 0] {
+        let pruned = prune(&mut world.conn, Duration::from_secs(3600), 1)
+            .await
+            .expect("pruned");
+        assert_eq!(pruned, left, "one at a time, the oldest first");
+    }
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.notes")
         .fetch_one(&mut *world.conn)
         .await
@@ -2941,6 +2943,37 @@ async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
             !plan.contains("SubPlan"),
             "progress of {} asks row by row:\n{plan}",
             world.engine.table(i)
+        );
+    }
+}
+
+/// A pass loads and encodes as many rows at once as fit a byte budget, so
+/// what it holds stays bounded however large the rows: never none.
+#[sqlx::test(migrations = false)]
+async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let i = world.engine.index("t_products").expect("products");
+    let mut keys = Vec::new();
+    for _ in 0..3 {
+        let id = Uuid::now_v7();
+        // Random, so it does not compress: a megabyte stored.
+        sqlx::query(
+            "INSERT INTO fixture.t_products (id, partition_id, name) \
+             SELECT $1, $2, string_agg(md5(random()::text), '') FROM generate_series(1, 32768)",
+        )
+        .bind(id)
+        .bind(world.partitions[0])
+        .execute(&mut *world.conn)
+        .await
+        .expect("a large product");
+        keys.push(id.to_string());
+    }
+    for (budget, fit) in [(2_500_000, 2), (10, 1)] {
+        let fitting = world.engine.fitting(&mut world.conn, i, &keys, budget);
+        assert_eq!(
+            fitting.await.expect("fits"),
+            fit,
+            "{budget} bytes: never none"
         );
     }
 }

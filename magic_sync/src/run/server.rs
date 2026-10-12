@@ -677,10 +677,17 @@ impl<S: Senders, T: Transport> Server<S, T> {
 
     async fn prune(&self) {
         let pruned = async {
-            let mut tx = self.begin().await?;
-            let pruned = crate::plan::prune(&mut tx, self.settings.prune_after).await?;
-            tx.commit().await?;
-            Ok::<_, Error>(pruned)
+            let mut pruned = 0;
+            loop {
+                let mut tx = self.begin().await?;
+                let now =
+                    crate::plan::prune(&mut tx, self.settings.prune_after, PRUNED_AT_ONCE).await?;
+                tx.commit().await?;
+                pruned += now;
+                if now < PRUNED_AT_ONCE.unsigned_abs() {
+                    return Ok::<_, Error>(pruned);
+                }
+            }
         }
         .await;
         match pruned {
@@ -804,6 +811,9 @@ struct Refiling {
 
 /// Proof that this process runs the relay: a connection holding the
 /// advisory lock. Drop it, or lose the connection, and the lock is free.
+/// Done notes pruned a transaction at a time.
+const PRUNED_AT_ONCE: i64 = 10_000;
+
 /// Whether the server process the statement runs on holds the advisory lock
 /// `$1`: a connection through a pooler in transaction mode may run each
 /// transaction on another, which does not.
