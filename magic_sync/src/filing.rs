@@ -61,7 +61,8 @@ impl Unfiled {
     }
 
     /// Row `at` of `table`, `codec`'s when the server mirrors it; `None`
-    /// when the replica gave no key with it, which breaks the protocol.
+    /// when the replica gave no key with it, or one that is not the table's,
+    /// which breaks the protocol.
     fn row<P: Sync + 'static>(
         codec: Option<&Codec<P>>,
         table: &envelope::Table,
@@ -81,22 +82,36 @@ impl Unfiled {
             keys: vec![key.clone()],
             deletes: Vec::new(),
         };
-        Some(Self::of(table, kept_key(codec, key), part, reason))
+        Some(Self::of(table, Self::key(codec, key)?, part, reason))
     }
 
+    /// `key` as [`kept_key`] keeps it; `None`, logged, for one that is not
+    /// its mirrored table's.
+    fn key<P: Sync + 'static>(codec: Option<&Codec<P>>, key: &envelope::Key) -> Option<String> {
+        let kept = kept_key(codec, key);
+        if kept.is_none() {
+            tracing::error!(
+                table = codec.map(|c| c.table.name),
+                "upload: a key that is not its table's — malformed, left out"
+            );
+        }
+        kept
+    }
+
+    /// A delete of `table`, as [`Unfiled::row`] keeps a row.
     fn delete<P: Sync + 'static>(
         codec: Option<&Codec<P>>,
         table: &envelope::Table,
         key: envelope::Key,
         reason: &str,
-    ) -> Self {
-        let text = kept_key(codec, &key);
+    ) -> Option<Self> {
+        let text = Self::key(codec, &key)?;
         let part = envelope::Table {
             table: table.table.clone(),
             deletes: vec![key],
             ..envelope::Table::default()
         };
-        Self::of(table, text, part, reason)
+        Some(Self::of(table, text, part, reason))
     }
 
     /// Every row and delete of `upload`, each a part of its own.
@@ -111,7 +126,7 @@ impl Unfiled {
                 table
                     .deletes
                     .iter()
-                    .map(|key| Self::delete(codec, table, key.clone(), reason)),
+                    .filter_map(|key| Self::delete(codec, table, key.clone(), reason)),
             );
         }
         parts
@@ -119,12 +134,13 @@ impl Unfiled {
 }
 
 /// A row's key as the inbox keeps it: as its table's codec writes it, or as
-/// it came, for a table this server does not mirror or a key that is not
-/// its table's.
-fn kept_key<P: Sync + 'static>(codec: Option<&Codec<P>>, key: &envelope::Key) -> String {
-    codec
-        .and_then(|codec| codec.key(&key.parts).ok())
-        .map_or_else(|| stored(&key.parts.join("|")), |key| key_text(&key))
+/// it came, for a table this server does not mirror. A key that is not its
+/// mirrored table's is no row of it: malformed, `None`.
+fn kept_key<P: Sync + 'static>(codec: Option<&Codec<P>>, key: &envelope::Key) -> Option<String> {
+    let Some(codec) = codec else {
+        return Some(stored(&key.parts.join("|")));
+    };
+    codec.key(&key.parts).ok().map(|key| key_text(&key))
 }
 
 /// Where the sender stands with the server, read once, its row locked for
@@ -235,13 +251,16 @@ async fn supersede<P: Sync + 'static>(
     for table in &upload.tables {
         let codec = codec_of(codecs, &table.table);
         for key in table.keys.iter().chain(&table.deletes) {
-            rows.0.push(stored(&table.table));
-            rows.1.push(kept_key(codec, key));
+            if let Some(key) = kept_key(codec, key) {
+                rows.0.push(stored(&table.table));
+                rows.1.push(key);
+            }
         }
     }
     Ok(sqlx::query_as(
         "WITH gone AS (DELETE FROM sync.inbox i USING unnest($2::text[], $3::text[]) AS u(t, k) \
-                        WHERE i.replica_id = $1 AND i.relation = u.t AND i.row_key = u.k \
+                        WHERE i.replica_id = $1 AND md5(i.relation) = md5(u.t) \
+                          AND md5(i.row_key) = md5(u.k) AND i.relation = u.t AND i.row_key = u.k \
                         RETURNING length(i.upload) AS bytes) \
          SELECT count(*), coalesce(sum(bytes), 0)::int8 FROM gone",
     )
@@ -271,7 +290,7 @@ async fn file_tables<P: Sync + 'static>(
                 table
                     .deletes
                     .iter()
-                    .map(|key| Unfiled::delete::<P>(None, table, key.clone(), why)),
+                    .filter_map(|key| Unfiled::delete::<P>(None, table, key.clone(), why)),
             );
             continue;
         };
@@ -312,7 +331,7 @@ async fn file_tables<P: Sync + 'static>(
         } else {
             let (gone, refused) =
                 delete(conn, codec, &keys_of(codec, &table.deletes), sender).await?;
-            unfiled.extend(refused.into_iter().map(|(key, why)| {
+            unfiled.extend(refused.into_iter().filter_map(|(key, why)| {
                 let key = envelope::Key {
                     parts: key.iter().map(ToString::to_string).collect(),
                 };
@@ -1101,7 +1120,8 @@ async fn keep(
             "INSERT INTO sync.inbox AS i \
                (replica_id, relation, row_key, upload, reason, first_at, attempts) \
              VALUES ($1, $2, $3, $4, $5, coalesce($6, now()), $7) \
-             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET upload = EXCLUDED.upload, \
+             ON CONFLICT (replica_id, md5(relation), md5(row_key)) \
+             DO UPDATE SET upload = EXCLUDED.upload, \
                reason = EXCLUDED.reason, first_at = EXCLUDED.first_at, last_at = now(), \
                attempts = EXCLUDED.attempts",
         )

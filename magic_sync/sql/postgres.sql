@@ -349,7 +349,9 @@ CREATE TABLE sync.inbox (
     attempts   INTEGER     NOT NULL DEFAULT 1
 );
 
-CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, relation, row_key);
+-- By a digest of the text: a sender's table and key may be longer than an
+-- index entry takes.
+CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, md5(relation), md5(row_key));
 
 COMMENT ON TABLE sync.inbox IS
     'What replicas uploaded that the server could not file for a reason a retry cannot '

@@ -802,9 +802,16 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
             .map(str::to_owned),
         ),
     );
-    let tables: Vec<String> = ["items", "readings", "logs", "nope", "", "it\0ems"]
+    // Text past what a btree entry takes, that does not compress: what a
+    // sender may say is bounded only by the message.
+    let long = |walk: &mut crate::testkit::Walk, len: usize| -> String {
+        (0..len / 16).map(|_| format!("{:016x}", walk.next())).collect()
+    };
+    parts.extend([long(&mut walk, 3200), format!("{}{}", items[0], long(&mut walk, 3200))]);
+    let mut tables: Vec<String> = ["items", "readings", "logs", "nope", "", "it\0ems"]
         .map(str::to_owned)
         .to_vec();
+    tables.extend([long(&mut walk, 3200), long(&mut walk, 6400)]);
     let epochs = [
         epoch.to_string(),
         epoch.to_string().to_uppercase(),
@@ -953,6 +960,16 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         assert!(
             count(&pool, "SELECT count(*) FROM sync.inbox").await <= came,
             "step {step}: the inbox holds more than came"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM sync.inbox WHERE relation IN ('items', 'readings', 'logs') \
+                   AND row_key !~ '^[0-9a-f-]{36}(\\|[0-9a-f-]{36})?$'"
+            )
+            .await,
+            0,
+            "step {step}: kept a key that is not its mirrored table's"
         );
         assert_eq!(
             count(
