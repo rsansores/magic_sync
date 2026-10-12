@@ -376,49 +376,8 @@ impl core::marker::Unpin for magic_sync::Error
 impl core::marker::UnsafeUnpin for magic_sync::Error
 impl !core::panic::unwind_safe::RefUnwindSafe for magic_sync::Error
 impl !core::panic::unwind_safe::UnwindSafe for magic_sync::Error
-pub struct magic_sync::Replica<P: 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink>
-impl<P: core::marker::Sync + 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink> magic_sync::run::replica::Replica<P, I, U>
-pub async fn magic_sync::run::replica::Replica<P, I, U>::new(sqlx_sqlite::SqlitePool, alloc::vec::Vec<magic_sync::wire::Codec<P>>, I, U, magic_sync::run::replica::Settings) -> core::result::Result<Self, magic_sync::Error>
-pub fn magic_sync::run::replica::Replica<P, I, U>::nudge(&self)
-pub async fn magic_sync::run::replica::Replica<P, I, U>::receive(&self, &[u8]) -> core::result::Result<magic_sync::replica::Received, magic_sync::Error>
-pub async fn magic_sync::run::replica::Replica<P, I, U>::run(&self, impl core::future::future::Future<Output = ()>)
-impl<P: 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink> core::fmt::Debug for magic_sync::run::replica::Replica<P, I, U>
-pub fn magic_sync::run::replica::Replica<P, I, U>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<P, I, U> !core::marker::Freeze for magic_sync::run::replica::Replica<P, I, U>
-impl<P, I, U> core::marker::Send for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Send
-impl<P, I, U> core::marker::Sync for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Sync
-impl<P, I, U> core::marker::Unpin for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Unpin, I: core::marker::Unpin, U: core::marker::Unpin
-impl<P, I, U> core::marker::UnsafeUnpin for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::UnsafeUnpin, I: core::marker::UnsafeUnpin, U: core::marker::UnsafeUnpin
-impl<P, I, U> !core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Replica<P, I, U>
-impl<P, I, U> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Replica<P, I, U>
-#[non_exhaustive] pub struct magic_sync::Settings
-pub magic_sync::Settings::backoff: magic_sync::run::Backoff
-pub magic_sync::Settings::digests_every: core::time::Duration
-pub magic_sync::Settings::digests_first: core::time::Duration
-pub magic_sync::Settings::idle: core::time::Duration
-pub magic_sync::Settings::inbound: magic_sync::envelope::Limits
-pub magic_sync::Settings::lanes: alloc::vec::Vec<magic_sync::replica::Lane>
-pub magic_sync::Settings::outbox: magic_sync::replica::Outbox
-pub magic_sync::Settings::send_timeout: core::time::Duration
-impl core::clone::Clone for magic_sync::run::replica::Settings
-pub fn magic_sync::run::replica::Settings::clone(&self) -> Self
-impl core::default::Default for magic_sync::run::replica::Settings
-pub fn magic_sync::run::replica::Settings::default() -> Self
-impl core::fmt::Debug for magic_sync::run::replica::Settings
-pub fn magic_sync::run::replica::Settings::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for magic_sync::run::replica::Settings
-impl core::marker::Send for magic_sync::run::replica::Settings
-impl core::marker::Sync for magic_sync::run::replica::Settings
-impl core::marker::Unpin for magic_sync::run::replica::Settings
-impl core::marker::UnsafeUnpin for magic_sync::run::replica::Settings
-impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Settings
-impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Settings
 pub const magic_sync::REPLICA_SCHEMA_VERSION: i32
 pub trait magic_sync::Columns: crate::__private::Sealed
-pub trait magic_sync::Identity: core::marker::Send + core::marker::Sync + 'static
-pub fn magic_sync::Identity::id(&self, &mut magic_sync::Conn) -> impl core::future::future::Future<Output = core::result::Result<core::option::Option<uuid::Uuid>, magic_sync::Error>> + core::marker::Send
-impl magic_sync::run::replica::Identity for uuid::Uuid
-pub async fn uuid::Uuid::id(&self, &mut magic_sync::Conn) -> core::result::Result<core::option::Option<uuid::Uuid>, magic_sync::Error>
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
 pub const magic_sync::Row::KEY: &'static [&'static str]
 pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror
@@ -426,6 +385,4 @@ pub const magic_sync::Row::SCHEMA: &'static str
 pub const magic_sync::Row::TABLE: &'static str
 pub fn magic_sync::Row::key(&self) -> magic_sync::row::Key
 pub fn magic_sync::Row::key_text(&self) -> alloc::string::String
-pub trait magic_sync::Uplink: core::marker::Send + core::marker::Sync + 'static
-pub fn magic_sync::Uplink::send(&self, uuid::Uuid, &'static str, alloc::vec::Vec<u8>) -> impl core::future::future::Future<Output = core::result::Result<(), magic_sync::Error>> + core::marker::Send
 pub type magic_sync::Conn = sqlx_sqlite::connection::SqliteConnection

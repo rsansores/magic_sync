@@ -265,7 +265,7 @@ const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] =
 /// [`Engine::triggers`]' script, and each later one when a release brings it
 /// (its changelog says). A step is never edited once released.
 ///
-/// [`Server::install`]: crate::Server::install
+/// [`Server::install`]: crate::run::server::Server::install
 #[must_use]
 pub fn migration(version: i32) -> Option<String> {
     let step = MIGRATIONS.get(usize::try_from(version.checked_sub(1)?).ok()?)?;
@@ -276,7 +276,7 @@ pub fn migration(version: i32) -> Option<String> {
 }
 
 /// The server's engine, built once from the codecs and the schema by the
-/// [`Server`](crate::Server), which hands it out for what a host asks of it:
+/// [`Server`](crate::run::server::Server), which hands it out for what a host asks of it:
 /// the triggers it needs ([`Engine::triggers`]), and how far along every
 /// replica is ([`status`](crate::status)).
 pub struct Engine {
@@ -871,10 +871,10 @@ impl Engine {
     /// `codecs`, one per line, read off the database `conn` is on: what a
     /// host with migrations writes in the migration that creates the tables —
     /// after the engine's first step ([`migration`]) — and what
-    /// [`Server::install`](crate::Server::install) runs. A mirrored table
+    /// [`Server::install`](crate::run::server::Server::install) runs. A mirrored table
     /// notes every write that changes a column it does not leave to the
     /// replicas, and refuses a truncate; a group table notes every write.
-    /// [`Server::new`](crate::Server::new) refuses to start while one is
+    /// [`Server::new`](crate::run::server::Server::new) refuses to start while one is
     /// missing or differs.
     ///
     /// A trigger as printed fires in every session but one whose

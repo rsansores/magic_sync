@@ -116,9 +116,9 @@ impl Default for Settings {
 /// of its own, and handed every message the server sends.
 ///
 /// ```no_run
-/// use magic_sync::run::replica::{Settings, Uplink};
+/// use magic_sync::run::replica::{Replica, Settings, Uplink};
 /// use magic_sync::wire::Codec;
-/// use magic_sync::{replica, Error, Replica};
+/// use magic_sync::{replica, Error};
 /// use std::sync::Arc;
 /// use uuid::Uuid;
 ///

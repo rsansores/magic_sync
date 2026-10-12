@@ -23,8 +23,8 @@ pub mod rows {
 
 #[cfg(feature = "server")]
 pub mod server {
-    use magic_sync::run::server::{Anyone, Settings, Transport};
-    use magic_sync::{Error, Server};
+    use magic_sync::run::server::{Anyone, Server, Settings, Transport};
+    use magic_sync::Error;
     use shop_rows::{codecs, REGISTERS};
     use sqlx::PgPool;
     use std::future::Future;
@@ -63,8 +63,8 @@ pub mod server {
 
 #[cfg(feature = "replica")]
 pub mod replica {
-    use magic_sync::run::replica::{Settings, Uplink};
-    use magic_sync::{Error, Replica};
+    use magic_sync::run::replica::{Replica, Settings, Uplink};
+    use magic_sync::Error;
     use shop_rows::codecs;
     use sqlx::SqlitePool;
     use std::future::Future;

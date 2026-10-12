@@ -1,6 +1,6 @@
 //! A replica's side: what the server sends, applied table by table through
 //! the codecs, and what the replica wrote, gathered to go up — run by the
-//! [`Replica`](crate::Replica). What a host does here itself is set up the
+//! [`Replica`](crate::run::replica::Replica). What a host does here itself is set up the
 //! database ([`install`], or [`triggers`] and [`check`] for one with
 //! migrations), say how its writes go up ([`Lane`], [`Outbox`]), and ask how
 //! far along they are ([`progress`]).
@@ -320,7 +320,7 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// set. [`Replica::new`] runs it; a host with migrations also runs it in a
 /// test, over the database its migrations build.
 ///
-/// [`Replica::new`]: crate::Replica::new
+/// [`Replica::new`]: crate::run::replica::Replica::new
 ///
 /// # Errors
 ///

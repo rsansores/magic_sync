@@ -198,9 +198,9 @@ impl Settings {
 ///
 /// ```no_run
 /// use magic_sync::plan::Replicas;
-/// use magic_sync::run::server::{Anyone, Settings, Transport};
+/// use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 /// use magic_sync::wire::Codec;
-/// use magic_sync::{Error, Server};
+/// use magic_sync::Error;
 /// use std::sync::Arc;
 /// use uuid::Uuid;
 ///
