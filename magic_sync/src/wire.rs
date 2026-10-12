@@ -153,8 +153,14 @@ impl<P: Sync + 'static> Codec<P> {
     /// the field's serde writes it — but an `i64` field as its decimal text,
     /// which a JSON number would round past 2^53 for a replica that reads
     /// numbers as doubles. A field serde names otherwise than itself does not
-    /// encode. `place` stamps a row a replica uploads; one of a table keyed
-    /// by its replica must name its sender, as with [`Codec::new`].
+    /// encode. That holds for `#[serde(rename)]` and `rename_all` on the
+    /// row, and for a part flattened in with `#[sqlx(flatten)]` unless the
+    /// field also says `#[serde(flatten)]`, so that serde writes the part's
+    /// fields beside the row's: otherwise every row of the table fails to
+    /// encode ([`Error::Misuse`]), the first time one travels.
+    ///
+    /// `place` stamps a row a replica uploads; one of a table keyed by its
+    /// replica must name its sender, as with [`Codec::new`].
     pub fn json<R>(place: Option<Place<R, P>>) -> Self
     where
         R: Row + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned,
@@ -934,5 +940,88 @@ where
     #[cfg(feature = "sqlite")]
     fn orphaned<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
         Box::pin(row::orphaned::<R>(conn, keys))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Columns, serde::Serialize, serde::Deserialize,
+    )]
+    struct Label {
+        label: String,
+    }
+
+    /// A part flattened in for sqlx, and for serde too.
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Row, serde::Serialize, serde::Deserialize,
+    )]
+    #[row(table = "flat", mirror = "catalog")]
+    struct Flat {
+        id: Uuid,
+        #[sqlx(flatten)]
+        #[serde(flatten)]
+        part: Label,
+    }
+
+    /// A part flattened in for sqlx only: serde nests it.
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Row, serde::Serialize, serde::Deserialize,
+    )]
+    #[row(table = "nested", mirror = "catalog")]
+    struct Nested {
+        id: Uuid,
+        #[sqlx(flatten)]
+        part: Label,
+    }
+
+    /// A field serde writes under another name.
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Row, serde::Serialize, serde::Deserialize,
+    )]
+    #[row(table = "renamed", mirror = "catalog")]
+    struct Renamed {
+        id: Uuid,
+        #[serde(rename = "name")]
+        title: String,
+    }
+
+    fn encoded<R: Row + serde::Serialize>(row: &R) -> Result<Vec<u8>, Error> {
+        json_encode(R::TABLE, &Table::of::<R>().columns, row)
+    }
+
+    #[test]
+    fn a_part_flattened_for_serde_too_travels_as_json() {
+        let row = Flat {
+            id: Uuid::nil(),
+            part: Label { label: "x".into() },
+        };
+        let bytes = encoded(&row).unwrap();
+        let columns = Table::of::<Flat>().columns;
+        assert_eq!(json_decode::<Flat>("flat", &columns, &bytes).unwrap(), row);
+    }
+
+    #[test]
+    fn a_field_serde_writes_otherwise_than_its_name_does_not_encode() {
+        let renamed = Renamed {
+            id: Uuid::nil(),
+            title: "x".into(),
+        };
+        let nested = Nested {
+            id: Uuid::nil(),
+            part: Label { label: "x".into() },
+        };
+        for error in [
+            encoded(&renamed).unwrap_err(),
+            encoded(&nested).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, Error::Misuse(why) if why.contains("by its name")),
+                "{error}"
+            );
+        }
     }
 }

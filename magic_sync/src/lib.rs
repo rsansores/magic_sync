@@ -24,11 +24,18 @@
 //!
 //! # Public dependencies
 //!
-//! The engine works over [`sqlx`] 0.8: the pools, connections and
-//! transactions a host hands it are sqlx's, and a database error is
-//! [`sqlx::Error`] ([`Error::Database`]). A table that travels as protobuf
-//! is a [`prost`] 0.14 message. A new major version of either is a new major
-//! version of this crate.
+//! What a host passes to the engine or reads back is another crate's type,
+//! and a new major version of any of them is a new major version of this
+//! crate:
+//!
+//! - [`sqlx`] 0.8: the pools, connections and transactions a host hands the
+//!   engine, and the database error ([`Error::Database`], [`sqlx::Error`]).
+//! - [`prost`] 0.14: a table that travels as protobuf is a message of it.
+//! - [`uuid`] 1: replicas, partitions and keys are [`uuid::Uuid`]s.
+//! - [`chrono`] 0.4: the times a status carries are its `DateTime<Utc>`.
+//! - [`serde`] 1: a table that travels as JSON ([`wire::Codec::json`]) is a
+//!   row that is `Serialize` and `Deserialize`, and the dashboard's
+//!   documents are serialized with it.
 
 #![warn(missing_docs, clippy::missing_errors_doc)]
 
