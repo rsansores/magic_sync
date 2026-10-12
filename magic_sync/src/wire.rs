@@ -766,22 +766,8 @@ where
                     });
                 }
             }
-            // A row refused may be taken once the rest are: one that points
-            // at a row after it, or takes a value one of them gives up.
-            let mut held = Vec::new();
-            loop {
-                let tried: Placed<R> = pending.clone();
-                let (_, again) = self.guarded(conn, pending, How::AllButOwned).await?;
-                let failed: std::collections::HashSet<usize> = again.iter().map(|r| r.at).collect();
-                let (left, took): (Placed<R>, Placed<R>) =
-                    tried.into_iter().partition(|(at, _)| failed.contains(at));
-                held.extend(took.iter().map(|(_, row)| row.key()));
-                if took.is_empty() || left.is_empty() {
-                    refused.extend(again);
-                    break;
-                }
-                pending = left;
-            }
+            let (held, again) = self.guarded(conn, pending, How::AllButOwned).await?;
+            refused.extend(again);
             row::unretire_by_keys::<R>(conn, &held).await?;
             Ok(refused)
         })

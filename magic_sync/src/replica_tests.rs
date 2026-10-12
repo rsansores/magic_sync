@@ -1857,6 +1857,46 @@ async fn a_unique_value_moves_between_rows_of_one_message(pool: SqlitePool) {
     );
 }
 
+/// A row refused is tried again once the whole message is in, not only its
+/// part: the value it takes may be given up by a delete of a later part —
+/// the server lists deletes after every table's rows — or by a row of the
+/// same table in a part after it.
+#[sqlx::test(migrations = false)]
+async fn a_unique_value_given_up_later_in_the_message_is_taken(pool: SqlitePool) {
+    let tables = TABLES.replace("label TEXT NOT NULL,", "label TEXT NOT NULL UNIQUE,");
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let aisle = Uuid::now_v7();
+    let shelf = |slot: i64, label: &str| {
+        let row = Shelf {
+            aisle,
+            slot,
+            label: label.to_owned(),
+            revision: 1,
+        };
+        (key(&[&aisle.to_string(), &slot.to_string()]), json(&row))
+    };
+    let labels = || w.texts("SELECT label FROM shelves ORDER BY slot");
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("shelves", vec![shelf(1, "x"), shelf(2, "y")])],
+    ))
+    .await;
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            upserts("shelves", vec![shelf(3, "x")]),
+            upserts("items", vec![item(Uuid::now_v7(), "between")]),
+            upserts("shelves", vec![shelf(4, "y"), shelf(2, "z")]),
+            deletes("shelves", vec![key(&[&aisle.to_string(), "1"])]),
+        ],
+    ))
+    .await;
+    assert_eq!(labels().await, ["z", "x", "y"]);
+    assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
+}
+
 /// A row the replica's own rows point at through a key that would cascade
 /// or set them null is kept, retired, like one a key would refuse to let
 /// go: letting it go would change rows of the replica's that the server

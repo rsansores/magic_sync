@@ -1007,7 +1007,9 @@ fn json<T: serde::Serialize>(keys: &[T]) -> String {
 /// refuses to delete, or that a row of the replica's own points at in a table
 /// with nothing to retire it by — is left as it was and noted as rejected,
 /// for [`outbox`] to report, rather than holding back the queue behind it; a
-/// storage failure is the error. A row the replica takes or lets go of is no
+/// storage failure is the error. A row refused is tried again once the whole
+/// message is in, while that takes one more: the value it takes may be given
+/// up later in the message. A row the replica takes or lets go of is no
 /// longer one to report.
 #[cfg(feature = "sqlite")]
 async fn apply<P: Sync + 'static>(
@@ -1018,8 +1020,7 @@ async fn apply<P: Sync + 'static>(
     care: &Care,
 ) -> Result<Vec<Applied>, Stop> {
     let naming = !message.snapshot_id.is_empty();
-    let mut taken = Vec::new();
-    let mut placed = Vec::new();
+    let mut parts = Vec::new();
     for (entry, table) in message.tables.iter().enumerate() {
         let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
             let why = if codec_of(codecs, &table.table).is_some() {
@@ -1031,6 +1032,34 @@ async fn apply<P: Sync + 'static>(
             continue;
         };
         let deletes = keys_of(codec, &table.deletes);
+        // A row refused earlier in the message and let go of now is the
+        // server's to let go: it is not tried again.
+        for part in parts
+            .iter_mut()
+            .filter(|p: &&mut Part<P>| p.codec.table.name == codec.table.name)
+        {
+            let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut part.refused)
+                .into_iter()
+                .partition(|(at, _)| {
+                    part.beside[*at]
+                        .as_ref()
+                        .is_some_and(|k| deletes.contains(k))
+                });
+            part.refused = kept;
+            if naming {
+                let keys: Vec<Key> = gone
+                    .iter()
+                    .filter_map(|(at, _)| part.beside[*at].clone())
+                    .collect();
+                let held = codec.present(conn, &keys).await?;
+                named(
+                    conn,
+                    codec.table.name,
+                    &held.iter().map(key_text).collect::<Vec<_>>(),
+                )
+                .await?;
+            }
+        }
         let_go(conn, codecs, codec, &deletes, Some(sequence), care).await?;
         let beside = parsed(codec, &table.keys);
         // A key twice in a part: the last row beside it is the one.
@@ -1040,72 +1069,140 @@ async fn apply<P: Sync + 'static>(
                 last.insert(key, at);
             }
         }
-        let rows: Vec<usize> = (0..beside.len())
-            .filter(|at| beside[*at].as_ref().is_none_or(|key| last[key] == *at))
-            .collect();
-        let mut held = Vec::new();
-        if care.careful {
-            let mut pending = Vec::new();
-            for at in rows {
-                let key = beside[at].as_ref();
-                match care.culprit(&table.table, &Spot::Upsert { entry, at }) {
-                    Some(culprit) => {
-                        let why = &culprit.why;
-                        refuse(conn, codec, key, why, naming, sequence).await?;
-                    }
-                    None => pending.push(at),
+        let mut pending = Vec::new();
+        for at in (0..beside.len()).filter(|at| beside[*at].as_ref().is_none_or(|k| last[k] == *at))
+        {
+            match care.culprit(&table.table, &Spot::Upsert { entry, at }) {
+                Some(culprit) => {
+                    let key = beside[at].as_ref();
+                    refuse(conn, codec, key, &culprit.why, naming, sequence).await?;
                 }
+                None => pending.push(at),
             }
-            // As taken all at once: one refused is tried again once the
-            // rest are in, while that takes one more.
-            loop {
-                let mut again = Vec::new();
-                for at in &pending {
-                    row_begun(conn).await?;
-                    let took = take(conn, codec, table, &beside, &[*at], naming, sequence).await;
-                    let row = Spot::Upsert { entry, at: *at };
-                    match row_done(conn, took, &table.table, row).await? {
-                        Ok(keys) if keys.is_empty() => again.push(*at),
-                        Ok(keys) => held.extend(keys),
-                        Err(e) => {
-                            let why = e.to_string();
-                            refuse(conn, codec, beside[*at].as_ref(), &why, naming, sequence)
-                                .await?;
-                        }
-                    }
-                }
-                if again.is_empty() || again.len() == pending.len() {
-                    break;
-                }
-                pending = again;
-            }
-        } else {
-            held = take(conn, codec, table, &beside, &rows, naming, sequence).await?;
         }
-        taken.push(Applied {
-            table: table.table.clone(),
-            keys: held.iter().map(|(_, key)| key.clone()).collect(),
-        });
-        placed.push((entry, codec, held));
+        let mut part = Part {
+            entry,
+            codec,
+            table,
+            beside,
+            held: Vec::new(),
+            refused: Vec::new(),
+        };
+        part.attempt(conn, &pending, naming, care).await?;
+        parts.push(part);
     }
+    loop {
+        let mut took = false;
+        for part in &mut parts {
+            let again: Vec<usize> = std::mem::take(&mut part.refused)
+                .into_iter()
+                .map(|(at, _)| at)
+                .collect();
+            let held = part.held.len();
+            part.attempt(conn, &again, naming, care).await?;
+            took |= part.held.len() > held;
+        }
+        if !took {
+            break;
+        }
+    }
+    let mut taken = Vec::new();
     let mut culprits = Vec::new();
-    for (entry, codec, held) in placed {
-        let keys: Vec<Key> = held.iter().map(|(_, key)| key.clone()).collect();
-        let orphans: HashSet<Key> = codec.unparented(conn, &keys).await?.into_iter().collect();
+    for part in parts {
+        for (at, why) in &part.refused {
+            let key = part.beside[*at].as_ref();
+            refuse(conn, part.codec, key, why, naming, sequence).await?;
+        }
+        let keys: Vec<Key> = part.held.iter().map(|(_, key)| key.clone()).collect();
+        let orphans: HashSet<Key> = part
+            .codec
+            .unparented(conn, &keys)
+            .await?
+            .into_iter()
+            .collect();
         culprits.extend(
-            held.into_iter()
+            part.held
+                .iter()
                 .filter(|(_, key)| orphans.contains(key))
                 .map(|(at, _)| Culprit {
-                    table: codec.table.name.to_owned(),
-                    row: Spot::Upsert { entry, at },
+                    table: part.codec.table.name.to_owned(),
+                    row: Spot::Upsert {
+                        entry: part.entry,
+                        at: *at,
+                    },
                     why: "a row it points at, through a foreign key, is not held here".to_owned(),
                 }),
         );
+        taken.push(Applied {
+            table: part.table.table.clone(),
+            keys,
+        });
     }
     if !culprits.is_empty() {
         return Err(Stop::Culprits(culprits));
     }
     Ok(taken)
+}
+
+/// One table's part of a message, as far as it was taken: the rows held, by
+/// their place in it with their keys, and the ones refused so far, with why.
+#[cfg(feature = "sqlite")]
+struct Part<'m, P: 'static> {
+    entry: usize,
+    codec: &'m Codec<P>,
+    table: &'m Table,
+    beside: Vec<Option<Key>>,
+    held: Vec<(usize, Key)>,
+    refused: Vec<(usize, String)>,
+}
+
+#[cfg(feature = "sqlite")]
+impl<P: Sync + 'static> Part<'_, P> {
+    /// The rows at `positions` tried: all at once, or — careful — each in a
+    /// savepoint of its own, so that one whose refusal takes the whole
+    /// transaction with it stops the message, named.
+    async fn attempt(
+        &mut self,
+        conn: &mut Conn,
+        positions: &[usize],
+        naming: bool,
+        care: &Care,
+    ) -> Result<(), Stop> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        if !care.careful {
+            let (held, refused) = take(
+                conn,
+                self.codec,
+                self.table,
+                &self.beside,
+                positions,
+                naming,
+            )
+            .await?;
+            self.held.extend(held);
+            self.refused.extend(refused);
+            return Ok(());
+        }
+        for at in positions {
+            row_begun(conn).await?;
+            let one = std::slice::from_ref(at);
+            let took = take(conn, self.codec, self.table, &self.beside, one, naming).await;
+            let row = Spot::Upsert {
+                entry: self.entry,
+                at: *at,
+            };
+            match row_done(conn, took, &self.table.table, row).await? {
+                Ok((held, refused)) => {
+                    self.held.extend(held);
+                    self.refused.extend(refused);
+                }
+                Err(e) => self.refused.push((*at, e.to_string())),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Text the replica keeps of what a server said, at most: a reason, the
@@ -1139,10 +1236,10 @@ fn capped(text: &str) -> &str {
 }
 
 /// The rows of `table` at `positions`, taken, each under the key it came
-/// `beside`: the ones the replica cannot take are rejected, the rest are no
-/// longer ones to report, nor to let go once filed; while a snapshot is
-/// `naming` them, it names each, taken or refused. Answers the rows the
-/// replica now holds, by their place in `table`, with their keys.
+/// `beside`: the ones taken are no longer ones to report, nor to let go
+/// once filed, and while a snapshot is `naming` them, it names each.
+/// Answers the rows the replica now holds and the ones it could not take,
+/// with why, each by its place in `table`.
 #[cfg(feature = "sqlite")]
 async fn take<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1151,27 +1248,20 @@ async fn take<P: Sync + 'static>(
     beside: &[Option<Key>],
     positions: &[usize],
     naming: bool,
-    sequence: i64,
-) -> Result<Vec<(usize, Key)>, Stop> {
+) -> Result<(Vec<(usize, Key)>, Vec<(usize, String)>), Stop> {
     let rows = positions
         .iter()
         .map(|at| (table.upserts[*at].clone(), beside[*at].clone()))
         .collect();
-    let failed: HashMap<usize, String> = codec
+    let refused: Vec<(usize, String)> = codec
         .apply_down(conn, rows)
         .await?
         .into_iter()
         .map(|refused| (positions[refused.at], refused.reason))
         .collect();
-    let mut refused = Vec::new();
-    for (at, why) in &failed {
-        let key = Vec::from_iter(beside[*at].as_ref().map(key_text));
-        reject(conn, &table.table, &key, why, sequence).await?;
-        refused.extend(beside[*at].clone());
-    }
     let held: Vec<(usize, Key)> = positions
         .iter()
-        .filter(|at| !failed.contains_key(at))
+        .filter(|at| !refused.iter().any(|(r, _)| r == *at))
         .filter_map(|at| Some((*at, beside[*at].clone()?)))
         .collect();
     let texts: Vec<String> = held.iter().map(|(_, key)| key_text(key)).collect();
@@ -1185,21 +1275,14 @@ async fn take<P: Sync + 'static>(
     .execute(&mut *conn)
     .await?;
     if naming {
-        let kept = codec.present(conn, &refused).await?;
-        let kept = kept.iter().map(key_text);
-        named(
-            conn,
-            &table.table,
-            &texts.into_iter().chain(kept).collect::<Vec<_>>(),
-        )
-        .await?;
+        named(conn, &table.table, &texts).await?;
     }
-    Ok(held)
+    Ok((held, refused))
 }
 
-/// The row of `table` at `at`, refused (`why`) before or as it was tried
-/// alone: rejected, and named by the snapshot in progress when the replica
-/// holds a copy of it.
+/// A row of `codec`'s table the replica could not take (`why`): rejected,
+/// and named by the snapshot in progress when the replica holds a copy of
+/// it.
 #[cfg(feature = "sqlite")]
 async fn refuse<P: Sync + 'static>(
     conn: &mut Conn,

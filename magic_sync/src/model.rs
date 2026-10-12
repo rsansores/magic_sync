@@ -22,6 +22,9 @@ use {
 /// A row, by its table and its key's text.
 pub(crate) type Row = (String, String);
 
+/// A row, with the bytes that carried it.
+type Carried = (Row, Vec<u8>);
+
 /// What a replica's data is: which rows it refuses to take, and which rows
 /// each points at.
 pub(crate) struct Rules {
@@ -252,19 +255,25 @@ impl Model {
             Body::Down(down) => {
                 let naming = !down.snapshot_id.is_empty();
                 self.taken.clear();
+                // Per table held, the rows it is yet to take.
+                let mut pending: Vec<(usize, Vec<Carried>)> = Vec::new();
                 for table in down.tables {
                     let holds = (rules.holds)(&table.table);
                     if holds {
-                        let gone = table
+                        let gone: Vec<Row> = table
                             .deletes
                             .iter()
                             .map(|key| (table.table.clone(), key.parts.join("|")))
                             .collect();
+                        // Refused earlier in the message, and let go of now.
+                        for (_, rows) in &mut pending {
+                            rows.retain(|(row, _)| !gone.contains(row));
+                        }
                         self.let_go(gone, sequence, rules);
                     }
-                    let mut pending = Vec::new();
+                    let mut rows = Vec::new();
                     // A key twice in a part: the last row beside it is the one.
-                    let rows: BTreeMap<String, usize> = table
+                    let last: BTreeMap<String, usize> = table
                         .keys
                         .iter()
                         .enumerate()
@@ -272,7 +281,7 @@ impl Model {
                         .collect();
                     for (at, (bytes, key)) in table.upserts.iter().zip(&table.keys).enumerate() {
                         let row = (table.table.clone(), key.parts.join("|"));
-                        if rows[&row.1] != at {
+                        if last[&row.1] != at {
                             continue;
                         }
                         if naming {
@@ -285,37 +294,22 @@ impl Model {
                         if !holds || beside || (rules.refuses)(&table.table, bytes) {
                             self.reject(row, "refused", sequence);
                         } else {
-                            pending.push((row, bytes.clone()));
+                            rows.push((row, bytes.clone()));
                         }
-                    }
-                    // One refused for what the replica holds is tried again
-                    // once the rest are in, while that takes one more.
-                    let mut taken = Vec::new();
-                    loop {
-                        let mut again = Vec::new();
-                        let mut took = false;
-                        for (row, bytes) in std::mem::take(&mut pending) {
-                            if !self.fits(&row, &bytes, rules) {
-                                again.push((row, bytes));
-                                continue;
-                            }
-                            took = true;
-                            self.rejections.remove(&row);
-                            taken.push(row.1.clone());
-                            self.retired.remove(&row);
-                            self.rows.insert(row, bytes);
-                        }
-                        if again.is_empty() || !took {
-                            for (row, _) in again {
-                                self.reject(row, "refused", sequence);
-                            }
-                            break;
-                        }
-                        pending = again;
                     }
                     if holds {
-                        self.taken.push((table.table, taken));
+                        self.taken.push((table.table, Vec::new()));
+                        self.take(self.taken.len() - 1, &mut rows, rules);
+                        pending.push((self.taken.len() - 1, rows));
                     }
+                }
+                // One refused for what the replica holds is tried again
+                // once the whole message is in, while that takes one more.
+                while pending.iter_mut().fold(false, |took, (entry, rows)| {
+                    self.take(*entry, rows, rules) || took
+                }) {}
+                for (row, _) in pending.into_iter().flat_map(|(_, rows)| rows) {
+                    self.reject(row, "refused", sequence);
                 }
                 Received::Applied
             }
@@ -344,6 +338,24 @@ impl Model {
                 Received::Ended
             }
         }
+    }
+
+    /// Takes what of `rows` fits, as the table entry `entry` of the last
+    /// message, leaving the rest: answers whether it took any.
+    fn take(&mut self, entry: usize, rows: &mut Vec<Carried>, rules: &Rules) -> bool {
+        let mut took = false;
+        for (row, bytes) in std::mem::take(rows) {
+            if !self.fits(&row, &bytes, rules) {
+                rows.push((row, bytes));
+                continue;
+            }
+            took = true;
+            self.rejections.remove(&row);
+            self.taken[entry].1.push(row.1.clone());
+            self.retired.remove(&row);
+            self.rows.insert(row, bytes);
+        }
+        took
     }
 
     /// Whether the database takes `row` as it stands: no other row holds

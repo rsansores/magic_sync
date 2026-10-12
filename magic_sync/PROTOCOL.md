@@ -243,12 +243,17 @@ their deletes ignored.
    - a row the replica had retired (4.3) becomes live again.
 
    A key both let go of and upserted in one part is held: its upsert comes
-   after. A key upserted twice in one part is the last row beside it. A row the database refuses is tried again once the rest of the
-   part are in, while that takes one more: it may point at a row after it,
-   or take a unique value a row after it gives up. Two rows that swap a
-   unique value cannot be taken one at a time — the database checks each
-   row as it is written — so both are rejected, and keep what they held,
-   until the server sends them otherwise.
+   after. A key upserted twice in one part is the last row beside it.
+
+**A row the database refuses is tried again once the whole message is in**
+— every part of it, the deletes of later parts included — and again while
+that takes one more: it may point at a row after it, or take a unique value
+a row after it, or a delete after it, gives up. One that a later part lets
+go of is not tried again: the server let go of it. What is still refused
+then is rejected (section 6). Two rows that swap a unique value cannot be
+taken one at a time — the database checks each row as it is written — so
+both are rejected, and keep what they held, until the server sends them
+otherwise.
 
 **A row the replica cannot take, or let go of, does not fail the message.**
 If a row does not decode, if the replica's database refuses it for its data
