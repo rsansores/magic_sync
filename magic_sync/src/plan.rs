@@ -2640,6 +2640,25 @@ impl Engine {
          WHERE NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = d.replica_id \
                               AND k.rel = d.rel AND k.row_key = d.row_key)";
 
+    /// Per replica, the tables the plan takes rows of back from it.
+    pub(crate) async fn dropping(
+        &self,
+        conn: &mut Conn,
+    ) -> Result<BTreeMap<Uuid, BTreeSet<String>>, Error> {
+        let rows: Vec<(Uuid, i32)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT d.replica_id, d.rel FROM ({}) AS d",
+            Self::DROPPED
+        ))
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut dropping: BTreeMap<Uuid, BTreeSet<String>> = BTreeMap::new();
+        for (replica, i) in rows {
+            let table = usize::try_from(i).map_or("", |i| self.table(i));
+            dropping.entry(replica).or_default().insert(table.to_owned());
+        }
+        Ok(dropping)
+    }
+
     /// Every replica the plan sends to, takes from or provisions.
     pub(crate) async fn touched(&self, conn: &mut Conn) -> Result<BTreeSet<Uuid>, Error> {
         Ok(sqlx::query_scalar("SELECT replica_id FROM sync_touched")

@@ -201,6 +201,10 @@ message it applied, and checks, in order:
 Then the replica applies `tables` **in the order given**. The server puts
 parents' rows before their children's, and children's deletes before their
 parents', so in that order no row ever points at a row the replica lacks.
+It keeps a table's deletes in the message that carries its upserts: the
+rows from a table's first upsert to its last delete are split across
+messages only when they do not fit one on their own. So a unique value one
+row lets go of is there, in the same message, for another row to take.
 
 For each `Table`:
 
