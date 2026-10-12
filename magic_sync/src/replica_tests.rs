@@ -2229,6 +2229,30 @@ fn uniquely_named_items() -> String {
     format!("{TABLES}CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;")
 }
 
+/// A key a later part of a message upserts again is that part's row: one
+/// an earlier part sent of it, refused, is not tried again once the rest of
+/// the message is in — it would take the older row over the newer.
+#[sqlx::test(migrations = false)]
+async fn a_refused_row_a_later_part_sends_again_is_not_tried_again(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [held, sent] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(held, "a")])]))
+        .await;
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            upserts("items", vec![item(sent, "a")]),
+            upserts("prices", Vec::new()),
+            upserts("items", vec![item(sent, "b")]),
+            deletes("items", vec![key(&[&held.to_string()])]),
+        ],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["b"]);
+    assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
+}
+
 /// A row retired for what pointed at it is let go of once nothing does —
 /// in the next message the replica applies, whatever it carries — and
 /// while it stays, its unique values are no live row's: the server's next

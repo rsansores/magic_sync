@@ -284,9 +284,15 @@ impl Model {
                             .iter()
                             .map(|key| (table.table.clone(), key.parts.join("|")))
                             .collect();
-                        // Refused earlier in the message, and let go of now.
+                        // Refused earlier in the message, and let go of or
+                        // sent again now.
+                        let again: Vec<Row> = table
+                            .keys
+                            .iter()
+                            .map(|key| (table.table.clone(), key.parts.join("|")))
+                            .collect();
                         for (_, rows) in &mut pending {
-                            rows.retain(|(row, _)| !gone.contains(row));
+                            rows.retain(|(row, _)| !gone.contains(row) && !again.contains(row));
                         }
                         self.let_go(gone, sequence, rules);
                     }

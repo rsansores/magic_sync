@@ -1177,14 +1177,22 @@ async fn apply<P: Sync + 'static>(
             continue;
         };
         let deletes = keys_of(codec, &table.deletes);
+        let beside = parsed(codec, &table.keys);
         // A row refused earlier in the message and let go of now is the
-        // server's to let go: it is not tried again.
+        // server's to let go, and one sent again now is this part's: it is
+        // not tried again.
         for part in parts
             .iter_mut()
             .filter(|p: &&mut Part<P>| p.codec.table.name == codec.table.name)
         {
-            let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut part.refused)
+            let refused = std::mem::take(&mut part.refused);
+            let (gone, kept): (Vec<_>, Vec<_>) = refused
                 .into_iter()
+                .filter(|(at, _)| {
+                    part.beside[*at]
+                        .as_ref()
+                        .is_none_or(|k| !beside.contains(&Some(k.clone())))
+                })
                 .partition(|(at, _)| {
                     part.beside[*at]
                         .as_ref()
@@ -1206,7 +1214,6 @@ async fn apply<P: Sync + 'static>(
             }
         }
         let_go(conn, codecs, codec, &deletes, by, care).await?;
-        let beside = parsed(codec, &table.keys);
         // A key twice in a part: the last row beside it is the one.
         let mut last = HashMap::new();
         for (at, key) in beside.iter().enumerate() {
