@@ -2312,7 +2312,7 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
 /// is a step of its own.
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
-    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0x3931_5e62_776a_f26c];
+    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0xb65d_0afa_13d6_7aab];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -2610,15 +2610,17 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
             ),
             // Named as the engine knows it, not by the partition it landed in.
             ("t_logs".into(), format!("{log}|{a}"), Some(a), None),
-            // A key that changed: the new one where it is now, the old one
-            // where it was, with what the row as it was pointed at.
-            ("t_counters".into(), log.to_string(), Some(b), None),
+            // A key that changed: the old one where it was, first, with
+            // what the row as it was pointed at — a batch that ends between
+            // the two takes the row back before it sends it again — then
+            // the new one where it is now.
             (
                 "t_counters".into(),
                 counter.to_string(),
                 Some(a),
                 pointed.clone()
             ),
+            ("t_counters".into(), log.to_string(), Some(b), None),
             ("t_counters".into(), log.to_string(), Some(b), None),
             // A row that moved: where it was, whose replicas let it go —
             // its first note, with what it pointed at — and where it is now.

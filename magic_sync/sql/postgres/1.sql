@@ -9,6 +9,13 @@
 
 CREATE SCHEMA sync;
 
+-- A digest of text, for an index over text longer than an entry takes. SHA-256
+-- rather than MD5, which a PostgreSQL in FIPS mode refuses; immutable, as the
+-- text's bytes are those of the database's one encoding.
+CREATE FUNCTION sync.digest(text) RETURNS bytea
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    RETURN sha256(convert_to($1, 'UTF8'));
+
 -- The version of this schema: the engine refuses to run against another.
 -- `plan::migration` appends the statement that writes it here; a later
 -- version is a step of its own, run after this one.
@@ -354,7 +361,7 @@ CREATE TABLE sync.inbox (
 
 -- By a digest of the text: a sender's table and key may be longer than an
 -- index entry takes.
-CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, md5(relation), md5(row_key));
+CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, sync.digest(relation), sync.digest(row_key));
 
 COMMENT ON TABLE sync.inbox IS
     'What replicas uploaded that the server could not file for a reason a retry cannot '
@@ -421,12 +428,15 @@ BEGIN
         SELECT string_agg(v_old ->> k, '|' ORDER BY n) INTO v_old_key
           FROM unnest(v_key) WITH ORDINALITY AS a(k, n);
     END IF;
-    -- A row that moved to another partition is gone from the one it was
-    -- in: noted there first, so its first note keeps what it pointed at.
-    IF v_old_key = v_new_key AND TG_ARGV[1] <> ''
-       AND v_old ->> TG_ARGV[1] IS DISTINCT FROM v_new ->> TG_ARGV[1] THEN
+    -- A row deleted, whose key changed, or that moved to another partition
+    -- is gone from where it was: noted there first — a plan that reads only
+    -- this note takes the row back before it sends it anywhere — and that
+    -- first note keeps what it pointed at.
+    IF v_old_key IS NOT NULL AND (v_old_key IS DISTINCT FROM v_new_key OR (TG_ARGV[1] <> ''
+       AND v_old ->> TG_ARGV[1] IS DISTINCT FROM v_new ->> TG_ARGV[1])) THEN
         INSERT INTO sync.notes (kind, relation, row_key, partition_id)
-        VALUES ('row', TG_ARGV[0], v_old_key, (v_old ->> TG_ARGV[1])::UUID)
+        VALUES ('row', TG_ARGV[0], v_old_key,
+                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_old ->> TG_ARGV[1])::UUID END)
         RETURNING id INTO v_note;
     END IF;
     IF v_new_key IS NOT NULL THEN
@@ -435,13 +445,6 @@ BEGIN
                 CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_new ->> TG_ARGV[1])::UUID END)
         RETURNING id INTO v_newest;
         v_note := coalesce(v_note, v_newest);
-    END IF;
-    -- A row deleted, or whose key changed: the old key is gone.
-    IF v_old_key IS DISTINCT FROM v_new_key AND v_old_key IS NOT NULL THEN
-        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
-        VALUES ('row', TG_ARGV[0], v_old_key,
-                CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_old ->> TG_ARGV[1])::UUID END)
-        RETURNING id INTO v_note;
     END IF;
     -- What the version before pointed at, with the note of its key.
     v_at := 4 + v_keys;

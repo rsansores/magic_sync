@@ -299,8 +299,8 @@ async fn supersede<P: Sync + 'static>(
     }
     Ok(sqlx::query_as(
         "WITH gone AS (DELETE FROM sync.inbox i USING unnest($2::text[], $3::text[]) AS u(t, k) \
-                        WHERE i.replica_id = $1 AND md5(i.relation) = md5(u.t) \
-                          AND md5(i.row_key) = md5(u.k) AND i.relation = u.t AND i.row_key = u.k \
+                        WHERE i.replica_id = $1 AND sync.digest(i.relation) = sync.digest(u.t) \
+                          AND sync.digest(i.row_key) = sync.digest(u.k) AND i.relation = u.t AND i.row_key = u.k \
                         RETURNING length(i.upload) AS bytes) \
          SELECT count(*), coalesce(sum(bytes), 0)::int8 FROM gone",
     )
@@ -1210,7 +1210,7 @@ async fn keep(
             "INSERT INTO sync.inbox AS i \
                (replica_id, relation, row_key, upload, reason, first_at, attempts) \
              VALUES ($1, $2, $3, $4, $5, coalesce($6, now()), $7) \
-             ON CONFLICT (replica_id, md5(relation), md5(row_key)) \
+             ON CONFLICT (replica_id, sync.digest(relation), sync.digest(row_key)) \
              DO UPDATE SET upload = EXCLUDED.upload, \
                reason = EXCLUDED.reason, first_at = EXCLUDED.first_at, last_at = now(), \
                attempts = EXCLUDED.attempts",

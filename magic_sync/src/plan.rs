@@ -1383,8 +1383,8 @@ impl Engine {
     async fn redeclared(&self, conn: &mut Conn) -> Result<(), Error> {
         let declared = self.declared();
         let before: Option<Option<String>> = sqlx::query_scalar(
-            "UPDATE sync.version v SET declared = md5($1) FROM sync.version was \
-              WHERE v.declared IS DISTINCT FROM md5($1) RETURNING was.declared",
+            "UPDATE sync.version v SET declared = encode(sync.digest($1), 'hex') FROM sync.version was \
+              WHERE v.declared IS DISTINCT FROM encode(sync.digest($1), 'hex') RETURNING was.declared",
         )
         .bind(&declared)
         .fetch_optional(&mut *conn)
