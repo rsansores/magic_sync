@@ -761,7 +761,10 @@ impl World {
         // index: refused a sequential scan, it makes one only where none
         // serves it. (What the connection counted before is not reported
         // until the transaction ends: what this one adds is the difference.)
-        sqlx::raw_sql("SET LOCAL enable_seqscan = off")
+        // Before PostgreSQL 18 a refused scan still made costs 10^10 more,
+        // past every JIT threshold: without `jit = off` each statement of
+        // the pass would be compiled, a second at a time.
+        sqlx::raw_sql("SET LOCAL enable_seqscan = off; SET LOCAL jit = off")
             .execute(&mut *tx)
             .await
             .expect("no sequential scans");
