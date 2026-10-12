@@ -81,6 +81,40 @@ async fn world_over(pool: SqlitePool, tables: &str, settings: Settings) -> World
     w
 }
 
+/// A replica over a database with no file is a replica: it has no crash to
+/// leave a message half applied through, so the journal it is always in is
+/// not refused.
+#[tokio::test]
+async fn a_replica_over_an_in_memory_database_receives() {
+    let options = "sqlite::memory:"
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .pragma("recursive_triggers", "ON");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    install(&mut pool.acquire().await.unwrap(), &codecs())
+        .await
+        .expect("installed");
+    let replica = Replica::new(
+        pool.clone(),
+        codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .expect("a replica over memory");
+    let received = replica.receive(&ending(BASE, 0, "provisioned", &[])).await;
+    assert!(
+        matches!(received, Ok(Received::SnapshotEnded)),
+        "{received:?}"
+    );
+}
+
 impl World {
     /// `bytes` received as a host receives them: nothing a message carries
     /// is an error.
