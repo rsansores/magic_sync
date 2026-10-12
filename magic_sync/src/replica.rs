@@ -310,7 +310,7 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// one missing or extra, nullable on one side only, of a type its field does
 /// not decode, keyed otherwise — with every difference named; a unique index
 /// of a table with a retired column that is not partial on `<retired> IS
-/// NULL`, which would hold a retired row's values against the server's live
+/// NULL` (alone, or among conditions joined by `AND`), which would hold a retired row's values against the server's live
 /// ones; triggers that
 /// are not the ones [`triggers`] writes — one missing, one that differs, or
 /// one left from a table that no longer travels, the engine's being those
@@ -349,14 +349,8 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
         let Some(retired) = table.retired else {
             continue;
         };
-        let live = format!("{retired} is null");
         for (index, sql) in crate::dialect::unique_indexes(conn, table.name).await? {
-            let only = |sql: String| {
-                let sql = sql.to_lowercase().replace(['"', '`', '[', ']'], "");
-                let (_, filter) = sql.rsplit_once(" where ")?;
-                Some(filter.split_whitespace().collect::<Vec<_>>().join(" "))
-            };
-            if sql.and_then(only).as_deref() != Some(live.as_str()) {
+            if !sql.is_some_and(|sql| leaves_out(&sql, retired)) {
                 return Err(Error::Misuse(format!(
                     "`{}`: the unique index `{index}` holds its retired rows' values too, which \
                      would refuse every row the server sends with one of them while the retired \
@@ -404,6 +398,61 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
     }
     settled(conn).await?;
     Ok(())
+}
+
+/// Whether the unique index `sql` creates leaves out every row `retired`
+/// is set on: its filter says `<retired> IS NULL`, alone or as one of the
+/// conditions it joins with `AND` — in whatever case, quoting, spacing or
+/// parentheses.
+#[cfg(feature = "sqlite")]
+fn leaves_out(sql: &str, retired: &str) -> bool {
+    let normal = |text: &str| {
+        text.to_lowercase()
+            .replace(['"', '`', '[', ']'], "")
+            .replace('(', " ( ")
+            .replace(')', " ) ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let live = normal(&format!("{retired} is null"));
+    let sql = normal(sql);
+    let Some((_, filter)) = sql.rsplit_once(" where ") else {
+        return false;
+    };
+    let mut terms = vec![filter.to_owned()];
+    while let Some(term) = terms.pop() {
+        if term == live {
+            return true;
+        }
+        // Split at each `and` outside parentheses; a term that is one pair
+        // of them, opened.
+        let words: Vec<&str> = term.split(' ').collect();
+        let mut depth = 0i32;
+        let mut parts = vec![Vec::new()];
+        let mut closed_at_end = true;
+        for (at, word) in words.iter().enumerate() {
+            match *word {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    closed_at_end &= depth > 0 || at == words.len() - 1;
+                }
+                "and" if depth == 0 => {
+                    parts.push(Vec::new());
+                    continue;
+                }
+                _ => {}
+            }
+            parts.last_mut().expect("one at least").push(*word);
+        }
+        if parts.len() > 1 {
+            terms.extend(parts.into_iter().map(|p| p.join(" ")));
+        } else if words.first() == Some(&"(") && closed_at_end {
+            terms.push(words[1..words.len() - 1].join(" "));
+        }
+    }
+    false
 }
 
 /// Whether a trigger of this name is one the engine writes (and [`install`]
