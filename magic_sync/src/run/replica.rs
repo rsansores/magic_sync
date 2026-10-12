@@ -169,6 +169,16 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     skips: Vec<AtomicUsize>,
 }
 
+impl<P: 'static, I: Identity, U: Uplink> std::fmt::Debug for Replica<P, I, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tables: Vec<_> = self.codecs.iter().map(|c| c.table.name).collect();
+        f.debug_struct("Replica")
+            .field("tables", &tables)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// A replica over a database the engine can run against
     /// ([`replica::check`]): `codecs` are the tables that travel, parents

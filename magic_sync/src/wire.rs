@@ -78,6 +78,14 @@ pub struct Codec<P> {
     ops: Box<dyn Ops<P>>,
 }
 
+impl<P> std::fmt::Debug for Codec<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Codec")
+            .field("table", &self.table.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Why a row could not be mapped to its message, or a message back to its
 /// row: what a [`Codec::new`] mapper fails with. Any error converts into it
 /// with `?`.

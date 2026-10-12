@@ -62,6 +62,12 @@ pub trait Senders: Send + Sync + 'static {
 /// that authenticates its replicas says which it knows with [`Senders`].
 pub struct Anyone(PgPool);
 
+impl std::fmt::Debug for Anyone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Anyone").finish_non_exhaustive()
+    }
+}
+
 impl Anyone {
     /// Every replica known, its uploads filed in a transaction of `pool`.
     #[must_use]
@@ -231,6 +237,15 @@ pub struct Server<S: Senders, T: Transport> {
     transport: T,
     senders: S,
     settings: Settings,
+}
+
+impl<S: Senders, T: Transport> std::fmt::Debug for Server<S, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("engine", &self.engine)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: Senders, T: Transport> Server<S, T> {

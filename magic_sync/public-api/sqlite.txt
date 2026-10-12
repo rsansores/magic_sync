@@ -255,6 +255,8 @@ pub async fn magic_sync::run::replica::Replica<P, I, U>::new(sqlx_sqlite::Sqlite
 pub fn magic_sync::run::replica::Replica<P, I, U>::nudge(&self)
 pub async fn magic_sync::run::replica::Replica<P, I, U>::receive(&self, &[u8]) -> core::result::Result<magic_sync::replica::Received, magic_sync::Error>
 pub async fn magic_sync::run::replica::Replica<P, I, U>::run(&self, impl core::future::future::Future<Output = ()>)
+impl<P: 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink> core::fmt::Debug for magic_sync::run::replica::Replica<P, I, U>
+pub fn magic_sync::run::replica::Replica<P, I, U>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<P, I, U> !core::marker::Freeze for magic_sync::run::replica::Replica<P, I, U>
 impl<P, I, U> core::marker::Send for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Send
 impl<P, I, U> core::marker::Sync for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Sync
@@ -316,6 +318,8 @@ pub struct magic_sync::wire::Codec<P>
 impl<P: core::marker::Sync + 'static> magic_sync::wire::Codec<P>
 pub fn magic_sync::wire::Codec<P>::json<R>(core::option::Option<magic_sync::wire::Place<R, P>>) -> Self where R: magic_sync::row::Row + core::clone::Clone + core::marker::Send + core::marker::Sync + serde_core::ser::Serialize + serde_core::de::DeserializeOwned
 pub fn magic_sync::wire::Codec<P>::new<R, M>(fn(R) -> core::result::Result<M, magic_sync::wire::MapError>, fn(M) -> core::result::Result<R, magic_sync::wire::MapError>, core::option::Option<magic_sync::wire::Place<R, P>>) -> Self where R: magic_sync::row::Row + core::clone::Clone + core::marker::Send + core::marker::Sync, M: prost::message::Message + core::default::Default + 'static
+impl<P> core::fmt::Debug for magic_sync::wire::Codec<P>
+pub fn magic_sync::wire::Codec<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<P> core::marker::Freeze for magic_sync::wire::Codec<P> where alloc::boxed::Box<dyn Ops<P>>: core::marker::Freeze
 impl<P> core::marker::Send for magic_sync::wire::Codec<P> where alloc::boxed::Box<dyn Ops<P>>: core::marker::Send
 impl<P> core::marker::Sync for magic_sync::wire::Codec<P> where alloc::boxed::Box<dyn Ops<P>>: core::marker::Sync
@@ -378,6 +382,8 @@ pub async fn magic_sync::run::replica::Replica<P, I, U>::new(sqlx_sqlite::Sqlite
 pub fn magic_sync::run::replica::Replica<P, I, U>::nudge(&self)
 pub async fn magic_sync::run::replica::Replica<P, I, U>::receive(&self, &[u8]) -> core::result::Result<magic_sync::replica::Received, magic_sync::Error>
 pub async fn magic_sync::run::replica::Replica<P, I, U>::run(&self, impl core::future::future::Future<Output = ()>)
+impl<P: 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink> core::fmt::Debug for magic_sync::run::replica::Replica<P, I, U>
+pub fn magic_sync::run::replica::Replica<P, I, U>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<P, I, U> !core::marker::Freeze for magic_sync::run::replica::Replica<P, I, U>
 impl<P, I, U> core::marker::Send for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Send
 impl<P, I, U> core::marker::Sync for magic_sync::run::replica::Replica<P, I, U> where alloc::vec::Vec<magic_sync::wire::Codec<P>>: core::marker::Sync

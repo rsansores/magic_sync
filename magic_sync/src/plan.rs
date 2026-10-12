@@ -287,6 +287,16 @@ pub struct Engine {
     pub(crate) replicas: Replicas,
 }
 
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tables: Vec<_> = self.order.iter().map(|&i| self.plans[i].table).collect();
+        f.debug_struct("Engine")
+            .field("tables", &tables)
+            .field("replicas", &self.replicas)
+            .finish_non_exhaustive()
+    }
+}
+
 use crate::Conn;
 
 /// The key text of the row aliased `alias`, its `columns` joined by `|`.

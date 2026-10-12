@@ -108,6 +108,7 @@ async fn a_replica_over_an_in_memory_database_receives() {
     )
     .await
     .expect("a replica over memory");
+    assert!(format!("{replica:?}").starts_with("Replica { tables: ["));
     let received = replica.receive(&ending(BASE, 0, "provisioned", &[])).await;
     assert!(
         matches!(received, Ok(Received::SnapshotEnded)),
