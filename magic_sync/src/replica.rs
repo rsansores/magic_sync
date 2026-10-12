@@ -286,7 +286,8 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// one missing or extra, nullable on one side only, of a type its field does
 /// not decode, keyed otherwise — with every difference named; triggers that
 /// are not the ones [`triggers`] writes — one missing, one that differs, or
-/// one left from a table that no longer travels; or a connection the engine
+/// one left from a table that no longer travels, the engine's being those
+/// named `sync_note_…` and `sync_refuse_…`; or a connection the engine
 /// cannot keep its word on — `synchronous` below `FULL`, `journal_mode`
 /// `OFF` or `MEMORY`, `recursive_triggers` off — which the pool's options
 /// set. [`Replica::new`] runs it; a host with migrations also runs it in a
@@ -341,12 +342,9 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
             Some(_) => {}
         }
     }
-    let ours = |name: &str, sql: &str| {
-        engines(name) || sql.contains("sync_notes") || sql.contains("sync_applying")
-    };
-    if let Some((name, _)) = live
-        .iter()
-        .find(|(name, sql)| ours(name, sql) && !wanted.iter().any(|t| t.name == **name))
+    if let Some(name) = live
+        .keys()
+        .find(|name| engines(name) && !wanted.iter().any(|t| t.name == **name))
     {
         return Err(Error::Misuse(format!(
             "the trigger `{name}` is not one of the engine's: a table that no longer travels, or one written by hand — drop it"
@@ -357,7 +355,8 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
 }
 
 /// Whether a trigger of this name is one the engine writes (and [`install`]
-/// replaces): a host's own may be named anything else.
+/// replaces): a host's own may be named anything else, and do anything —
+/// read the engine's tables included.
 #[cfg(feature = "sqlite")]
 fn engines(name: &str) -> bool {
     name.starts_with("sync_note_") || name.starts_with("sync_refuse_")

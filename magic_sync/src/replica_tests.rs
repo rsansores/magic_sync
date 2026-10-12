@@ -3732,9 +3732,10 @@ async fn the_triggers_script_runs_again_over_what_it_wrote(pool: SqlitePool) {
     assert_eq!(live_triggers(&mut conn).await, before);
 }
 
-/// The engine's triggers are checked as they are, not by name: one that
-/// differs, one missing, and one left from a table that no longer travels
-/// are each refused; installing puts them right, in one transaction.
+/// The engine's triggers — known by their name — are checked as they are:
+/// one that differs, one missing, and one left from a table that no longer
+/// travels are each refused; installing puts them right, in one
+/// transaction.
 #[sqlx::test(migrations = false)]
 async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
     let w = world(pool).await;
@@ -3757,11 +3758,6 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
             "CREATE TRIGGER sync_note_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
             "the trigger `sync_note_gone_insert` is not one of the engine's",
         ),
-        (
-            "CREATE TRIGGER by_hand AFTER INSERT ON receipts BEGIN \
-             INSERT INTO sync_notes (relation, row_key) VALUES ('receipts', NEW.id); END",
-            "the trigger `by_hand` is not one of the engine's",
-        ),
     ];
     for (case, why) in cases {
         sqlx::raw_sql(case).execute(&mut *conn).await.unwrap();
@@ -3769,20 +3765,21 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
             Err(Error::Misuse(refused)) => assert!(refused.contains(why), "{case}: {refused}"),
             other => panic!("{case}: {other:?}"),
         }
-        if case.contains("by_hand") {
-            sqlx::raw_sql("DROP TRIGGER by_hand")
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-        }
         install(&mut conn, &codecs()).await.expect("put right");
     }
 
-    // A host's own trigger may be named as it likes: install leaves it.
-    sqlx::raw_sql("CREATE TRIGGER sync_audit AFTER INSERT ON receipts BEGIN SELECT 1; END")
-        .execute(&mut *conn)
+    // A host's own trigger may be named as it likes, and read what it likes
+    // of the engine's: the check and install leave it.
+    sqlx::raw_sql(
+        "CREATE TRIGGER sync_audit AFTER INSERT ON receipts \
+         WHEN NOT EXISTS (SELECT 1 FROM sync_applying) BEGIN SELECT 1; END",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    check(&mut conn, &codecs())
         .await
-        .unwrap();
+        .expect("a host's trigger is the host's");
     install(&mut conn, &codecs())
         .await
         .expect("installed again");
