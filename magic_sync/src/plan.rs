@@ -356,6 +356,12 @@ enum Set {
     Kept(usize, bool),
 }
 
+/// Whether the replica a row of `sync.held` as `h` is of refused the row: the
+/// last version sent it is the one it refused. One sent again since is on its
+/// way. What plans, what the status shows and what is compared ask this one
+/// question.
+pub(crate) const REFUSED: &str = "coalesce(h.refused >= h.sequence, false)";
+
 /// What the replica `replica` holds of the row of the relation `relation`
 /// (SQL text both) whose key is the text `key`, as `alias(replica_id,
 /// row_key, noted, refused)` — nothing, for one provisioned; refused while
@@ -365,7 +371,7 @@ enum Set {
 fn holds(join: &str, alias: &str, replica: &str, relation: &str, key: &str) -> String {
     format!(
         "{join} LATERAL (SELECT h.replica_id, h.row_key, h.noted, \
-                                coalesce(h.refused >= h.sequence, false) AS refused \
+                                {REFUSED} AS refused \
                            FROM sync.held h \
                           WHERE h.replica_id = {replica} AND h.relation = {relation} AND h.row_key = {key} \
                             AND NOT EXISTS (SELECT 1 FROM sync_live provisioned \
@@ -391,7 +397,7 @@ fn holders(relation: &str, key: &str) -> String {
 /// refused` (see [`holds`]), looked up key by key.
 fn held_by_key(relation: &str, keys: &str) -> String {
     format!(
-        "SELECT h.replica_id, h.row_key, h.noted, coalesce(h.refused >= h.sequence, false) AS refused \
+        "SELECT h.replica_id, h.row_key, h.noted, {REFUSED} AS refused \
            FROM ({keys}) AS k(row_key) \
           CROSS JOIN LATERAL (SELECT * FROM sync.held h \
                                WHERE h.relation = {relation} AND h.row_key = k.row_key OFFSET 0) h"
@@ -402,7 +408,7 @@ fn held_by_key(relation: &str, keys: &str) -> String {
 /// as [`held_by_key`] does, looked up replica by replica.
 fn held_by_replica(relation: &str, replicas: &str) -> String {
     format!(
-        "SELECT h.replica_id, h.row_key, h.noted, coalesce(h.refused >= h.sequence, false) AS refused \
+        "SELECT h.replica_id, h.row_key, h.noted, {REFUSED} AS refused \
            FROM ({replicas}) AS r(replica_id) \
           CROSS JOIN LATERAL (SELECT * FROM sync.held h \
                                WHERE h.replica_id = r.replica_id AND h.relation = {relation} OFFSET 0) h"

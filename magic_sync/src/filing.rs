@@ -12,6 +12,7 @@
 //! in `sync.inbox` as it came, and filed again after a deploy.
 
 use crate::envelope::{self, Up};
+use crate::plan::REFUSED;
 use crate::relay::{resync, stored};
 use crate::replica::{codec_of, keys_of, UpProgress};
 use crate::row::{key_text, Key};
@@ -996,13 +997,13 @@ async fn compare<P: Sync + 'static>(
     let (last, held): (
         Option<i64>,
         sqlx::types::Json<BTreeMap<String, Vec<String>>>,
-    ) = sqlx::query_as(
+    ) = sqlx::query_as(&format!(
         "SELECT (SELECT last_sequence FROM sync.chains WHERE replica_id = $1), \
                     coalesce((SELECT jsonb_object_agg(relation, keys) FROM ( \
-                       SELECT relation, jsonb_agg(row_key) AS keys FROM sync.held \
-                        WHERE replica_id = $1 AND relation = ANY($2) AND refused IS NULL \
-                        GROUP BY relation) t), '{}')",
-    )
+                       SELECT relation, jsonb_agg(row_key) AS keys FROM sync.held h \
+                        WHERE replica_id = $1 AND relation = ANY($2) AND NOT {REFUSED} \
+                        GROUP BY relation) t), '{{}}')"
+    ))
     .bind(replica)
     .bind(&names)
     .fetch_one(&mut *conn)

@@ -969,11 +969,13 @@ impl World {
     }
 
     /// The engine records `replica` holding exactly what it holds — what it
-    /// took as taken, what it refused as refused.
+    /// took as taken, what it refused as refused, as the planner reads it —
+    /// and the status counts what it took, table by table.
     async fn assert_recorded(&mut self, replica: Uuid) {
-        let recorded: Vec<(String, String, bool)> = sqlx::query_as(
-            "SELECT relation, row_key, refused IS NOT NULL FROM sync.held WHERE replica_id = $1",
-        )
+        let recorded: Vec<(String, String, bool)> = sqlx::query_as(&format!(
+            "SELECT relation, row_key, {} FROM sync.held h WHERE replica_id = $1",
+            crate::plan::REFUSED
+        ))
         .bind(replica)
         .fetch_all(&mut *self.conn)
         .await
@@ -1015,6 +1017,21 @@ impl World {
                 "{replica}: recorded {what} other than it is:\n  recorded, not so {:?}\n  so, not recorded {:?}\n  last steps: {:#?}",
                 recorded.difference(holds).collect::<Vec<_>>(),
                 holds.difference(&recorded).collect::<Vec<_>>(),
+                self.last_steps(),
+            );
+        }
+        let progress = self
+            .engine
+            .progress(&mut self.conn, crate::status::Scope::Replicas(&[replica]))
+            .await
+            .expect("progress");
+        for table in progress.replicas.iter().flat_map(|r| &r.tables) {
+            let took = held.iter().filter(|(t, _)| *t == table.table).count();
+            assert_eq!(
+                (table.holds + table.to_remove, table.in_flight),
+                (i64::try_from(took).expect("rows"), 0),
+                "{replica}: the status counts {} other than it took; last steps: {:#?}",
+                table.table,
                 self.last_steps(),
             );
         }
