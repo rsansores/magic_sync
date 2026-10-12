@@ -173,6 +173,7 @@ pub const magic_sync::row::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::row::Row::SCHEMA: &'static str
 pub const magic_sync::row::Row::TABLE: &'static str
 pub fn magic_sync::row::Row::key(&self) -> magic_sync::row::Key
+pub fn magic_sync::row::Row::key_text(&self) -> alloc::string::String
 pub trait magic_sync::row::Version
 pub const magic_sync::row::Version::KIND: magic_sync::row::VersionKind
 impl magic_sync::row::Version for chrono::naive::datetime::NaiveDateTime
@@ -926,6 +927,7 @@ pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::Row::SCHEMA: &'static str
 pub const magic_sync::Row::TABLE: &'static str
 pub fn magic_sync::Row::key(&self) -> magic_sync::row::Key
+pub fn magic_sync::Row::key_text(&self) -> alloc::string::String
 pub trait magic_sync::Senders: core::marker::Send + core::marker::Sync + 'static
 pub type magic_sync::Senders::Known: core::marker::Send + core::marker::Sync + 'static
 pub fn magic_sync::Senders::filing(&self, &Self::Known) -> impl core::future::future::Future<Output = core::result::Result<sqlx_core::transaction::Transaction<'static, sqlx_postgres::database::Postgres>, magic_sync::Error>> + core::marker::Send

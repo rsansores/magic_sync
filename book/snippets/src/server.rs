@@ -7,7 +7,8 @@ use magic_sync::plan::Engine;
 use magic_sync::run::server::{Senders, Settings};
 use magic_sync::status::{ReplicaState, RowState, Scope};
 use magic_sync::Error;
-use shop_rows::{codecs, REGISTERS};
+use magic_sync::Row;
+use shop_rows::{codecs, Product, REGISTERS};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::fmt::Display;
 use uuid::Uuid;
@@ -147,10 +148,10 @@ pub async fn progress(engine: &Engine, pool: &PgPool, register: Uuid) -> Result<
 // ANCHOR_END: progress
 
 // ANCHOR: row
-pub async fn who_holds(engine: &Engine, pool: &PgPool, product: Uuid) -> Result<(), Error> {
+pub async fn who_holds(engine: &Engine, pool: &PgPool, product: &Product) -> Result<(), Error> {
     let mut conn = pool.acquire().await?;
     let row = engine
-        .row_progress(&mut conn, Scope::All, "products", &product.to_string())
+        .row_progress(&mut conn, Scope::All, "products", &product.key_text())
         .await?;
     for place in row.places {
         let state = match place.state {

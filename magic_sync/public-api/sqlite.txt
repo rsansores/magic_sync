@@ -233,6 +233,7 @@ pub const magic_sync::row::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::row::Row::SCHEMA: &'static str
 pub const magic_sync::row::Row::TABLE: &'static str
 pub fn magic_sync::row::Row::key(&self) -> magic_sync::row::Key
+pub fn magic_sync::row::Row::key_text(&self) -> alloc::string::String
 pub trait magic_sync::row::Version
 pub const magic_sync::row::Version::KIND: magic_sync::row::VersionKind
 impl magic_sync::row::Version for chrono::naive::datetime::NaiveDateTime
@@ -418,6 +419,7 @@ pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::Row::SCHEMA: &'static str
 pub const magic_sync::Row::TABLE: &'static str
 pub fn magic_sync::Row::key(&self) -> magic_sync::row::Key
+pub fn magic_sync::Row::key_text(&self) -> alloc::string::String
 pub trait magic_sync::Uplink: core::marker::Send + core::marker::Sync + 'static
 pub fn magic_sync::Uplink::send(&self, uuid::Uuid, &'static str, alloc::vec::Vec<u8>) -> impl core::future::future::Future<Output = core::result::Result<(), magic_sync::Error>> + core::marker::Send
 pub type magic_sync::Conn = sqlx_sqlite::connection::SqliteConnection

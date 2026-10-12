@@ -171,6 +171,14 @@ pub trait Row:
 
     /// The row's key values, in [`Row::KEY`] order.
     fn key(&self) -> Key;
+
+    /// The row's key as the engine writes it where a key is text — the `key`
+    /// of `plan::Engine::row_progress`, a key in the engine's tables and in a
+    /// log: its parts joined by `|`, a uuid lowercase and hyphenated, an
+    /// integer decimal.
+    fn key_text(&self) -> String {
+        key_text(&self.key())
+    }
 }
 
 /// One value of a key.
@@ -1404,6 +1412,20 @@ mod tests {
         id: Uuid,
         #[row(version)]
         at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[test]
+    fn a_rows_key_text_joins_its_parts_in_their_one_form() {
+        let group = Uuid::parse_str("0192F6A0-0000-7000-8000-00000000000A").unwrap();
+        let order = Order {
+            group,
+            line: -3,
+            r#type: String::new(),
+            total: 0,
+            note: None,
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(order.key_text(), "0192f6a0-0000-7000-8000-00000000000a|-3");
     }
 
     #[test]

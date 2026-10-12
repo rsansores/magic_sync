@@ -839,7 +839,9 @@ impl Engine {
     }
 
     /// Where one row stands on every replica of `scope` that holds it,
-    /// should, or is owed it.
+    /// should, or is owed it. `key` is the row's key as text, in the form
+    /// [`Row::key_text`](crate::Row::key_text) writes: the parts of a key of
+    /// several columns joined by `|`, a uuid lowercase and hyphenated.
     ///
     /// # Errors
     ///
