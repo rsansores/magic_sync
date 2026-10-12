@@ -460,6 +460,25 @@ async fn pins(pool: &SqlitePool, model: &mut Model) {
         .collect();
 }
 
+/// The uplink took `up`: the engine forgets a rejection it told of a row
+/// it holds no copy of, as PROTOCOL.md section 6 lets it — the model, which
+/// keeps it, is told so.
+fn forgets_what_it_told(model: &mut Model, up: &Up) {
+    for rejected in &up.rejected {
+        let key = rejected.key.as_ref().map(|k| k.parts.join("|"));
+        let row = (rejected.table.clone(), key.unwrap_or_default());
+        let held = model.rows.contains_key(&row) || model.retired.contains_key(&row);
+        if !held
+            && model
+                .rejections
+                .get(&row)
+                .is_some_and(|r| r.sequence == rejected.sequence)
+        {
+            model.rejections.remove(&row);
+        }
+    }
+}
+
 /// What the replica holds of the server's rows, its rejections, and where
 /// it stands, against the model.
 async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) {
@@ -839,6 +858,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 let went = node.replica.send_lane(lane, walk.below(5) == 0).await;
                 assert!(quiet || went.is_ok() || uplink.refusing.lock().unwrap().is_some());
                 for (_, up) in uplink.taken() {
+                    forgets_what_it_told(&mut model, &up);
                     answers.extend(server.file(&up, me));
                 }
                 server.answer(&mut walk);
@@ -983,6 +1003,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
             said |= node.replica.send_lane(lane, digests).await.unwrap().message;
         }
         for (_, up) in uplink.taken() {
+            forgets_what_it_told(&mut model, &up);
             answers.extend(server.file(&up, me));
         }
         server.answer(&mut walk);

@@ -386,7 +386,7 @@ was restored from an older copy.
 
 A row the replica could not take, or could not let go of (4.1), is a
 **rejection**: the table, the key — **required**, in the form of section 3:
-read off the row, or from `keys[i]` if the row did not even decode — why,
+the one the row came beside, `keys[i]`, or its delete's — why,
 and the `(epoch, sequence)` of the message that carried the row, or its
 delete. A row whose key cannot be told is logged and not reported.
 
@@ -402,8 +402,11 @@ delete. A row whose key cannot be told is logged and not reported.
   the server leaves out the rows recorded refused. It reports only the
   rejections of the epoch it follows; a snapshot of a new epoch clears the
   others — those of the tables it names as it ends, and those of a table it
-  does not hold from the server, which no snapshot names. Such a rejection of
-  the epoch it follows it **may** forget once reported.
+  does not hold from the server, which no snapshot names. A rejection of a
+  row it holds no copy of — of a table it does not hold from the server, or
+  a row it never took — leaves nothing out of a digest: it **may** forget
+  that one once reported, and the engine does, so what it keeps of
+  rejections is bounded by what it holds.
 - It keeps what the server said within bounds: a reason **may** be cut (to
   512 bytes), and rows of a table it does not know, named or keyed longer
   than that, are logged rather than kept — no server sends such a table. So

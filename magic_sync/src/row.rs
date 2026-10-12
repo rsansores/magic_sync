@@ -723,12 +723,10 @@ async fn keep<R: Row>(
                 R::TABLE
             )
         };
-        for chunk in keys.chunks(keys_per_statement::<R>()) {
-            let kept = key_select::<R>(exec, chunk).await?;
-            retired
-                .refused
-                .extend(kept.into_iter().map(|key| (key, why.clone())));
-        }
+        let kept = key_select::<R>(exec, keys).await?;
+        retired
+            .refused
+            .extend(kept.into_iter().map(|key| (key, why.clone())));
         return Ok(0);
     };
     let retire = |keys: &[Key]| {
@@ -948,18 +946,20 @@ async fn one_by_one<'k>(
     Ok(refused)
 }
 
-/// The keys of `keys` the table holds.
+/// The keys of `keys` the table holds, retired or not.
 #[cfg(feature = "sqlite")]
-async fn key_select<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<Key>, Error> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
+pub(crate) async fn key_select<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<Key>, Error> {
     let kinds = key_kinds::<R>();
-    let mut qb =
-        sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(R::KEY), R::QUALIFIED));
-    key_filter::<R>(&mut qb, keys);
-    let rows = qb.build().fetch_all(&mut *exec).await?;
-    rows.iter().map(|row| key_of_row(row, &kinds, 0)).collect()
+    let mut out = Vec::new();
+    for chunk in keys.chunks(keys_per_statement::<R>()) {
+        let mut qb =
+            sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(R::KEY), R::QUALIFIED));
+        key_filter::<R>(&mut qb, chunk);
+        for row in qb.build().fetch_all(&mut *exec).await? {
+            out.push(key_of_row(&row, &kinds, 0)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Opens a savepoint, for [`released`] to close.

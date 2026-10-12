@@ -1084,15 +1084,58 @@ async fn a_row_the_replica_cannot_take_is_reported_until_it_takes_it(pool: Sqlit
     assert_eq!(up.rejected[0].key, Some(key(&[&broken.to_string()])));
     assert_eq!(up.sequence, BASE + 1, "confirmed with its refusal");
     assert!(w.up(0, false).await.is_none(), "said once");
+    assert!(
+        w.rejected().await.is_empty(),
+        "forgotten once told: the replica holds nothing of it to leave out"
+    );
 
     w.receive(&down(
         2,
         "",
-        vec![upserts("items", vec![item(broken, "fixed")])],
+        vec![upserts(
+            "items",
+            vec![
+                item(broken, "fixed"),
+                (key(&[&good.to_string()]), vec![0xff, 0xff]),
+            ],
+        )],
     ))
     .await;
-    assert!(w.rejected().await.is_empty());
     assert_eq!(w.items().await, ["fixed", "good"]);
+    w.up(0, false).await.expect("the refusal");
+    assert_eq!(
+        w.rejected().await,
+        [format!("items {good}")],
+        "kept once told: the replica holds an older copy, which its digests leave out"
+    );
+}
+
+/// A snapshot names the rows it carried that the replica refused only
+/// where the replica holds a copy the sweep must not take: what a server
+/// sends the replica cannot take, however much, is not kept to be named.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_names_only_refused_rows_the_replica_holds(pool: SqlitePool) {
+    let w = world(pool).await;
+    let [held] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![item(held, "held")])],
+    ))
+    .await;
+    let mut rows: Vec<(WireKey, Vec<u8>)> = (0..500)
+        .map(|_| (key(&[&Uuid::now_v7().to_string()]), vec![0xff, 0xff]))
+        .collect();
+    rows.push((key(&[&held.to_string()]), vec![0xff, 0xff]));
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(2, &s, vec![upserts("items", rows)])).await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_snapshot_keys").await,
+        1,
+        "the one it holds"
+    );
+    w.receive(&end(3, &s, &["items"])).await;
+    assert_eq!(w.items().await, ["held"], "refused, so kept");
 }
 
 #[sqlx::test(migrations = false)]

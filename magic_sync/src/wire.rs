@@ -295,6 +295,12 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.retire(conn, keys, held, server)
     }
 
+    /// The keys of `keys` this replica holds, retired or not.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        self.ops.present(conn, keys)
+    }
+
     /// The rows of this table rows point at, by what they point at them with
     /// ([`row::pointed`]).
     #[cfg(feature = "sqlite")]
@@ -449,6 +455,8 @@ trait Ops<P>: Send + Sync {
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
     fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
+    #[cfg(feature = "sqlite")]
+    fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
     fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>>;
     #[cfg(feature = "sqlite")]
@@ -794,6 +802,11 @@ where
     #[cfg(feature = "sqlite")]
     fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
         Box::pin(row::unparented::<R>(conn, keys))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::key_select::<R>(conn, keys))
     }
 
     #[cfg(feature = "sqlite")]
