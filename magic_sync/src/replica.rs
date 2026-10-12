@@ -1769,13 +1769,12 @@ impl Lane {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Outbox {
-    /// How large a message the uplink takes: rows per message, and bytes.
+    /// How large a message the uplink takes: rows per message — the rows
+    /// it carries and the rejections together — and bytes.
     pub limits: envelope::Limits,
     /// How long an upload the server has not answered waits before it goes
     /// again.
     pub resend_after: std::time::Duration,
-    /// Rejections per message, at most.
-    pub rejections: std::num::NonZeroUsize,
     /// How often, at most, the replica tells the server its backlog while it
     /// grows — and how often it says it again, unchanged, while it is not
     /// empty; it says at once when it empties, or starts.
@@ -1788,7 +1787,6 @@ impl Default for Outbox {
         Outbox {
             limits: envelope::Limits::default(),
             resend_after: std::time::Duration::from_secs(600),
-            rejections: std::num::NonZeroUsize::new(500).expect("not zero"),
             backlog_every: std::time::Duration::from_secs(60),
         }
     }
@@ -1929,23 +1927,22 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     };
     let limit = settings.limits.bytes;
     // What the message takes beyond what it is built with: its upload's
-    // number (63 bits, nine bytes), and on the main lane the backlog,
-    // whatever it says by the end — per table, its name and three numbers.
+    // number (63 bits, nine bytes), and on the main lane the backlog.
     let mut reserved = framed(9);
     let mut rejected = Vec::new();
     let mut untold_gap = false;
     // Whether the last applied is news to the server.
     let mut news = false;
-    // Rows and rejections it may carry, at most, after those it passes over.
-    let mut items = window.map_or(usize::MAX, |w| w.take);
+    // Rows and rejections it may carry, together, at most, after those it
+    // passes over.
+    let mut items = settings
+        .limits
+        .rows
+        .min(window.map_or(usize::MAX, |w| w.take));
     let mut skip = window.map_or(0, |w| w.skip);
+    // Room the backlog takes, while it is to go.
+    let mut backlog = None;
     if main {
-        let tables: usize = progress(conn)
-            .await?
-            .iter()
-            .map(|t| framed(framed(t.table.len()) + 3 * 11))
-            .sum();
-        reserved += framed(tables);
         let applied: Option<Applying> = sqlx::query_as(
             "SELECT epoch, sequence, nonce, mac, acknowledged, gap, gap_told FROM sync_applied \
               WHERE id = 1",
@@ -1956,17 +1953,38 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         reserved += applied
             .as_ref()
             .map_or(0, |a| framed(a.epoch.len()) + framed(a.mac.len()) + 3 * 11);
+        // The backlog, whatever it says by the end — per table, its name
+        // and three numbers — unless it could not go even alone.
+        let tables: usize = progress(conn)
+            .await?
+            .iter()
+            .map(|t| framed(framed(t.table.len()) + 3 * 11))
+            .sum();
+        if up.encoded_len() + reserved + framed(tables) <= limit {
+            reserved += framed(tables);
+            backlog = Some(framed(tables));
+        } else {
+            tracing::error!(
+                bytes = framed(tables),
+                limit,
+                "sync: a backlog larger than a message carries — not told"
+            );
+        }
         // One over the cap says whether this message reports them all: the
         // server must hear of a refusal before the message it refused is
         // confirmed, or it would take the refused row for applied.
-        let most = settings.rejections.get().min(items);
-        let mut pending = unreported(conn, skip.saturating_add(most).saturating_add(1)).await?;
+        let mut pending = unreported(conn, skip.saturating_add(items).saturating_add(1)).await?;
         let passed = skip.min(pending.len());
         pending.drain(..passed);
         skip -= passed;
-        let mut all_reported = passed == 0 && pending.len() <= most;
-        for (row, sequence) in pending.into_iter().take(most) {
+        let mut all_reported = passed == 0 && pending.len() <= items;
+        for (row, sequence) in pending.into_iter().take(items) {
             let weight = framed(row.encoded_len());
+            // The first always fits, the backlog waiting for the next
+            // message when it leaves it no room.
+            if up.encoded_len() + reserved + weight > limit && up.rejected.is_empty() {
+                reserved -= backlog.take().unwrap_or_default();
+            }
             if up.encoded_len() + reserved + weight > limit {
                 all_reported = false;
                 break;
@@ -2053,7 +2071,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         || !up.digests.is_empty()
         || news
         || untold_gap;
-    if main {
+    if backlog.is_some() {
         let now = progress(conn).await?;
         up.backlog = backlog_due(conn, now, settings, sending).await?;
     }

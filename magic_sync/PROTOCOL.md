@@ -430,7 +430,10 @@ delete — for a row the end of a snapshot could not let go of, the
 - It keeps what the server said within bounds: a reason **may** be cut (to
   512 bytes), and rows of a table it does not know, named or keyed longer
   than that, are logged rather than kept — no server sends such a table. So
-  any rejection fits a message up, and never holds back the confirmation.
+  any rejection fits a message up — the backlog (section 7) waiting for the
+  next one when it would leave the first rejection no room — and never
+  holds back the confirmation. Rejections count against a message's rows
+  as the rows it carries do.
 
 On a rejection of the last message that carried the row, the server
 records the row **refused**: still held for every decision that takes rows

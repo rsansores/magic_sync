@@ -474,7 +474,6 @@ fn settings() -> Settings {
     Settings {
         outbox: Outbox {
             limits: Limits::new(3, 5000).unwrap(),
-            rejections: std::num::NonZeroUsize::new(2).unwrap(),
             ..Outbox::default()
         },
         lanes: vec![Lane::new("main", &[]), Lane::new("history", &["events"])],

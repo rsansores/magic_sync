@@ -13,7 +13,7 @@ use crate::conformance::{
     codecs, json, nonce_of, settled, Event, Price, Reading, Shelf, Task, Uplinked,
 };
 use crate::envelope::{
-    Backlog, Down, EndSnapshot, Filed, Key as WireKey, Limits, Table, ToReplica,
+    Backlog, Down, EndSnapshot, Filed, Key as WireKey, Limits, Table, ToReplica, ENVELOPE_ROOM,
 };
 use crate::run::replica::{Replica, Settings};
 use crate::testkit::ItemRow;
@@ -3166,7 +3166,7 @@ async fn a_row_that_does_not_encode_is_set_aside_and_the_rest_goes(pool: SqliteP
 async fn digests_wait_for_the_confirmation_they_are_read_against(pool: SqlitePool) {
     let settings = Settings {
         outbox: Outbox {
-            rejections: std::num::NonZeroUsize::MIN,
+            limits: Limits::new(1, 512 * 1024).unwrap(),
             ..Outbox::default()
         },
         ..Settings::default()
@@ -3372,7 +3372,7 @@ async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool
     let pool = settled(pool).await;
     let settings = Settings {
         outbox: Outbox {
-            rejections: std::num::NonZeroUsize::MIN,
+            limits: Limits::new(1, 512 * 1024).unwrap(),
             ..Outbox::default()
         },
         ..Settings::default()
@@ -3390,6 +3390,72 @@ async fn a_replica_confirms_only_once_every_refusal_is_reported(pool: SqlitePool
     assert_eq!((first.rejected.len(), first.sequence), (1, 0));
     let last = w.up(0, false).await.unwrap();
     assert_eq!((last.rejected.len(), last.sequence), (1, BASE + 1));
+}
+
+/// Rejections are rows of a message as much as the replica's writes are:
+/// together within the limit, rejections first.
+#[sqlx::test(migrations = false)]
+async fn rejections_and_writes_share_a_messages_rows(pool: SqlitePool) {
+    let settings = Settings {
+        outbox: Outbox {
+            limits: Limits::new(2, 512 * 1024).unwrap(),
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    let broken: Vec<(WireKey, Vec<u8>)> = ids::<3>()
+        .iter()
+        .map(|id| (key(&[&id.to_string()]), vec![0xff]))
+        .collect();
+    w.receive(&down(1, "", vec![upserts("items", broken)]))
+        .await;
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'x')")
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let carried = |up: &Up| (up.rejected.len(), up.tables.len());
+    assert_eq!(carried(&w.up(0, false).await.unwrap()), (2, 0));
+    assert_eq!(carried(&w.up(0, false).await.unwrap()), (1, 1));
+}
+
+/// A rejection always fits a message up: when what the backlog would take
+/// leaves it no room, the backlog waits for the next message, and the
+/// confirmation goes.
+#[sqlx::test(migrations = false)]
+async fn a_rejection_displaces_a_backlog_too_large_to_go_beside_it(pool: SqlitePool) {
+    let settings = Settings {
+        outbox: Outbox {
+            limits: Limits::new(10, ENVELOPE_ROOM + 1).unwrap(),
+            ..Outbox::default()
+        },
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    // Writes of tables a later build sent, set aside here and counted.
+    for n in 0..50 {
+        sqlx::query("INSERT INTO sync_notes (relation, row_key, set_aside) VALUES ($1, 'k', 'x')")
+            .bind(format!("a_table_of_a_later_build_{n:03}"))
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    // A rejection as large as any: of a table named, and keyed, as long as
+    // the replica keeps.
+    let long = "x".repeat(500);
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(&long, vec![(key(&[&long]), vec![0xff])])],
+    ))
+    .await;
+    let up = w.up(0, false).await.unwrap();
+    assert!(up.encoded_len() <= ENVELOPE_ROOM + 1);
+    assert_eq!((up.rejected.len(), up.sequence), (1, BASE + 1));
+    assert!(up.backlog.is_none());
+    let up = w.up(0, false).await.unwrap();
+    assert_eq!(up.backlog.map(|b| b.tables.len()), Some(50));
 }
 
 /// The replica tells the server what it wrote and the server has not filed:

@@ -81,7 +81,6 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Lane
 #[non_exhaustive] pub struct magic_sync::replica::Outbox
 pub magic_sync::replica::Outbox::backlog_every: core::time::Duration
 pub magic_sync::replica::Outbox::limits: magic_sync::envelope::Limits
-pub magic_sync::replica::Outbox::rejections: core::num::nonzero::NonZeroUsize
 pub magic_sync::replica::Outbox::resend_after: core::time::Duration
 impl core::clone::Clone for magic_sync::replica::Outbox
 pub fn magic_sync::replica::Outbox::clone(&self) -> Self
