@@ -449,7 +449,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         )
         .await?;
         tx.commit().await?;
+        let witnessed = &self.witnessed[lane];
         let Some(outgoing) = outgoing.filter(|o| skip == 0 || o.items() > 0) else {
+            // Nothing left of what was being narrowed down.
+            witnessed.store(false, Ordering::Relaxed);
             if skip > 0 {
                 self.skips[lane].store(0, Ordering::Relaxed);
                 self.caps[lane].store(0, Ordering::Relaxed);
@@ -482,7 +485,6 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             digests: false,
         };
         let items = outgoing.items();
-        let witnessed = &self.witnessed[lane];
         match sent {
             Ok(()) => {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -526,11 +528,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 self.caps[lane].store(1, Ordering::Relaxed);
             }
             Err(e) => {
-                // The transport may be another by the time it takes again:
-                // what it took before witnesses nothing after.
-                if e.is_transient() {
-                    witnessed.store(false, Ordering::Relaxed);
-                } else {
+                // The transport may be another by the time it takes again,
+                // or refuses with no row to blame: what it took before
+                // witnesses nothing after.
+                witnessed.store(false, Ordering::Relaxed);
+                if !e.is_transient() {
                     tracing::error!(
                         lane = outgoing.lane,
                         items,

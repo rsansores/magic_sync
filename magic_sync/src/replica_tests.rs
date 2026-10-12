@@ -3889,6 +3889,56 @@ async fn a_witness_from_before_a_failure_blames_no_row_after_it(pool: SqlitePool
     );
 }
 
+/// What the transport took while a refusal was narrowed down is no witness
+/// once the search is over — nothing left of it to send, or a message with
+/// no row refused for good since: a row it refuses after is not blamed.
+async fn a_witness_from_a_search_that_ended_blames_no_row_after_it(
+    pool: SqlitePool,
+    ended_by_refusal: bool,
+) {
+    {
+        let w = world(pool).await;
+        w.exec("DELETE FROM sync_notes").await.unwrap();
+        events(&w, &["one", "two"]).await;
+        *w.uplink.cannot_take.lock().unwrap() =
+            Some(|up: &Up| up.tables.iter().map(|t| t.upserts.len()).sum::<usize>() > 1);
+        w.replica.send_lane(0, false).await.expect("halved");
+        w.replica.send_lane(0, false).await.expect("one taken");
+        assert_eq!(w.uplink.taken().len(), 1);
+        // The rest of it went another way.
+        w.exec("DELETE FROM sync_notes WHERE sent_at IS NULL")
+            .await
+            .unwrap();
+        *w.uplink.cannot_take.lock().unwrap() = None;
+        *w.uplink.refusing.lock().unwrap() = Some(false);
+        if ended_by_refusal {
+            w.receive(&down(1, "", vec![upserts("prices", Vec::new())]))
+                .await;
+        }
+        let _ = w.replica.send_lane(0, false).await;
+        events(&w, &["three"]).await;
+        for _ in 0..4 {
+            let _ = w.replica.send_lane(0, false).await;
+        }
+        assert_eq!(
+            w.count("SELECT count(*) FROM sync_notes WHERE set_aside IS NOT NULL")
+                .await,
+            0,
+            "ended by a refusal: {ended_by_refusal}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_witness_from_a_search_with_nothing_left_blames_no_row_after_it(pool: SqlitePool) {
+    a_witness_from_a_search_that_ended_blames_no_row_after_it(pool, false).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_witness_before_a_refusal_with_no_row_blames_no_row_after_it(pool: SqlitePool) {
+    a_witness_from_a_search_that_ended_blames_no_row_after_it(pool, true).await;
+}
+
 /// A transport that refuses every message for good — a revoked credential, a
 /// host that answers 403 — says nothing of any one row: nothing is set aside
 /// on its word, whatever the number of rows, and it goes on being asked.
