@@ -2866,6 +2866,33 @@ async fn events(w: &World, names: &[&str]) {
     }
 }
 
+/// What the transport took before it failed for a while is no witness
+/// against a row it refuses for good after: by then it may refuse
+/// everything, and the row is not blamed.
+#[sqlx::test(migrations = false)]
+async fn a_witness_from_before_a_failure_blames_no_row_after_it(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["one", "two"]).await;
+    *w.uplink.cannot_take.lock().unwrap() =
+        Some(|up: &Up| up.tables.iter().map(|t| t.upserts.len()).sum::<usize>() > 1);
+    w.replica.send_lane(0, false).await.expect("halved");
+    w.replica.send_lane(0, false).await.expect("one taken");
+    assert_eq!(w.uplink.taken().len(), 1);
+    *w.uplink.cannot_take.lock().unwrap() = None;
+    *w.uplink.refusing.lock().unwrap() = Some(true);
+    assert!(w.replica.send_lane(0, false).await.is_err());
+    *w.uplink.refusing.lock().unwrap() = Some(false);
+    for _ in 0..5 {
+        let _ = w.replica.send_lane(0, false).await;
+    }
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes WHERE set_aside IS NOT NULL")
+            .await,
+        0
+    );
+}
+
 /// A transport that refuses every message for good — a revoked credential, a
 /// host that answers 403 — says nothing of any one row: nothing is set aside
 /// on its word, whatever the number of rows, and it goes on being asked.

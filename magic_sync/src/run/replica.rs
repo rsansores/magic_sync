@@ -152,8 +152,9 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     /// while the uplink refuses one for good: 0 for no cap.
     caps: Vec<AtomicUsize>,
     /// Per lane, whether the transport took a message while it was being
-    /// asked for less than the replica had to say: proof that a row it then
-    /// refuses alone is the one at fault, and not the transport.
+    /// asked for less than the replica had to say, and has not failed since:
+    /// proof that a row it then refuses alone is the one at fault, and not
+    /// the transport.
     witnessed: Vec<AtomicBool>,
     /// Per lane, how many rows and rejections the next message passes over
     /// while it looks for one the transport takes: 0 when it is not looking.
@@ -465,7 +466,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 self.caps[lane].store(1, Ordering::Relaxed);
             }
             Err(e) => {
-                if !e.is_transient() {
+                // The transport may be another by the time it takes again:
+                // what it took before witnesses nothing after.
+                if e.is_transient() {
+                    witnessed.store(false, Ordering::Relaxed);
+                } else {
                     tracing::error!(
                         lane = outgoing.lane,
                         items,
