@@ -579,7 +579,7 @@ runners.
 
 | File | What it is |
 |---|---|
-| `sql/postgres.sql` | the server's schema |
+| `sql/postgres/` | the server's schema, one step per version |
 | `sql/sqlite/` | a replica's schema, one step per version |
 | `proto/sync.proto` | the engine's messages, for a replica in another language |
 

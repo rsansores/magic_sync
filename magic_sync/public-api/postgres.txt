@@ -62,6 +62,7 @@ impl core::marker::Unpin for magic_sync::plan::Replicas
 impl core::marker::UnsafeUnpin for magic_sync::plan::Replicas
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::plan::Replicas
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::plan::Replicas
+pub fn magic_sync::plan::migration(i32) -> core::option::Option<alloc::string::String>
 pub async fn magic_sync::plan::note_resync(&mut magic_sync::Conn, core::option::Option<uuid::Uuid>, uuid::Uuid) -> core::result::Result<(), magic_sync::Error>
 pub mod magic_sync::row
 #[non_exhaustive] pub enum magic_sync::row::KeyKind
@@ -922,7 +923,6 @@ impl core::marker::Unpin for magic_sync::run::server::Settings
 impl core::marker::UnsafeUnpin for magic_sync::run::server::Settings
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::server::Settings
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Settings
-pub const magic_sync::POSTGRES_SCHEMA: &str
 pub const magic_sync::SERVER_SCHEMA_VERSION: i32
 pub trait magic_sync::Columns: crate::__private::Sealed
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static

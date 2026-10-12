@@ -27,9 +27,9 @@ build upgraded is refused by an earlier one rather than misread.
   advisory lock), before the server starts; `replica::install` does the same
   on a replica, in one transaction.
 - **With migrations**, the upgrade is a migration of yours that runs the
-  release's step, as your first one ran [`POSTGRES_SCHEMA`] (on a replica,
-  the step itself, [`replica::migration`]`(n)` for version `n`, which also
-  records the version): the changelog names it. Print the triggers again
+  release's step: [`plan::migration`]`(n)` on the server, [`replica::migration`]`(n)`
+  on a replica, for version `n` — each also records the version, and your
+  first migration ran step 1: the changelog names the step. Print the triggers again
   ([The tables](tables.md)) in the same migration: a release may write them
   differently, and the server refuses to start while one differs.
 
@@ -83,6 +83,6 @@ upgrade them together.
 
 [`SERVER_SCHEMA_VERSION`]: ../api/server/magic_sync/constant.SERVER_SCHEMA_VERSION.html
 [`REPLICA_SCHEMA_VERSION`]: ../api/replica/magic_sync/constant.REPLICA_SCHEMA_VERSION.html
-[`POSTGRES_SCHEMA`]: ../api/server/magic_sync/constant.POSTGRES_SCHEMA.html
+[`plan::migration`]: ../api/server/magic_sync/plan/fn.migration.html
 [`replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
 [`PROTOCOL`]: ../api/server/magic_sync/envelope/constant.PROTOCOL.html

@@ -9,9 +9,9 @@
 
 CREATE SCHEMA sync;
 
--- The version of this schema: the engine refuses to run against another. A
--- later version is a script of its own, run after this one, that ends by
--- writing its number here.
+-- The version of this schema: the engine refuses to run against another.
+-- `plan::migration` appends the statement that writes it here; a later
+-- version is a step of its own, run after this one.
 CREATE TABLE sync.version (
     id       INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     version  INTEGER NOT NULL,
@@ -478,5 +478,3 @@ BEGIN
     RETURN NULL;
 END;
 $$;
-
-INSERT INTO sync.version (version) VALUES (1);

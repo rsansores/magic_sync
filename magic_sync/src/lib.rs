@@ -196,12 +196,6 @@ pub const SERVER_SCHEMA_VERSION: i32 = 1;
 #[cfg(feature = "sqlite")]
 pub const REPLICA_SCHEMA_VERSION: i32 = 1;
 
-/// The server's schema at [`SERVER_SCHEMA_VERSION`], as one SQL script: a host with
-/// migrations runs it in one, before the migration that writes the triggers
-/// [`plan::Engine::triggers`] prints.
-#[cfg(feature = "postgres")]
-pub const POSTGRES_SCHEMA: &str = include_str!("../sql/postgres.sql");
-
 use __private::Db;
 
 #[cfg(all(test, feature = "postgres"))]

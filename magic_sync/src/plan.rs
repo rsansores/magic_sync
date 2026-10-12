@@ -252,10 +252,28 @@ pub(crate) const RECORD_CHUNK: usize = 2_000;
 /// installing at once run one after the other ("SYNCINST").
 const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 
-/// The engine's schema, one script per version: a database at version `n`
-/// runs the scripts after the `n`th, in one transaction. Each script ends by
-/// writing its version.
-const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [crate::POSTGRES_SCHEMA];
+/// The engine's steps, in order, each as released and never edited: the
+/// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
+const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] =
+    [include_str!("../sql/postgres/1.sql")];
+
+/// The engine's step to `version` of its schema on the server, as one SQL
+/// script that also records the version it brings it to — `None` for a
+/// version no build of the engine has had yet. [`Server::install`] runs every
+/// step a database lacks, in order; a host with migrations runs each, in one
+/// of its own: the first before the migration that writes
+/// [`Engine::triggers`]' script, and each later one when a release brings it
+/// (its changelog says). A step is never edited once released.
+///
+/// [`Server::install`]: crate::Server::install
+#[must_use]
+pub fn migration(version: i32) -> Option<String> {
+    let step = MIGRATIONS.get(usize::try_from(version.checked_sub(1)?).ok()?)?;
+    Some(format!(
+        "{step}\nINSERT INTO sync.version (id, version) VALUES (1, {version}) \
+         ON CONFLICT (id) DO UPDATE SET version = excluded.version;\n"
+    ))
+}
 
 /// The server's engine, built once from the codecs and the schema by the
 /// [`Server`](crate::Server), which hands it out for what a host asks of it:
@@ -676,10 +694,11 @@ async fn migrate(conn: &mut Conn) -> Result<(), Error> {
             crate::SERVER_SCHEMA_VERSION
         )));
     }
-    for script in &MIGRATIONS[from..] {
+    for step in (installed + 1)..=crate::SERVER_SCHEMA_VERSION {
+        let script = migration(step).expect("a step of this build");
         // Not `raw_sql`: its future is not `Send` for every lifetime a
         // host's spawn asks of it.
-        sqlx::Executor::execute(&mut *conn, *script).await?;
+        sqlx::Executor::execute(&mut *conn, script.as_str()).await?;
     }
     Ok(())
 }
@@ -780,7 +799,7 @@ impl Engine {
     /// For a host that has no migrations of its own. Run it before anything
     /// writes a mirrored table — a write before its trigger is never noted —
     /// on a connection that may create triggers. A host with migrations runs
-    /// [`POSTGRES_SCHEMA`](crate::POSTGRES_SCHEMA) in one and writes each
+    /// [`migration`]`(1)` in one and writes each
     /// table's triggers in the migration that creates it, as it does its
     /// indexes; [`Engine::new`] refuses to start while one is missing.
     pub(crate) async fn install(
@@ -841,7 +860,7 @@ impl Engine {
     /// The statements that create every trigger the server needs for
     /// `codecs`, one per line, read off the database `conn` is on: what a
     /// host with migrations writes in the migration that creates the tables —
-    /// after [`POSTGRES_SCHEMA`](crate::POSTGRES_SCHEMA) — and what
+    /// after the engine's first step ([`migration`]) — and what
     /// [`Server::install`](crate::Server::install) runs. A mirrored table
     /// notes every write that changes a column it does not leave to the
     /// replicas, and refuses a truncate; a group table notes every write.
@@ -3353,7 +3372,7 @@ pub(crate) mod tests {
             .execute(&mut *conn)
             .await
             .expect("drop the schema");
-        sqlx::raw_sql(crate::POSTGRES_SCHEMA)
+        sqlx::raw_sql(&migration(1).expect("the first step"))
             .execute(&mut *conn)
             .await
             .expect("the schema");
