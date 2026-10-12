@@ -1061,7 +1061,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
 
     spawnable(Engine::triggers(&mut conn, &codecs(), REPLICAS));
     spawnable(crate::row::upsert::<Item>(&mut conn, Vec::new()));
-    spawnable(crate::row::get::<Item>(&mut conn, &Vec::new()));
+    spawnable(crate::row::get_by_keys::<Item>(&mut conn, &[]));
     let engine = server.engine();
     let scope = crate::status::Scope::All;
     spawnable(engine.overview(&mut conn, scope, 1));

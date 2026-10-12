@@ -9,17 +9,10 @@
 //! does not decode, or a primary key other than the row's `key`, is refused
 //! with every difference named.
 //!
-//! What a host does with its rows directly is then generic over the row and
-//! names no column, so a column added to the struct is written and read
-//! without touching them:
-//!
-//! - [`upsert`] — every column, newest wins when the record has a version.
-//! - [`insert_ignore`] — history: the first delivery wins.
-//! - [`get`] / [`get_many`] — rows as the replicas see them, by key.
-//! - [`get_by_keys`] — rows by key, every one the table holds.
-//!
-//! None rewrites a `#[row(created)]` column: a row's creation is its first
-//! write.
+//! The engine's own reads and writes of a row are generic over it and name no
+//! column, so a column added to the struct is written and read without
+//! touching them; none rewrites a `#[row(created)]` column: a row's creation
+//! is its first write.
 
 use crate::dialect::ident;
 use crate::{Conn, Db, Error};
@@ -455,36 +448,6 @@ fn update_clause_where<R: Row>(take: impl Fn(&str) -> bool) -> String {
     )
 }
 
-/// The rows of `keys` replicas see, every column: on the server through the
-/// relation the row's `active` names, on a replica less the rows it retired.
-/// A key with no such row is left out.
-///
-/// # Errors
-///
-/// [`Error::Database`] when the database fails, or a row does not decode as
-/// `R`.
-pub async fn get_many<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
-    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
-    let relation = crate::dialect::active::<R>();
-    let mut out = Vec::with_capacity(keys.len());
-    for chunk in keys.chunks(keys_per_statement::<R>()) {
-        let mut qb = sqlx::QueryBuilder::new(format!("SELECT {} FROM {relation}", listed(&names)));
-        key_filter::<R>(&mut qb, chunk);
-        out.extend(qb.build_query_as::<R>().fetch_all(&mut *exec).await?);
-    }
-    Ok(out)
-}
-
-/// The row of `key` replicas see, as [`get_many`] reads it.
-///
-/// # Errors
-///
-/// [`Error::Database`] when the database fails, or a row does not decode as
-/// `R`.
-pub async fn get<R: Row>(exec: &mut Conn, key: &Key) -> Result<Option<R>, Error> {
-    Ok(get_many::<R>(exec, std::slice::from_ref(key)).await?.pop())
-}
-
 /// `WHERE (k1, k2) IN ((…), …)` for one chunk of keys.
 fn key_filter<R: Row>(qb: &mut sqlx::QueryBuilder<'_, Db>, keys: &[Key]) {
     qb.push(format!(" WHERE ({}) IN (", listed(R::KEY)));
@@ -515,7 +478,7 @@ fn keys_per_statement<R: Row>() -> usize {
 ///
 /// [`Error::Database`] when the database fails, or a row does not decode as
 /// `R`.
-pub async fn get_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
+pub(crate) async fn get_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
     let mut out = Vec::with_capacity(keys.len());
     for chunk in keys.chunks(keys_per_statement::<R>()) {
@@ -1185,67 +1148,42 @@ pub(crate) async fn update_held<R: Row>(
 
 /// Writes every column of every row, the incoming value winning on a key the
 /// table holds — unless the row has a version and the stored one is newer,
-/// so a late write never rolls the row back. Answers the keys it wrote. On
-/// a replica, of a table it writes whole: a record.
+/// so a late write never rolls the row back. Answers the keys it wrote.
 ///
 /// # Errors
 ///
-/// [`Error::Database`] when the database fails or refuses a row;
-/// [`Error::Misuse`] on a replica, for a table the server writes — a
-/// catalog, or one written on both sides, of which a replica edits only
-/// the columns it owns, with an `UPDATE` of those.
-pub async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
-    writes_whole::<R>()?;
+/// [`Error::Database`] when the database fails or refuses a row.
+#[cfg(feature = "postgres")]
+pub(crate) async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
     write_keys(exec, rows, &newest::<R>(update_clause_where::<R>(|_| true))).await
 }
 
-/// Refuses a host's write of whole rows of a table the server writes, on a
-/// replica: its triggers would refuse the rows one by one.
-fn writes_whole<R: Row>() -> Result<(), Error> {
-    let how = match R::MIRROR {
-        _ if crate::dialect::WRITES_ANY_TABLE => return Ok(()),
-        Mirror::Record => return Ok(()),
-        Mirror::Both => {
-            "a row of it begins on the server: a replica edits the columns it owns, with an UPDATE of those"
-        }
-        Mirror::Catalog | Mirror::ServerOnly => "it is the server's: a replica does not write it",
-    };
-    Err(Error::Misuse(format!(
-        "`{}` is not a replica's to write whole: {how}",
-        R::TABLE
-    )))
-}
-
 /// Inserts every row whose key is new; one the table holds is left as it
-/// was. Answers the keys it inserted. On a replica, of a record only, as
-/// [`upsert`].
+/// was. Answers the keys it inserted.
 ///
 /// # Errors
 ///
-/// [`Error::Database`] when the database fails or refuses a row;
-/// [`Error::Misuse`] on a replica, for a table the server writes.
-pub async fn insert_ignore<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
-    writes_whole::<R>()?;
+/// [`Error::Database`] when the database fails or refuses a row.
+#[cfg(feature = "postgres")]
+pub(crate) async fn insert_ignore<R: Row>(
+    exec: &mut Conn,
+    rows: Vec<R>,
+) -> Result<Vec<Key>, Error> {
     let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(R::KEY));
     write_keys(exec, rows, &conflict).await
 }
 
 /// A conflict update that applies only when the incoming version is not older
 /// than the stored one, for a row that has one.
+#[cfg(feature = "postgres")]
 fn newest<R: Row>(mut conflict: String) -> String {
     let Some(version) = R::VERSION.filter(|_| conflict.contains("DO UPDATE")) else {
         return conflict;
     };
-    let kind = declared::<R>()
-        .iter()
-        .find(|c| c.name == version)
-        .and_then(|c| c.version)
-        .unwrap_or(VersionKind::Integer);
     conflict.push_str(" WHERE ");
     conflict.push_str(&crate::dialect::not_older(
         &format!("EXCLUDED.{}", ident(version)),
         &format!("{}.{}", R::QUALIFIED, ident(version)),
-        kind,
     ));
     conflict
 }
@@ -1477,6 +1415,49 @@ mod tests {
         assert_eq!(Report::VERSION, Some("at"));
     }
 
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = false)]
+    async fn a_record_is_upserted_newest_wins_and_inserted_first_wins(pool: sqlx::PgPool) {
+        sqlx::raw_sql("CREATE TABLE reports (id uuid PRIMARY KEY, at timestamptz NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let first = Report {
+            id: Uuid::now_v7(),
+            at: chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap(),
+        };
+        let older = Report {
+            at: first.at - chrono::Duration::seconds(1),
+            ..first.clone()
+        };
+        let newer = Report {
+            at: first.at + chrono::Duration::seconds(1),
+            ..first.clone()
+        };
+        async fn by_key(conn: &mut Conn, report: &Report) -> Vec<Report> {
+            get_by_keys::<Report>(conn, &[report.key()]).await.unwrap()
+        }
+        upsert(&mut conn, vec![first.clone()]).await.unwrap();
+        upsert(&mut conn, vec![older.clone()]).await.unwrap();
+        assert_eq!(
+            by_key(&mut conn, &first).await,
+            vec![first.clone()],
+            "a late report"
+        );
+        upsert(&mut conn, vec![newer.clone()]).await.unwrap();
+        assert_eq!(by_key(&mut conn, &first).await, vec![newer.clone()]);
+        let other = Report {
+            id: Uuid::now_v7(),
+            ..first.clone()
+        };
+        let inserted = insert_ignore(&mut conn, vec![older, other.clone()])
+            .await
+            .unwrap();
+        assert_eq!(inserted, [other.key()], "the one it held left as it was");
+        assert_eq!(by_key(&mut conn, &first).await, [newer]);
+    }
+
     /// Two parts that bring in the same column, and one that brings in a
     /// column the row says it leaves out: nothing the derive can see.
     #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
@@ -1594,8 +1575,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            get::<Order>(&mut conn, &order.key()).await.unwrap(),
-            Some(order.clone()),
+            get_by_keys::<Order>(&mut conn, &[order.key()])
+                .await
+                .unwrap(),
+            vec![order.clone()],
             "an older version, taken"
         );
         let table = Table::of::<Order>();

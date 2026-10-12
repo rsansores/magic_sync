@@ -3,7 +3,6 @@
 //! Generic code over [`Row`](crate::row::Row) never carries a backend `cfg`:
 //! where postgres and sqlite differ, the difference is an item here.
 
-use crate::row::{Row, VersionKind};
 use crate::{Conn, Error};
 
 /// A name as SQL quotes it, whatever it is spelled with.
@@ -24,21 +23,12 @@ mod imp {
 
     /// Every version type compares natively here: a `timestamptz` to the
     /// microsecond.
-    pub(crate) fn not_older(incoming: &str, stored: &str, _kind: VersionKind) -> String {
+    pub(crate) fn not_older(incoming: &str, stored: &str) -> String {
         format!("{incoming} >= {stored}")
-    }
-
-    /// The relation a row's active rows are read from: the view its `ACTIVE`
-    /// names, or the table.
-    pub(crate) fn active<R: Row>() -> String {
-        R::ACTIVE.unwrap_or(R::QUALIFIED).to_owned()
     }
 
     /// Binds one statement may carry.
     pub(crate) const MAX_BINDS: usize = 65_535;
-
-    /// A host writes whole rows of any table here.
-    pub(crate) const WRITES_ANY_TABLE: bool = true;
 
     /// `(column, nullable, generated)` for every column of `schema.table`.
     /// Read from `pg_attribute`, which answers whatever the role may see.
@@ -90,34 +80,6 @@ mod imp {
 
     /// This instant, as the backend writes a timestamp.
     pub(crate) const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
-
-    /// Numbers compare natively. Anything else is text here, and a timestamp
-    /// is text not every writer formats alike, so text compares normalised as
-    /// an instant (to the millisecond, `%f`'s precision) — and as itself when
-    /// it is no instant, rather than as a NULL no comparison passes.
-    pub(crate) fn not_older(incoming: &str, stored: &str, kind: VersionKind) -> String {
-        match kind {
-            VersionKind::Instant => {
-                let instant =
-                    |v: &str| format!("coalesce(strftime('%Y-%m-%dT%H:%M:%fZ', {v}), {v})");
-                format!("{} >= {}", instant(incoming), instant(stored))
-            }
-            VersionKind::Integer => format!("{incoming} >= {stored}"),
-        }
-    }
-
-    /// The relation a row's active rows are read from: on a replica, its rows
-    /// less the ones it retired.
-    pub(crate) fn active<R: Row>() -> String {
-        match R::RETIRED {
-            Some(retired) => format!(
-                "(SELECT * FROM {} WHERE {} IS NULL)",
-                R::QUALIFIED,
-                ident(retired)
-            ),
-            None => R::QUALIFIED.to_owned(),
-        }
-    }
 
     /// The foreign keys of `table`, as `(parent, its columns, the parent's
     /// columns)`: a key naming no parent columns names the parent's primary
@@ -251,10 +213,6 @@ mod imp {
 
     /// Binds one statement may carry (`SQLITE_MAX_VARIABLE_NUMBER`).
     pub(crate) const MAX_BINDS: usize = 32_766;
-
-    /// A host writes whole rows here only of a record: of a two-way row a
-    /// replica writes the columns it owns, and the rest are the server's.
-    pub(crate) const WRITES_ANY_TABLE: bool = false;
 
     /// `(column, nullable, generated)` for every column of `table`. A primary
     /// key is NOT NULL only when declared so: sqlite lets a non-INTEGER one

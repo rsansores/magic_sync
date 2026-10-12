@@ -245,11 +245,6 @@ impl magic_sync::row::Version for i64
 pub const i64::KIND: magic_sync::row::VersionKind
 impl<Tz: chrono::offset::TimeZone> magic_sync::row::Version for chrono::datetime::DateTime<Tz>
 pub const chrono::datetime::DateTime<Tz>::KIND: magic_sync::row::VersionKind
-pub async fn magic_sync::row::get<R: magic_sync::row::Row>(&mut magic_sync::Conn, &magic_sync::row::Key) -> core::result::Result<core::option::Option<R>, magic_sync::Error>
-pub async fn magic_sync::row::get_by_keys<R: magic_sync::row::Row>(&mut magic_sync::Conn, &[magic_sync::row::Key]) -> core::result::Result<alloc::vec::Vec<R>, magic_sync::Error>
-pub async fn magic_sync::row::get_many<R: magic_sync::row::Row>(&mut magic_sync::Conn, &[magic_sync::row::Key]) -> core::result::Result<alloc::vec::Vec<R>, magic_sync::Error>
-pub async fn magic_sync::row::insert_ignore<R: magic_sync::row::Row>(&mut magic_sync::Conn, alloc::vec::Vec<R>) -> core::result::Result<alloc::vec::Vec<magic_sync::row::Key>, magic_sync::Error>
-pub async fn magic_sync::row::upsert<R: magic_sync::row::Row>(&mut magic_sync::Conn, alloc::vec::Vec<R>) -> core::result::Result<alloc::vec::Vec<magic_sync::row::Key>, magic_sync::Error>
 pub type magic_sync::row::Key = alloc::vec::Vec<magic_sync::row::KeyPart>
 pub mod magic_sync::run
 pub mod magic_sync::run::replica
