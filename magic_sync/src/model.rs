@@ -135,6 +135,9 @@ pub(crate) struct Model {
     /// Rows it retired, as the bytes that carried them: sent again, they
     /// are live again; let go of again, they go, or are refused.
     pub(crate) retired: BTreeMap<Row, Vec<u8>>,
+    /// Rows of its own it deleted, of a table keyed by it, whose deletes
+    /// the server has not filed: not taken again meanwhile (4.1).
+    pub(crate) deleted: BTreeSet<Row>,
     /// What the last message it applied took, per table entry: the keys of
     /// the rows it holds from it.
     pub(crate) taken: Vec<(String, Vec<String>)>,
@@ -297,7 +300,7 @@ impl Model {
                         .collect();
                     for (at, (bytes, key)) in table.upserts.iter().zip(&table.keys).enumerate() {
                         let row = (table.table.clone(), key.parts.join("|"));
-                        if last[&row.1] != at {
+                        if last[&row.1] != at || self.deleted.contains(&row) {
                             continue;
                         }
                         if naming {

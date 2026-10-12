@@ -1152,7 +1152,8 @@ fn json<T: serde::Serialize>(keys: &[T]) -> String {
 /// of its part is in, and once the whole message is, while that takes one
 /// more: what it points at, or the value it takes, may come later in the
 /// message. A row the replica takes or lets go of is no longer one to
-/// report.
+/// report. A row of its own it [`deleted`] is not taken until the server
+/// filed the delete.
 #[cfg(feature = "sqlite")]
 async fn apply<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1213,9 +1214,13 @@ async fn apply<P: Sync + 'static>(
                 last.insert(key, at);
             }
         }
+        let deleted = deleted(conn, codec, &beside).await?;
         let mut pending = Vec::new();
-        for at in (0..beside.len()).filter(|at| beside[*at].as_ref().is_none_or(|k| last[k] == *at))
-        {
+        for at in (0..beside.len()).filter(|at| {
+            beside[*at]
+                .as_ref()
+                .is_none_or(|k| last[k] == *at && !deleted.contains(k))
+        }) {
             match care.culprit(&table.table, &Spot::Upsert { entry, at }) {
                 Some(why) => {
                     let key = beside[at].as_ref();
@@ -1289,6 +1294,40 @@ async fn apply<P: Sync + 'static>(
         return Err(Stop::Culprits(culprits));
     }
     Ok(taken)
+}
+
+/// The rows of `keys` the replica deleted of its own, in a table keyed by
+/// it, whose deletes the server has not filed: one it sends meanwhile it
+/// sent before it heard of the delete, and lets go of once it files it.
+#[cfg(feature = "sqlite")]
+async fn deleted<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+    keys: &[Option<Key>],
+) -> Result<HashSet<Key>, Error> {
+    if !codec.takes_deletes() {
+        return Ok(HashSet::new());
+    }
+    let keys: Vec<Key> = keys.iter().flatten().cloned().collect();
+    let noted: HashSet<String> = sqlx::query_scalar(
+        "SELECT row_key FROM sync_notes WHERE relation = $1 \
+           AND row_key IN (SELECT value FROM json_each($2))",
+    )
+    .bind(codec.table.name)
+    .bind(json(&keys.iter().map(key_text).collect::<Vec<_>>()))
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .collect();
+    let noted: Vec<Key> = keys
+        .into_iter()
+        .filter(|key| noted.contains(&key_text(key)))
+        .collect();
+    let held: HashSet<Key> = codec.present(conn, &noted).await?.into_iter().collect();
+    Ok(noted
+        .into_iter()
+        .filter(|key| !held.contains(key))
+        .collect())
 }
 
 /// One table's part of a message, as far as it was taken: the rows held, by

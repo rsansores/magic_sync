@@ -253,7 +253,11 @@ their deletes ignored.
      or whose clock was set back, sends what it has;
    - columns the replica owns in a table written by both sides are **not**
      overwritten;
-   - a row the replica had retired (4.3) becomes live again.
+   - a row the replica had retired (4.3) becomes live again;
+   - a row of its own it deleted, in a table keyed by the replica, whose
+     delete the server has not filed yet (4.4), is **not** taken: the
+     server sent it before it heard of the delete, and lets go of it once
+     it files it.
 
    A key both let go of and upserted in one part is held: its upsert comes
    after. A key upserted twice in one part is the last row beside it.

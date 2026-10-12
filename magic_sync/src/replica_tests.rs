@@ -57,14 +57,23 @@ async fn world_with(pool: SqlitePool, settings: Settings) -> World {
 }
 
 async fn world_over(pool: SqlitePool, tables: &str, settings: Settings) -> World {
+    world_of(pool, tables, settings, codecs()).await
+}
+
+async fn world_of(
+    pool: SqlitePool,
+    tables: &str,
+    settings: Settings,
+    codecs: Vec<Codec<()>>,
+) -> World {
     let pool = settled(pool).await;
     sqlx::raw_sql(tables).execute(&pool).await.expect("tables");
-    install(&mut pool.acquire().await.unwrap(), &codecs())
+    install(&mut pool.acquire().await.unwrap(), &codecs)
         .await
         .expect("installed");
     let me = Uuid::now_v7();
     let uplink = Uplinked::default();
-    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings)
+    let replica = Replica::new(pool.clone(), codecs, me, uplink.clone(), settings)
         .await
         .expect("a replica");
     let w = World {
@@ -2732,6 +2741,83 @@ async fn a_replica_deletes_only_its_own_rows_of_a_two_way_table(pool: SqlitePool
         .await
         .unwrap();
     assert_eq!(noted, [format!("{me}|{mine}")]);
+}
+
+/// The suite's tables, and carts.
+fn with_carts() -> Vec<Codec<()>> {
+    let mut codecs = codecs();
+    codecs.push(Codec::json::<Cart>(None));
+    codecs
+}
+
+const CARTS: &str = "CREATE TABLE carts (replica_id BLOB NOT NULL, id BLOB NOT NULL, \
+    note TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (replica_id, id));";
+
+/// A cart of `replica_id`, as the server sends it at version `at`.
+fn cart_of(replica_id: Uuid, id: Uuid, at: i64) -> (WireKey, Vec<u8>) {
+    let row = Cart {
+        replica_id,
+        id,
+        note: String::new(),
+        at,
+    };
+    (key(&[&replica_id.to_string(), &id.to_string()]), json(&row))
+}
+
+/// A row the replica deleted of its own, in a two-way table, is not taken
+/// again from a message the server sent before it filed the delete: the
+/// server lets go of it once it files it, so the replica would hold a row
+/// nobody holds for it. Once the delete is filed, the row is the server's
+/// to send again.
+#[sqlx::test(migrations = false)]
+async fn a_row_the_replica_deleted_is_not_taken_again_until_the_delete_is_filed(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{CARTS}"),
+        Settings::default(),
+        with_carts(),
+    )
+    .await;
+    let id = Uuid::now_v7();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("carts", vec![cart_of(w.me, id, 1)])],
+    ))
+    .await;
+    assert!(w.up(0, false).await.is_some(), "what was applied");
+    w.exec(&format!("DELETE FROM carts WHERE id = x'{}'", id.simple()))
+        .await
+        .unwrap();
+    let late = w
+        .receive(&down(
+            2,
+            "",
+            vec![upserts("carts", vec![cart_of(w.me, id, 2)])],
+        ))
+        .await;
+    assert!(
+        matches!(&late, Received::Applied(a) if a.iter().all(|a| a.keys.is_empty())),
+        "{late:?}"
+    );
+    assert_eq!(w.count("SELECT count(*) FROM carts").await, 0);
+    assert!(w.rejected().await.is_empty());
+    let up = w.up(0, false).await.expect("the delete");
+    assert_eq!(up.tables[0].deletes.len(), 1);
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads,
+        })
+        .encoded(),
+    )
+    .await;
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("carts", vec![cart_of(w.me, id, 3)])],
+    ))
+    .await;
+    assert_eq!(w.count("SELECT count(*) FROM carts").await, 1);
 }
 
 /// A table with writes of the replica's the server has not filed is left
