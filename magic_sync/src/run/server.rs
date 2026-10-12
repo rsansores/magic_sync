@@ -102,9 +102,9 @@ pub struct Settings {
     /// Bytes its outbox may hold, likewise.
     pub outbox_bytes: NonZeroU64,
     /// Parts of a replica's uploads the server may keep, unable to file
-    /// them, until a fix files them: past that its uploads fail as
-    /// transient and come again, waiting on the replica instead, which is
-    /// an alarm.
+    /// them, until a fix files them — and never past 64 MiB of them: past
+    /// that its uploads fail as transient and come again, waiting on the
+    /// replica instead, which is an alarm.
     pub inbox: NonZeroU32,
     /// The role every transaction of the engine's own assumes, when the
     /// database gives the connecting one less than the engine needs: its

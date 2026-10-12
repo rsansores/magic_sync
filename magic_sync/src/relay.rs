@@ -1008,9 +1008,15 @@ async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error
 }
 
 /// Text as the database stores it: `text` takes no NUL, which a replica, a
-/// transport or a host may put in a string the engine keeps.
+/// transport or a host may put in a string the engine keeps; and no more
+/// than 4 KiB of it, however long what a replica says.
 pub(crate) fn stored(text: &str) -> String {
-    text.replace('\0', "\u{FFFD}")
+    const STORED: usize = 4 << 10;
+    let mut end = text.len().min(STORED);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].replace('\0', "\u{FFFD}")
 }
 
 /// Notes `replica`'s provisioning from scratch, unless one is pending

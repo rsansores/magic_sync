@@ -2977,3 +2977,33 @@ async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) 
         );
     }
 }
+
+/// What the server keeps of a replica's uploads, unable to file them, is
+/// bounded by its bytes as well as by its parts: a replica sending a few
+/// large ones is held back, as one sending many small ones is.
+#[sqlx::test(migrations = false)]
+async fn a_replicas_inbox_is_bounded_by_its_bytes(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let replica = live_in(&mut world.conn, world.partitions[0]).await[0];
+    sqlx::query(
+        "INSERT INTO sync.inbox (replica_id, upload, reason) \
+         VALUES ($1, convert_to(repeat('x', 64 << 20), 'UTF8'), 'a bug')",
+    )
+    .bind(replica)
+    .execute(&mut *world.conn)
+    .await
+    .expect("a large part kept");
+    let mut tx = world.conn.begin().await.expect("a transaction");
+    let kept = crate::filing::keep_whole(&mut tx, replica, b"more", "a bug", i64::MAX).await;
+    assert!(matches!(&kept, Err(e) if e.is_transient()), "{kept:?}");
+}
+
+/// What a replica says — a reason, a table's name — is kept at most 4 KiB
+/// of it, cut between characters, however long it says it.
+#[test]
+fn text_a_replica_says_is_kept_bounded() {
+    let said = format!("{}é{}", "x".repeat(4095), "y".repeat(1 << 20));
+    let kept = crate::relay::stored(&said);
+    assert_eq!(kept.len(), 4095, "cut before the character that crosses");
+    assert_eq!(crate::relay::stored("a\0b"), "a\u{FFFD}b");
+}

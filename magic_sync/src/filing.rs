@@ -108,7 +108,7 @@ struct Standing {
 /// database refuses for its data — is kept as it came in the server's inbox,
 /// to be filed again once a fix is deployed; rows whose filing fails as a
 /// whole are kept whole — while the sender's part of the inbox holds fewer
-/// than `inbox`: past that the upload fails as transient and comes again,
+/// than `inbox` parts, and less than 64 MiB: past that the upload fails as transient and comes again,
 /// waiting on the replica rather than here. What the upload says of the
 /// replica — what it refused, applied, missed, holds and has not sent — is
 /// filed apart from its rows, so neither holds back the other. An error is
@@ -814,6 +814,9 @@ async fn compare<P: Sync + 'static>(
     Ok(differ)
 }
 
+/// Tables a backlog may name: more than any server mirrors.
+const BACKLOG_TABLES: usize = 1024;
+
 /// What `replica` says it wrote and the server has not filed.
 async fn backlog(conn: &mut Conn, replica: Uuid, told: &envelope::Backlog) -> Result<(), Error> {
     let tables: Option<Vec<UpProgress>> = told
@@ -828,8 +831,8 @@ async fn backlog(conn: &mut Conn, replica: Uuid, told: &envelope::Backlog) -> Re
             })
         })
         .collect();
-    let Some(tables) = tables else {
-        tracing::error!(%replica, "upload: a backlog counting more rows than a table has — malformed, left out");
+    let Some(tables) = tables.filter(|t| t.len() <= BACKLOG_TABLES) else {
+        tracing::error!(%replica, "upload: a backlog counting more rows than a table has, or more tables than a server mirrors — malformed, left out");
         return Ok(());
     };
     sqlx::query(
@@ -842,6 +845,11 @@ async fn backlog(conn: &mut Conn, replica: Uuid, told: &envelope::Backlog) -> Re
     .await?;
     Ok(())
 }
+
+/// Bytes of a replica's uploads the server keeps, unable to file them,
+/// besides the parts its settings count: a few parts as large as an upload
+/// may be are as much as a replica may make it hold.
+const INBOX_BYTES: i64 = 64 << 20;
 
 /// A part of an upload waiting in the inbox.
 #[derive(Debug, sqlx::FromRow)]
@@ -901,17 +909,20 @@ async fn insert(
     let since = match keeping {
         Keeping::Again(kept) => Some(kept),
         Keeping::New(bound) => {
-            let held: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM sync.inbox WHERE replica_id = $1")
-                    .bind(replica)
-                    .fetch_one(&mut *conn)
-                    .await?;
-            if held >= bound {
-                tracing::error!(%replica, held, "sync ALARM: a replica's inbox is full — its uploads wait on it until a fix files what is kept");
+            let (held, bytes): (i64, i64) = sqlx::query_as(
+                "SELECT count(*), coalesce(sum(length(upload)), 0)::int8 FROM sync.inbox \
+                  WHERE replica_id = $1",
+            )
+            .bind(replica)
+            .fetch_one(&mut *conn)
+            .await?;
+            if held >= bound || bytes >= INBOX_BYTES {
+                tracing::error!(%replica, held, bytes, "sync ALARM: a replica's inbox is full — its uploads wait on it until a fix files what is kept");
                 return Err(Error::Host {
                     reason: format!(
                         "the server keeps {held} parts of this replica's uploads it could not \
-                         file, as many as it may: the upload comes again once a fix files them"
+                         file, {bytes} bytes, as many as it may: the upload comes again once a \
+                         fix files them"
                     ),
                     transient: true,
                 });
