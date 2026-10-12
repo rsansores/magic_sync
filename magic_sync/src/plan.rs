@@ -2654,7 +2654,10 @@ impl Engine {
         let mut dropping: BTreeMap<Uuid, BTreeSet<String>> = BTreeMap::new();
         for (replica, i) in rows {
             let table = usize::try_from(i).map_or("", |i| self.table(i));
-            dropping.entry(replica).or_default().insert(table.to_owned());
+            dropping
+                .entry(replica)
+                .or_default()
+                .insert(table.to_owned());
         }
         Ok(dropping)
     }

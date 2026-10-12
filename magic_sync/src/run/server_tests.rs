@@ -561,10 +561,12 @@ async fn count(pool: &PgPool, sql: &str) -> i64 {
 
 /// An upload whose filing fails for a reason no resend cures is kept whole,
 /// answered so the replica stops sending it, and filed after a fix; an
-/// upload that fails again holds back no other.
+/// upload that fails again holds back no other. What it says of its sender
+/// is filed all the same: what it applied is recorded.
 #[sqlx::test(migrations = false)]
 async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool: PgPool) {
-    let (_, [a, b]) = world(&pool).await;
+    let (partition, [a, b]) = world(&pool).await;
+    item(&pool, partition, "sent").await;
     let wire = Wire::default();
     let senders = Broken {
         pool: pool.clone(),
@@ -580,17 +582,45 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     )
     .await
     .unwrap();
+    while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
 
-    for (replica, number) in [(a, 7), (b, 8)] {
-        let filed = server
-            .receive(
-                replica,
-                &upload(number, "readings", vec![reading(replica, "kept")]),
+    let applied = |replica: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT applied_sequence FROM sync.replicas WHERE replica_id = $1",
             )
+            .bind(replica)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for (replica, number) in [(a, 7), (b, 8)] {
+        let last: i64 =
+            sqlx::query_scalar("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
+                .bind(replica)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut up = envelope::Up::decode(
+            upload(number, "readings", vec![reading(replica, "kept")]).as_slice(),
+        )
+        .unwrap();
+        let said = crate::testkit::confirmation(&pool, replica, last as u64).await;
+        (up.epoch, up.sequence, up.nonce, up.mac) =
+            (said.epoch, said.sequence, said.nonce, said.mac);
+        let filed = server
+            .receive(replica, &up.encode_to_vec())
             .await
             .expect("no reason to send it again");
         assert!(filed.is_empty());
         assert_eq!(wire.filed(replica), [number], "answered");
+        assert_eq!(
+            applied(replica).await,
+            Some(last),
+            "what it applied, recorded"
+        );
     }
     assert_eq!(
         count(
@@ -805,9 +835,14 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
     // Text past what a btree entry takes, that does not compress: what a
     // sender may say is bounded only by the message.
     let long = |walk: &mut crate::testkit::Walk, len: usize| -> String {
-        (0..len / 16).map(|_| format!("{:016x}", walk.next())).collect()
+        (0..len / 16)
+            .map(|_| format!("{:016x}", walk.next()))
+            .collect()
     };
-    parts.extend([long(&mut walk, 3200), format!("{}{}", items[0], long(&mut walk, 3200))]);
+    parts.extend([
+        long(&mut walk, 3200),
+        format!("{}{}", items[0], long(&mut walk, 3200)),
+    ]);
     let mut tables: Vec<String> = ["items", "readings", "logs", "nope", "", "it\0ems"]
         .map(str::to_owned)
         .to_vec();

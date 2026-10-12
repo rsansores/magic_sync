@@ -692,7 +692,12 @@ async fn unheld<R: Row>(
     )
     .bind(sender)
     .bind(R::TABLE)
-    .bind(unwritten.iter().map(|(_, key)| row::key_text(key)).collect::<Vec<_>>())
+    .bind(
+        unwritten
+            .iter()
+            .map(|(_, key)| row::key_text(key))
+            .collect::<Vec<_>>(),
+    )
     .fetch_one(&mut *conn)
     .await?;
     if provisioning {

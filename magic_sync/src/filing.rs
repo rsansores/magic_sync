@@ -207,12 +207,41 @@ pub(crate) async fn file<P: Sync + 'static>(
             Vec::new()
         }
     };
+    said_apart(conn, codecs, sender, &standing, upload).await?;
+    Ok(filed)
+}
+
+/// What [`file`] does with an upload from `sender` whose filing failed as a
+/// whole, in a transaction of its own, for `reason`: its rows kept in the
+/// inbox, and what it says of its sender filed.
+pub(crate) async fn file_failed<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    upload: &Up,
+    sender: Uuid,
+    reason: &str,
+    inbox: i64,
+) -> Result<(), Error> {
+    let standing = standing(conn, sender).await?;
+    keep_whole(conn, codecs, sender, upload, reason, inbox).await?;
+    said_apart(conn, codecs, sender, &standing, upload).await
+}
+
+/// What `upload` says of `sender`, filed apart from its rows: a failure of
+/// it is logged, and holds back nothing else.
+async fn said_apart<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    sender: Uuid,
+    standing: &Standing,
+    upload: &Up,
+) -> Result<(), Error> {
     crate::row::savepoint(conn).await?;
-    let said = said(conn, codecs, sender, &standing, upload).await;
+    let said = said(conn, codecs, sender, standing, upload).await;
     if let Err(e) = crate::row::released(conn, said).await? {
         tracing::error!(%sender, "sync: what a replica said of itself could not be filed — left out: {e}");
     }
-    Ok(filed)
+    Ok(())
 }
 
 /// The rows of `upload` filed; what of them could not be is kept in the
@@ -1161,7 +1190,7 @@ async fn keep(
 /// Keeps every row and delete of an upload from `replica`, each as a part
 /// of its own, when filing it failed as a whole for a reason a retry cannot
 /// change — while its part of the inbox holds fewer than `inbox`. What it
-/// says of the replica is of its moment, and not kept.
+/// says of the replica is of its moment, and not kept: it is filed apart.
 pub(crate) async fn keep_whole<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],

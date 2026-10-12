@@ -2870,7 +2870,11 @@ async fn a_replica_that_deletes_its_own_two_way_row_holds_what_is_recorded(pool:
         .collect();
     world.file(a, &up).await;
     assert_eq!(world.count("SELECT count(*) FROM fixture.pads").await, 0);
-    assert_eq!(held(a).await, 0, "not recorded held by the replica that deleted it");
+    assert_eq!(
+        held(a).await,
+        0,
+        "not recorded held by the replica that deleted it"
+    );
     assert_eq!(
         world
             .count("SELECT count(*) FROM sync.notes WHERE kind = 'resync'")

@@ -354,7 +354,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// speaks a later protocol than this build. Filing it again is harmless.
     /// Anything else that fails is no reason to send it again — the same
     /// bytes would fail the same way — so its rows are kept in the inbox,
-    /// it is answered, and they are filed again after a deploy.
+    /// what it says of its replica is filed, it is answered, and the rows
+    /// are filed again after a deploy.
     ///
     /// Answers what was filed, per table, for the host to act on.
     ///
@@ -410,15 +411,27 @@ impl<S: Senders, T: Transport> Server<S, T> {
             Err(e) if e.is_transient() => return Err(e),
             Err(e) => {
                 let mut tx = self.begin().await?;
-                filing::keep_whole(
-                    &mut tx,
-                    &self.codecs,
-                    replica,
-                    &up,
-                    &e.to_string(),
-                    self.inbox(),
-                )
-                .await?;
+                if self.engine.is_replica(&mut tx, replica).await? {
+                    filing::file_failed(
+                        &mut tx,
+                        &self.codecs,
+                        &up,
+                        replica,
+                        &e.to_string(),
+                        self.inbox(),
+                    )
+                    .await?;
+                } else {
+                    filing::keep_whole(
+                        &mut tx,
+                        &self.codecs,
+                        replica,
+                        &up,
+                        &e.to_string(),
+                        self.inbox(),
+                    )
+                    .await?;
+                }
                 tx.commit().await?;
                 Vec::new()
             }
