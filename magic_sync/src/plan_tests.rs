@@ -2378,7 +2378,7 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
 /// is a step of its own.
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
-    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0xb65d_0afa_13d6_7aab];
+    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0xc781_7272_4649_71fb];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

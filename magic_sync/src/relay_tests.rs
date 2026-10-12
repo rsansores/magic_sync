@@ -3075,3 +3075,44 @@ async fn a_pass_short_of_memory_keeps_a_unique_value_moving_in_one_message(pool:
     assert!(model.rejections.is_empty(), "{:?}", model.rejections);
     assert_eq!(items_of(&model), names(&["taken"]));
 }
+
+/// A delete a replica refuses records the row held again as it was noted
+/// when it was taken back: what it points at there is read from the change
+/// that followed that version, not from the row's first.
+#[sqlx::test(migrations = false)]
+async fn a_refused_delete_holds_the_row_again_as_it_was_noted(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(15);
+    let mut models = world.models();
+    let x = world.item("one").await;
+    world.rename(x, "two").await;
+    world.settle(&wire, &mut models).await;
+    let noted = || async {
+        sqlx::query_as::<_, (i64, bool)>(
+            "SELECT noted, refused IS NOT NULL FROM sync.held \
+              WHERE replica_id = $1 AND row_key = $2",
+        )
+        .bind(a)
+        .bind(x.to_string())
+        .fetch_one(&world.pool)
+        .await
+        .unwrap()
+    };
+    let (kept, _) = noted().await;
+    assert!(kept > 0);
+    models
+        .get_mut(&a)
+        .unwrap()
+        .pinned
+        .insert(("items".to_owned(), x.to_string()));
+    world
+        .exec(
+            "DELETE FROM fixture.items WHERE id = $1 AND partition_id = $2 AND $3 <> ''",
+            x,
+            "x",
+        )
+        .await;
+    world.settle(&wire, &mut models).await;
+    assert_eq!(noted().await, (kept, true));
+}

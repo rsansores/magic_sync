@@ -150,13 +150,15 @@ COMMENT ON COLUMN sync.held.noted IS
 
 -- Rows taken back from a replica, until it says it applied the message that
 -- took them: a refusal of that message is a delete it could not carry out,
--- and the row is held again, refused; a refusal of an older one is of a
+-- and the row is held again, refused, as noted when it was taken back
+-- (`noted`); a refusal of an older one is of a
 -- version it no longer matters it did not take.
 CREATE TABLE sync.gone (
     replica_id UUID   NOT NULL,
     relation   TEXT   NOT NULL,
     row_key    TEXT   NOT NULL,
     sequence   BIGINT NOT NULL,
+    noted      BIGINT NOT NULL,
     PRIMARY KEY (replica_id, relation, row_key)
 );
 

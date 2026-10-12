@@ -3383,13 +3383,17 @@ pub(crate) async fn prune(
     limit: i64,
 ) -> Result<u64, Error> {
     // A note of a row a replica holds a version from before it says what
-    // that version pointed at: it stays while the replica holds it.
+    // that version pointed at: it stays while the replica holds it — or may
+    // keep it, refusing the row's take-back.
     let done = sqlx::query(
         "DELETE FROM sync.notes WHERE id IN (SELECT n.id FROM sync.notes n \
            WHERE n.done_at < now() - make_interval(secs => $1) \
              AND NOT EXISTS (SELECT 1 FROM sync.held h WHERE n.kind = 'row' \
                                 AND h.relation = n.relation AND h.row_key = n.row_key \
                                 AND h.noted < n.id) \
+             AND NOT EXISTS (SELECT 1 FROM sync.gone g WHERE n.kind = 'row' \
+                                AND g.relation = n.relation AND g.row_key = n.row_key \
+                                AND g.noted < n.id) \
            ORDER BY n.done_at LIMIT $2)",
     )
     .bind(age.as_secs_f64())

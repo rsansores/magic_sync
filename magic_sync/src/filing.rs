@@ -736,8 +736,9 @@ async fn rejected<P: Sync + 'static>(
 /// Records `key` of `table` refused by `replica`'s message `sequence`, as
 /// that message left the row: held — unless a later message carried it
 /// since — or taken back by it, which the replica could not carry out, or
-/// swept by the end of its snapshot, which it could not either. Answers
-/// whether it was; any other row the message did not concern.
+/// swept by the end of its snapshot, which it could not either — a row it
+/// was to let go of noted as it was then. Answers whether it was; any other
+/// row the message did not concern.
 async fn refuse(
     conn: &mut Conn,
     replica: Uuid,
@@ -757,11 +758,10 @@ async fn refuse(
     .await?;
     match held {
         Some(carried) if carried != sequence => return Ok(false),
-        Some(_) => {}
-        None => {
-            let taken = sqlx::query(
-                "DELETE FROM sync.gone \
-                  WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence = $4",
+        Some(_) => {
+            sqlx::query(
+                "UPDATE sync.held SET refused = $4 \
+                  WHERE replica_id = $1 AND relation = $2 AND row_key = $3",
             )
             .bind(replica)
             .bind(table)
@@ -769,22 +769,37 @@ async fn refuse(
             .bind(sequence)
             .execute(&mut *conn)
             .await?;
-            if taken.rows_affected() == 0 && standing.snapshot_end != Some(sequence) {
+        }
+        // It keeps the row it was to let go of, as it was noted then.
+        None => {
+            let noted: Option<i64> = sqlx::query_scalar(
+                "DELETE FROM sync.gone \
+                  WHERE replica_id = $1 AND relation = $2 AND row_key = $3 AND sequence = $4 \
+                 RETURNING noted",
+            )
+            .bind(replica)
+            .bind(table)
+            .bind(key)
+            .bind(sequence)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if noted.is_none() && standing.snapshot_end != Some(sequence) {
                 return Ok(false);
             }
+            sqlx::query(
+                "INSERT INTO sync.held (replica_id, relation, row_key, noted, sequence, refused) \
+                 VALUES ($1, $2, $3, $5, $4, $4) \
+                 ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET refused = EXCLUDED.refused",
+            )
+            .bind(replica)
+            .bind(table)
+            .bind(key)
+            .bind(sequence)
+            .bind(noted.unwrap_or_default())
+            .execute(&mut *conn)
+            .await?;
         }
     }
-    sqlx::query(
-        "INSERT INTO sync.held AS h (replica_id, relation, row_key, noted, sequence, refused) \
-         VALUES ($1, $2, $3, 0, $4, $4) \
-         ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET refused = EXCLUDED.refused",
-    )
-    .bind(replica)
-    .bind(table)
-    .bind(key)
-    .bind(sequence)
-    .execute(&mut *conn)
-    .await?;
     Ok(true)
 }
 

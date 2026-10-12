@@ -923,20 +923,19 @@ impl Writer {
             .execute(&mut *conn)
             .await?;
         }
+        // Taken back as it was noted: refused, it is held again so.
         sqlx::query(
-            "DELETE FROM sync.held h \
-              USING unnest($1::uuid[], $2::text[], $3::text[]) AS d(r, t, k) \
-              WHERE h.replica_id = d.r AND h.relation = d.t AND h.row_key = d.k",
-        )
-        .bind(&gone.0)
-        .bind(&gone.1)
-        .bind(&gone.2)
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query(
-            "INSERT INTO sync.gone (replica_id, relation, row_key, sequence) \
-             SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
-             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET sequence = EXCLUDED.sequence",
+            "WITH u AS (SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
+                            AS u(r, t, k, s)), \
+                  d AS (DELETE FROM sync.held h USING u \
+                         WHERE h.replica_id = u.r AND h.relation = u.t AND h.row_key = u.k \
+                        RETURNING h.replica_id, h.relation, h.row_key, h.noted) \
+             INSERT INTO sync.gone AS g (replica_id, relation, row_key, sequence, noted) \
+             SELECT u.r, u.t, u.k, u.s, coalesce(d.noted, 0) FROM u \
+               LEFT JOIN d ON d.replica_id = u.r AND d.relation = u.t AND d.row_key = u.k \
+             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET \
+               sequence = EXCLUDED.sequence, \
+               noted = CASE WHEN EXCLUDED.noted = 0 THEN g.noted ELSE EXCLUDED.noted END",
         )
         .bind(&gone.0)
         .bind(&gone.1)
