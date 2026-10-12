@@ -33,6 +33,15 @@ the triggers the book shows for the shop — and `MAGIC_SYNC_BLESS=1` writes
 them anew; the dashboard's types and fixtures are written by the status
 tests, with `UPDATE_CONTRACT=1`. Read the difference before committing it.
 
+The planner's walks (`every_replica_holds_exactly_what_its_strategies_say`
+and `whatever_fails_on_the_way…` in `plan_tests.rs`) take the seeds in
+`SEEDS`; `MAGIC_SYNC_WALK_SEEDS` gives them others — seeds, comma-separated,
+or `random` — and each walk prints the seeds it took. A nightly workflow runs
+them with `random`: a walk that fails there is taken again with
+`MAGIC_SYNC_WALK_SEEDS` set to the seeds it printed, in their order — how
+much a pass plans follows a seed's place — and they join `SEEDS` with the
+fix.
+
 ## The benchmarks
 
 The operations that move many rows at once, and the dashboard's reads over

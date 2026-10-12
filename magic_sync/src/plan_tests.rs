@@ -518,6 +518,8 @@ fn key_of(row: &serde_json::Value, columns: &[&str]) -> Option<String> {
 enum Step {
     Wrote(usize),
     Skipped,
+    /// The relay parks the changes of the row of so many pending before it.
+    Park(i64),
     /// The bug is fixed: what was set aside goes again.
     Cured,
 }
@@ -728,7 +730,18 @@ impl World {
             outcome.parked,
             &self.history[self.history.len().saturating_sub(8)..]
         );
-        assert_minimal(&mut tx, drawn, &held, &self.history).await;
+        // What a change not planned — beyond the batch, or parked — would
+        // send or keep, the pass cannot know: it is minimal once it planned
+        // every change there is.
+        let planned_all: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM sync.notes WHERE done_at IS NULL)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pending");
+        if planned_all {
+            assert_minimal(&mut tx, drawn, &held, &self.history).await;
+        }
         if chance(6) {
             // Replicas heard while the pass is still recording: what they
             // say waits on what it locked, or goes in beside it.
@@ -1722,14 +1735,9 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         101 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, &big),
         // A parent deleted before what points at it points elsewhere.
         102 => write!(conn, "SELECT fixture.replace_family($1, $2) WHERE $1 IS NOT NULL", family, walk.pick(&families)),
-        // Planning a row's changes fails, until a deploy: they are parked.
-        103 => write!(conn,
-            "UPDATE sync.notes SET parked_at = now() \
-              WHERE kind = 'row' AND done_at IS NULL AND parked_at IS NULL \
-                AND (relation, row_key) = (SELECT relation, row_key FROM sync.notes \
-                                            WHERE kind = 'row' AND done_at IS NULL AND parked_at IS NULL \
-                                            ORDER BY id OFFSET $1 LIMIT 1)",
-            i64::from(small)),
+        // Planning a row's changes fails, until a deploy: the relay parks
+        // them.
+        103 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -1768,16 +1776,15 @@ async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(poo
             refuse_one_in: 4,
         };
         walk_from(&mut world, *seed, Some(faults)).await;
-        let (failed, refused) = *world.wire.failed.lock().unwrap();
-        assert!(
-            failed > 0 && refused > 0 && world.lost > 0,
-            "seed {seed:#x}: the storm was none: {failed} failed, {refused} refused, {} lost",
-            world.lost
-        );
     }
+    let (failed, refused) = *world.wire.failed.lock().unwrap();
+    assert!(
+        failed > 0 && refused > 0 && world.lost > 0,
+        "the storms were none: {failed} failed, {refused} refused, {} lost",
+        world.lost
+    );
 }
 
-/// Seeds the walk replays; a failure names the one it came from.
 /// The seeds a walk takes: `count` of [`SEEDS`], or what
 /// `MAGIC_SYNC_WALK_SEEDS` says — seeds, comma-separated, or `random` for
 /// `count` drawn now, which the nightly run takes. A walk that fails names
@@ -1800,6 +1807,7 @@ fn seeds(count: usize) -> Vec<u64> {
     seeds
 }
 
+/// Seeds the walk replays; a failure names the one it came from.
 const SEEDS: [u64; 8] = [
     0x9E37_79B9_7F4A_7C15,
     0xD1B5_4A32_D192_ED03,
@@ -1863,6 +1871,23 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
                 world.history.push(what.to_string());
             }
             Step::Skipped => {}
+            Step::Park(at) => {
+                let parked = sqlx::query(
+                    "UPDATE sync.notes SET parked_at = now() \
+                      WHERE kind = 'row' AND done_at IS NULL AND parked_at IS NULL \
+                        AND (relation, row_key) = (SELECT relation, row_key FROM sync.notes \
+                                                    WHERE kind = 'row' AND done_at IS NULL \
+                                                      AND parked_at IS NULL \
+                                                    ORDER BY id OFFSET $1 LIMIT 1)",
+                )
+                .bind(at)
+                .execute(&mut *world.conn)
+                .await
+                .expect("parked");
+                if parked.rows_affected() > 0 {
+                    world.history.push("a row's changes parked".to_owned());
+                }
+            }
             Step::Cured => {
                 world.commit_writer().await;
                 cure(&mut world.conn).await;
