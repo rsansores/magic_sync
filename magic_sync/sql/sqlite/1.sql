@@ -57,6 +57,13 @@ CREATE TABLE sync_backlog (
     reported_at INTEGER NOT NULL
 );
 
+-- When the replica next tells the server what it holds (unix milliseconds):
+-- kept here, so a replica that restarts often still says it.
+CREATE TABLE sync_digests (
+    id  INTEGER PRIMARY KEY CHECK (id = 1),
+    due INTEGER NOT NULL
+);
+
 -- Rows the server sent that this replica could not take, or could not let
 -- go of, until it does: the server is told once (reported_at), quarantines
 -- them, and sends them again once a fix is deployed on either side. `epoch`

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
-use tokio::time::Instant;
+
 use uuid::Uuid;
 
 /// Which replica this is: a `Uuid` the replica knows from the start, or the
@@ -84,7 +84,9 @@ pub struct Settings {
     /// failed, for a while: a send that hangs holds back only its lane, and
     /// only so long.
     pub send_timeout: Duration,
-    /// When the first digests go, after the replica starts: once it settled.
+    /// When the first digests go, after the replica first starts on its
+    /// database: once it settled. When they are due is kept in the
+    /// database, so a replica that restarts often says them all the same.
     pub digests_first: Duration,
     /// How often digests go after that.
     pub digests_every: Duration,
@@ -152,8 +154,9 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     /// while the uplink refuses one for good: 0 for no cap.
     caps: Vec<AtomicUsize>,
     /// Per lane, whether the transport took a message while it was being
-    /// asked for less than the replica had to say: proof that a row it then
-    /// refuses alone is the one at fault, and not the transport.
+    /// asked for less than the replica had to say, and has not failed since:
+    /// proof that a row it then refuses alone is the one at fault, and not
+    /// the transport.
     witnessed: Vec<AtomicBool>,
     /// Per lane, how many rows and rejections the next message passes over
     /// while it looks for one the transport takes: 0 when it is not looking.
@@ -167,7 +170,8 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// is; `uplink` how a message reaches the server. Refused, too, when the
     /// settings cannot send up: no lane, a table on two lanes or on none.
     /// What an earlier run set aside, because it could not go up as it was,
-    /// is offered again: this build may send it.
+    /// is offered again: this build may send it; what it wrote of a table
+    /// that no longer goes up is dropped, for it never will.
     ///
     /// # Errors
     ///
@@ -197,6 +201,13 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         }
         let mut conn = pool.acquire().await?;
         replica::check(&mut conn, &codecs).await?;
+        let dropped = replica::forsake(&mut conn, &codecs).await?;
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "sync: writes of tables that no longer go up, which never will — dropped"
+            );
+        }
         let offered = replica::retry_set_aside(&mut conn).await?;
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");
@@ -235,15 +246,19 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
             replica::settled(&mut tx).await?;
             let stop = match replica::receive(&mut tx, &self.codecs, bytes, &care).await {
-                Ok(received) => {
-                    tx.commit().await?;
-                    break received;
+                // A key checked at commit may refuse it: a row of the
+                // message is at fault, and found once applied carefully.
+                Ok(received) => match tx.commit().await {
+                    Ok(()) => break received,
+                    Err(e) => Stop::Failed(e.into()),
+                },
+                Err(stop) => {
+                    drop(tx);
+                    stop
                 }
-                Err(stop) => stop,
             };
             // The database may have rolled the transaction back under it: a
             // connection that no longer knows whether it is in one goes.
-            drop(tx);
             conn.close_on_drop();
             match stop {
                 Stop::Culprits(culprits) => care.refuse(culprits)?,
@@ -317,16 +332,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     async fn lane(&self, lane: usize, mut stopped: watch::Receiver<bool>) {
         let first = self.settings.backoff.first;
         let mut backoff = first;
-        let mut digests_at = Instant::now() + self.settings.digests_first;
         while !*stopped.borrow() {
-            let now = Instant::now();
-            let digests = lane == 0 && now >= digests_at;
-            let (wait, failed) = match self.send_lane(lane, digests).await {
+            let (wait, failed) = match self.turn(lane).await {
                 Ok(went) => {
                     backoff = first;
-                    if went.digests {
-                        digests_at = now + self.settings.digests_every;
-                    }
                     if went.message {
                         continue;
                     }
@@ -349,6 +358,20 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 () = tokio::time::sleep(wait) => {}
             }
         }
+    }
+
+    /// One turn of `lane`: a message, with the digests when they are due
+    /// on the main lane.
+    async fn turn(&self, lane: usize) -> Result<Went, Error> {
+        let settings = &self.settings;
+        let digests = lane == 0
+            && replica::digests_due(
+                &mut *self.pool.acquire().await?,
+                settings.digests_first,
+                settings.digests_every,
+            )
+            .await?;
+        self.send_lane(lane, digests).await
     }
 
     /// One message on `lane`, when it has something to say: read and
@@ -425,8 +448,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             Ok(()) => {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 replica::delivered(&mut tx, &outgoing).await?;
-                tx.commit().await?;
                 went.digests = !outgoing.up.digests.is_empty();
+                if went.digests {
+                    replica::digested(&mut tx, self.settings.digests_every).await?;
+                }
+                tx.commit().await?;
                 witnessed.store(cap > 0, Ordering::Relaxed);
                 self.skips[lane].store(0, Ordering::Relaxed);
                 self.caps[lane].store(0, Ordering::Relaxed);
@@ -461,7 +487,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 self.caps[lane].store(1, Ordering::Relaxed);
             }
             Err(e) => {
-                if !e.is_transient() {
+                // The transport may be another by the time it takes again:
+                // what it took before witnesses nothing after.
+                if e.is_transient() {
+                    witnessed.store(false, Ordering::Relaxed);
+                } else {
                     tracing::error!(
                         lane = outgoing.lane,
                         items,

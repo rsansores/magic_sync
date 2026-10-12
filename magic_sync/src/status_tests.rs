@@ -515,6 +515,9 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
             tables: vec![WireTable {
                 table: "from_a_newer_build".into(),
                 upserts: vec![vec![1, 2, 3]],
+                keys: vec![WireKey {
+                    parts: vec!["1".into()],
+                }],
                 ..WireTable::default()
             }],
             ..Up::default()

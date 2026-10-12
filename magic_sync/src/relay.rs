@@ -64,7 +64,8 @@ pub trait Transport: Send + Sync + 'static {
     /// `id` names the message, one of its own for every message the engine
     /// sends, and the same every time that message is sent again — after a
     /// failure, or by a relay that took over: what a transport that
-    /// deduplicates deduplicates by.
+    /// deduplicates deduplicates by. A message a database restored from an
+    /// older copy numbers again is another message, with another id.
     ///
     /// # Errors
     ///
@@ -172,6 +173,9 @@ struct Writer {
     last: BTreeMap<Uuid, (i64, i64)>,
     /// Per replica provisioned, its snapshot's first message, and its last.
     began: BTreeMap<Uuid, i64>,
+    /// Whether any row was set aside when the pass began: the rows it
+    /// carries are looked for there only then.
+    quarantined: bool,
     ended: BTreeMap<Uuid, i64>,
     written: usize,
     upserts: usize,
@@ -366,13 +370,13 @@ impl<P: Sync + 'static> Relay<'_, P> {
             for sql in [
                 "DELETE FROM sync.held WHERE replica_id = ANY($1)",
                 "DELETE FROM sync.gone WHERE replica_id = ANY($1)",
-                "DELETE FROM sync.outbox WHERE replica_id = ANY($1)",
             ] {
                 sqlx::query(sql)
                     .bind(&snapshots)
                     .execute(&mut *conn)
                     .await?;
             }
+            drop_outbox(conn, &snapshots, i64::MAX, false).await?;
         }
         let ids: BTreeMap<Uuid, String> = snapshots
             .iter()
@@ -403,6 +407,9 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 .collect(),
             began: BTreeMap::new(),
             ended: BTreeMap::new(),
+            quarantined: sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sync.quarantine)")
+                .fetch_one(&mut *conn)
+                .await?,
             written: 0,
             upserts: 0,
             deletes: 0,
@@ -508,9 +515,10 @@ impl<P: Sync + 'static> Relay<'_, P> {
     /// with one, which another would only replace. Answers them.
     async fn bound(&self, conn: &mut Conn, replicas: &[Uuid]) -> Result<Vec<Uuid>, Error> {
         let over: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT replica_id FROM sync.outbox \
-              WHERE replica_id = ANY($1) AND NOT snapshot GROUP BY replica_id \
-             HAVING count(*) > $2 OR sum(length(message)) > $3",
+            "SELECT o.replica_id FROM sync.outbox o LEFT JOIN sync.bodies b ON b.id = o.body \
+              WHERE o.replica_id = ANY($1) AND NOT o.snapshot GROUP BY o.replica_id \
+             HAVING count(*) > $2 \
+                 OR sum(length(o.head) + coalesce(length(b.bytes), 0) + length(o.tail)) > $3",
         )
         .bind(replicas)
         .bind(self.bound.messages)
@@ -649,13 +657,15 @@ impl<P: Sync + 'static> Relay<'_, P> {
         loop {
             // A page of messages, and of bytes: what replicas sent to side
             // by side hold at once stays bounded however large each is.
-            let page: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-                "SELECT sequence, message FROM ( \
-                     SELECT sequence, message, \
-                            sum(length(message)) OVER (ORDER BY sequence) - length(message) AS before \
-                       FROM sync.outbox WHERE replica_id = $1 AND sequence > $2 \
-                      ORDER BY sequence LIMIT 64) AS page \
-                  WHERE before < $3 ORDER BY sequence",
+            let page: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT sequence, nonce, message FROM ( \
+                     SELECT o.sequence, o.nonce, o.head || coalesce(b.bytes, '') || o.tail AS message, \
+                            sum(length(o.head) + coalesce(length(b.bytes), 0) + length(o.tail)) \
+                              OVER (ORDER BY o.sequence) AS through \
+                       FROM sync.outbox o LEFT JOIN sync.bodies b ON b.id = o.body \
+                      WHERE o.replica_id = $1 AND o.sequence > $2 \
+                      ORDER BY o.sequence LIMIT 64) AS page \
+                  WHERE through - length(message) < $3 ORDER BY sequence",
             )
             .bind(replica)
             .bind(after)
@@ -667,8 +677,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
             }
             let mut failure = None;
             let start = after;
-            for (sequence, message) in page {
-                let id = format!("{epoch}-{sequence}");
+            for (sequence, nonce, message) in page {
+                let id = format!("{epoch}-{sequence}-{nonce}");
                 let went =
                     tokio::time::timeout(self.timeout, transport.send(replica, message, &id))
                         .await
@@ -686,11 +696,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 sent += 1;
             }
             if after > start {
-                sqlx::query("DELETE FROM sync.outbox WHERE replica_id = $1 AND sequence <= $2")
-                    .bind(replica)
-                    .bind(after)
-                    .execute(&mut **conn.lock().await)
-                    .await?;
+                drop_outbox(&mut **conn.lock().await, &[replica], after, true).await?;
             }
             if failure.is_some() {
                 return Ok((sent, failure));
@@ -819,7 +825,7 @@ impl Writer {
                 .fetch_all(&mut *conn)
                 .await?;
         drawn.sort_unstable();
-        let mut outbox = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut outbox = Outboxed::default();
         let mut held = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut gone = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (Ready { replica, mut body }, sequence) in ready.into_iter().zip(drawn) {
@@ -869,26 +875,11 @@ impl Writer {
             let nonce = i64::try_from(nonce).expect("a nonce is below 2^63");
             self.last.insert(replica, (sequence, nonce));
             self.written += 1;
-            outbox.0.push(replica);
-            outbox.1.push(sequence);
-            outbox.3.push(match &body {
-                Body::Down(down) => !down.snapshot_id.is_empty(),
-                _ => true,
-            });
-            outbox.2.push(body.encoded());
+            outbox.push(replica, sequence, nonce, body);
         }
         self.upserts += held.0.len();
         self.deletes += gone.0.len();
-        sqlx::query(
-            "INSERT INTO sync.outbox (replica_id, sequence, message, snapshot) \
-             SELECT * FROM unnest($1::uuid[], $2::bigint[], $3::bytea[], $4::boolean[])",
-        )
-        .bind(&outbox.0)
-        .bind(&outbox.1)
-        .bind(&outbox.2)
-        .bind(&outbox.3)
-        .execute(&mut *conn)
-        .await?;
+        outbox.write(conn).await?;
         // Each version recorded with the newest note of its row the pass
         // sees, looked up once per row however many replicas it goes to.
         sqlx::query(
@@ -910,7 +901,7 @@ impl Writer {
         .await?;
         // A row set aside, carried again — or let go of again, after the
         // replica refused to — leaves once the message is applied.
-        for carried in [&held, &gone] {
+        for carried in [&held, &gone].into_iter().filter(|_| self.quarantined) {
             sqlx::query(
                 "UPDATE sync.quarantine q SET carried = u.s \
                    FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) AS u(r, t, k, s) \
@@ -946,6 +937,129 @@ impl Writer {
         .await?;
         Ok(())
     }
+}
+
+/// The messages one flush writes to the outboxes, each in its parts, every
+/// body stored once however many of them carry it.
+#[derive(Default)]
+struct Outboxed {
+    replicas: Vec<Uuid>,
+    sequences: Vec<i64>,
+    nonces: Vec<i64>,
+    heads: Vec<Vec<u8>>,
+    /// Each message's body, by its place in `bodies`.
+    carries: Vec<Option<usize>>,
+    tails: Vec<Vec<u8>>,
+    snapshots: Vec<bool>,
+    bodies: Vec<Vec<u8>>,
+    /// The bodies by a hash of their bytes.
+    found: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+impl Outboxed {
+    fn push(&mut self, replica: Uuid, sequence: i64, nonce: i64, body: Body) {
+        use std::hash::{Hash as _, Hasher as _};
+        self.snapshots.push(match &body {
+            Body::Down(down) => !down.snapshot_id.is_empty(),
+            _ => true,
+        });
+        let envelope::Parts { head, body, tail } = body.parts();
+        let carries = (!body.is_empty()).then(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            body.hash(&mut hasher);
+            let same = self.found.entry(hasher.finish()).or_default();
+            if let Some(&at) = same.iter().find(|&&at| self.bodies[at] == body) {
+                return at;
+            }
+            same.push(self.bodies.len());
+            self.bodies.push(body);
+            self.bodies.len() - 1
+        });
+        self.replicas.push(replica);
+        self.sequences.push(sequence);
+        self.nonces.push(nonce);
+        self.heads.push(head);
+        self.carries.push(carries);
+        self.tails.push(tail);
+    }
+
+    /// Writes the bodies, then the messages that carry them.
+    async fn write(self, conn: &mut Conn) -> Result<(), Error> {
+        let count = i64::try_from(self.bodies.len())
+            .map_err(|_| Error::Misuse("more bodies than a sequence holds".into()))?;
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('sync.bodies', 'id')) FROM generate_series(1, $1)",
+        )
+        .bind(count)
+        .fetch_all(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO sync.bodies (id, bytes) SELECT * FROM unnest($1::int8[], $2::bytea[])",
+        )
+        .bind(&ids)
+        .bind(&self.bodies)
+        .execute(&mut *conn)
+        .await?;
+        let carries: Vec<Option<i64>> =
+            self.carries.iter().map(|at| at.map(|at| ids[at])).collect();
+        sqlx::query(
+            "INSERT INTO sync.outbox (replica_id, sequence, nonce, head, body, tail, snapshot) \
+             SELECT * FROM unnest($1::uuid[], $2::int8[], $3::int8[], $4::bytea[], $5::int8[], \
+                                  $6::bytea[], $7::boolean[])",
+        )
+        .bind(&self.replicas)
+        .bind(&self.sequences)
+        .bind(&self.nonces)
+        .bind(&self.heads)
+        .bind(&carries)
+        .bind(&self.tails)
+        .bind(&self.snapshots)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Drops the messages of `replicas` up to `through` from their outboxes, and
+/// every body no message left carries; records them sent when `sent` — in
+/// one statement, so a message the transport took is never left out of
+/// when the replica was last sent to.
+pub(crate) async fn drop_outbox(
+    conn: &mut Conn,
+    replicas: &[Uuid],
+    through: i64,
+    sent: bool,
+) -> Result<(), Error> {
+    // What a message it drops shares with one it keeps stays: the
+    // statement sees the outbox as it was before it.
+    sqlx::query(
+        "WITH gone AS (DELETE FROM sync.outbox WHERE replica_id = ANY($1) AND sequence <= $2 \
+                        RETURNING body), \
+              sent AS (INSERT INTO sync.replicas (replica_id, last_sent_at) \
+                       SELECT r, now() FROM unnest($1::uuid[]) AS r WHERE $3 \
+                       ON CONFLICT (replica_id) DO UPDATE SET last_sent_at = now()) \
+         DELETE FROM sync.bodies b WHERE b.id IN (SELECT body FROM gone) \
+            AND NOT EXISTS (SELECT 1 FROM sync.outbox o WHERE o.body = b.id \
+                              AND NOT (o.replica_id = ANY($1) AND o.sequence <= $2))",
+    )
+    .bind(replicas)
+    .bind(through)
+    .bind(sent)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Drops every body no message in an outbox carries: what a statement that
+/// dropped the last message carrying one could not see go — another
+/// replica's, dropped at the same time — or a replica forgotten.
+pub(crate) async fn sweep_bodies(conn: &mut Conn) -> Result<(), Error> {
+    sqlx::query(
+        "DELETE FROM sync.bodies b WHERE NOT EXISTS (SELECT 1 FROM sync.outbox o WHERE o.body = b.id)",
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Where a message stands in its replica's chain, and the seal on it.
@@ -986,8 +1100,8 @@ impl Place {
 /// whole instead.
 async fn collapse(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error> {
     tracing::error!(%replica, why, "sync ALARM: a replica's messages dropped — it is provisioned again");
+    drop_outbox(conn, &[replica], i64::MAX, false).await?;
     for sql in [
-        "DELETE FROM sync.outbox WHERE replica_id = $1",
         "DELETE FROM sync.held WHERE replica_id = $1",
         "DELETE FROM sync.gone WHERE replica_id = $1",
     ] {
@@ -1099,7 +1213,8 @@ pub(crate) async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
 /// as `c`, has a message it has not said it applied: one written for it in
 /// this epoch past the last it confirmed. Read from what each writer
 /// records of its own — the relay its chain, a filing what was confirmed —
-/// never from a flag the two would race to set.
+/// never from a flag the two would race to set. What the status shows and
+/// what heals a silent replica ask this one question.
 pub(crate) const UNCONFIRMED: &str = "(c.last_sequence IS NOT NULL \
      AND (r.applied_epoch IS DISTINCT FROM (SELECT epoch FROM sync.epoch) \
           OR coalesce(r.applied_sequence, 0) < c.last_sequence))";

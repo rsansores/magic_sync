@@ -151,6 +151,9 @@ pub(crate) struct Plan {
     owned: Vec<&'static str>,
     /// Every column a row of it carries.
     columns: Vec<&'static str>,
+    /// How large a row aliased `t` is, as SQL: every column it carries, as
+    /// long as it is rather than as the database stores it.
+    size: String,
     /// How its codec writes a row.
     encoding: &'static str,
 }
@@ -346,8 +349,11 @@ async fn analyze(conn: &mut Conn, tables: &str) -> Result<(), Error> {
 enum Set {
     Suspect,
     Blocked,
-    /// What replicas keep of a table beyond what its rules send them.
-    Kept(usize),
+    /// What replicas keep of a table beyond what its rules send them; for
+    /// a version of a row they hold that points there when `older`, which
+    /// holds up that row and keeps of its followers only those they hold:
+    /// what that version needs is the row, not what follows it since.
+    Kept(usize, bool),
 }
 
 /// What the replica `replica` holds of the row of the relation `relation`
@@ -472,7 +478,7 @@ CREATE TEMP TABLE IF NOT EXISTS sync_suspect (
     PRIMARY KEY (replica_id, rel, row_key)) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_kept (
     replica_id UUID, rel INTEGER, row_key TEXT, round INTEGER NOT NULL,
-    sends BOOLEAN NOT NULL, up BOOLEAN NOT NULL, down BOOLEAN NOT NULL,
+    sends BOOLEAN NOT NULL, up BOOLEAN NOT NULL, down BOOLEAN NOT NULL, older BOOLEAN NOT NULL,
     PRIMARY KEY (replica_id, rel, row_key)) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_sends (
     rel INTEGER, row_key TEXT, replica_id UUID, lacks BOOLEAN) ON COMMIT DELETE ROWS;
@@ -1066,6 +1072,7 @@ impl Engine {
                     .map(|c| c.name)
                     .collect(),
                 columns: t.columns.iter().map(|c| c.name).collect(),
+                size: String::new(),
                 encoding: t.encoding,
             });
         }
@@ -1188,7 +1195,7 @@ impl Engine {
                 )));
             }
         }
-        for plan in &plans {
+        for plan in &mut plans {
             readable(
                 conn,
                 &format!("SELECT 1 FROM {} LIMIT 0", plan.active),
@@ -1196,6 +1203,20 @@ impl Engine {
             )
             .await?;
             let columns = typed_columns(conn, &plan.relation.sql()).await?;
+            // The length of text and bytes is read off the stored value
+            // without decompressing it; anything else, as its text.
+            plan.size = plan
+                .columns
+                .iter()
+                .map(|c| match type_of(&columns, c).as_deref() {
+                    Some("text" | "bytea" | "character varying" | "character") => {
+                        format!("coalesce(octet_length(t.{}), 0)", ident(c))
+                    }
+                    _ => format!("coalesce(octet_length(t.{}::text), 0)", ident(c)),
+                })
+                .chain(["0".to_owned()])
+                .collect::<Vec<_>>()
+                .join(" + ");
             let has = |column: &str| type_of(&columns, column).is_some();
             let missing = match plan.route {
                 Route::Broadcast => replicas.partition.filter(|p| !has(p)),
@@ -1477,9 +1498,12 @@ impl Engine {
     /// it keeps spreads to the parents and followers it needs, a round at a
     /// time from the rows the last round added. What it lacks of that is
     /// sent, with the rows that changed since its version; the rows in
-    /// question it does not keep are taken back. A row it holds that a
-    /// change not yet planned pointed at, before that change, stays too: the
-    /// replica still holds that change's older version.
+    /// question it does not keep are taken back. A row it holds in a version
+    /// older than the row — kept while a change of it waits, is parked, or
+    /// went where the replica could not take it — holds up what that version
+    /// pointed at, which the first change after it recorded: whatever that
+    /// change's state, one rule for every question of what a held row points
+    /// at.
     ///
     /// A row that cannot go, and every row that points at it — held, or
     /// that the plan would send — is kept by no replica: it is taken back
@@ -1741,8 +1765,8 @@ impl Engine {
                 );
                 self.add(conn, Set::Blocked, &select, round + 1).await?;
             }
-            // A version it holds that pointed there, changed since by a
-            // note not planned yet, points there still.
+            // A version it holds that pointed there, changed since, points
+            // there still.
             for (c, parent) in self
                 .pointing()
                 .into_iter()
@@ -1807,6 +1831,39 @@ impl Engine {
             );
             self.add(conn, Set::Suspect, &select, 0).await?;
         }
+        // The parent of a follower the batch changed, held by a replica
+        // that may hold it only for a version of a row that points there
+        // and changed since: whether it keeps it for more than that, and
+        // the new follower with it, is the plan's question.
+        for (f, column, p) in self
+            .followers()
+            .filter(|(f, _, _)| asked.changed.contains(f))
+        {
+            for c in self
+                .pointing()
+                .into_iter()
+                .filter(|(_, parent)| *parent == p)
+                .map(|(c, _)| c)
+            {
+                let select = format!(
+                    "SELECT DISTINCT h.replica_id, {p}, pp.row_key, NULL \
+                       FROM sync_changed x JOIN {} t ON {} \
+                       JOIN sync.pointed pp ON pp.relation = {} AND pp.row_key = t.{}::text \
+                       JOIN sync.notes n ON n.id = pp.note AND n.relation = {} \
+                                        AND n.id NOT IN (SELECT id FROM sync_batch) \
+                       JOIN sync.held h ON h.relation = n.relation AND h.row_key = n.row_key \
+                                       AND h.noted < n.id \
+                       JOIN sync_live l ON l.replica_id = h.replica_id AND NOT l.fresh \
+                      WHERE x.rel = {f}",
+                    self.plans[f].relation.sql(),
+                    self.row_is(f, "x.row_key"),
+                    literal(self.plans[p].table),
+                    ident(column),
+                    literal(self.plans[c].table),
+                );
+                self.add(conn, Set::Suspect, &select, 0).await?;
+            }
+        }
         let mut round = 0;
         loop {
             let from = self.frontier(conn, "sync_suspect", round).await?;
@@ -1840,7 +1897,7 @@ impl Engine {
                 );
                 self.add(conn, Set::Suspect, &select, round + 1).await?;
             }
-            // What the version a replica holds of a row the batch changed
+            // What the version a replica holds of a row changed since
             // pointed at is in question with it, whatever the row points
             // at now, or whether it is still there.
             for (c, parent) in self
@@ -1850,8 +1907,7 @@ impl Engine {
             {
                 let select = format!(
                     "SELECT d.replica_id, {parent}, p.row_key, NULL FROM sync_suspect d {} {} \
-                      WHERE d.rel = {c} AND d.round = $1 - 1 \
-                        AND d.row_key IN (SELECT row_key FROM sync_changed WHERE rel = {c})",
+                      WHERE d.rel = {c} AND d.round = $1 - 1",
                     self.pointed_by_held(c, parent, "d"),
                     holds(
                         "JOIN",
@@ -1997,21 +2053,29 @@ impl Engine {
                 }
                 continue;
             }
+            // A row sent holds up what it points at; one kept as its
+            // replica holds it, what that version points at: the row as it
+            // is, unless it changed since — then the first change after
+            // that version says (`pointed_by_held`), whether planned, in
+            // the batch, waiting or parked.
             for (c, reference) in self.references().filter(|(c, _)| from.contains(c)) {
                 let source = format!(
                     "SELECT k.replica_id, {} FROM sync_kept k JOIN {} t ON {} \
-                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND {}",
+                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND {} \
+                        AND (k.sends OR NOT EXISTS ( \
+                              SELECT 1 FROM sync.held h JOIN sync.notes n ON n.kind = 'row' \
+                                 AND n.relation = h.relation AND n.row_key = h.row_key AND n.id > h.noted \
+                               WHERE h.replica_id = k.replica_id AND h.relation = {} \
+                                 AND h.row_key = k.row_key))",
                     key_sql("t", &reference.columns),
                     self.plans[c].relation.sql(),
                     self.row_is(c, "k.row_key"),
                     not_null("t", &reference.columns),
+                    literal(self.plans[c].table),
                 );
                 self.keep(conn, reference.parent, round + 1, &source)
                     .await?;
             }
-            // A row kept as its replica holds it, changed since by the
-            // batch — gone, or kept for a change not planned yet — holds
-            // up what its version pointed at, not what the row does now.
             for (c, parent) in self
                 .pointing()
                 .into_iter()
@@ -2019,19 +2083,23 @@ impl Engine {
             {
                 let source = format!(
                     "SELECT k.replica_id, p.row_key FROM sync_kept k {} \
-                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND NOT k.sends \
-                        AND k.row_key IN (SELECT row_key FROM sync_changed WHERE rel = {c})",
+                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND NOT k.sends",
                     self.pointed_by_held(c, parent, "k"),
                 );
-                self.keep(conn, parent, round + 1, &source).await?;
+                self.keep_for_older(conn, parent, round + 1, &source)
+                    .await?;
             }
             for (f, column, p) in self.followers().filter(|(_, _, p)| from.contains(p)) {
                 let source = format!(
-                    "SELECT k.replica_id, {} FROM sync_kept k JOIN {} t ON {} \
-                      WHERE k.rel = {p} AND k.round = $1 - 1 AND k.down",
-                    self.key_of_row(f),
+                    "SELECT k.replica_id, {key} FROM sync_kept k JOIN {} t ON {} \
+                      WHERE k.rel = {p} AND k.round = $1 - 1 AND k.down \
+                        AND (NOT k.older OR EXISTS (SELECT 1 FROM sync.held h \
+                                                     WHERE h.replica_id = k.replica_id \
+                                                       AND h.relation = {} AND h.row_key = {key}))",
                     self.plans[f].active,
                     key_eq("t", &[column], &self.plans[p].key, "k.row_key"),
+                    literal(self.plans[f].table),
+                    key = self.key_of_row(f),
                 );
                 self.keep(conn, f, round + 1, &source).await?;
             }
@@ -2040,20 +2108,10 @@ impl Engine {
     }
 
     /// Keeps, at `round`, the rows in question that a row its replica holds
-    /// still points at in the version it holds: one a change not yet planned
-    /// — beyond the batch, or parked — pointed at before. Answers whether it
-    /// kept any.
+    /// still points at in the version it holds: one the first change of it
+    /// after that version — beyond the batch, waiting, parked or planned
+    /// long ago — pointed at before. Answers whether it kept any.
     async fn keep_older(&self, conn: &mut Conn, round: i32) -> Result<bool, Error> {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM sync.pointed p JOIN sync.notes n ON n.id = p.note \
-                             WHERE n.done_at IS NULL \
-                               AND NOT EXISTS (SELECT 1 FROM sync_batch b WHERE b.id = n.id))",
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-        if !waiting {
-            return Ok(false);
-        }
         let mut kept = 0;
         for (c, parent) in self.pointing() {
             let source = format!(
@@ -2065,7 +2123,7 @@ impl Engine {
                                        AND x.rel = {c} AND x.row_key = h.row_key AND NOT x.sends))",
                 self.held_older(c, parent, "d.replica_id", "d.row_key"),
             );
-            kept += self.keep(conn, parent, round, &source).await?;
+            kept += self.keep_for_older(conn, parent, round, &source).await?;
         }
         Ok(kept > 0)
     }
@@ -2099,16 +2157,21 @@ impl Engine {
     }
 
     /// Joins `h`, the rows of `c` the replica `replica` holds in a version
-    /// that pointed at the row of `parent` whose key is the text `text`,
-    /// changed since by a note not planned yet — beyond the batch, or
-    /// parked — whose pointers `sync.pointed` keeps, by the row pointed at.
+    /// that pointed at the row of `parent` whose key is the text `text`:
+    /// what the first change of the row after that version — beyond the
+    /// batch, whether waiting, parked or planned long ago — pointed at
+    /// before, which `sync.pointed` keeps by the row pointed at. A change in
+    /// the batch is the plan's own question ([`Engine::pointed_by_held`]).
     fn held_older(&self, c: usize, parent: usize, replica: &str, text: &str) -> String {
         let child = literal(self.plans[c].table);
         format!(
             "JOIN sync.pointed p ON p.relation = {} AND p.row_key = {text} \
-             JOIN sync.notes n ON n.id = p.note AND n.done_at IS NULL AND n.relation = {child} \
+             JOIN sync.notes n ON n.id = p.note AND n.relation = {child} \
                               AND n.id NOT IN (SELECT id FROM sync_batch) \
-             {}",
+             {} \
+             JOIN LATERAL (SELECT min(m.id) AS id FROM sync.notes m \
+                            WHERE m.kind = 'row' AND m.relation = {child} AND m.row_key = n.row_key \
+                              AND m.id > h.noted) first ON first.id = n.id",
             literal(self.plans[parent].table),
             holds("JOIN", "h", replica, &child, "n.row_key"),
         )
@@ -2134,7 +2197,23 @@ impl Engine {
         let select = format!(
             "SELECT x.replica_id, {i}, x.row_key, NULL FROM ({source}) AS x(replica_id, row_key)"
         );
-        self.add(conn, Set::Kept(i), &select, round).await
+        self.add(conn, Set::Kept(i, false), &select, round).await
+    }
+
+    /// Keeps for `i`, at `round`, what `source` names as [`Engine::keep`]
+    /// does, for a version of a row its replica holds that points there:
+    /// the row is held up, and no follower it lacks goes with it.
+    async fn keep_for_older(
+        &self,
+        conn: &mut Conn,
+        i: usize,
+        round: i32,
+        source: &str,
+    ) -> Result<u64, Error> {
+        let select = format!(
+            "SELECT x.replica_id, {i}, x.row_key, NULL FROM ({source}) AS x(replica_id, row_key)"
+        );
+        self.add(conn, Set::Kept(i, true), &select, round).await
     }
 
     /// Adds to the plan's `set` the rows `select` answers —
@@ -2153,11 +2232,13 @@ impl Engine {
                  SELECT q.replica_id, q.rel, q.row_key, q.why, $1 FROM ({select}) AS q(replica_id, rel, row_key, why) \
                  ON CONFLICT DO NOTHING"
             ),
-            Set::Kept(i) => {
+            Set::Kept(i, older) => {
                 let plan = &self.plans[i];
                 format!(
-                    "INSERT INTO sync_kept (replica_id, rel, row_key, round, sends, up, down) \
-                     SELECT s.replica_id, s.rel, s.row_key, $1, s.sends, s.sends OR s.doubt, s.lacks OR s.doubt \
+                    "INSERT INTO sync_kept (replica_id, rel, row_key, round, sends, up, down, older) \
+                     SELECT DISTINCT ON (s.replica_id, s.rel, s.row_key) \
+                            s.replica_id, s.rel, s.row_key, $1, s.sends, s.sends OR s.doubt, \
+                            s.lacks OR s.doubt, {older} \
                        FROM (SELECT q.replica_id, q.rel, q.row_key, \
                                     h.replica_id IS NULL OR h.refused AS lacks, \
                                     (h.replica_id IS NULL OR h.refused OR {}) AND t.{} IS NOT NULL AS sends, \
@@ -2171,7 +2252,8 @@ impl Engine {
                               WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
                                                    AND b.rel = q.rel AND b.row_key = q.row_key) {}) AS s \
                       WHERE s.lacks OR s.sends OR s.doubt \
-                     ON CONFLICT DO NOTHING",
+                     ON CONFLICT (replica_id, rel, row_key) DO UPDATE SET older = false, round = $1 \
+                      WHERE sync_kept.older AND NOT EXCLUDED.older",
                     stale("c.noted"),
                     ident(plan.key[0].name),
                     holds("LEFT JOIN", "h", "q.replica_id", &literal(plan.table), "q.row_key"),
@@ -2190,6 +2272,8 @@ impl Engine {
                 )
             }
         };
+        // A row kept for an older version, and then for itself, spreads
+        // again, to every follower, from where it was found the second time.
         Ok(sqlx::query(&sql)
             .bind(round)
             .execute(&mut *conn)
@@ -2669,7 +2753,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Lets go of the rows set aside the plan owes no replica any more.
+    /// Lets go of the rows set aside the plan owes no replica any more; and
+    /// notes again, to be tried where they were set aside, those the server
+    /// set aside that point at a row the batch changed: what kept them from
+    /// going — that row could not go — may be gone with the change, which
+    /// the rows themselves did not see.
     pub(crate) async fn settle(&self, conn: &mut Conn) -> Result<(), Error> {
         sqlx::query(
             "DELETE FROM sync.quarantine q USING sync_settled s \
@@ -2677,6 +2765,26 @@ impl Engine {
         )
         .execute(&mut *conn)
         .await?;
+        for (c, reference) in self.references() {
+            let child = literal(self.plans[c].table);
+            sqlx::query(&format!(
+                "INSERT INTO sync.notes (kind, relation, row_key) \
+                 SELECT DISTINCT 'retry', q.relation, q.row_key FROM sync_changed x \
+                   JOIN {} t ON {} \
+                   JOIN sync.quarantine q ON q.relation = {child} AND q.row_key = {} \
+                                         AND q.cause = 'server' \
+                  WHERE x.rel = {} \
+                    AND NOT EXISTS (SELECT 1 FROM sync.notes n \
+                                     WHERE n.done_at IS NULL AND n.kind = 'retry' \
+                                       AND n.relation = q.relation AND n.row_key = q.row_key)",
+                self.plans[c].relation.sql(),
+                self.points_at(reference, "x.row_key"),
+                self.key_of_row(c),
+                reference.parent,
+            ))
+            .execute(&mut *conn)
+            .await?;
+        }
         Ok(())
     }
 
@@ -2755,9 +2863,9 @@ impl Engine {
     }
 
     /// How many of `keys` of table `i`, from the first, hold no more than
-    /// `budget` bytes between them as the database stores them — one at
-    /// least: what a pass loads and encodes at once stays bounded however
-    /// large the rows.
+    /// `budget` bytes between them, each as long as it is, not as the
+    /// database stores it — one at least: what a pass loads and encodes at
+    /// once stays bounded however large the rows.
     pub(crate) async fn fitting(
         &self,
         conn: &mut Conn,
@@ -2767,9 +2875,10 @@ impl Engine {
     ) -> Result<usize, Error> {
         let plan = &self.plans[i];
         let sizes: Vec<i64> = sqlx::query_scalar(&format!(
-            "SELECT coalesce(pg_column_size(t.*), 0)::int8 \
+            "SELECT ({})::int8 \
                FROM unnest($1::text[]) WITH ORDINALITY AS k(row_key, n) \
                LEFT JOIN {} t ON {} ORDER BY k.n",
+            plan.size,
             plan.relation.sql(),
             self.row_is(i, "k.row_key"),
         ))

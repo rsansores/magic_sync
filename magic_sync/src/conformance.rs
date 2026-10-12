@@ -278,6 +278,10 @@ pub fn matches_golden(path: &str, text: &str) {
     );
 }
 
+/// The seal the messages built by hand carry: a server's is its own
+/// HMAC, which a replica cannot check, and gives back as it came.
+pub const SEAL: [u8; 16] = [0x5e; 16];
+
 /// The nonce the messages built by hand carry at `sequence`: a server draws
 /// its own at random.
 pub fn nonce_of(sequence: u64) -> u64 {
@@ -304,6 +308,7 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
         previous,
         nonce: nonce_of(sequence),
         previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+        mac: SEAL.to_vec(),
         ..Down::default()
     };
     let down = |sequence: u64, previous: u64, snapshot: &str, epoch: &str| {
@@ -318,16 +323,17 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
             previous,
             nonce: nonce_of(sequence),
             previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
-            ..EndSnapshot::default()
+            mac: SEAL.to_vec(),
         })
     };
     let message = |protocol: u32, body: Option<Body>| ToReplica { protocol, body }.encode_to_vec();
     let one = |body: Body| message(1, Some(body));
-    let with = |change: fn(&mut Down)| {
-        let mut d = chained(101, 100, "", EPOCH);
+    let after = |previous: u64, change: fn(&mut Down)| {
+        let mut d = chained(previous + 1, previous, "", EPOCH);
         change(&mut d);
         one(Body::Down(d))
     };
+    let with = |change: fn(&mut Down)| after(100, change);
     let mut truncated = one(down(101, 100, "", EPOCH));
     truncated.truncate(truncated.len() - 3);
     let snapshot = "0192f6a0-0000-7000-8000-000000005eee";
@@ -365,6 +371,19 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
         ),
         ("no_nonce", "malformed", with(|d| d.nonce = 0)),
         ("nonce_too_large", "malformed", with(|d| d.nonce = 1 << 63)),
+        (
+            "follows_a_nonce_too_large",
+            "malformed",
+            with(|d| d.previous_nonce = 1 << 63),
+        ),
+        ("no_mac", "malformed", with(|d| d.mac = Vec::new())),
+        ("mac_too_short", "malformed", with(|d| d.mac.truncate(15))),
+        ("mac_too_long", "malformed", with(|d| d.mac.push(0x5e))),
+        (
+            "snapshot_no_uuid",
+            "malformed",
+            one(down(101, 0, "snapshot", EPOCH)),
+        ),
         (
             "follows_without_its_nonce",
             "malformed",
@@ -423,22 +442,42 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
                 });
             }),
         ),
+        // A row beside a key not its own is rejected, and the rest applied.
+        (
+            "a_row_beside_another_key",
+            "applied",
+            after(101, |d| {
+                let row = ItemRow {
+                    id: "0192f6a0-0000-7000-8000-0000000000b1".to_owned(),
+                    partition_id: Uuid::nil().to_string(),
+                    name: "beside".to_owned(),
+                };
+                d.tables.push(Table {
+                    table: "items".to_owned(),
+                    upserts: vec![row.encode_to_vec()],
+                    keys: vec![crate::envelope::Key {
+                        parts: vec!["0192f6a0-0000-7000-8000-0000000000b2".to_owned()],
+                    }],
+                    ..Table::default()
+                });
+            }),
+        ),
         (
             "begins_a_snapshot",
             "applied",
-            one(down(102, 0, snapshot, EPOCH)),
+            one(down(103, 0, snapshot, EPOCH)),
         ),
         (
             "follows_the_snapshot_and_is_not_of_it",
             "malformed",
-            one(down(103, 102, "", EPOCH)),
+            one(down(104, 103, "", EPOCH)),
         ),
         (
             "follows_the_snapshot_and_is_of_another",
             "malformed",
-            one(down(103, 102, other, EPOCH)),
+            one(down(104, 103, other, EPOCH)),
         ),
-        ("ends_the_snapshot", "ended", one(end(103, 102, snapshot))),
+        ("ends_the_snapshot", "ended", one(end(104, 103, snapshot))),
     ]
 }
 
@@ -449,7 +488,8 @@ fn the_malformed_corpus_is_the_one_checked_in() {
     let header = "# Messages no server sends, and between them the few that set the scene:\n\
                   # `case outcome hex` per message, in order. A replica provisioned by an\n\
                   # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, nonce\n\
-                  # 0x5eed000000000064, of nothing, makes of each what `outcome` says: `malformed`\n\
+                  # 0x5eed000000000064, sealed with sixteen bytes 0x5e, of nothing, makes of each\n\
+                  # what `outcome` says: `malformed`\n\
                   # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2).\n";
     let text: String = malformed()
         .iter()
@@ -758,6 +798,9 @@ mod server {
             }
             for bytes in std::mem::take(&mut *kept.sent.lock().unwrap()) {
                 let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
+                // The bytes the transport took are the message's own, as
+                // this build encodes it, however the outbox kept them.
+                assert_eq!(message.encode_to_vec(), bytes, "{step}: as encoded");
                 let (snapshot, place) = match &mut message.body {
                     Some(Body::Down(m)) => (Some(&mut m.snapshot_id), Some((m.sequence, m.nonce))),
                     Some(Body::EndSnapshot(m)) => {
@@ -799,6 +842,7 @@ mod server {
                         previous: sequence,
                         previous_nonce: nonce,
                         nonce: nonce_of(sequence + 1_000),
+                        mac: SEAL.to_vec(),
                         ..crate::envelope::Down::default()
                     })
                     .encoded()
@@ -885,7 +929,16 @@ mod server {
                         i64::try_from(up.rejected.len()).unwrap(),
                         "{name}: what it refused, set aside"
                     ),
-                    "agrees" | "ignored" => {}
+                    "agrees" => assert_eq!(
+                        scalar(
+                            "SELECT count(*) FROM sync.replicas \
+                              WHERE replica_id = $1 AND compared_at IS NOT NULL"
+                        )
+                        .await,
+                        1,
+                        "{name}: its digests compared"
+                    ),
+                    "ignored" => {}
                     other => panic!("{name}: an outcome this suite does not know: {other}"),
                 }
             }

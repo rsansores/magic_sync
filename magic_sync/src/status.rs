@@ -407,8 +407,7 @@ pub struct Quarantined {
     pub attempts: i32,
 }
 
-/// What a replica sent that the server could not file: a row, a delete, or a
-/// whole upload.
+/// What a replica sent that the server could not file: a row, or a delete.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
@@ -417,7 +416,7 @@ pub struct Unfiled {
     pub id: i64,
     /// The replica that sent it.
     pub replica: Uuid,
-    /// Empty for a whole upload kept as it came.
+    /// The table of the row, or of the delete.
     pub table: String,
     /// Why it could not be filed.
     pub reason: String,
@@ -1119,7 +1118,7 @@ impl Engine {
                 .fetch_one(&mut *conn)
                 .await?,
             first: sqlx::query(&format!(
-                "SELECT id, replica_id AS replica, coalesce(relation, '') AS table, reason, \
+                "SELECT id, replica_id AS replica, relation AS table, reason, \
                         first_at, last_at, attempts \
                    FROM sync.inbox WHERE {mine} ORDER BY id LIMIT $2"
             ))
@@ -1165,28 +1164,25 @@ impl Engine {
         scoped: &Scoped,
         notes: &[NoteGroup],
     ) -> Result<Fleet, Error> {
-        let recorded: Vec<Recorded> = sqlx::query_as(
+        let recorded: Vec<Recorded> = sqlx::query_as(&format!(
             "SELECT s.id AS replica, r.failures, coalesce(r.last_error, c.dropped) AS last_error, \
                     r.retry_after AS retry_at, \
                     r.last_sent_at AS sent_at, r.applied_at, \
-                    coalesce(c.last_sequence IS NOT NULL \
-                             AND (r.applied_epoch IS DISTINCT FROM e.epoch \
-                                  OR coalesce(r.applied_sequence, 0) < c.last_sequence), false) \
-                      AS unconfirmed, \
+                    coalesce({}, false) AS unconfirmed, \
                     r.backlog, r.backlog_at, greatest(r.last_sent_at, r.applied_at) AS waiting_since, \
                     coalesce(q.n, 0) AS quarantined, coalesce(i.n, 0) AS unfiled, \
                     coalesce(o.n, 0) AS owed \
                FROM unnest($1::uuid[]) AS s(id) \
                LEFT JOIN sync.replicas r ON r.replica_id = s.id \
                LEFT JOIN sync.chains c ON c.replica_id = s.id \
-               LEFT JOIN sync.epoch e ON true \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.quarantine \
                            WHERE replica_id = ANY($1) GROUP BY 1) q ON q.replica_id = s.id \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.inbox \
                            WHERE replica_id = ANY($1) GROUP BY 1) i ON i.replica_id = s.id \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.outbox \
                            WHERE replica_id = ANY($1) GROUP BY 1) o ON o.replica_id = s.id",
-        )
+            crate::relay::UNCONFIRMED
+        ))
         .bind(scoped.ids())
         .fetch_all(&mut *conn)
         .await?;

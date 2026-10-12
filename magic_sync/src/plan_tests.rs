@@ -51,7 +51,7 @@ CREATE TABLE fixture.t_families (
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_kinds (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    family_id UUID REFERENCES fixture.t_families (id),
+    family_id UUID REFERENCES fixture.t_families (id) DEFERRABLE INITIALLY DEFERRED,
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
@@ -89,7 +89,9 @@ CREATE TABLE fixture.t_orders (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL,
     replica_id UUID REFERENCES fixture.t_replicas (id),
     customer_id UUID REFERENCES fixture.t_customers (id), name TEXT NOT NULL DEFAULT 'o',
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    -- A second key into the same table.
+    referrer_id UUID REFERENCES fixture.t_customers (id));
 CREATE TABLE fixture.t_sizes (
     code INTEGER PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
@@ -126,6 +128,12 @@ CREATE TABLE fixture.t_task_lines (
 CREATE TABLE fixture.t_tallies (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0);
+-- A family gone before its kinds point elsewhere, in one transaction: the
+-- foreign key waits for the commit.
+CREATE FUNCTION fixture.replace_family(gone UUID, by UUID) RETURNS VOID LANGUAGE sql AS $$
+    DELETE FROM fixture.t_families WHERE id = gone;
+    UPDATE fixture.t_kinds SET family_id = by WHERE family_id = gone;
+$$;
 CREATE VIEW t_replicas AS SELECT * FROM fixture.t_replicas WHERE retired_at IS NULL;
 CREATE VIEW t_families AS SELECT * FROM fixture.t_families WHERE retired_at IS NULL;
 CREATE VIEW t_kinds AS SELECT * FROM fixture.t_kinds WHERE retired_at IS NULL;
@@ -151,8 +159,13 @@ END $$;
 /// A name this build cannot encode: the bug a deploy fixes.
 const POISON: &str = "poison";
 
-/// Longer than a name, or an address, may be for any message to carry it.
-const OVERSIZE: usize = 20_000;
+/// How large the walk's messages may be: a row past
+/// [`Limits::largest_row`](crate::envelope::Limits::largest_row) of them
+/// goes in none.
+const LIMITS: crate::envelope::Limits = crate::envelope::Limits {
+    rows: 7,
+    bytes: 16 << 10,
+};
 
 fn poisoned<S: serde::Serializer>(name: &str, s: S) -> Result<S::Ok, S::Error> {
     if name == POISON {
@@ -295,6 +308,7 @@ struct Order {
     name: String,
     rev: i64,
     retired_at: Option<DateTime<Utc>>,
+    referrer_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
@@ -441,6 +455,7 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
     ("t_calls", &["customer_id", "number"], "t_phones"),
     ("t_emails", &["customer_id"], "t_customers"),
     ("t_orders", &["customer_id"], "t_customers"),
+    ("t_orders", &["referrer_id"], "t_customers"),
     ("t_bins", &["size_code"], "t_sizes"),
     ("t_accounts", &["size_code"], "t_sizes"),
     ("t_tasks", &["store", "slot"], "t_bins"),
@@ -503,6 +518,8 @@ fn key_of(row: &serde_json::Value, columns: &[&str]) -> Option<String> {
 enum Step {
     Wrote(usize),
     Skipped,
+    /// The relay parks the changes of the row of so many pending before it.
+    Park(i64),
     /// The bug is fixed: what was set aside goes again.
     Cured,
 }
@@ -521,6 +538,10 @@ fn parents(table: &str, bytes: &[u8]) -> Vec<Row> {
 /// or a fix of the data, cures.
 const REFUSED: &str = "refused";
 
+/// The title a replica's upload of a two-way row carries: never one the
+/// server's rows have.
+const UPLOADED: &str = "uploaded";
+
 /// The replicas of the walk: their foreign keys, and the rows they refuse.
 const RULES: Rules = Rules {
     refuses: |_, bytes| {
@@ -528,6 +549,7 @@ const RULES: Rules = Rules {
             .is_ok_and(|row| row.get("name").and_then(|n| n.as_str()) == Some(REFUSED))
     },
     parents,
+    ..Rules::ANY
 };
 
 /// The server's relay over the walk's tables, as a host's runs it, planning
@@ -540,10 +562,7 @@ fn relay<'a>(
     crate::relay::Relay {
         engine,
         codecs,
-        limits: crate::envelope::Limits {
-            rows: 7,
-            bytes: 16 << 10,
-        },
+        limits: LIMITS,
         batch,
         timeout: std::time::Duration::from_secs(5),
         backoff: crate::run::Backoff::new(
@@ -703,7 +722,26 @@ impl World {
                 .into_iter()
                 .collect();
         let outcome = relay.record(&mut tx).await.expect("recorded");
-        assert_minimal(&mut tx, drawn, &held, &self.history).await;
+        // Nothing here is a note no build can plan: a note parked is the
+        // planner failing.
+        assert!(
+            outcome.parked.is_empty(),
+            "the planner failed: {:?}; last steps: {:#?}",
+            outcome.parked,
+            &self.history[self.history.len().saturating_sub(8)..]
+        );
+        // What a change not planned — beyond the batch, or parked — would
+        // send or keep, the pass cannot know: it is minimal once it planned
+        // every change there is.
+        let planned_all: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM sync.notes WHERE done_at IS NULL)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pending");
+        if planned_all {
+            assert_minimal(&mut tx, drawn, &held, &self.history).await;
+        }
         if chance(6) {
             // Replicas heard while the pass is still recording: what they
             // say waits on what it locked, or goes in beside it.
@@ -743,11 +781,13 @@ impl World {
             .chain(live.iter())
             .map(|r| (*r, self.wire.ids(*r).len()))
             .collect();
-        let outbox: Vec<(Uuid, i64, Vec<u8>, bool)> =
-            sqlx::query_as("SELECT replica_id, sequence, message, snapshot FROM sync.outbox")
-                .fetch_all(&mut *self.conn)
-                .await
-                .expect("the outbox");
+        let outbox: Vec<Outboxed> = sqlx::query_as(
+            "SELECT o.replica_id, o.sequence, o.nonce, o.head, o.body, b.bytes, o.tail, o.snapshot \
+               FROM sync.outbox o LEFT JOIN sync.bodies b ON b.id = o.body",
+        )
+        .fetch_all(&mut *self.conn)
+        .await
+        .expect("the outbox");
         let sent = if chance(12) {
             self.history
                 .push("the relay died before it sent".to_owned());
@@ -764,15 +804,22 @@ impl World {
             // outbox: the next relay sends them again.
             self.history
                 .push("the relay died before it trimmed its outbox".to_owned());
-            for (replica, sequence, message, snapshot) in outbox {
+            for message in outbox {
                 sqlx::query(
-                    "INSERT INTO sync.outbox (replica_id, sequence, message, snapshot) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    "WITH body AS (INSERT INTO sync.bodies (id, bytes) \
+                                   SELECT $5, $6 WHERE $5 IS NOT NULL ON CONFLICT DO NOTHING) \
+                     INSERT INTO sync.outbox \
+                       (replica_id, sequence, nonce, head, body, tail, snapshot) \
+                     VALUES ($1, $2, $3, $4, $5, $7, $8) ON CONFLICT DO NOTHING",
                 )
-                .bind(replica)
-                .bind(sequence)
-                .bind(message)
-                .bind(snapshot)
+                .bind(message.replica_id)
+                .bind(message.sequence)
+                .bind(message.nonce)
+                .bind(message.head)
+                .bind(message.body)
+                .bind(message.bytes)
+                .bind(message.tail)
+                .bind(message.snapshot)
                 .execute(&mut *self.conn)
                 .await
                 .expect("sent again");
@@ -981,6 +1028,18 @@ impl World {
     /// now — but a row it refused to take or to let go of, which it holds as
     /// it had it, or not at all, and the columns it owns, which are its own.
     async fn assert_holdings(&mut self, seed: u64, step: usize) {
+        let made: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM fixture.t_tallies WHERE name = $1")
+                .bind(UPLOADED)
+                .fetch_one(&mut *self.conn)
+                .await
+                .expect("tallies");
+        assert_eq!(
+            made,
+            0,
+            "seed {seed:#x}, after step {step}: a replica's upload made a two-way row, or brought one back; last steps: {:#?}",
+            self.last_steps()
+        );
         let oracle = Oracle::read(&mut self.conn).await;
         let replicas: Vec<Uuid> =
             sqlx::query_scalar("SELECT id FROM t_replicas WHERE live ORDER BY id")
@@ -1002,10 +1061,29 @@ impl World {
                     !model.rows.contains_key(*row) && !model.rejections.contains_key(*row)
                 })
                 .collect();
+            // What a row it refused to let go of points at, it keeps for
+            // it: the server takes back none of that while the refusal
+            // stands.
+            let mut covered: BTreeSet<Row> = BTreeSet::new();
+            let mut rest: Vec<Row> = model.rejections.keys().cloned().collect();
+            while let Some(row) = rest.pop() {
+                let Some(bytes) = model.rows.get(&row) else {
+                    continue;
+                };
+                for parent in parents(&row.0, bytes) {
+                    if covered.insert(parent.clone()) {
+                        rest.push(parent);
+                    }
+                }
+            }
             let extra: Vec<(&Row, Vec<&Row>)> = model
                 .rows
                 .keys()
-                .filter(|row| !should.contains(*row) && !model.rejections.contains_key(*row))
+                .filter(|row| {
+                    !should.contains(*row)
+                        && !model.rejections.contains_key(*row)
+                        && !covered.contains(*row)
+                })
                 .map(|row| {
                     let pointing = model
                         .rows
@@ -1054,9 +1132,61 @@ impl World {
         Some(serde_json::from_slice(bytes).expect("JSON"))
     }
 
-    /// What a relay does once a deploy fixed what refused them: every row
-    /// set aside goes again.
+    /// A replica's edit of its column of a two-way row, uploaded and filed:
+    /// of one it was sent — which the server may have deleted since — or,
+    /// now and then, of one it never was. The title it uploads is never the
+    /// server's, which takes only the replica's column of a row it has.
+    async fn upload_edit(&mut self, walk: &mut Walk) {
+        let held: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT replica_id, row_key FROM sync.held WHERE relation = 't_tallies' ORDER BY 1, 2",
+        )
+        .fetch_all(&mut *self.conn)
+        .await
+        .expect("held");
+        let picked = (!held.is_empty()).then(|| held[walk.below(held.len())].clone());
+        let (replica, key) = match picked {
+            Some(held) if walk.below(4) > 0 => held,
+            _ => match walk.pick(&self.replicas.keys().copied().collect::<Vec<_>>()) {
+                Some(replica) => (replica, walk.uuid().to_string()),
+                None => return,
+            },
+        };
+        let tally = Tally {
+            id: key.parse().expect("a uuid"),
+            partition_id: self.partitions[0],
+            kind_id: None,
+            name: UPLOADED.to_owned(),
+            seen: i32::try_from(walk.below(1000)).expect("small"),
+        };
+        let row = crate::wire::json_encode("t_tallies", &Table::of::<Tally>().columns, &tally)
+            .expect("a tally");
+        let up = crate::envelope::Up {
+            tables: vec![crate::envelope::Table {
+                table: "t_tallies".to_owned(),
+                upserts: vec![row],
+                keys: vec![crate::envelope::Key { parts: vec![key] }],
+                deletes: Vec::new(),
+            }],
+            protocol: crate::envelope::PROTOCOL,
+            ..crate::envelope::Up::default()
+        };
+        let mut tx = self.conn.begin().await.expect("a transaction");
+        match crate::filing::file(&mut tx, &self.codecs, &up, replica, &(), i64::MAX).await {
+            Ok(_) => tx.commit().await.expect("filed"),
+            // It waited on the long writer's lock: it comes again.
+            Err(e) if e.is_transient() => return,
+            Err(e) => panic!("an upload: {e}"),
+        }
+        self.history
+            .push("a replica's edit of a tally uploaded".to_owned());
+    }
+
+    /// What a relay does once a deploy fixed what refused them: every note
+    /// parked planned again, every row set aside sent again.
     async fn retry_quarantine(&mut self) {
+        crate::relay::unpark(&mut self.conn)
+            .await
+            .expect("unparked");
         crate::relay::retry_quarantine(&mut self.conn)
             .await
             .expect("noted again");
@@ -1122,7 +1252,7 @@ impl Oracle {
         let cannot = |(table, _): &Row, row: &serde_json::Value| {
             POISONED.iter().any(|(t, column)| {
                 t == table && row.get(*column).and_then(|v| v.as_str()) == Some(POISON)
-            }) || row.to_string().len() > OVERSIZE
+            }) || row.to_string().len() > LIMITS.largest_row()
         };
         let mut dead: BTreeSet<Row> = rows
             .iter()
@@ -1236,6 +1366,19 @@ impl Oracle {
 /// A pass sends each replica only rows it should hold, or held already —
 /// a change not planned yet may still point at it there — and takes back
 /// only rows it should not hold: what `tx` — the pass, recorded and not
+/// A message in an outbox, as it is kept: its parts, and its body.
+#[derive(sqlx::FromRow)]
+struct Outboxed {
+    replica_id: Uuid,
+    sequence: i64,
+    nonce: i64,
+    head: Vec<u8>,
+    body: Option<i64>,
+    bytes: Option<Vec<u8>>,
+    tail: Vec<u8>,
+    snapshot: bool,
+}
+
 /// committed — wrote to the outboxes past the message `drawn`, against what
 /// should be held as the pass read the rows, and `held`, what the replicas
 /// held before it.
@@ -1246,12 +1389,14 @@ async fn assert_minimal(
     history: &[String],
 ) {
     use prost::Message as _;
-    let written: Vec<(Uuid, Vec<u8>)> =
-        sqlx::query_as("SELECT replica_id, message FROM sync.outbox WHERE sequence > $1")
-            .bind(drawn)
-            .fetch_all(&mut *tx)
-            .await
-            .expect("written");
+    let written: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT o.replica_id, o.head || coalesce(b.bytes, '') || o.tail FROM sync.outbox o \
+           LEFT JOIN sync.bodies b ON b.id = o.body WHERE o.sequence > $1",
+    )
+    .bind(drawn)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("written");
     if written.is_empty() {
         return;
     }
@@ -1320,7 +1465,16 @@ async fn wrote(
     query: sqlx::query::Query<'_, crate::Db, sqlx::postgres::PgArguments>,
 ) -> bool {
     let mut tx = conn.begin().await.expect("a transaction");
-    match query.execute(&mut *tx).await {
+    // A deferred foreign key is checked at the end of the step, which a
+    // long writer's commit would otherwise do for every step it took.
+    let done = match query.execute(&mut *tx).await {
+        Ok(done) => sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await
+            .map(|_| done),
+        failed => failed,
+    };
+    match done {
         Ok(done) => {
             tx.commit().await.expect("committed");
             done.rows_affected() > 0
@@ -1423,7 +1577,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(103);
+    let choice = walk.below(105);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1450,7 +1604,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
     );
     let small = i32::try_from(walk.below(4)).expect("small");
     let other = partitions[walk.below(partitions.len())];
-    let big = "o".repeat(OVERSIZE + 1);
+    let big = "o".repeat(LIMITS.largest_row() + 1);
     let done = match choice {
         0 => write!(conn, "INSERT INTO fixture.t_kinds (id, partition_id, name, family_id) VALUES ($1, $2, 'k', $3)", new, partition, family),
         1 => write!(conn, "INSERT INTO fixture.t_products (id, partition_id, kind_id, name) VALUES ($1, $2, $3, 'p')", new, partition, kind),
@@ -1482,7 +1636,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         28 => write!(conn, "UPDATE fixture.t_orders SET replica_id = $2 WHERE id = $1", order, replica),
         29 => write!(conn, &format!("UPDATE fixture.t_orders SET {RETIRE} WHERE id = $1"), order),
         30 => write!(conn, "DELETE FROM fixture.t_orders WHERE id = $1", order),
-        31 => write!(conn, "UPDATE fixture.t_orders SET name = name || '.', customer_id = coalesce($2, customer_id) WHERE id = $1", order, customer),
+        31 => write!(conn, "UPDATE fixture.t_orders SET name = name || '.', customer_id = coalesce($2, customer_id), referrer_id = $3 WHERE id = $1", order, customer, other_customer),
         32 => write!(conn, "INSERT INTO fixture.t_sizes (code, partition_id, name) VALUES ($1, $2, 's')", i32::try_from(number).expect("a code"), partition),
         33 => write!(conn, "UPDATE fixture.t_sizes SET name = name || '.' WHERE code = $1 AND name <> $2", size, POISON),
         34 => write!(conn, &format!("UPDATE fixture.t_sizes SET {RETIRE} WHERE code = $1"), size),
@@ -1579,6 +1733,11 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         // Rows no message can carry.
         100 => write!(conn, "UPDATE fixture.t_products SET name = $2 WHERE id = $1", product, &big),
         101 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, &big),
+        // A parent deleted before what points at it points elsewhere.
+        102 => write!(conn, "SELECT fixture.replace_family($1, $2) WHERE $1 IS NOT NULL", family, walk.pick(&families)),
+        // Planning a row's changes fails, until a deploy: the relay parks
+        // them.
+        103 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -1591,7 +1750,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
 #[sqlx::test(migrations = false)]
 async fn every_replica_holds_exactly_what_its_strategies_say(pool: crate::DbPool) {
     let mut world = world(pool).await;
-    for (n, seed) in SEEDS.iter().enumerate() {
+    for (n, seed) in seeds(SEEDS.len()).iter().enumerate() {
         // Every other walk plans in batches that split what was written
         // together.
         world.batch = [100, 3, 1][n % 3];
@@ -1610,20 +1769,42 @@ async fn every_replica_holds_exactly_what_its_strategies_say(pool: crate::DbPool
 #[sqlx::test(migrations = false)]
 async fn whatever_fails_on_the_way_every_replica_ends_holding_what_it_should(pool: crate::DbPool) {
     let mut world = world(pool).await;
-    for (n, seed) in SEEDS[..3].iter().enumerate() {
-        world.batch = [100, 5, 2][n];
+    for (n, seed) in seeds(3).iter().enumerate() {
+        world.batch = [100, 5, 2][n % 3];
         let faults = Faults {
             fail: 20,
             refuse_one_in: 4,
         };
         walk_from(&mut world, *seed, Some(faults)).await;
-        let (failed, refused) = *world.wire.failed.lock().unwrap();
-        assert!(
-            failed > 0 && refused > 0 && world.lost > 0,
-            "seed {seed:#x}: the storm was none: {failed} failed, {refused} refused, {} lost",
-            world.lost
-        );
     }
+    let (failed, refused) = *world.wire.failed.lock().unwrap();
+    assert!(
+        failed > 0 && refused > 0 && world.lost > 0,
+        "the storms were none: {failed} failed, {refused} refused, {} lost",
+        world.lost
+    );
+}
+
+/// The seeds a walk takes: `count` of [`SEEDS`], or what
+/// `MAGIC_SYNC_WALK_SEEDS` says — seeds, comma-separated, or `random` for
+/// `count` drawn now, which the nightly run takes. A walk that fails names
+/// its seed, which it then takes again.
+fn seeds(count: usize) -> Vec<u64> {
+    let seeds: Vec<u64> = match std::env::var("MAGIC_SYNC_WALK_SEEDS") {
+        Err(_) => SEEDS[..count].to_vec(),
+        Ok(said) if said == "random" => (0..count).map(|_| rand::random()).collect(),
+        Ok(said) => said
+            .split(',')
+            .map(|seed| {
+                let seed = seed.trim();
+                seed.strip_prefix("0x")
+                    .map_or_else(|| seed.parse(), |hex| u64::from_str_radix(hex, 16))
+                    .expect("MAGIC_SYNC_WALK_SEEDS: seeds, or `random`")
+            })
+            .collect(),
+    };
+    eprintln!("walk seeds: {seeds:#x?}");
+    seeds
 }
 
 /// Seeds the walk replays; a failure names the one it came from.
@@ -1690,12 +1871,32 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
                 world.history.push(what.to_string());
             }
             Step::Skipped => {}
+            Step::Park(at) => {
+                let parked = sqlx::query(
+                    "UPDATE sync.notes SET parked_at = now() \
+                      WHERE kind = 'row' AND done_at IS NULL AND parked_at IS NULL \
+                        AND (relation, row_key) = (SELECT relation, row_key FROM sync.notes \
+                                                    WHERE kind = 'row' AND done_at IS NULL \
+                                                      AND parked_at IS NULL \
+                                                    ORDER BY id OFFSET $1 LIMIT 1)",
+                )
+                .bind(at)
+                .execute(&mut *world.conn)
+                .await
+                .expect("parked");
+                if parked.rows_affected() > 0 {
+                    world.history.push("a row's changes parked".to_owned());
+                }
+            }
             Step::Cured => {
                 world.commit_writer().await;
                 cure(&mut world.conn).await;
                 world.history.push("the fix".to_owned());
                 world.retry_quarantine().await;
             }
+        }
+        if walk.below(12) == 0 {
+            world.upload_edit(&mut walk).await;
         }
         if let Some((_, passes)) = &mut world.writer {
             *passes = passes.saturating_sub(1);
@@ -1730,6 +1931,11 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
                 world.settle().await;
                 world.retry_quarantine().await;
             }
+            // What is parked is not sent until a deploy: the replicas hold
+            // what they should once it is planned.
+            crate::relay::unpark(&mut world.conn)
+                .await
+                .expect("unparked");
             world.settle().await;
             world.assert_holdings(seed, n).await;
         }
@@ -3039,7 +3245,8 @@ async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
 }
 
 /// A pass loads and encodes as many rows at once as fit a byte budget, so
-/// what it holds stays bounded however large the rows: never none.
+/// what it holds stays bounded however large the rows: never none. A row is
+/// as large as it is, however small the database stores it.
 #[sqlx::test(migrations = false)]
 async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) {
     let mut world = world(pool).await;
@@ -3047,10 +3254,10 @@ async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) 
     let mut keys = Vec::new();
     for _ in 0..3 {
         let id = Uuid::now_v7();
-        // Random, so it does not compress: a megabyte stored.
+        // A megabyte the database stores in a few kilobytes.
         sqlx::query(
             "INSERT INTO fixture.t_products (id, partition_id, name) \
-             SELECT $1, $2, string_agg(md5(random()::text), '') FROM generate_series(1, 32768)",
+             VALUES ($1, $2, repeat('o', 1 << 20))",
         )
         .bind(id)
         .bind(world.partitions[0])
@@ -3077,15 +3284,27 @@ async fn a_replicas_inbox_is_bounded_by_its_bytes(pool: crate::DbPool) {
     let mut world = world(pool).await;
     let replica = live_in(&mut world.conn, world.partitions[0]).await[0];
     sqlx::query(
-        "INSERT INTO sync.inbox (replica_id, upload, reason) \
-         VALUES ($1, convert_to(repeat('x', 64 << 20), 'UTF8'), 'a bug')",
+        "INSERT INTO sync.inbox (replica_id, relation, row_key, upload, reason) \
+         VALUES ($1, 'large', '1', convert_to(repeat('x', 64 << 20), 'UTF8'), 'a bug')",
     )
     .bind(replica)
     .execute(&mut *world.conn)
     .await
     .expect("a large part kept");
     let mut tx = world.conn.begin().await.expect("a transaction");
-    let kept = crate::filing::keep_whole(&mut tx, replica, b"more", "a bug", i64::MAX).await;
+    let more = crate::envelope::Up {
+        tables: vec![crate::envelope::Table {
+            table: "more".to_owned(),
+            upserts: vec![b"more".to_vec()],
+            keys: vec![crate::envelope::Key {
+                parts: vec!["1".to_owned()],
+            }],
+            deletes: Vec::new(),
+        }],
+        ..crate::envelope::Up::default()
+    };
+    let kept =
+        crate::filing::keep_whole(&mut tx, &codecs(), replica, &more, "a bug", i64::MAX).await;
     assert!(matches!(&kept, Err(e) if e.is_transient()), "{kept:?}");
 }
 
@@ -3125,4 +3344,132 @@ async fn a_codec_that_writes_rows_otherwise_declares_otherwise(pool: crate::DbPo
         .expect("an engine")
         .declared();
     assert_ne!(before, after);
+}
+
+/// A replica holds a row in the version a parked change left it at, and
+/// that version points at a row since gone from the server: what that
+/// version points at stays with it, whether the change that let go of it
+/// is pending, parked or planned long ago.
+#[sqlx::test(migrations = false)]
+async fn what_a_version_held_for_a_parked_change_points_at_stays(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[0];
+    let (family, kind, product) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for (sql, id, parent) in [
+        ("INSERT INTO fixture.t_families (id, partition_id, name) VALUES ($1, $2, 'f')", family, None),
+        ("INSERT INTO fixture.t_kinds (id, partition_id, name, family_id) VALUES ($1, $2, 'k', $3)", kind, Some(family)),
+        ("INSERT INTO fixture.t_products (id, partition_id, name, kind_id) VALUES ($1, $2, 'p', $3)", product, Some(kind)),
+    ] {
+        sqlx::query(sql)
+            .bind(id)
+            .bind(partition)
+            .bind(parent)
+            .execute(&mut *world.conn)
+            .await
+            .expect("a row");
+    }
+    world.settle().await;
+    // The product no longer points at its kind; planning that is parked,
+    // and its replicas hold it as it was.
+    for sql in [
+        "UPDATE fixture.t_products SET kind_id = NULL WHERE id = $1",
+        "UPDATE sync.notes SET parked_at = now() WHERE relation = 't_products' AND done_at IS NULL \
+           AND $1 IS NOT NULL",
+        "DELETE FROM fixture.t_kinds WHERE id = $1",
+    ] {
+        let id = if sql.contains("t_kinds") { kind } else { product };
+        sqlx::query(sql)
+            .bind(id)
+            .execute(&mut *world.conn)
+            .await
+            .expect(sql);
+    }
+    world.settle().await;
+    sqlx::query("DELETE FROM fixture.t_families WHERE id = $1")
+        .bind(family)
+        .execute(&mut *world.conn)
+        .await
+        .expect("the family gone");
+    world.settle().await;
+
+    // The parked change planned at last: everything goes.
+    crate::relay::unpark(&mut world.conn)
+        .await
+        .expect("unparked");
+    world.settle().await;
+    for (replica, model) in &world.replicas {
+        assert!(
+            !model
+                .rows
+                .keys()
+                .any(|(t, _)| t == "t_kinds" || t == "t_families"),
+            "{replica} still holds {:?}",
+            model.rows.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A replica holds a customer only because the version it holds of its
+/// order, changed since by a change still parked, points there: a new
+/// email of that customer is not the replica's to hold, and is not sent.
+#[sqlx::test(migrations = false)]
+async fn a_parent_held_for_an_older_version_brings_no_new_follower(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[0];
+    let replica: Uuid = sqlx::query_scalar(
+        "SELECT id FROM fixture.t_replicas WHERE partition_id = $1 AND live ORDER BY id LIMIT 1",
+    )
+    .bind(partition)
+    .fetch_one(&mut *world.conn)
+    .await
+    .expect("a replica");
+    let (customer, other, order) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for id in [customer, other] {
+        sqlx::query(
+            "INSERT INTO fixture.t_customers (id, partition_id, name) VALUES ($1, $2, 'c')",
+        )
+        .bind(id)
+        .bind(partition)
+        .execute(&mut *world.conn)
+        .await
+        .expect("a customer");
+    }
+    sqlx::query(
+        "INSERT INTO fixture.t_orders (id, partition_id, replica_id, customer_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(order)
+    .bind(partition)
+    .bind(replica)
+    .bind(customer)
+    .execute(&mut *world.conn)
+    .await
+    .expect("an order");
+    world.settle().await;
+    for sql in [
+        "UPDATE fixture.t_orders SET customer_id = $2 WHERE id = $1",
+        "UPDATE sync.notes SET parked_at = now() WHERE relation = 't_orders' AND done_at IS NULL \
+           AND $1 = $1 AND $2 = $2",
+        "INSERT INTO fixture.t_emails (id, partition_id, customer_id, address) \
+         VALUES (gen_random_uuid(), (SELECT partition_id FROM fixture.t_orders WHERE id = $1), $2, 'e')",
+    ] {
+        let parent = if sql.contains("t_emails") {
+            customer
+        } else {
+            other
+        };
+        sqlx::query(sql)
+            .bind(order)
+            .bind(parent)
+            .execute(&mut *world.conn)
+            .await
+            .expect(sql);
+    }
+    // Every pass holds what it sends to what the replica should hold.
+    world.settle().await;
+    let emails = world.replicas[&replica]
+        .rows
+        .keys()
+        .filter(|(t, _)| t == "t_emails")
+        .count();
+    assert_eq!(emails, 0);
 }

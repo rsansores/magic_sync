@@ -204,11 +204,15 @@ notes it read, the planner works out how that set moved, around what changed
    older than a change of the batch, or refused — is sent; the rows in
    question it does not keep are taken back.
 
-A row a replica holds that a change not yet planned pointed at before stays
-too — beyond the batch, or parked, that change's older version is what the
-replica holds, and it still points there. Rows that cannot go (section 4.3)
-are never kept, nor any row that points at one; a plan that would send such
-a row runs again with it among them.
+What a row a replica holds points at is what the version it holds points
+at: the row as it is, unless it changed since — then what the first change
+after that version recorded it pointed at before, whether that change waits
+beyond the batch, is parked, or was planned while the replica kept the older
+version for something that still needed it. That version's parents stay as
+long as it does. Rows that cannot go (section 4.3) are never kept, nor any
+row that points at one; a plan that would send such a row runs again with it
+among them, and a row set aside for pointing at one is tried again once that
+row changes.
 
 The plan is worked out in the database, in temporary tables of the relay's
 connection, set by set, and read a page at a time by what records it: a
@@ -300,7 +304,12 @@ decides what a replica will hold before anything goes, and nothing goes that
 is not recorded: a relay that dies after the commit loses nothing — whoever
 runs the relay next sends the outbox — and one that dies before it sent
 nothing. A message keeps its number, and its transport id, however often it
-goes.
+goes; a database restored from an older copy numbers its next messages again,
+and each of those has an id of its own (`{epoch}-{sequence}-{nonce}`). What a
+message carries is stored once, in `sync.bodies`, however many replicas'
+messages carry it — the rows of a change every replica gets are one body —
+under each replica's own head and tail: a protobuf message is its fields one
+after the other, so the bytes the transport is given are the message's own.
 
 The record transaction runs on the connection that holds the relay's lock. If
 that connection is lost, PostgreSQL releases the lock and rolls back the
@@ -373,7 +382,11 @@ what the server knows about it**, never what the rows claim:
 
 - a record is kept from its first delivery, or the newest report wins when it
   has a `VERSION`;
-- a two-way table takes only the columns the replica owns;
+- a two-way table takes only the columns the replica owns, and only of a row
+  the server has and records the replica holding: an edit of a row it is
+  taking back, or of one it forgot the replica holds while it provisions it
+  again, waits; one of a row the replica was never sent is refused — a
+  replica never creates a two-way row;
 - a catalog is refused, because replicas do not write the server's tables;
 - a replica deletes only its own rows.
 
@@ -415,8 +428,8 @@ fixed:
 | The transport, for one replica — unreachable, refusing a message for good, or not answering within `send_timeout` | that replica waits out a backoff (`sync.replicas`, the refusal in `last_error`); its outbox keeps the message and every one after it, in order; every other replica carries on. An outbox past its bound, or a message refused for good three times in a row, is dropped and the replica provisioned again, with an alarm | sent when its backoff ends |
 | A row larger than any message may be | left out at loading and **quarantined**, as one that does not encode | as above, once a fix makes it smaller or the limit larger |
 | A replica, taking a row or letting one go | rows refused together are tried one by one, so only the refused row is left out; the replica notes it in the same transaction (`sync_rejections`), with the message that refused it, and reports it in an `Up` before it says it applied that message; the server records the row *refused* — still held for what takes rows back, so a delete still goes, not for progress or digests — and quarantines it. A rejection of a message other than the last that carried the row is ignored | a fix deployed on either side lets the retry through |
-| The server, filing an uploaded row or delete | the row, or the delete, is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed | filed again when the relay starts and on a timer, a page at a time beside the passes |
-| The server, filing an upload as a whole | the upload is kept whole in `sync.inbox` and answered, so the replica does not send it again for nothing | as above |
+| The server, filing an uploaded row or delete | the row, or the delete, is kept **as it came**, bytes and all, in `sync.inbox` (the replica may have let go of it since); the rest of the upload is filed. The inbox keeps one part per row, the newest the replica sent: a later upload of the row takes its place, or drops it once filed, so what is filed again never rolls a row back | filed again when the relay starts and on a timer, a page at a time beside the passes |
+| The server, filing an upload as a whole | every row and delete of it is kept in `sync.inbox`, and it is answered, so the replica does not send it again for nothing | as above |
 | The server, with a replica's part of the inbox full (`Settings::inbox`) | that replica's uploads that would add to it fail as transient: they wait on the replica, unanswered, with an alarm | filed again, a page at a time beside the passes, once a fix files what is kept; what a sender the host no longer knows uploaded waits `prune_after`, then is dropped with an alarm |
 | The transport, losing the last messages it was sent | a replica that leaves them unconfirmed while nothing is sent to it and nothing confirmed by it is provisioned again after `unconfirmed_after`, then after twice as long while it stays silent | by itself |
 | Anything nobody foresaw | see below | |

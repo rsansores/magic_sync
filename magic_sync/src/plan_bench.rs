@@ -213,6 +213,51 @@ async fn bench_10k_products_imported_for_100_units(pool: crate::DbPool) {
     assert_eq!(drained.upserts, 1_000_000);
 }
 
+/// A kind 10k products pointed at, through 20k changes of theirs not yet
+/// pruned: what a replica holds at a version older than the row is read off
+/// that history, and the kind's own change asks it.
+#[sqlx::test(migrations = false)]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
+async fn bench_a_kind_changed_under_a_long_history_of_pointers(pool: crate::DbPool) {
+    let (mut conn, engine, partition, _) = fleet(&pool, 10).await;
+    let kind = Uuid::now_v7();
+    exec(
+        &mut conn,
+        "INSERT INTO fixture.t_kinds (id, partition_id, name) VALUES ($1, $2, 'k')",
+        &[kind, partition],
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO fixture.t_products (id, partition_id, kind_id, name)
+         SELECT uuidv7(), $1, $2, 'p' || n FROM generate_series(1, 10000) n",
+    )
+    .bind(partition)
+    .bind(kind)
+    .execute(&mut *conn)
+    .await
+    .expect("an import");
+    drain(&pool, &engine).await;
+    for _ in 0..2 {
+        exec(
+            &mut conn,
+            "UPDATE fixture.t_products SET name = name || '.' WHERE kind_id = $1",
+            &[kind],
+        )
+        .await;
+        drain(&pool, &engine).await;
+    }
+
+    exec(
+        &mut conn,
+        "UPDATE fixture.t_kinds SET name = 'k2' WHERE id = $1",
+        &[kind],
+    )
+    .await;
+    let drained = drain(&pool, &engine).await;
+    println!("a kind changed under 20k changes that pointed at it: {drained}");
+    assert_eq!(drained.upserts, 10);
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_a_replica_provisioned_with_30k_rows(pool: crate::DbPool) {

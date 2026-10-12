@@ -110,7 +110,9 @@ CREATE TABLE sync.held (
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
-CREATE INDEX held_row ON sync.held (relation, row_key);
+-- Who holds a row, and — the prune's question of a note — whether anyone
+-- holds it at a version older than the note: the first entry answers.
+CREATE INDEX held_row ON sync.held (relation, row_key, noted);
 -- What a replica has on its way: the rows past the last message it
 -- confirmed, however many it holds.
 CREATE INDEX held_sent ON sync.held (replica_id, sequence);
@@ -166,6 +168,18 @@ CREATE TABLE sync.epoch (
 );
 INSERT INTO sync.epoch DEFAULT VALUES;
 
+-- What messages carry, each stored once however many replicas it goes to:
+-- the rows a broadcast sends every replica are one body, under each
+-- replica's own envelope.
+CREATE TABLE sync.bodies (
+    id    BIGSERIAL PRIMARY KEY,
+    bytes BYTEA     NOT NULL
+);
+
+COMMENT ON TABLE sync.bodies IS
+    'The tables a message carries, as protobuf, shared by every outbox message that carries '
+    'them: gone with the last of those.';
+
 -- The messages each replica is owed, written in the transaction that
 -- records what they carry, and sent after it commits, in order: a message
 -- leaves once the transport took it. A replica the transport cannot reach
@@ -173,16 +187,33 @@ INSERT INTO sync.epoch DEFAULT VALUES;
 CREATE TABLE sync.outbox (
     replica_id UUID        NOT NULL,
     sequence   BIGINT      NOT NULL,
-    message    BYTEA       NOT NULL,
+    nonce      BIGINT      NOT NULL,
+    head       BYTEA       NOT NULL,
+    body       BIGINT      REFERENCES sync.bodies (id),
+    tail       BYTEA       NOT NULL,
     snapshot   BOOLEAN     NOT NULL,
     written_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (replica_id, sequence)
 );
 
+-- What still carries a body, when a message that did leaves.
+CREATE INDEX outbox_body ON sync.outbox (body);
+
 COMMENT ON TABLE sync.outbox IS
-    'Messages written for a replica and not yet taken by the transport, as the bytes it '
-    'carries. Sent in sequence order once the pass that wrote them commits, by whichever '
-    'process runs the relay: a crash or a lost lock loses none of them.';
+    'Messages written for a replica and not yet taken by the transport. Sent in sequence order '
+    'once the pass that wrote them commits, by whichever process runs the relay: a crash or a '
+    'lost lock loses none of them.';
+COMMENT ON COLUMN sync.outbox.head IS
+    'The bytes the transport is given are head, then the body''s, then tail: a message is a '
+    'protobuf ToReplica, and the tables of its body are fields of it like the others, so the '
+    'replica''s own fields — the message''s place in its chain, the seal — go around a body '
+    'shared with others.';
+COMMENT ON COLUMN sync.outbox.body IS
+    'What it carries, in sync.bodies. NULL: nothing but its head and tail.';
+COMMENT ON COLUMN sync.outbox.nonce IS
+    'The message''s nonce: with the epoch and the sequence, the id the transport is given, '
+    'the same every time it goes, and another for a message numbered again by a database '
+    'restored from an older copy.';
 COMMENT ON COLUMN sync.outbox.snapshot IS
     'Part of a snapshot: what the replica should hold, whole. A snapshot written for a replica '
     'replaces its outbox, so these lead it; what follows them counts against its bound.';
@@ -233,7 +264,10 @@ CREATE TABLE sync.replicas (
     heals            INTEGER     NOT NULL DEFAULT 0,
     backlog          JSONB,
     backlog_at       TIMESTAMPTZ,
-    drifted_at       TIMESTAMPTZ
+    drifted_at       TIMESTAMPTZ,
+    asked_at         TIMESTAMPTZ,
+    compared_at      TIMESTAMPTZ,
+    asks             INTEGER     NOT NULL DEFAULT 0
 );
 
 COMMENT ON TABLE sync.replicas IS
@@ -255,6 +289,13 @@ COMMENT ON COLUMN sync.replicas.last_error IS
 COMMENT ON COLUMN sync.replicas.refusals IS
     'Times in a row the transport refused its next message for good: past a few it is '
     'provisioned again, and that is an alarm.';
+COMMENT ON COLUMN sync.replicas.asked_at IS
+    'When it was last provisioned again for what it says of itself — it missed a message, or '
+    'holds less than recorded — which no seal proves: asks counts those since it was last quiet '
+    'a while, and each waits twice as long as the one before, up to 32 times the first.';
+COMMENT ON COLUMN sync.replicas.compared_at IS
+    'When its digests were last compared with what the server records: not again for ten '
+    'minutes, however often it sends them.';
 COMMENT ON COLUMN sync.replicas.drifted_at IS
     'When its digests last differed from what the server records and it was provisioned '
     'again for it. Digests that differ again within a day are a bug no provisioning cures: '
@@ -292,12 +333,15 @@ COMMENT ON COLUMN sync.quarantine.carried IS
     'applied it, the row leaves the quarantine. NULL: not carried since.';
 
 -- What replicas uploaded that the server could not file, kept as it came: the
--- replica may have let go of it since. Filed again on a timer and when the
--- relay starts, and gone once filed.
+-- replica may have let go of it since. One part per row, the newest the
+-- replica sent: an upload of the row takes its place, or drops it once filed,
+-- so what is filed again never rolls the row back. Filed again on a timer and
+-- when the relay starts, and gone once filed.
 CREATE TABLE sync.inbox (
     id         BIGSERIAL   PRIMARY KEY,
     replica_id UUID        NOT NULL,
-    relation   TEXT,
+    relation   TEXT        NOT NULL,
+    row_key    TEXT        NOT NULL,
     upload     BYTEA       NOT NULL,
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -305,19 +349,21 @@ CREATE TABLE sync.inbox (
     attempts   INTEGER     NOT NULL DEFAULT 1
 );
 
-CREATE INDEX inbox_replica ON sync.inbox (replica_id);
--- The same part of an upload kept twice — the replica sent it again — is one.
-CREATE UNIQUE INDEX inbox_once ON sync.inbox (replica_id, md5(upload));
+CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, relation, row_key);
 
 COMMENT ON TABLE sync.inbox IS
     'What replicas uploaded that the server could not file for a reason a retry cannot '
     'change: a table it does not mirror, a row that does not decode, a row or a delete its '
-    'database refuses — or a whole upload, when filing it failed as a whole. Never repaired '
-    'by hand: a deploy that fixes the cause lets the next retry file it.';
+    'database refuses, an edit of a two-way row it does not record the replica holding — or '
+    'every row of an upload whose filing failed as a whole. Never repaired by hand: a deploy '
+    'that fixes the cause lets the next retry file it.';
 COMMENT ON COLUMN sync.inbox.relation IS
-    'The table, for one row or one delete. NULL: a whole upload.';
+    'The table of the row, or of the delete.';
+COMMENT ON COLUMN sync.inbox.row_key IS
+    'Its key, as the table''s codec writes it, or as it came for a table the server does not '
+    'mirror: the replica''s newest upload of the row is the one kept.';
 COMMENT ON COLUMN sync.inbox.upload IS
-    'An Up, as protobuf: the upload as it came, or one table''s row or delete of it.';
+    'An Up, as protobuf: one table''s row or delete, as the upload carried it.';
 
 -- A truncate would take rows away without a note, and every replica would
 -- keep them.

@@ -7,6 +7,7 @@ use crate::conformance::{codecs, settled, Uplinked};
 use crate::envelope::{self, Body, Down, Key as WireKey, Table};
 use crate::testkit::ItemRow;
 use prost::Message as _;
+use tokio::time::Instant;
 
 const TABLES: &str = "
 CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT);
@@ -57,7 +58,7 @@ fn rows(sequence: u64, previous: u64, name: &str) -> Vec<u8> {
         } else {
             crate::conformance::nonce_of(previous)
         },
-        mac: Vec::new(),
+        mac: crate::conformance::SEAL.to_vec(),
     })
     .encoded()
 }
@@ -384,6 +385,76 @@ async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
         (first.sequence, first.digests.len()),
         (1, 0),
         "confirmed at once, without them"
+    );
+}
+
+/// What a replica wrote of a table that no longer goes up — its triggers
+/// dropped, as `check` requires — never will: its notes are dropped when
+/// the replica starts, rather than counted in the backlog for ever.
+#[sqlx::test(migrations = false)]
+async fn notes_of_a_table_that_no_longer_goes_up_are_dropped(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    sqlx::query(
+        "INSERT INTO sync_notes (relation, row_key) VALUES ('retired_table', 'a'), ('events', 'b'); \
+         INSERT INTO sync_leaving (relation, row_key) VALUES ('retired_table', 'a')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    Replica::new(
+        pool.clone(),
+        codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        settings(),
+    )
+    .await
+    .unwrap();
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT relation FROM sync_notes UNION ALL SELECT relation FROM sync_leaving",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, ["events"]);
+}
+
+/// When digests are due is the database's, not the process's: a replica
+/// that restarts more often than `digests_first` still sends them, once
+/// they are due since it first started.
+#[sqlx::test(migrations = false)]
+async fn digests_are_due_across_restarts(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let settings = || Settings {
+        digests_first: Duration::from_millis(400),
+        digests_every: Duration::from_secs(3600),
+        ..settings()
+    };
+    let digested = || {
+        uplink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, up)| !up.digests.is_empty())
+            .count()
+    };
+    let me = Uuid::now_v7();
+    for run in 0..3 {
+        let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings())
+            .await
+            .unwrap();
+        if run == 0 {
+            replica.receive(&rows(1, 0, "one")).await.unwrap();
+        }
+        let started = Instant::now();
+        until(&replica, || started.elapsed() > Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        digested(),
+        1,
+        "due once since it first started, then not for an hour"
     );
 }
 

@@ -39,10 +39,83 @@ impl Body {
         }
         .encode_to_vec()
     }
+
+    /// The bytes [`Body::encoded`] writes, in three — a head, a body other
+    /// replicas' messages may share, and a tail — as the outbox keeps them:
+    /// a protobuf message is its fields one after the other, and the tables
+    /// a `Down` carries are fields between its snapshot's id and its place in
+    /// its replica's chain. Any other message is all head.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn parts(self) -> Parts {
+        use prost::Message as _;
+        let Body::Down(down) = self else {
+            return Parts {
+                head: self.encoded(),
+                body: Vec::new(),
+                tail: Vec::new(),
+            };
+        };
+        let Down {
+            snapshot_id,
+            tables,
+            sequence,
+            epoch,
+            previous,
+            nonce,
+            previous_nonce,
+            mac,
+        } = down;
+        let snapshot = Down {
+            snapshot_id,
+            ..Down::default()
+        }
+        .encode_to_vec();
+        let body = Down {
+            tables,
+            ..Down::default()
+        }
+        .encode_to_vec();
+        let tail = Down {
+            sequence,
+            epoch,
+            previous,
+            nonce,
+            previous_nonce,
+            mac,
+            ..Down::default()
+        }
+        .encode_to_vec();
+        let mut head = ToReplica {
+            protocol: PROTOCOL,
+            body: None,
+        }
+        .encode_to_vec();
+        prost::encoding::encode_key(DOWN, prost::encoding::WireType::LengthDelimited, &mut head);
+        prost::encoding::encode_varint(
+            (snapshot.len() + body.len() + tail.len()) as u64,
+            &mut head,
+        );
+        head.extend(snapshot);
+        Parts { head, body, tail }
+    }
+}
+
+/// The field of `ToReplica` that holds a `Down`.
+#[cfg(feature = "postgres")]
+const DOWN: u32 = 2;
+
+/// A message as the outbox keeps it ([`Body::parts`]): the transport is
+/// given `head`, then `body`, then `tail`.
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+pub(crate) struct Parts {
+    pub(crate) head: Vec<u8>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) tail: Vec<u8>,
 }
 
 /// The server's seal on its message `sequence` of `epoch`, nonce `nonce`, to
-/// `replica`: HMAC-SHA256 under the epoch's secret, cut to 16 bytes. A
+/// `replica`: HMAC-SHA256 under the epoch's secret, cut to [`SEAL`] bytes. A
 /// replica gives it back as it came when it says it applied the message, so
 /// the server knows it sent that message — this installation, before or
 /// after a restore of its database — and no one made it up.
@@ -55,13 +128,49 @@ pub(crate) fn seal(
     nonce: u64,
 ) -> Vec<u8> {
     use hmac::Mac as _;
+    sealer(secret, replica, epoch, sequence, nonce)
+        .finalize()
+        .into_bytes()[..SEAL]
+        .to_vec()
+}
+
+/// Whether `mac` is the server's seal on that message ([`seal`]), compared
+/// in a time that says nothing of where it differs.
+#[cfg(feature = "postgres")]
+pub(crate) fn sealed(
+    secret: &[u8],
+    replica: uuid::Uuid,
+    epoch: uuid::Uuid,
+    (sequence, nonce): (u64, u64),
+    mac: &[u8],
+) -> bool {
+    use hmac::Mac as _;
+    mac.len() == SEAL
+        && sealer(secret, replica, epoch, sequence, nonce)
+            .verify_truncated_left(mac)
+            .is_ok()
+}
+
+/// The bytes of a seal.
+#[cfg(feature = "postgres")]
+const SEAL: usize = 16;
+
+#[cfg(feature = "postgres")]
+fn sealer(
+    secret: &[u8],
+    replica: uuid::Uuid,
+    epoch: uuid::Uuid,
+    sequence: u64,
+    nonce: u64,
+) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac as _;
     let mut mac =
         hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
     mac.update(replica.as_bytes());
     mac.update(epoch.as_bytes());
     mac.update(&sequence.to_be_bytes());
     mac.update(&nonce.to_be_bytes());
-    mac.finalize().into_bytes()[..16].to_vec()
+    mac
 }
 
 #[cfg(all(test, feature = "postgres"))]
@@ -278,6 +387,49 @@ mod tests {
                     parts: vec![n.to_string()],
                 })
                 .collect(),
+        }
+    }
+
+    /// A message the outbox keeps in parts is, put back together, the very
+    /// bytes the message encodes to: whatever its rows, its snapshot, its
+    /// place in the chain — of any length, or none — and whichever kind.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_message_in_parts_is_the_message() {
+        let mut walk = crate::testkit::Walk(0x9A27);
+        let text = |walk: &mut crate::testkit::Walk| -> String {
+            "x".repeat([0, 1, 36, 200][walk.below(4)])
+        };
+        for _ in 0..500 {
+            let number =
+                |walk: &mut crate::testkit::Walk| [0, 1, 300, u64::MAX >> 1][walk.below(4)];
+            let tables = (0..walk.below(3))
+                .map(|_| rows("t", &[walk.below(300), walk.below(20_000)][..walk.below(3)]))
+                .collect();
+            let down = Down {
+                snapshot_id: text(&mut walk),
+                tables,
+                sequence: number(&mut walk),
+                epoch: text(&mut walk),
+                previous: number(&mut walk),
+                nonce: number(&mut walk),
+                previous_nonce: number(&mut walk),
+                mac: vec![7; [0, 16][walk.below(2)]],
+            };
+            let end = EndSnapshot {
+                snapshot_id: text(&mut walk),
+                tables: vec![text(&mut walk)],
+                sequence: number(&mut walk),
+                ..EndSnapshot::default()
+            };
+            for body in [Body::Down(down.clone()), Body::EndSnapshot(end)] {
+                let Parts {
+                    head,
+                    body: rows,
+                    tail,
+                } = body.clone().parts();
+                assert_eq!([head, rows, tail].concat(), body.encoded());
+            }
         }
     }
 

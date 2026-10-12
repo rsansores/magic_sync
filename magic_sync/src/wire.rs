@@ -245,23 +245,26 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.load(conn, keys)
     }
 
-    /// A replica writing what the server sent: every column the replica does
-    /// not own, whatever the version — and a row it had retired is offered
-    /// again. A record is refused. Answers the keys the replica now
-    /// holds, and the rows it could not take — that do not decode, or that the
-    /// database refuses for their data — by their place in `rows`, with why.
+    /// A replica writing what the server sent, each row beside the key it
+    /// came with (`None` when that key does not parse): every column the
+    /// replica does not own, whatever the version — and a row it had retired
+    /// is offered again. A record is refused. Answers the rows it could not
+    /// take — that do not decode, that came beside a key not their own, or
+    /// that the database refuses for their data — by their place in `rows`,
+    /// with why: the rest it now holds, under the keys they came beside.
     #[cfg(feature = "sqlite")]
     pub(crate) fn apply_down<'a>(
         &'a self,
         conn: &'a mut Conn,
-        rows: Vec<Vec<u8>>,
-    ) -> Fut<'a, Taken> {
+        rows: Vec<(Vec<u8>, Option<Key>)>,
+    ) -> Fut<'a, Vec<Refused>> {
         self.ops.apply_down(conn, rows)
     }
 
     /// The server writing what a replica sent: a record first-delivery-wins
     /// (or newest-wins when it carries a version), a two-way table only the
-    /// columns the replica owns; a catalog is refused. `sender` is the replica
+    /// columns the replica owns, of a row the server has and records `sender`
+    /// holding; a catalog is refused. `sender` is the replica
     /// the message came from; `known` is the server's knowledge of it. Answers
     /// the keys written, and the rows it could not take — that do not
     /// decode, or that the database refuses for their data — by their place in
@@ -277,17 +280,44 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.apply_up(conn, rows, sender, known)
     }
 
-    /// A replica letting rows go: deleted, or retired where a row of its own
-    /// still points at them, or refused one by one ([`row::retire_by_keys`]);
-    /// the rows of `held` retired, none deleted.
+    /// A replica letting rows go together: deleted, or retired where a row
+    /// that stays for the replica still points at them — of its own, or one
+    /// of `server`'s tables (each with its retired column) it retired — or
+    /// refused one by one ([`row::retire_by_keys`]); the rows of `held`
+    /// retired, none deleted.
     #[cfg(feature = "sqlite")]
     pub(crate) fn retire<'a>(
         &'a self,
         conn: &'a mut Conn,
         keys: &'a [Key],
         held: &'a [Key],
+        server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired> {
-        self.ops.retire(conn, keys, held)
+        self.ops.retire(conn, keys, held, server)
+    }
+
+    /// The keys of `keys` this replica holds, retired or not.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        self.ops.present(conn, keys)
+    }
+
+    /// The rows of this table rows point at, by what they point at them with
+    /// ([`row::pointed`]).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>> {
+        self.ops.pointed(conn)
+    }
+
+    /// The keys of `pointed` whose values rows still point at, and this table
+    /// no longer holds ([`row::broken`]).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn broken<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        pointed: &'a [row::Pointed],
+    ) -> Fut<'a, Vec<Key>> {
+        self.ops.broken(conn, pointed)
     }
 
     /// The keys of `keys` whose row points at one this replica does not hold
@@ -371,8 +401,8 @@ impl<P: Sync + 'static> Codec<P> {
 /// Things by their place in a message's rows.
 type Placed<T> = Vec<(usize, T)>;
 
-/// What [`Codec::apply_down`] or [`Codec::apply_up`] did with a message's
-/// rows.
+/// What [`Codec::apply_up`] did with a message's rows.
+#[cfg(feature = "postgres")]
 #[derive(Debug, Default)]
 pub(crate) struct Taken {
     /// The keys of the rows this side now holds.
@@ -386,9 +416,6 @@ pub(crate) struct Taken {
 pub(crate) struct Refused {
     /// Its place in the message's rows.
     pub(crate) at: usize,
-    /// Its key, read off the row: `None` when the row does not decode.
-    #[cfg(feature = "sqlite")]
-    pub(crate) key: Option<Key>,
     /// Why.
     pub(crate) reason: String,
 }
@@ -404,7 +431,11 @@ pub(crate) struct Encoded {
 trait Ops<P>: Send + Sync {
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded>;
     #[cfg(feature = "sqlite")]
-    fn apply_down<'a>(&'a self, conn: &'a mut Conn, rows: Vec<Vec<u8>>) -> Fut<'a, Taken>;
+    fn apply_down<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        rows: Vec<(Vec<u8>, Option<Key>)>,
+    ) -> Fut<'a, Vec<Refused>>;
     #[cfg(feature = "postgres")]
     fn apply_up<'a>(
         &'a self,
@@ -419,11 +450,18 @@ trait Ops<P>: Send + Sync {
         conn: &'a mut Conn,
         keys: &'a [Key],
         held: &'a [Key],
+        server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired>;
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
     fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
+    #[cfg(feature = "sqlite")]
+    fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
+    #[cfg(feature = "sqlite")]
+    fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>>;
+    #[cfg(feature = "sqlite")]
+    fn broken<'a>(&'a self, conn: &'a mut Conn, pointed: &'a [row::Pointed]) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
     fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
@@ -436,9 +474,10 @@ enum How {
     /// A replica taking the server's: every column but its own, newest wins.
     #[cfg(feature = "sqlite")]
     AllButOwned,
-    /// The server taking a two-way table's: only the columns the replica owns.
+    /// The server taking a two-way table's: only the columns the replica
+    /// owns, of a row the replica named is recorded holding.
     #[cfg(feature = "postgres")]
-    OnlyOwned,
+    OnlyOwned(Uuid),
     /// The server taking state a replica reports: newest wins.
     #[cfg(feature = "postgres")]
     Newest,
@@ -549,8 +588,6 @@ where
                 Err(e) => {
                     failed.push(Refused {
                         at,
-                        #[cfg(feature = "sqlite")]
-                        key: None,
                         reason: e.to_string(),
                     });
                 }
@@ -564,7 +601,7 @@ where
             #[cfg(feature = "sqlite")]
             How::AllButOwned => row::overwrite_except(conn, rows, &self.owned).await,
             #[cfg(feature = "postgres")]
-            How::OnlyOwned => row::update_only(conn, rows, &self.owned).await,
+            How::OnlyOwned(sender) => row::update_held(conn, rows, &self.owned, sender).await,
             #[cfg(feature = "postgres")]
             How::Newest => row::upsert(conn, rows).await,
             #[cfg(feature = "postgres")]
@@ -598,14 +635,10 @@ where
         let mut written = Vec::new();
         let mut refused = Vec::new();
         for (at, one) in rows {
-            #[cfg(feature = "sqlite")]
-            let key = one.key();
             match self.attempt(conn, vec![one], how).await? {
                 Ok(keys) => written.extend(keys),
                 Err(e) => refused.push(Refused {
                     at,
-                    #[cfg(feature = "sqlite")]
-                    key: Some(key),
                     reason: e.to_string(),
                 }),
             }
@@ -627,6 +660,59 @@ where
     }
 }
 
+/// What becomes of the edits of a two-way table's rows `sender` uploaded
+/// that the server did not write. One of a row `sender` was sent waits in
+/// the inbox, answered by its place in the upload: the server forgot what
+/// it holds until its provisioning is recorded, or deleted the row and is
+/// taking it back — the delete wins, and the edit leaves the inbox once
+/// `sender` let go of the row. One of a row never sent it breaks the
+/// protocol, and is left out.
+#[cfg(feature = "postgres")]
+async fn unheld<R: Row>(
+    conn: &mut Conn,
+    unwritten: Vec<(usize, Key)>,
+    sender: Uuid,
+) -> Result<Vec<Refused>, Error> {
+    if unwritten.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<Key> = unwritten.iter().map(|(_, key)| key.clone()).collect();
+    let there: std::collections::HashSet<Key> = row::get_by_keys::<R>(conn, &keys)
+        .await?
+        .iter()
+        .map(Row::key)
+        .collect();
+    let texts: Vec<String> = keys.iter().map(row::key_text).collect();
+    let sent: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT row_key FROM sync.held WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3) \
+         UNION SELECT row_key FROM sync.gone WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+    )
+    .bind(sender)
+    .bind(R::TABLE)
+    .bind(&texts)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .collect();
+    let mut kept = Vec::new();
+    for (at, key) in unwritten {
+        let text = row::key_text(&key);
+        let reason = match (there.contains(&key), sent.contains(&text)) {
+            (true, _) => "an edit of a row the server does not record the replica holding",
+            (false, true) => "an edit of a row the server deleted, and is taking back",
+            (false, false) => {
+                tracing::error!(%sender, table = R::TABLE, key = text, "upload: an edit of a two-way row never sent it — malformed, left out");
+                continue;
+            }
+        };
+        kept.push(Refused {
+            at,
+            reason: reason.to_owned(),
+        });
+    }
+    Ok(kept)
+}
+
 impl<R, P: Sync> Ops<P> for Typed<R, P>
 where
     R: Row + Clone + Send + Sync,
@@ -646,7 +732,11 @@ where
     }
 
     #[cfg(feature = "sqlite")]
-    fn apply_down<'a>(&'a self, conn: &'a mut Conn, rows: Vec<Vec<u8>>) -> Fut<'a, Taken> {
+    fn apply_down<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        rows: Vec<(Vec<u8>, Option<Key>)>,
+    ) -> Fut<'a, Vec<Refused>> {
         Box::pin(async move {
             if !matches!(R::MIRROR, Mirror::Catalog | Mirror::Both) {
                 return Err(Error::Misuse(format!(
@@ -654,18 +744,37 @@ where
                     R::TABLE
                 )));
             }
-            let (rows, mut rejected) = self.decode(rows);
-            let offered: Vec<(usize, Key)> =
-                rows.iter().map(|(at, row)| (*at, row.key())).collect();
-            let (_, refused) = self.guarded(conn, rows, How::AllButOwned).await?;
-            let held: Vec<Key> = offered
-                .into_iter()
-                .filter(|(at, _)| !refused.iter().any(|r| r.at == *at))
-                .map(|(_, key)| key)
-                .collect();
+            let (bytes, beside): (Vec<Vec<u8>>, Vec<Option<Key>>) = rows.into_iter().unzip();
+            let (decoded, mut refused) = self.decode(bytes);
+            let mut pending = Vec::new();
+            for (at, row) in decoded {
+                if beside[at].as_ref() == Some(&row.key()) {
+                    pending.push((at, row));
+                } else {
+                    refused.push(Refused {
+                        at,
+                        reason: "a row beside a key that is not its own".to_owned(),
+                    });
+                }
+            }
+            // A row refused may be taken once the rest are: one that points
+            // at a row after it, or takes a value one of them gives up.
+            let mut held = Vec::new();
+            loop {
+                let tried: Placed<R> = pending.clone();
+                let (_, again) = self.guarded(conn, pending, How::AllButOwned).await?;
+                let failed: std::collections::HashSet<usize> = again.iter().map(|r| r.at).collect();
+                let (left, took): (Placed<R>, Placed<R>) =
+                    tried.into_iter().partition(|(at, _)| failed.contains(at));
+                held.extend(took.iter().map(|(_, row)| row.key()));
+                if took.is_empty() || left.is_empty() {
+                    refused.extend(again);
+                    break;
+                }
+                pending = left;
+            }
             row::unretire_by_keys::<R>(conn, &held).await?;
-            rejected.extend(refused);
-            Ok(Taken { held, rejected })
+            Ok(refused)
         })
     }
 
@@ -679,7 +788,7 @@ where
     ) -> Fut<'a, Taken> {
         Box::pin(async move {
             let how = match R::MIRROR {
-                Mirror::Both => How::OnlyOwned,
+                Mirror::Both => How::OnlyOwned(sender),
                 Mirror::Record if R::VERSION.is_some() => How::Newest,
                 Mirror::Record => How::First,
                 _ => {
@@ -710,8 +819,19 @@ where
                     own
                 });
             }
+            let offered: Vec<(usize, Key)> =
+                rows.iter().map(|(at, row)| (*at, row.key())).collect();
             let (written, refused) = self.guarded(conn, rows, how).await?;
             rejected.extend(refused);
+            if let How::OnlyOwned(_) = how {
+                let unwritten: Vec<(usize, Key)> = offered
+                    .into_iter()
+                    .filter(|(at, key)| {
+                        !written.contains(key) && !rejected.iter().any(|r| r.at == *at)
+                    })
+                    .collect();
+                rejected.extend(unheld::<R>(conn, unwritten, sender).await?);
+            }
             Ok(Taken {
                 held: written,
                 rejected,
@@ -725,8 +845,9 @@ where
         conn: &'a mut Conn,
         keys: &'a [Key],
         held: &'a [Key],
+        server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired> {
-        Box::pin(row::retire_by_keys::<R>(conn, keys, held))
+        Box::pin(row::retire_by_keys::<R>(conn, keys, held, server))
     }
 
     #[cfg(feature = "postgres")]
@@ -747,5 +868,20 @@ where
     #[cfg(feature = "sqlite")]
     fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
         Box::pin(row::unparented::<R>(conn, keys))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::key_select::<R>(conn, keys))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>> {
+        Box::pin(row::pointed::<R>(conn))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn broken<'a>(&'a self, conn: &'a mut Conn, pointed: &'a [row::Pointed]) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::broken::<R>(conn, pointed))
     }
 }

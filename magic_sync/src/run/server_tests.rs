@@ -8,6 +8,7 @@ use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, Readi
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use crate::wire::MapError;
 use prost::Message as _;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 const SCHEMA: &str = "
@@ -30,17 +31,21 @@ const REPLICAS: Replicas = Replicas {
     partition: Some("partition_id"),
 };
 
-/// What every replica was sent, in order.
+/// What every replica was sent, in order: each message once, by its id, as a
+/// transport that deduplicates delivers it — a relay stopped between a send
+/// and the trim of its outbox sends that message again.
 #[derive(Clone, Default)]
-struct Wire(Arc<Mutex<Vec<(Uuid, Body)>>>);
+struct Wire(Arc<Mutex<Vec<(Uuid, Body)>>>, Arc<Mutex<BTreeSet<String>>>);
 
 impl Transport for Wire {
-    async fn send(&self, replica: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
+    async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
         let message = ToReplica::decode(message.as_slice()).expect("a message");
-        self.0
-            .lock()
-            .unwrap()
-            .push((replica, message.body.expect("a body")));
+        if self.1.lock().unwrap().insert(id.to_owned()) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((replica, message.body.expect("a body")));
+        }
         Ok(())
     }
 }
@@ -516,11 +521,19 @@ fn reading(replica: Uuid, value: &str) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// An upload of `rows` of `table`, readings each, with their keys.
 fn upload(number: u64, table: &str, rows: Vec<Vec<u8>>) -> Vec<u8> {
+    let keys = rows
+        .iter()
+        .map(|row| envelope::Key {
+            parts: vec![ReadingRow::decode(row.as_slice()).expect("a reading").id],
+        })
+        .collect();
     envelope::Up {
         tables: vec![WireTable {
             table: table.to_owned(),
             upserts: rows,
+            keys,
             ..WireTable::default()
         }],
         uploads: vec![number],
@@ -582,7 +595,7 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     assert_eq!(
         count(
             &pool,
-            "SELECT count(*) FROM sync.inbox WHERE relation IS NULL"
+            "SELECT count(*) FROM sync.inbox WHERE relation = 'readings'"
         )
         .await,
         2
@@ -931,7 +944,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         assert_eq!(
             count(
                 &pool,
-                "SELECT count(*) FROM sync.inbox WHERE relation IS NULL"
+                "SELECT count(*) FROM sync.inbox WHERE reason LIKE 'filing its upload failed%'"
             )
             .await,
             0,

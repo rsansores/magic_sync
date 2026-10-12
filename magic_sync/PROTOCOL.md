@@ -125,6 +125,27 @@ carries nothing a replica can act on: it **must** apply none of it, **should** l
 **must** acknowledge it, so it does not hold back the queue. The digests
 (section 8) find whatever it carried, if it mattered.
 
+What a server sends, field by field — anything else is a number no server
+sends, and the corpus of malformed messages (`tests/golden/malformed.txt`)
+has a case of each:
+
+| Field | What a server sends | Cases |
+|---|---|---|
+| `protocol` | 1 to the replica's own | `no_protocol` |
+| `sequence` | 1 to 2^63 − 1 | `sequence_zero`, `sequence_too_large` |
+| `nonce` | 1 to 2^63 − 1 | `no_nonce`, `nonce_too_large` |
+| `previous` | below `sequence` | `follows_itself`, `follows_a_later_one` |
+| `previous_nonce` | 0 with `previous` 0, and otherwise 1 to 2^63 − 1 | `follows_without_its_nonce`, `follows_nothing_with_a_nonce`, `follows_a_nonce_too_large` |
+| `epoch` | a UUID | `epoch_no_uuid` |
+| `snapshot_id` | a UUID; empty on a message of no snapshot | `snapshot_no_uuid`, `ends_a_snapshot_of_no_id` |
+| `mac` | 16 bytes | `no_mac`, `mac_too_short`, `mac_too_long` |
+| `keys` | one per upsert | `keys_not_one_per_row` |
+
+A row's own fields are the row's to answer for, not the message's: a key
+that does not parse, a row that does not decode, a table the replica does
+not hold — the row is rejected, or its delete ignored (4.1), and the rest
+applied (`a_delete_of_a_key_that_does_not_parse`, `a_row_beside_another_key`).
+
 What changes the protocol's number: a new kind of body, or a field whose
 meaning changes. What does not: a new field. A side **must** ignore fields it
 does not know, so a message with a field added means to a side that predates
@@ -146,6 +167,7 @@ message it applied, and checks, in order:
 
 - `sequence` 0 or above 2^63 − 1, an `epoch` that is not a UUID, a
   `previous` at or past `sequence`, a `nonce` 0 or above 2^63 − 1, a
+  `mac` of other than 16 bytes, a `previous_nonce` above 2^63 − 1, a
   `previous` of 0 with a `previous_nonce`, or another `previous` without
   one, or a `previous` of 0 on a message that begins no snapshot: no server
   numbers a message so; nor sends a table whose `keys` are not one per
@@ -187,9 +209,26 @@ catalog, or a table written on both sides. Rows of any other table — a
 record of the replica's own, a table it does not know — are rejected, and
 their deletes ignored.
 
-1. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
+1. **Deletes**, first: a value a row lets go of — a unique one — is then
+   free for an upsert of the same part to take. The keys in `deletes` are
+   let go of together:
+   - a row that a row staying for the replica points at — a row of its own,
+     through any foreign key: one that would refuse the delete, checked at
+     once or at commit, and one that would cascade or set the pointing
+     row's columns, which would change a row the server never sent; or a row
+     it retired — is retired instead (4.3), and so, in turn, are the rows a
+     row retired so points at among them. Where the table has nothing to
+     retire it by, the row is kept, and a rejection recorded (section 6);
+   - every other is deleted, together, so rows that point only at one
+     another — a tree, a row that points at itself — go whatever the order
+     of their keys. One the database refuses to let go — a trigger, or a
+     row of the server's that stays and points at it — is kept, and a
+     rejection recorded.
+2. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
    message; `keys[i]` is the key of `upserts[i]`, and there **must** be one
-   key per upsert. For each row:
+   key per upsert. A row whose own key is not the one beside it is no row
+   the server meant: the replica rejects it under the key beside it. For
+   each row:
    - insert it, or overwrite the stored row with the same key, **whatever
      its version**: the messages of an epoch are ordered by their chain
      (4.1), so the one applied last is the server's latest, even when its
@@ -198,13 +237,14 @@ their deletes ignored.
    - columns the replica owns in a table written by both sides are **not**
      overwritten;
    - a row the replica had retired (4.3) becomes live again.
-2. **Deletes.** For each key in `deletes`: delete the row. If a row of the
-   replica's own points at it — through any foreign key: one that would
-   refuse the delete, checked at once or at commit, and one that would
-   cascade or set the pointing row's columns, which would change a row the
-   server never sent — retire it instead (4.3);
-   where the table has nothing to retire it by, or the database refuses to
-   let it go, keep it and record a rejection (section 6).
+
+   A key both let go of and upserted in one part is held: its upsert comes
+   after. A key upserted twice in one part is the last row beside it. A row the database refuses is tried again once the rest of the
+   part are in, while that takes one more: it may point at a row after it,
+   or take a unique value a row after it gives up. Two rows that swap a
+   unique value cannot be taken one at a time — the database checks each
+   row as it is written — so both are rejected, and keep what they held,
+   until the server sends them otherwise.
 
 **A row the replica cannot take, or let go of, does not fail the message.**
 If a row does not decode, if the replica's database refuses it for its data
@@ -212,10 +252,13 @@ If a row does not decode, if the replica's database refuses it for its data
 the replica **must** leave that row as it was, apply everything else, and
 record a **rejection** (section 6) in the same transaction. Nothing a message
 carries fails it — not even a row whose refusal rolls the whole transaction
-back (a trigger's `RAISE(ROLLBACK)`), nor one a deferred foreign key would
-refuse at commit because the row it points at is not held: the replica
-applies the message again, row by row, with those rows rejected before they
-are tried. Only a failure of the
+back (a trigger's `RAISE(ROLLBACK)`), nor one a foreign key checked at commit
+refuses — because the row it points at is not held, or because rows point
+at a value of it the message changed or let go of: a constraint that fails
+the commit is the replica finding such a row, never a failure of its
+storage. The replica applies the message again, row by row, finds the rows
+at fault, and applies it once more with them rejected before they are
+tried. Only a failure of the
 replica's own storage (the database is unavailable, the disk is full, the
 file is damaged) fails the message: then the replica **must not**
 acknowledge it, and it will be delivered again.
@@ -321,7 +364,8 @@ recorded sending the replica:
   the sequence of the last it sent it, or of the last it heard applied,
   with another nonce: the server sealed it, and has no record of it. Its
   own database was restored from a copy older than what the replica
-  applied. It takes a new epoch, with a new secret, drops what it was about
+  applied. It raises an alarm — whoever runs it should know the database
+  went back — takes a new epoch, with a new secret, drops what it was about
   to send, and provisions every replica again;
 - a message older than the last it heard the replica applied: the replica
   was restored from an older copy, and holds less than the server records.
@@ -336,6 +380,14 @@ whenever that sequence grows. The server provisions it again, unless a
 snapshot that began after that message is on its way: a snapshot that began
 before it is one the replica lost the beginning of, or applied before it
 was restored from an older copy.
+A gap past every message the server sent the replica is none it could have
+missed: malformed, and left out.
+
+Neither a gap nor a message older than the last applied carries a seal the
+server can check, so what a replica says of itself provisions it again at
+most once a minute, and twice as long between each time while it keeps
+saying so, up to 32 minutes; one quiet for 64 minutes starts over. Until then
+the server leaves it as it is, and the replica's next `Up` says it again.
 
 ---
 
@@ -343,9 +395,10 @@ was restored from an older copy.
 
 A row the replica could not take, or could not let go of (4.1), is a
 **rejection**: the table, the key — **required**, in the form of section 3:
-read off the row, or from `keys[i]` if the row did not even decode — why,
+the one the row came beside, `keys[i]`, or its delete's — why,
 and the `(epoch, sequence)` of the message that carried the row, or its
-delete. A row whose key cannot be told is logged and not reported.
+delete — for a row the end of a snapshot could not let go of, the
+`EndSnapshot`'s. A row whose key cannot be told is logged and not reported.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.
@@ -359,8 +412,11 @@ delete. A row whose key cannot be told is logged and not reported.
   the server leaves out the rows recorded refused. It reports only the
   rejections of the epoch it follows; a snapshot of a new epoch clears the
   others — those of the tables it names as it ends, and those of a table it
-  does not hold from the server, which no snapshot names. Such a rejection of
-  the epoch it follows it **may** forget once reported.
+  does not hold from the server, which no snapshot names. A rejection of a
+  row it holds no copy of — of a table it does not hold from the server, or
+  a row it never took — leaves nothing out of a digest: it **may** forget
+  that one once reported, and the engine does, so what it keeps of
+  rejections is bounded by what it holds.
 - It keeps what the server said within bounds: a reason **may** be cut (to
   512 bytes), and rows of a table it does not know, named or keyed longer
   than that, are logged rather than kept — no server sends such a table. So
@@ -426,10 +482,18 @@ For a table the replica writes and the server mirrors:
 The server files an upload under **the replica it came from** (the transport
 says which), whatever the rows themselves claim: a row of a table keyed by
 its replica that names another replica there is malformed, and left out. A
+row of a table written on both sides is an edit of the columns the replica
+owns, filed only as an update of a row the server has and records the
+replica holding: one of a row it is taking back, or of one it does not
+record the replica holding while it provisions it again, is kept and filed
+later; one of a row it never sent the replica is malformed, and left out. A
 row the server cannot file, or a delete its database refuses, is kept on the
 server, not lost, and filed later; so are an upload's rows whose filing fails
 as a whole for a reason a resend cannot cure. Either still counts as filed
-for `Filed`. What the upload says of the replica — rejections, the last
+for `Filed`. The server keeps, of each row, the newest upload of it: a later
+upload of the row replaces what it kept, or drops it once filed, so what is
+filed later never rolls the row back. So it keeps a row only with its key in
+`keys`: one without is malformed, and left out. What the upload says of the replica — rejections, the last
 applied message, a gap, digests, the backlog — is filed apart from its rows,
 so neither holds back the other. Deletes of a table not keyed by the replica,
 and keys that are not the table's, are malformed and left out. An upload
@@ -494,8 +558,9 @@ within a day of the provisioning they caused are a bug no provisioning cures:
 the server logs them and does not act on them. A digest of a table the server
 does not send the replica — a later build's, or one it no longer sends — is
 skipped. Two digests of one table are malformed: none of that `Up`'s digests
-is compared. A replica that skips digests loses only
-this safety net.
+is compared. The server compares a replica's digests at most once every ten
+minutes: those that come sooner are not compared. A replica that skips
+digests loses only this safety net.
 
 ---
 
@@ -606,6 +671,8 @@ A replica implementation is complete when:
 - [ ] it overwrites a row with what the server sends, whatever its version;
 - [ ] it never overwrites the columns it owns;
 - [ ] it retires a row it cannot delete, and revives a retired row sent again;
+- [ ] it applies a table's deletes before its upserts, lets go of the deletes
+      together, and tries a refused upsert again once the rest are in (4.1);
 - [ ] it begins a snapshot with the message that follows nothing — an
       `EndSnapshot` included — and sweeps on its end, in reverse table order;
 - [ ] it leaves as it was and records, in the same transaction, a row it
