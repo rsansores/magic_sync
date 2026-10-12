@@ -668,6 +668,11 @@ says how to read it.
   of `to_replica.txt` before its upload is answered — its rows, its
   rejections and what it applied; its digests; the same with a seal the
   server never made — each with what the server makes of it.
+- `tests/golden/to_server_verdicts.txt`: uploads a replica sends after a
+  provisioning, a change and a take-back it applied — a refused delete
+  with what it applied, an edit of a two-way row, a delete of a row of its
+  own, a refused sweep, a gap, what it applied said again lower, of another
+  epoch, and past anything sent — each with what the server makes of it.
 
 A replica implementation is complete when:
 
