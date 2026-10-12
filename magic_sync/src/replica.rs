@@ -742,6 +742,11 @@ struct Place<'m> {
     ends: bool,
 }
 
+/// How long a server's seal is: the replica keeps it, and gives it back in
+/// every confirmation, so one of any other length is no server's.
+#[cfg(feature = "sqlite")]
+const SEALED: usize = 16;
+
 /// The last message this replica applied, and where it stands.
 #[cfg(feature = "sqlite")]
 #[derive(sqlx::FromRow)]
@@ -815,6 +820,12 @@ async fn chained(conn: &mut Conn, place: Place<'_>) -> Result<Result<i64, Receiv
         return Ok(Err(malformed(
             "a message that follows nothing and begins no snapshot".to_owned(),
         )));
+    }
+    if place.mac.len() != SEALED {
+        return Ok(Err(malformed(format!(
+            "message {sequence} sealed with {} bytes, not {SEALED}",
+            place.mac.len()
+        ))));
     }
     let last: Option<Last> = sqlx::query_as(
         "SELECT epoch, sequence, nonce, snapshot_id, gap FROM sync_applied WHERE id = 1",

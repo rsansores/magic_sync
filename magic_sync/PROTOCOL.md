@@ -125,6 +125,27 @@ carries nothing a replica can act on: it **must** apply none of it, **should** l
 **must** acknowledge it, so it does not hold back the queue. The digests
 (section 8) find whatever it carried, if it mattered.
 
+What a server sends, field by field — anything else is a number no server
+sends, and the corpus of malformed messages (`tests/golden/malformed.txt`)
+has a case of each:
+
+| Field | What a server sends | Cases |
+|---|---|---|
+| `protocol` | 1 to the replica's own | `no_protocol` |
+| `sequence` | 1 to 2^63 − 1 | `sequence_zero`, `sequence_too_large` |
+| `nonce` | 1 to 2^63 − 1 | `no_nonce`, `nonce_too_large` |
+| `previous` | below `sequence` | `follows_itself`, `follows_a_later_one` |
+| `previous_nonce` | 0 with `previous` 0, and otherwise 1 to 2^63 − 1 | `follows_without_its_nonce`, `follows_nothing_with_a_nonce`, `follows_a_nonce_too_large` |
+| `epoch` | a UUID | `epoch_no_uuid` |
+| `snapshot_id` | a UUID; empty on a message of no snapshot | `snapshot_no_uuid`, `ends_a_snapshot_of_no_id` |
+| `mac` | 16 bytes | `no_mac`, `mac_too_short`, `mac_too_long` |
+| `keys` | one per upsert | `keys_not_one_per_row` |
+
+A row's own fields are the row's to answer for, not the message's: a key
+that does not parse, a row that does not decode, a table the replica does
+not hold — the row is rejected, or its delete ignored (4.1), and the rest
+applied (`a_delete_of_a_key_that_does_not_parse`).
+
 What changes the protocol's number: a new kind of body, or a field whose
 meaning changes. What does not: a new field. A side **must** ignore fields it
 does not know, so a message with a field added means to a side that predates
@@ -146,6 +167,7 @@ message it applied, and checks, in order:
 
 - `sequence` 0 or above 2^63 − 1, an `epoch` that is not a UUID, a
   `previous` at or past `sequence`, a `nonce` 0 or above 2^63 − 1, a
+  `mac` of other than 16 bytes, a
   `previous` of 0 with a `previous_nonce`, or another `previous` without
   one, or a `previous` of 0 on a message that begins no snapshot: no server
   numbers a message so; nor sends a table whose `keys` are not one per

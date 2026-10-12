@@ -186,6 +186,7 @@ impl Model {
             || place.previous_nonce > MOST
             || (place.previous == 0) != (place.previous_nonce == 0)
             || (place.previous == 0 && place.snapshot_id.is_empty())
+            || place.mac.len() != 16
         {
             return Received::Malformed;
         }
@@ -547,6 +548,7 @@ mod tests {
             sequence: 100,
             epoch: EPOCH.to_owned(),
             nonce: nonce_of(100),
+            mac: crate::conformance::SEAL.to_vec(),
             ..EndSnapshot::default()
         })
         .encoded();

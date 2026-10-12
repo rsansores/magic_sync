@@ -132,7 +132,7 @@ impl Server {
             previous,
             nonce,
             previous_nonce,
-            mac: Vec::new(),
+            mac: crate::conformance::SEAL.to_vec(),
         })
         .encoded()
     }
@@ -264,7 +264,7 @@ impl Server {
             previous,
             nonce,
             previous_nonce,
-            mac: Vec::new(),
+            mac: crate::conformance::SEAL.to_vec(),
         })
         .encoded();
         self.queue.push_back(end);

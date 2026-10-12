@@ -57,7 +57,7 @@ fn rows(sequence: u64, previous: u64, name: &str) -> Vec<u8> {
         } else {
             crate::conformance::nonce_of(previous)
         },
-        mac: Vec::new(),
+        mac: crate::conformance::SEAL.to_vec(),
     })
     .encoded()
 }

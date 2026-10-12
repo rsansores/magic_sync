@@ -278,6 +278,10 @@ pub fn matches_golden(path: &str, text: &str) {
     );
 }
 
+/// The seal the messages built by hand carry: a server's is its own
+/// HMAC, which a replica cannot check, and gives back as it came.
+pub const SEAL: [u8; 16] = [0x5e; 16];
+
 /// The nonce the messages built by hand carry at `sequence`: a server draws
 /// its own at random.
 pub fn nonce_of(sequence: u64) -> u64 {
@@ -304,6 +308,7 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
         previous,
         nonce: nonce_of(sequence),
         previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+        mac: SEAL.to_vec(),
         ..Down::default()
     };
     let down = |sequence: u64, previous: u64, snapshot: &str, epoch: &str| {
@@ -318,6 +323,7 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
             previous,
             nonce: nonce_of(sequence),
             previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
+            mac: SEAL.to_vec(),
             ..EndSnapshot::default()
         })
     };
@@ -365,6 +371,19 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
         ),
         ("no_nonce", "malformed", with(|d| d.nonce = 0)),
         ("nonce_too_large", "malformed", with(|d| d.nonce = 1 << 63)),
+        (
+            "follows_a_nonce_too_large",
+            "malformed",
+            with(|d| d.previous_nonce = 1 << 63),
+        ),
+        ("no_mac", "malformed", with(|d| d.mac = Vec::new())),
+        ("mac_too_short", "malformed", with(|d| d.mac.truncate(15))),
+        ("mac_too_long", "malformed", with(|d| d.mac.push(0x5e))),
+        (
+            "snapshot_no_uuid",
+            "malformed",
+            one(down(101, 0, "snapshot", EPOCH)),
+        ),
         (
             "follows_without_its_nonce",
             "malformed",
@@ -449,7 +468,8 @@ fn the_malformed_corpus_is_the_one_checked_in() {
     let header = "# Messages no server sends, and between them the few that set the scene:\n\
                   # `case outcome hex` per message, in order. A replica provisioned by an\n\
                   # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, nonce\n\
-                  # 0x5eed000000000064, of nothing, makes of each what `outcome` says: `malformed`\n\
+                  # 0x5eed000000000064, sealed with sixteen bytes 0x5e, of nothing, makes of each\n\
+                  # what `outcome` says: `malformed`\n\
                   # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2).\n";
     let text: String = malformed()
         .iter()
@@ -799,6 +819,7 @@ mod server {
                         previous: sequence,
                         previous_nonce: nonce,
                         nonce: nonce_of(sequence + 1_000),
+                        mac: SEAL.to_vec(),
                         ..crate::envelope::Down::default()
                     })
                     .encoded()

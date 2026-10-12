@@ -446,6 +446,7 @@ async fn every_message_of_the_malformed_corpus_is_what_its_line_says(pool: Sqlit
         sequence: 100,
         epoch: SERVER.to_owned(),
         nonce: nonce_of(100),
+        mac: crate::conformance::SEAL.to_vec(),
         ..EndSnapshot::default()
     })
     .encoded();
@@ -477,6 +478,7 @@ async fn every_message_of_the_malformed_corpus_is_what_its_line_says(pool: Sqlit
         epoch: SERVER.to_owned(),
         nonce: nonce_of(last + 1),
         previous_nonce: nonce_of(last),
+        mac: crate::conformance::SEAL.to_vec(),
         ..Down::default()
     })
     .encoded();
@@ -737,6 +739,7 @@ async fn a_message_numbered_again_with_another_nonce_is_not_taken(pool: SqlitePo
         previous: BASE,
         nonce: 7,
         previous_nonce: nonce_of(BASE),
+        mac: crate::conformance::SEAL.to_vec(),
         ..Down::default()
     })
     .encoded();
@@ -750,6 +753,7 @@ async fn a_message_numbered_again_with_another_nonce_is_not_taken(pool: SqlitePo
         previous: BASE + 1,
         nonce: 8,
         previous_nonce: 7,
+        mac: crate::conformance::SEAL.to_vec(),
         ..Down::default()
     })
     .encoded();
