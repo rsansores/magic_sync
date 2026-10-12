@@ -2882,6 +2882,108 @@ async fn digests_leave_out_a_table_with_writes_not_filed(pool: SqlitePool) {
     assert_eq!(digested(&up), ["items", "shelves", "prices", "tasks"]);
 }
 
+/// Digests read before the host wrote a table go without that table's:
+/// the outbox that sends them, in the transaction it reads the notes in,
+/// leaves out every table with a note by then — the write may go in the
+/// same message, and the server would compare what it is about to change.
+#[sqlx::test(migrations = false)]
+async fn digests_leave_out_a_table_written_since_they_were_read(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{CARTS}"),
+        Settings::default(),
+        with_carts(),
+    )
+    .await;
+    let id = Uuid::now_v7();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("carts", vec![cart_of(w.me, id, 1)])],
+    ))
+    .await;
+    assert!(w.up(0, false).await.is_some());
+    let mut conn = w.pool.acquire().await.unwrap();
+    let read = held(&mut conn, &with_carts()).await.unwrap();
+    drop(conn);
+    w.exec(&format!("DELETE FROM carts WHERE id = x'{}'", id.simple()))
+        .await
+        .unwrap();
+    let mut tx = w.pool.begin().await.unwrap();
+    let lanes = Settings::default().lanes;
+    let up = outbox(
+        &mut tx,
+        &with_carts(),
+        &lanes,
+        0,
+        &Outbox::default(),
+        Some(read),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .up;
+    assert_eq!(up.tables[0].deletes.len(), 1);
+    assert!(!up.digests.is_empty());
+    assert!(
+        up.digests.iter().all(|d| d.table != "carts"),
+        "{:?}",
+        up.digests
+    );
+}
+
+/// The host deletes its rows while the replica sends its digests: whenever
+/// the delete lands — before they are read, while, or after — no message
+/// carries a table's digest beside a write of it.
+#[sqlx::test(migrations = false)]
+async fn a_delete_racing_the_digests_never_goes_beside_its_tables(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{CARTS}"),
+        Settings::default(),
+        with_carts(),
+    )
+    .await;
+    for n in 1..=100 {
+        let id = Uuid::now_v7();
+        w.receive(&down(
+            n,
+            "",
+            vec![upserts("carts", vec![cart_of(w.me, id, 1)])],
+        ))
+        .await;
+        while w.up(0, false).await.is_some() {}
+        let delete = format!("DELETE FROM carts WHERE id = x'{}'", id.simple());
+        // Later each round, across the whole of the send.
+        let late = async {
+            tokio::time::sleep(std::time::Duration::from_micros(20 * (n % 25))).await;
+            w.exec(&delete).await
+        };
+        let (sent, deleted) = tokio::join!(w.replica.send_lane(0, true), late);
+        sent.unwrap();
+        deleted.unwrap();
+        for (_, up) in w.uplink.taken() {
+            for table in &up.tables {
+                assert!(
+                    up.digests.iter().all(|d| d.table != table.table),
+                    "round {n}: `{}` digested beside a write of it",
+                    table.table
+                );
+            }
+        }
+        while let Some(up) = w.up(0, false).await {
+            w.receive(
+                &Body::Filed(Filed {
+                    uploads: up.uploads,
+                })
+                .encoded(),
+            )
+            .await;
+        }
+    }
+}
+
 /// A record is the replica's: the server sends none of it and lets go of
 /// none of it. History is written once; state is edited, and a changed key
 /// goes up as the old one gone.

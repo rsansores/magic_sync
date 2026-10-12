@@ -522,7 +522,9 @@ Test vectors: no keys → `0xcbf29ce484222325`; the single key `a` →
 A replica **must** leave out of its digests every table of which it wrote
 rows the server has not filed yet (section 7): what the server records of
 it is about to change, and a comparison now would find them apart for
-nothing.
+nothing. That holds from when it reads them to when it sends them: a table
+written in between — a write that may go up in the very message — goes
+without its digest too.
 
 ---
 

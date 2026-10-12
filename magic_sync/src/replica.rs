@@ -2147,7 +2147,8 @@ pub(crate) struct Window {
 /// wrote (as they are now), on every lane; on the first lane — the main one
 /// — also the rows it could not take, the last message it applied when the
 /// server has not heard of it, the backlog when it is due, and the
-/// `digests` of what it holds, when given ([`held`]). Run it in a transaction begun with
+/// `digests` of what it holds, when given ([`held`]) — but of a table
+/// written since they were read. Run it in a transaction begun with
 /// `BEGIN IMMEDIATE`, and commit before the message goes: it reads all of
 /// that as of one moment, and draws the upload's number. Hand the message
 /// to the transport, then to [`delivered`] — or, when the transport refuses
@@ -2279,7 +2280,16 @@ pub(crate) async fn outbox<P: Sync + 'static>(
             // the server has not heard of it.
             if all_reported {
                 let read = Some((a.epoch.clone(), a.sequence));
-                if let Some(held) = digests.filter(|held| held.applied == read) {
+                if let Some(mut held) = digests.filter(|held| held.applied == read) {
+                    // A table the host wrote since they were read goes
+                    // without one: the write may be in this very message.
+                    let noted: HashSet<String> =
+                        sqlx::query_scalar("SELECT DISTINCT relation FROM sync_notes")
+                            .fetch_all(&mut *conn)
+                            .await?
+                            .into_iter()
+                            .collect();
+                    held.digests.retain(|d| !noted.contains(&d.table));
                     let weight: usize = held.digests.iter().map(|d| framed(d.encoded_len())).sum();
                     if up.encoded_len() + reserved + weight <= limit {
                         up.digests = held.digests;
