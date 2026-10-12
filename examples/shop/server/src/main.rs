@@ -310,10 +310,7 @@ async fn listing(
             &mut conn,
             Scope::All,
             page.state,
-            magic_sync::status::Page {
-                offset: page.offset,
-                limit: 20,
-            },
+            magic_sync::status::Page::new(page.offset, 20),
         )
         .await?;
     Ok(Json(listing))

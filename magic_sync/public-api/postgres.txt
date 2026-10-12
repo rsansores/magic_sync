@@ -509,9 +509,11 @@ impl core::marker::Unpin for magic_sync::status::Overview
 impl core::marker::UnsafeUnpin for magic_sync::status::Overview
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::Overview
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::Overview
-pub struct magic_sync::status::Page
+#[non_exhaustive] pub struct magic_sync::status::Page
 pub magic_sync::status::Page::limit: u32
 pub magic_sync::status::Page::offset: u32
+impl magic_sync::status::Page
+pub const fn magic_sync::status::Page::new(u32, u32) -> Self
 impl core::clone::Clone for magic_sync::status::Page
 pub fn magic_sync::status::Page::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::status::Page

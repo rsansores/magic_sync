@@ -35,11 +35,20 @@ pub const CONTRACT: u32 = 1;
 /// Which of a listing's entries a read answers: up to `limit` of them, from
 /// `offset`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Page {
     /// Entries skipped.
     pub offset: u32,
     /// Entries answered, at most.
     pub limit: u32,
+}
+
+impl Page {
+    /// Up to `limit` entries, from `offset`.
+    #[must_use]
+    pub const fn new(offset: u32, limit: u32) -> Self {
+        Page { offset, limit }
+    }
 }
 
 /// Which replicas a read covers. Only live replicas are counted: a partition

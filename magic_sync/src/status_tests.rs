@@ -562,10 +562,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
             &mut conn,
             Scope::All,
             Some(ReplicaState::CatchingUp),
-            Page {
-                offset: 0,
-                limit: 10,
-            },
+            Page::new(0, 10),
         )
         .await
         .unwrap();

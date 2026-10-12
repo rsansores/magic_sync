@@ -1065,15 +1065,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
     let engine = server.engine();
     let scope = crate::status::Scope::All;
     spawnable(engine.overview(&mut conn, scope, 1));
-    spawnable(engine.listing(
-        &mut conn,
-        scope,
-        None,
-        crate::status::Page {
-            offset: 0,
-            limit: 1,
-        },
-    ));
+    spawnable(engine.listing(&mut conn, scope, None, crate::status::Page::new(0, 1)));
     spawnable(engine.health(&mut conn, scope, 1));
     spawnable(engine.progress(&mut conn, scope));
     spawnable(engine.row_progress(&mut conn, scope, "items", ""));
