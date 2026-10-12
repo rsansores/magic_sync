@@ -765,35 +765,13 @@ impl Engine {
             replicas.iter().map(|r| (*r, Vec::new())).collect();
         for &i in &self.order {
             let table = self.plans[i].table;
-            // A table that only travels with others is owed what the engine
-            // decided to send it: there is no rule to count it from.
-            let wanted = self.wanted_sql(i, "true");
-            let ruled = wanted.is_some();
-            let wanted = wanted.unwrap_or_else(|| {
-                "SELECT NULL::uuid AS replica_id, NULL::text AS key WHERE false".to_owned()
-            });
-            let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
-                "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
-                 h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
-                              {} AS outdated \
-                         FROM sync.held h CROSS JOIN sync.epoch e \
-                         LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
-                        WHERE h.relation = $1 AND h.replica_id = ANY($2) AND h.refused IS NULL) \
-                 SELECT coalesce(w.replica_id, h.replica_id), \
-                        count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
-                        count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed), \
-                        count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed AND h.outdated), \
-                        count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND NOT h.confirmed), \
-                        count(*) FILTER (WHERE $3 AND w.key IS NULL AND h.key IS NOT NULL) \
-                   FROM w FULL JOIN h ON w.replica_id = h.replica_id AND w.key = h.key \
-                  GROUP BY 1",
-                stale("p.noted")
-            ))
-            .bind(table)
-            .bind(&replicas)
-            .bind(ruled)
-            .fetch_all(&mut *tx)
-            .await?;
+            let (sql, ruled) = self.progress_sql(i);
+            let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+                .bind(table)
+                .bind(&replicas)
+                .bind(ruled)
+                .fetch_all(&mut *tx)
+                .await?;
             let mut counted: HashMap<Uuid, (i64, i64, i64, i64, i64)> = rows
                 .into_iter()
                 .map(|(r, should, holds, outdated, in_flight, to_remove)| {
@@ -826,6 +804,39 @@ impl Engine {
                 .map(|(replica, tables)| ReplicaProgress { replica, tables })
                 .collect(),
         })
+    }
+
+    /// How far the replicas `$2` are from holding what they should of the
+    /// table `i` (named `$1`; `$3`: whether it has a rule): per replica,
+    /// what it should hold, holds, holds outdated, has in flight and holds
+    /// to be removed — each read once, joined as sets, never asked row by
+    /// row. Whether the table has a rule.
+    pub(crate) fn progress_sql(&self, i: usize) -> (String, bool) {
+        // A table that only travels with others is owed what the engine
+        // decided to send it: there is no rule to count it from.
+        let wanted = self.wanted_sql(i, "true");
+        let ruled = wanted.is_some();
+        let wanted = wanted.unwrap_or_else(|| {
+            "SELECT NULL::uuid AS replica_id, NULL::text AS key WHERE false".to_owned()
+        });
+        let sql = format!(
+            "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
+             h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
+                          {} AS outdated \
+                     FROM sync.held h CROSS JOIN sync.epoch e \
+                     LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
+                    WHERE h.relation = $1 AND h.replica_id = ANY($2) AND h.refused IS NULL) \
+             SELECT coalesce(w.replica_id, h.replica_id), \
+                    count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
+                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed), \
+                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed AND h.outdated), \
+                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND NOT h.confirmed), \
+                    count(*) FILTER (WHERE $3 AND w.key IS NULL AND h.key IS NOT NULL) \
+               FROM w FULL JOIN h ON w.replica_id = h.replica_id AND w.key = h.key \
+              GROUP BY 1",
+            stale("p.noted")
+        );
+        (sql, ruled)
     }
 
     /// Where one row stands on every replica of `scope` that holds it,
@@ -1257,20 +1268,23 @@ impl Engine {
                 entry.pending += note.count;
             }
         }
-        // Only the replicas with a message unconfirmed have a row in flight:
-        // the others' held rows are not read.
+        // Only the replicas with a message unconfirmed have a row in flight,
+        // and only the rows past what each confirmed are read.
         let unconfirmed: Vec<Uuid> = fleet
             .replicas
             .iter()
             .filter(|r| r.unconfirmed)
             .map(|r| r.replica)
             .collect();
-        let counted: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&format!(
+        let counted: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
             "WITH c AS ( \
                  SELECT h.relation, h.replica_id, count(*) AS in_flight, 0 AS quarantined, 0 AS unfiled \
-                   FROM sync.held h CROSS JOIN sync.epoch e \
-                   LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id \
-                  WHERE h.replica_id = ANY($1) AND h.refused IS NULL AND NOT {CONFIRMED} \
+                   FROM sync.epoch e CROSS JOIN unnest($1::uuid[]) AS u(replica_id) \
+                   LEFT JOIN sync.replicas r ON r.replica_id = u.replica_id \
+                   JOIN sync.held h ON h.replica_id = u.replica_id \
+                                   AND h.sequence > CASE WHEN r.applied_epoch = e.epoch \
+                                                         THEN coalesce(r.applied_sequence, 0) ELSE 0 END \
+                  WHERE h.refused IS NULL \
                   GROUP BY 1, 2 \
                  UNION ALL \
                  SELECT relation, replica_id, 0, count(*), 0 FROM sync.quarantine \
@@ -1280,8 +1294,8 @@ impl Engine {
                   WHERE replica_id = ANY($2) AND relation IS NOT NULL GROUP BY 1, 2) \
              SELECT relation, sum(in_flight)::int8, sum(quarantined)::int8, sum(unfiled)::int8, \
                     count(DISTINCT replica_id) \
-               FROM c GROUP BY 1"
-        ))
+               FROM c GROUP BY 1",
+        )
         .bind(&unconfirmed)
         .bind(scoped.ids())
         .fetch_all(&mut *conn)

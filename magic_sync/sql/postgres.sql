@@ -111,6 +111,11 @@ CREATE TABLE sync.held (
 );
 
 CREATE INDEX held_row ON sync.held (relation, row_key);
+-- What a replica has on its way: the rows past the last message it
+-- confirmed, however many it holds.
+CREATE INDEX held_sent ON sync.held (replica_id, sequence);
+-- What it refused, read on every acknowledgement: few, among all it holds.
+CREATE INDEX held_refused ON sync.held (replica_id) WHERE refused IS NOT NULL;
 
 COMMENT ON TABLE sync.held IS
     'Every mirrored row each replica holds, as the engine sent it — recorded with the message '

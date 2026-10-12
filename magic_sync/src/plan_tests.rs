@@ -2904,3 +2904,43 @@ async fn a_replica_live_again_before_it_was_seen_gone_misses_nothing(pool: crate
     world.settle().await;
     world.assert_holdings(0, 0).await;
 }
+
+/// What progress reads of each table is joined as sets — what the rules
+/// send, what is held, what is pending — never asked row by row: a read
+/// whose cost grows with the rows held times anything is a read that does
+/// not finish over a large fleet.
+#[sqlx::test(migrations = false)]
+async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    sqlx::query("INSERT INTO fixture.t_products (id, partition_id, name) VALUES ($1, $2, 'p')")
+        .bind(Uuid::now_v7())
+        .bind(world.partitions[0])
+        .execute(&mut *world.conn)
+        .await
+        .expect("a product");
+    world.settle().await;
+    sqlx::query("UPDATE fixture.t_products SET name = 'q'")
+        .execute(&mut *world.conn)
+        .await
+        .expect("a change pending");
+    let replicas: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM fixture.t_replicas")
+        .fetch_all(&mut *world.conn)
+        .await
+        .expect("replicas");
+    for i in 0..world.engine.plans.len() {
+        let (sql, ruled) = world.engine.progress_sql(i);
+        let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {sql}"))
+            .bind(world.engine.table(i))
+            .bind(&replicas)
+            .bind(ruled)
+            .fetch_all(&mut *world.conn)
+            .await
+            .expect("a plan");
+        let plan = plan.join("\n");
+        assert!(
+            !plan.contains("SubPlan"),
+            "progress of {} asks row by row:\n{plan}",
+            world.engine.table(i)
+        );
+    }
+}
