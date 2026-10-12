@@ -450,30 +450,60 @@ async fn a_replica_refuses_a_setting_with_no_handler_and_a_handler_of_none(pool:
         .expect("a setting and its handler");
 }
 
+/// A handler that cannot carry anything out until it is told it can.
+#[derive(Clone, Default)]
+struct Until(Arc<std::sync::atomic::AtomicBool>);
+
+impl CarryOut<Screen> for Until {
+    async fn carry_out(&self, _: Wish<Screen>) -> Outcome {
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            Outcome::Applied
+        } else {
+            Outcome::Later("away".to_owned())
+        }
+    }
+}
+
 /// The handlers a replica runs with are offered wishes while it runs: one
-/// a message brings, and one the host offers again.
+/// a message brings, and one waiting, when the host offers it again.
 #[sqlx::test(migrations = false)]
 async fn a_running_replica_offers_the_wishes_a_message_brings(pool: SqlitePool) {
-    let hand = Hand::default();
-    let w = Arc::new(wish_world(pool, &hand).await);
+    let ready = Until::default();
+    let settings = Settings {
+        wishes: Wishes::new().on::<Screen>(ready.clone()),
+        ..Settings::default()
+    };
+    let w = Arc::new(
+        world_of(
+            pool,
+            &format!("{TABLES}{SCREENS}"),
+            settings,
+            golden_codecs(),
+        )
+        .await,
+    );
     w.set(40, 1).await;
     let stop = Arc::new(Notify::new());
     let running = {
         let (w, stop) = (w.clone(), stop.clone());
         tokio::spawn(async move { w.replica.run(stop.notified()).await })
     };
-    hand.answering(Outcome::Later("away".to_owned()));
     w.receive(&down(
         1,
         "",
         vec![wishes(vec![wished(&w.screen(70, 1), 5, false)])],
     ))
     .await;
-    let until = |level: i64| {
+    let until = |answer: &'static str| {
         let w = w.clone();
         async move {
-            for _ in 0..200 {
-                if w.setting().await == Some((level, 2)) {
+            for _ in 0..500 {
+                if w.answered()
+                    .await
+                    .and_then(|(_, outcome, _)| outcome)
+                    .as_deref()
+                    == Some(answer)
+                {
                     return true;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -481,15 +511,11 @@ async fn a_running_replica_offers_the_wishes_a_message_brings(pool: SqlitePool) 
             false
         }
     };
-    for _ in 0..200 {
-        if hand.seen().len() == 1 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(hand.seen().len(), 1, "offered once the message applied");
+    assert!(until("waiting").await, "offered once the message applied");
+    ready.0.store(true, std::sync::atomic::Ordering::Relaxed);
     w.replica.offer_wishes();
-    assert!(until(70).await, "offered again when the host asks");
+    assert!(until("applied").await, "offered again when the host asks");
+    assert_eq!(w.setting().await, Some((70, 2)));
     stop.notify_one();
     running.await.unwrap();
 }
