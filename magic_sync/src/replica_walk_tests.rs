@@ -65,6 +65,8 @@ const RULES: Rules = Rules {
         }
     },
     parents: |_, _| Vec::new(),
+    retires: |table| matches!(table, "items" | "tasks"),
+    ..Rules::ANY
 };
 
 /// The walk's server: what it holds, what it sent this replica, and the

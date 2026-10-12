@@ -279,17 +279,20 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.apply_up(conn, rows, sender, known)
     }
 
-    /// A replica letting rows go: deleted, or retired where a row of its own
-    /// still points at them, or refused one by one ([`row::retire_by_keys`]);
-    /// the rows of `held` retired, none deleted.
+    /// A replica letting rows go together: deleted, or retired where a row
+    /// that stays for the replica still points at them — of its own, or one
+    /// of `server`'s tables (each with its retired column) it retired — or
+    /// refused one by one ([`row::retire_by_keys`]); the rows of `held`
+    /// retired, none deleted.
     #[cfg(feature = "sqlite")]
     pub(crate) fn retire<'a>(
         &'a self,
         conn: &'a mut Conn,
         keys: &'a [Key],
         held: &'a [Key],
+        server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired> {
-        self.ops.retire(conn, keys, held)
+        self.ops.retire(conn, keys, held, server)
     }
 
     /// The keys of `keys` whose row points at one this replica does not hold
@@ -422,6 +425,7 @@ trait Ops<P>: Send + Sync {
         conn: &'a mut Conn,
         keys: &'a [Key],
         held: &'a [Key],
+        server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired>;
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
@@ -745,8 +749,9 @@ where
         conn: &'a mut Conn,
         keys: &'a [Key],
         held: &'a [Key],
+        server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired> {
-        Box::pin(row::retire_by_keys::<R>(conn, keys, held))
+        Box::pin(row::retire_by_keys::<R>(conn, keys, held, server))
     }
 
     #[cfg(feature = "postgres")]

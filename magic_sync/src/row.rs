@@ -404,7 +404,7 @@ where
         qb.push(format!(" RETURNING {}", listed(R::KEY)));
         let rows = qb.build().fetch_all(&mut *exec).await?;
         for row in &rows {
-            written.push(key_of_row(row, &kinds)?);
+            written.push(key_of_row(row, &kinds, 0)?);
         }
     }
     Ok(written)
@@ -419,16 +419,20 @@ fn key_kinds<R: Row>() -> Vec<Option<KeyKind>> {
         .collect()
 }
 
-/// A key read off a result row whose leading columns are the key's.
-fn key_of_row(row: &<Db as sqlx::Database>::Row, kinds: &[Option<KeyKind>]) -> Result<Key, Error> {
+/// A key read off a result row's columns from `first` on.
+fn key_of_row(
+    row: &<Db as sqlx::Database>::Row,
+    kinds: &[Option<KeyKind>],
+    first: usize,
+) -> Result<Key, Error> {
     use sqlx::Row as _;
     kinds
         .iter()
         .enumerate()
         .map(|(i, kind)| {
             Ok(match kind {
-                Some(KeyKind::Integer) => KeyPart::Int(row.try_get::<i64, _>(i)?),
-                _ => KeyPart::Uuid(row.try_get::<Uuid, _>(i)?),
+                Some(KeyKind::Integer) => KeyPart::Int(row.try_get::<i64, _>(first + i)?),
+                _ => KeyPart::Uuid(row.try_get::<Uuid, _>(first + i)?),
             })
         })
         .collect()
@@ -541,108 +545,209 @@ pub(crate) async fn delete_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Res
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Retired {
     pub(crate) deleted: u64,
-    /// Kept, because a row here still points at them, and retired.
+    /// Kept, because a row that stays points at them, and retired.
     pub(crate) kept: u64,
     /// Still held as they were: the database refused to let them go (a
-    /// trigger), or a row here points at them and the table has no retired
-    /// column. With why.
+    /// trigger, a row of the server's that stays and points at them), or a
+    /// row that stays points at them and the table has no retired column.
+    /// With why.
     pub(crate) refused: Vec<(Key, String)>,
 }
 
-/// Lets go of the rows of `keys` on a replica, one by one as far as the
-/// database is concerned: a row nothing here points at is deleted; one a row
-/// of the replica's own still points at — through any foreign key, checked
-/// now whether it is deferred or not, and whatever it does on delete: a
-/// cascade or a set-null would change the replica's own row — is kept with
-/// its retired column set; and one the database refuses to let go is
-/// answered apart, so it cannot fail the rest. The rows of `held` are kept
-/// retired whatever points at them, for what the replica wrote of them has
-/// not reached the server yet. A transient failure is the error.
+/// Lets go of the rows of `keys` on a replica, together. A row a row that
+/// stays for the replica points at — one of its own, through any foreign
+/// key, checked now whether it is deferred or not, and whatever it does on
+/// delete: a cascade or a set-null would change the replica's own row; or a
+/// row it retired, of `server`'s tables (each with its retired column) — is
+/// kept with its retired column set, and then so are the rows that one
+/// points at among them. The rest are deleted together, so rows that point
+/// only at one another go; one the database refuses to let go — a trigger,
+/// a row of the server's that stays and points at it — is answered apart,
+/// so it cannot fail the rest, once those it waited for have gone. The rows
+/// of `held` are kept retired whatever points at them, for what the replica
+/// wrote of them has not reached the server yet. A transient failure is the
+/// error.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn retire_by_keys<R: Row>(
     exec: &mut Conn,
     keys: &[Key],
     held: &[Key],
+    server: &[(&str, Option<&str>)],
 ) -> Result<Retired, Error> {
     let mut retired = Retired::default();
     if keys.is_empty() && held.is_empty() {
         return Ok(retired);
     }
-    let pointed: Vec<String> = crate::dialect::pointing(exec, R::TABLE, R::KEY)
-        .await?
-        .into_iter()
-        .map(|(child, from, to)| {
+    let mut pointers = Vec::new();
+    // The table's own keys into itself, whose rows let go of together keep
+    // one another only while one of them stays.
+    let mut inward = Vec::new();
+    for (child, from, to) in crate::dialect::pointing(exec, R::TABLE, R::KEY).await? {
+        let stays = match server.iter().find(|(t, _)| t.eq_ignore_ascii_case(&child)) {
+            None => String::new(),
+            Some((_, Some(column))) => format!(" AND c.{} IS NOT NULL", ident(column)),
+            Some((_, None)) => continue,
+        };
+        if child.eq_ignore_ascii_case(R::TABLE) {
+            inward.push((from, to));
+            continue;
+        }
+        let on: Vec<String> = from
+            .iter()
+            .zip(&to)
+            .map(|(f, t)| format!("c.{} = {}.{}", ident(f), R::QUALIFIED, ident(t)))
+            .collect();
+        pointers.push(format!(
+            "EXISTS (SELECT 1 FROM {} c WHERE {}{stays})",
+            ident(&child),
+            on.join(" AND ")
+        ));
+    }
+    keep::<R>(exec, held, true, &mut retired).await?;
+    let kinds = key_kinds::<R>();
+    let mut pinned: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    let mut pointed: Vec<(Key, bool, Key)> = Vec::new();
+    for chunk in keys.chunks(keys_per_statement::<R>()) {
+        if !pointers.is_empty() {
+            let mut qb =
+                sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(R::KEY), R::QUALIFIED));
+            key_filter::<R>(&mut qb, chunk);
+            qb.push(format!(" AND ({})", pointers.join(" OR ")));
+            for row in qb.build().fetch_all(&mut *exec).await? {
+                pinned.insert(key_of_row(&row, &kinds, 0)?);
+            }
+        }
+        for (from, to) in &inward {
+            let column = |alias: &str, names: &[&str]| {
+                names
+                    .iter()
+                    .map(|n| format!("{alias}.{}", ident(n)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let retired_column =
+                R::RETIRED.map_or("NULL".to_owned(), |r| format!("c.{}", ident(r)));
             let on: Vec<String> = from
                 .iter()
-                .zip(&to)
-                .map(|(f, t)| format!("c.{} = {}.{}", ident(f), R::QUALIFIED, ident(t)))
+                .zip(to)
+                .map(|(f, t)| format!("c.{} = p.{}", ident(f), ident(t)))
                 .collect();
-            format!(
-                "EXISTS (SELECT 1 FROM {} c WHERE {})",
-                ident(&child),
-                on.join(" AND ")
-            )
-        })
+            let mut qb = sqlx::QueryBuilder::new(format!(
+                "SELECT {}, {retired_column} IS NOT NULL, {} FROM {} c JOIN (SELECT * FROM {}",
+                column("c", R::KEY),
+                column("p", R::KEY),
+                R::QUALIFIED,
+                R::QUALIFIED
+            ));
+            key_filter::<R>(&mut qb, chunk);
+            qb.push(format!(") p ON {}", on.join(" AND ")));
+            for row in qb.build().fetch_all(&mut *exec).await? {
+                use sqlx::Row as _;
+                let retired_child: bool = row.try_get(R::KEY.len())?;
+                pointed.push((
+                    key_of_row(&row, &kinds, 0)?,
+                    retired_child,
+                    key_of_row(&row, &kinds, R::KEY.len() + 1)?,
+                ));
+            }
+        }
+    }
+    // What stays keeps what it points at: a row asked to stay by another
+    // table, or retired before and not let go of now, or kept so in turn.
+    let asked: std::collections::HashSet<&Key> = keys.iter().collect();
+    loop {
+        let more: Vec<Key> = pointed
+            .iter()
+            .filter(|(child, retired, parent)| {
+                !pinned.contains(parent)
+                    && (pinned.contains(child) || (*retired && !asked.contains(child)))
+            })
+            .map(|(_, _, parent)| parent.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        pinned.extend(more);
+    }
+    let kept: Vec<Key> = keys
+        .iter()
+        .filter(|key| pinned.contains(*key))
+        .cloned()
         .collect();
-    let unpointed = if pointed.is_empty() {
-        String::new()
-    } else {
-        format!(" AND NOT ({})", pointed.join(" OR "))
-    };
-    for (keys, hold) in [(keys, false), (held, true)] {
-        for chunk in keys.chunks(keys_per_statement::<R>()) {
+    keep::<R>(exec, &kept, false, &mut retired).await?;
+    let mut going: Vec<Key> = keys
+        .iter()
+        .filter(|key| !pinned.contains(*key))
+        .cloned()
+        .collect();
+    loop {
+        let before = retired.deleted;
+        let mut refused = Vec::new();
+        for chunk in going.chunks(keys_per_statement::<R>()) {
             let delete = |keys: &[Key]| {
                 let mut qb = sqlx::QueryBuilder::new(format!("DELETE FROM {}", R::QUALIFIED));
                 key_filter::<R>(&mut qb, keys);
-                qb.push(&unpointed);
                 qb
             };
-            let refused = if hold {
-                Vec::new()
-            } else {
-                one_by_one(exec, chunk, delete, &mut retired.deleted).await?
-            };
-            let left: Vec<Key> = chunk
-                .iter()
-                .filter(|key| !refused.iter().any(|(r, _)| r == *key))
-                .cloned()
-                .collect();
-            retired.refused.extend(refused);
-            let Some(column) = R::RETIRED else {
-                let kept = key_select::<R>(exec, &left).await?;
-                retired.refused.extend(kept.into_iter().map(|key| {
-                    let why = if hold {
-                        format!(
-                            "what this replica wrote of it has not reached the server, and `{}` \
-                             has no retired column to keep it by",
-                            R::TABLE
-                        )
-                    } else {
-                        format!(
-                            "a row here points at it, and `{}` has no retired column to keep it by",
-                            R::TABLE
-                        )
-                    };
-                    (key, why)
-                }));
-                continue;
-            };
-            let retire = |keys: &[Key]| {
-                let mut qb = sqlx::QueryBuilder::new(format!(
-                    "UPDATE {} SET {} = {}",
-                    R::QUALIFIED,
-                    ident(column),
-                    crate::dialect::NOW
-                ));
-                key_filter::<R>(&mut qb, keys);
-                qb.push(format!(" AND {} IS NULL", ident(column)));
-                qb
-            };
-            let refused = one_by_one(exec, &left, retire, &mut retired.kept).await?;
-            retired.refused.extend(refused);
+            refused.extend(one_by_one(exec, chunk, delete, &mut retired.deleted).await?);
         }
+        if refused.is_empty() || retired.deleted == before {
+            retired.refused.extend(refused);
+            return Ok(retired);
+        }
+        going = refused.into_iter().map(|(key, _)| key).collect();
     }
-    Ok(retired)
+}
+
+/// Keeps the rows of `keys` retired, or — where the table has no retired
+/// column — refuses to let them go, saying why: what the replica wrote of
+/// them has not reached the server (`unfiled`), or a row that stays points
+/// at them. Answers how many it retired that were not already.
+#[cfg(feature = "sqlite")]
+async fn keep<R: Row>(
+    exec: &mut Conn,
+    keys: &[Key],
+    unfiled: bool,
+    retired: &mut Retired,
+) -> Result<u64, Error> {
+    let Some(column) = R::RETIRED else {
+        let why = if unfiled {
+            format!(
+                "what this replica wrote of it has not reached the server, and `{}` has no \
+                 retired column to keep it by",
+                R::TABLE
+            )
+        } else {
+            format!(
+                "a row here points at it, and `{}` has no retired column to keep it by",
+                R::TABLE
+            )
+        };
+        for chunk in keys.chunks(keys_per_statement::<R>()) {
+            let kept = key_select::<R>(exec, chunk).await?;
+            retired
+                .refused
+                .extend(kept.into_iter().map(|key| (key, why.clone())));
+        }
+        return Ok(0);
+    };
+    let retire = |keys: &[Key]| {
+        let mut qb = sqlx::QueryBuilder::new(format!(
+            "UPDATE {} SET {} = {}",
+            R::QUALIFIED,
+            ident(column),
+            crate::dialect::NOW
+        ));
+        key_filter::<R>(&mut qb, keys);
+        qb.push(format!(" AND {} IS NULL", ident(column)));
+        qb
+    };
+    let before = retired.kept;
+    for chunk in keys.chunks(keys_per_statement::<R>()) {
+        let refused = one_by_one(exec, chunk, retire, &mut retired.kept).await?;
+        retired.refused.extend(refused);
+    }
+    Ok(retired.kept - before)
 }
 
 /// The keys of `keys` whose row points, through a foreign key, at a row the
@@ -690,7 +795,7 @@ pub(crate) async fn unparented<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<
         key_filter::<R>(&mut qb, chunk);
         qb.push(format!(" AND ({})", missing.join(" OR ")));
         for row in qb.build().fetch_all(&mut *exec).await? {
-            orphans.push(key_of_row(&row, &kinds)?);
+            orphans.push(key_of_row(&row, &kinds, 0)?);
         }
     }
     Ok(orphans)
@@ -744,7 +849,7 @@ async fn key_select<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<Key>, E
         sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(R::KEY), R::QUALIFIED));
     key_filter::<R>(&mut qb, keys);
     let rows = qb.build().fetch_all(&mut *exec).await?;
-    rows.iter().map(|row| key_of_row(row, &kinds)).collect()
+    rows.iter().map(|row| key_of_row(row, &kinds, 0)).collect()
 }
 
 /// Opens a savepoint, for [`released`] to close.
@@ -838,7 +943,7 @@ async fn keys_where<R: Row>(exec: &mut Conn, filter: &str) -> Result<Vec<Key>, E
     Ok(rows
         .iter()
         .filter_map(|row| {
-            key_of_row(row, &kinds)
+            key_of_row(row, &kinds, 0)
                 .inspect_err(|e| {
                     tracing::error!(
                         table = R::TABLE,
@@ -1287,7 +1392,7 @@ mod tests {
                 .map_err(|e| e.to_string()),
             Ok(())
         );
-        let retired = retire_by_keys::<Order>(&mut conn, &[order.key()], &[])
+        let retired = retire_by_keys::<Order>(&mut conn, &[order.key()], &[], &[])
             .await
             .unwrap();
         assert_eq!(retired.deleted, 1);

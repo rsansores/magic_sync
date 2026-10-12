@@ -959,6 +959,8 @@ async fn apply<P: Sync + 'static>(
             reject(conn, &table.table, &foreign_keys(table), why, sequence).await?;
             continue;
         };
+        let deletes = keys_of(codec, &table.deletes);
+        let_go(conn, codecs, codec, &deletes, Some(sequence), care).await?;
         let beside = parsed(codec, &table.keys);
         let mut held = Vec::new();
         if care.careful {
@@ -983,8 +985,6 @@ async fn apply<P: Sync + 'static>(
             let every: Vec<usize> = (0..table.upserts.len()).collect();
             held = take(conn, codec, table, &beside, &every, naming, sequence).await?;
         }
-        let deletes = keys_of(codec, &table.deletes);
-        let_go(conn, codec, &deletes, Some(sequence), care).await?;
         taken.push(Applied {
             table: table.table.clone(),
             keys: held.iter().map(|(_, key)| key.clone()).collect(),
@@ -1129,46 +1129,61 @@ async fn named(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Erro
 
 /// Lets go of the rows of `keys` ([`let_go_together`]) — carefully, one by
 /// one, once a refusal rolled a whole transaction back: one the database
-/// refuses to let go of alone is refused, and one whose refusal did so is
-/// refused before it is tried.
+/// refuses to let go of alone is tried again once the others have gone, and
+/// refused when that changes nothing; one whose refusal took the whole
+/// transaction with it is refused before it is tried.
 #[cfg(feature = "sqlite")]
 async fn let_go<P: Sync + 'static>(
     conn: &mut Conn,
+    codecs: &[Codec<P>],
     codec: &Codec<P>,
     keys: &[Key],
     sequence: Option<i64>,
     care: &Care,
 ) -> Result<(), Stop> {
     if !care.careful {
-        return let_go_together(conn, codec, keys, sequence).await;
+        let_go_together(conn, codecs, codec, keys, sequence).await?;
+        return Ok(());
     }
     let table = codec.table.name;
+    let mut pending = Vec::new();
     for key in keys {
-        let row = Spot::LetGo(key_text(key));
-        if let Some(culprit) = care.culprit(table, &row) {
-            kept(conn, table, key, &culprit.why, sequence).await?;
-            continue;
-        }
-        row_begun(conn).await?;
-        let gone = let_go_together(conn, codec, std::slice::from_ref(key), sequence).await;
-        if let Err(e) = row_done(conn, gone, table, row).await? {
-            kept(conn, table, key, &e.to_string(), sequence).await?;
+        match care.culprit(table, &Spot::LetGo(key_text(key))) {
+            Some(culprit) => kept(conn, table, key, &culprit.why, sequence).await?,
+            None => pending.push(key.clone()),
         }
     }
-    Ok(())
+    loop {
+        let mut again = Vec::new();
+        for key in &pending {
+            row_begun(conn).await?;
+            let one = std::slice::from_ref(key);
+            let gone = let_go_together(conn, codecs, codec, one, sequence).await;
+            match row_done(conn, gone, table, Spot::LetGo(key_text(key))).await? {
+                Ok(refused) => again.extend(refused),
+                Err(e) => kept(conn, table, key, &e.to_string(), sequence).await?,
+            }
+        }
+        if again.is_empty() || again.len() == pending.len() {
+            return Ok(());
+        }
+        pending = again;
+    }
 }
 
-/// Lets go of the rows of `keys`: the ones the database refuses to let go
-/// are [`kept`], the rest are no longer ones to report. A row of a table
-/// written on both sides whose edits have not reached the server is held
-/// retired until they have ([`filed`]), so the edits are not lost.
+/// Lets go of the rows of `keys`, together ([`Codec::retire`]): the ones the
+/// database refuses to let go are [`kept`] — and answered — the rest are no
+/// longer ones to report. A row of a table written on both sides whose
+/// edits have not reached the server is held retired until they have
+/// ([`filed`]), so the edits are not lost.
 #[cfg(feature = "sqlite")]
 async fn let_go_together<P: Sync + 'static>(
     conn: &mut Conn,
+    codecs: &[Codec<P>],
     codec: &Codec<P>,
     keys: &[Key],
     sequence: Option<i64>,
-) -> Result<(), Stop> {
+) -> Result<Vec<Key>, Stop> {
     let noted: HashSet<String> = if matches!(codec.table.mirror, crate::row::Mirror::Both) {
         sqlx::query_scalar(
             "SELECT row_key FROM sync_notes WHERE relation = $1 \
@@ -1187,7 +1202,12 @@ async fn let_go_together<P: Sync + 'static>(
         .iter()
         .cloned()
         .partition(|key| noted.contains(&key_text(key)));
-    let retired = codec.retire(conn, &free, &held).await?;
+    let server: Vec<(&str, Option<&str>)> = codecs
+        .iter()
+        .filter(|c| c.sent_down())
+        .map(|c| (c.table.name, c.table.retired))
+        .collect();
+    let retired = codec.retire(conn, &free, &held, &server).await?;
     let refused: HashSet<&Key> = retired.refused.iter().map(|(key, _)| key).collect();
     let leaving: Vec<String> = held
         .iter()
@@ -1218,7 +1238,7 @@ async fn let_go_together<P: Sync + 'static>(
         refused = retired.refused.len(),
         "sync: rows let go of — the kept ones retired, still pointed at here or with edits on their way"
     );
-    Ok(())
+    Ok(retired.refused.into_iter().map(|(key, _)| key).collect())
 }
 
 /// A row the replica could not let go of: rejected, as refused by the message
@@ -1339,7 +1359,7 @@ async fn end_snapshot<P: Sync + 'static>(
             .into_iter()
             .filter(|key| !named.contains(&key_text(key)))
             .collect();
-        let_go(conn, codec, &stale, Some(sequence), care).await?;
+        let_go(conn, codecs, codec, &stale, Some(sequence), care).await?;
     }
     // A table the replica holds from no server is in no snapshot, so none
     // clears what a server since gone made it refuse of it, and nothing
@@ -1408,7 +1428,7 @@ async fn filed<P: Sync + 'static>(
                 codec.key(&parts).ok()
             })
             .collect();
-        let_go(conn, codec, &keys, applied, care).await?;
+        let_go(conn, codecs, codec, &keys, applied, care).await?;
     }
     Ok(())
 }

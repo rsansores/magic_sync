@@ -528,6 +528,7 @@ const RULES: Rules = Rules {
             .is_ok_and(|row| row.get("name").and_then(|n| n.as_str()) == Some(REFUSED))
     },
     parents,
+    ..Rules::ANY
 };
 
 /// The server's relay over the walk's tables, as a host's runs it, planning

@@ -29,6 +29,11 @@ pub(crate) struct Rules {
     pub(crate) refuses: fn(&str, &[u8]) -> bool,
     /// The rows a row of `table` points at.
     pub(crate) parents: fn(&str, &[u8]) -> Vec<Row>,
+    /// Whether rows of `table` can be retired (4.3).
+    pub(crate) retires: fn(&str) -> bool,
+    /// The key a row of `table` holds, read off the row: `None` takes the
+    /// key beside it on trust.
+    pub(crate) key: fn(&str, &[u8]) -> Option<String>,
 }
 
 impl Rules {
@@ -36,6 +41,8 @@ impl Rules {
     pub(crate) const ANY: Rules = Rules {
         refuses: |_, _| false,
         parents: |_, _| Vec::new(),
+        retires: |_| false,
+        key: |_, _| None,
     };
 }
 
@@ -225,6 +232,12 @@ impl Model {
                 let naming = !down.snapshot_id.is_empty();
                 self.taken.clear();
                 for table in down.tables {
+                    let gone = table
+                        .deletes
+                        .iter()
+                        .map(|key| (table.table.clone(), key.parts.join("|")))
+                        .collect();
+                    self.let_go(gone, sequence, rules);
                     let mut taken = Vec::new();
                     for (bytes, key) in table.upserts.iter().zip(&table.keys) {
                         let row = (table.table.clone(), key.parts.join("|"));
@@ -233,7 +246,9 @@ impl Model {
                                 snapshot.named.insert(row.clone());
                             }
                         }
-                        if (rules.refuses)(&table.table, bytes) {
+                        let beside =
+                            (rules.key)(&table.table, bytes).is_some_and(|own| own != row.1);
+                        if beside || (rules.refuses)(&table.table, bytes) {
                             self.reject(row, "refused", sequence);
                             continue;
                         }
@@ -241,10 +256,6 @@ impl Model {
                         taken.push(row.1.clone());
                         self.retired.remove(&row);
                         self.rows.insert(row, bytes.clone());
-                    }
-                    for key in &table.deletes {
-                        let row = (table.table.clone(), key.parts.join("|"));
-                        self.let_go(row, sequence, rules);
                     }
                     self.taken.push((table.table, taken));
                 }
@@ -265,38 +276,90 @@ impl Model {
                         .filter(|row| row.0 == *table && !snapshot.named.contains(*row))
                         .cloned()
                         .collect();
-                    for row in stale {
-                        self.let_go(row, sequence, rules);
-                    }
+                    self.let_go(stale, sequence, rules);
                 }
                 Received::Ended
             }
         }
     }
 
-    /// Lets go of `row`: a row of the server's it holds that points at it,
-    /// or one of its own in a table with nothing to retire it by, or its
-    /// database refusing the delete, keeps it, rejected, as a foreign key or
-    /// a trigger would; one of its own in a table it retires by retires it.
-    fn let_go(&mut self, row: Row, sequence: u64, rules: &Rules) {
-        let held = self.rows.contains_key(&row) || self.retired.contains_key(&row);
-        let pointed = self
-            .rows
+    /// Lets go of `rows`, together (4.1): one that a row staying for the
+    /// replica points at — a row of its own, or one it retired — is retired
+    /// where its table can be, and otherwise kept, rejected; and so in turn
+    /// is what a row retired so points at among them. The rest go, but one
+    /// the database refuses — kept by a trigger, or pointed at by a row of
+    /// the server's that stays — which is kept, rejected.
+    fn let_go(&mut self, rows: Vec<Row>, sequence: u64, rules: &Rules) {
+        let asked: BTreeSet<Row> = rows.into_iter().collect();
+        let held: BTreeSet<Row> = asked
             .iter()
-            .any(|((table, _), bytes)| (rules.parents)(table, bytes).contains(&row));
-        if pointed || (held && !self.retiring.contains(&row) && self.pinned.contains(&row)) {
-            self.reject(row, "pointed at", sequence);
-            return;
+            .filter(|row| self.rows.contains_key(*row) || self.retired.contains_key(*row))
+            .cloned()
+            .collect();
+        for row in asked.difference(&held) {
+            self.rejections.remove(row);
         }
-        let bytes = self.rows.remove(&row);
-        if held && self.retiring.contains(&row) {
-            if let Some(bytes) = bytes {
-                self.retired.insert(row.clone(), bytes);
+        // Rows kept for the replica: retired, or — where their table cannot
+        // be — kept as they are.
+        let mut retiring: BTreeSet<Row> = held
+            .iter()
+            .filter(|row| self.retiring.contains(*row))
+            .cloned()
+            .collect();
+        let mut kept = BTreeSet::new();
+        loop {
+            let more: BTreeSet<Row> = self
+                .retired
+                .iter()
+                .filter(|(row, _)| !asked.contains(*row) || retiring.contains(*row))
+                .chain(self.rows.iter().filter(|(row, _)| retiring.contains(*row)))
+                .flat_map(|(row, bytes)| (rules.parents)(&row.0, bytes))
+                .filter(|parent| {
+                    held.contains(parent) && !retiring.contains(parent) && !kept.contains(parent)
+                })
+                .collect();
+            if more.is_empty() {
+                break;
             }
-        } else {
-            self.retired.remove(&row);
+            let (retire, keep): (Vec<Row>, Vec<Row>) =
+                more.into_iter().partition(|row| (rules.retires)(&row.0));
+            retiring.extend(retire);
+            kept.extend(keep);
         }
-        self.rejections.remove(&row);
+        let mut going: BTreeSet<Row> = held
+            .iter()
+            .filter(|row| {
+                !retiring.contains(*row) && !kept.contains(*row) && !self.pinned.contains(*row)
+            })
+            .cloned()
+            .collect();
+        loop {
+            let refused: BTreeSet<Row> = self
+                .rows
+                .iter()
+                .filter(|(row, _)| !going.contains(*row) && !retiring.contains(*row))
+                .flat_map(|(row, bytes)| (rules.parents)(&row.0, bytes))
+                .filter(|parent| going.contains(parent))
+                .collect();
+            if refused.is_empty() {
+                break;
+            }
+            going.retain(|row| !refused.contains(row));
+        }
+        for row in held {
+            if retiring.contains(&row) {
+                if let Some(bytes) = self.rows.remove(&row) {
+                    self.retired.insert(row.clone(), bytes);
+                }
+                self.rejections.remove(&row);
+            } else if going.contains(&row) {
+                self.rows.remove(&row);
+                self.retired.remove(&row);
+                self.rejections.remove(&row);
+            } else {
+                self.reject(row, "pointed at", sequence);
+            }
+        }
     }
 
     fn reject(&mut self, row: Row, reason: &str, sequence: u64) {

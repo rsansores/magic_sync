@@ -209,7 +209,22 @@ catalog, or a table written on both sides. Rows of any other table — a
 record of the replica's own, a table it does not know — are rejected, and
 their deletes ignored.
 
-1. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
+1. **Deletes**, first: a value a row lets go of — a unique one — is then
+   free for an upsert of the same part to take. The keys in `deletes` are
+   let go of together:
+   - a row that a row staying for the replica points at — a row of its own,
+     through any foreign key: one that would refuse the delete, checked at
+     once or at commit, and one that would cascade or set the pointing
+     row's columns, which would change a row the server never sent; or a row
+     it retired — is retired instead (4.3), and so, in turn, are the rows a
+     row retired so points at among them. Where the table has nothing to
+     retire it by, the row is kept, and a rejection recorded (section 6);
+   - every other is deleted, together, so rows that point only at one
+     another — a tree, a row that points at itself — go whatever the order
+     of their keys. One the database refuses to let go — a trigger, or a
+     row of the server's that stays and points at it — is kept, and a
+     rejection recorded.
+2. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
    message; `keys[i]` is the key of `upserts[i]`, and there **must** be one
    key per upsert. A row whose own key is not the one beside it is no row
    the server meant: the replica rejects it under the key beside it. For
@@ -222,13 +237,14 @@ their deletes ignored.
    - columns the replica owns in a table written by both sides are **not**
      overwritten;
    - a row the replica had retired (4.3) becomes live again.
-2. **Deletes.** For each key in `deletes`: delete the row. If a row of the
-   replica's own points at it — through any foreign key: one that would
-   refuse the delete, checked at once or at commit, and one that would
-   cascade or set the pointing row's columns, which would change a row the
-   server never sent — retire it instead (4.3);
-   where the table has nothing to retire it by, or the database refuses to
-   let it go, keep it and record a rejection (section 6).
+
+   A key both let go of and upserted in one part is held: its upsert comes
+   after. A row the database refuses is tried again once the rest of the
+   part are in, while that takes one more: it may point at a row after it,
+   or take a unique value a row after it gives up. Two rows that swap a
+   unique value cannot be taken one at a time — the database checks each
+   row as it is written — so both are rejected, and keep what they held,
+   until the server sends them otherwise.
 
 **A row the replica cannot take, or let go of, does not fail the message.**
 If a row does not decode, if the replica's database refuses it for its data
@@ -630,6 +646,8 @@ A replica implementation is complete when:
 - [ ] it overwrites a row with what the server sends, whatever its version;
 - [ ] it never overwrites the columns it owns;
 - [ ] it retires a row it cannot delete, and revives a retired row sent again;
+- [ ] it applies a table's deletes before its upserts, lets go of the deletes
+      together, and tries a refused upsert again once the rest are in (4.1);
 - [ ] it begins a snapshot with the message that follows nothing — an
       `EndSnapshot` included — and sweeps on its end, in reverse table order;
 - [ ] it leaves as it was and records, in the same transaction, a row it

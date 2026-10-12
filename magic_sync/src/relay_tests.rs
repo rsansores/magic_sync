@@ -1618,7 +1618,7 @@ impl World {
 /// What the replicas of these tests refuse: a row named "refused".
 const REFUSING: Rules = Rules {
     refuses: |_, bytes| ItemRow::decode(bytes).is_ok_and(|row| row.name == "refused"),
-    parents: |_, _| Vec::new(),
+    ..Rules::ANY
 };
 
 impl World {

@@ -1560,6 +1560,155 @@ async fn a_row_beside_another_key_is_rejected_under_that_key(pool: SqlitePool) {
     assert_eq!(w.rejected().await, expected);
 }
 
+/// Items that point at one another, as a tree does: each at its parent, the
+/// root at itself.
+fn tree_tables() -> String {
+    TABLES.replace(
+        "partition_id BLOB NOT NULL,",
+        "partition_id BLOB NOT NULL REFERENCES items (id),",
+    )
+}
+
+/// An item of the tree, under `parent`.
+fn node(id: Uuid, parent: Uuid, name: &str) -> (WireKey, Vec<u8>) {
+    let row = ItemRow {
+        id: id.to_string(),
+        partition_id: parent.to_string(),
+        name: name.to_owned(),
+    };
+    (key(&[&id.to_string()]), row.encode_to_vec())
+}
+
+/// Rows let go of together that point only at one another go together — a
+/// tree whose root points at itself, in whatever order its keys come, and
+/// however the database is made to take them one by one; but what a row of
+/// the replica's own points at is retired, and so is what that one points
+/// at in turn, which the retired row still needs.
+#[sqlx::test(migrations = false)]
+async fn rows_let_go_of_together_that_point_at_one_another_go_together(pool: SqlitePool) {
+    let w = world_over(pool, &tree_tables(), Settings::default()).await;
+    let [root, child, grand, other] = ids();
+    let tree = |n: u64, names: [&str; 3]| {
+        down(
+            n,
+            "",
+            vec![upserts(
+                "items",
+                vec![
+                    node(root, root, names[0]),
+                    node(child, root, names[1]),
+                    node(grand, child, names[2]),
+                    node(other, other, "other"),
+                ],
+            )],
+        )
+    };
+    let gone = |n: u64| {
+        let keys = [root, child, grand]
+            .iter()
+            .map(|id| key(&[&id.to_string()]))
+            .collect();
+        down(n, "", vec![deletes("items", keys)])
+    };
+    w.receive(&tree(1, ["root", "child", "grand"])).await;
+    w.receive(&gone(2)).await;
+    assert_eq!(w.texts("SELECT name FROM items").await, ["other"]);
+    assert!(w.rejected().await.is_empty());
+
+    // Taken one by one, a parent before its children cannot go alone: it
+    // goes once they have.
+    w.exec(
+        "CREATE TRIGGER one_by_one BEFORE DELETE ON items WHEN OLD.name = 'other' \
+         BEGIN SELECT RAISE(ABORT, 'kept'); END",
+    )
+    .await
+    .unwrap();
+    w.receive(&tree(3, ["root", "child", "grand"])).await;
+    let keys = [root, child, grand, other]
+        .iter()
+        .map(|id| key(&[&id.to_string()]))
+        .collect();
+    w.receive(&down(4, "", vec![deletes("items", keys)])).await;
+    assert_eq!(w.texts("SELECT name FROM items").await, ["other"]);
+    assert_eq!(w.rejected().await, [format!("items {other}")]);
+
+    // A receipt of the replica's own keeps the leaf, and the leaf the rest.
+    w.receive(&tree(5, ["root", "child", "grand"])).await;
+    sqlx::query("INSERT INTO receipts (item_id) VALUES ($1)")
+        .bind(grand)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.receive(&gone(6)).await;
+    assert_eq!(w.items().await, ["other"]);
+    assert_eq!(
+        w.count("SELECT count(*) FROM items WHERE retired_at IS NOT NULL")
+            .await,
+        3
+    );
+    assert!(w.rejected().await.is_empty(), "taken again since");
+    // A snapshot that names none of them sweeps them as one.
+    sqlx::query("DELETE FROM receipts")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(
+        7,
+        &s,
+        vec![upserts("items", vec![node(other, other, "other")])],
+    ))
+    .await;
+    w.receive(&end(8, &s, &["items"])).await;
+    assert_eq!(w.texts("SELECT name FROM items").await, ["other"]);
+}
+
+/// Within a table's part, its deletes come first: a unique value one row
+/// gives up is another's in the same message, and so is one a row taken
+/// later in the part gives up. Two rows that swap one cannot be taken one
+/// at a time: both are rejected, and keep what they had.
+#[sqlx::test(migrations = false)]
+async fn a_unique_value_moves_between_rows_of_one_message(pool: SqlitePool) {
+    let tables = TABLES.replace("label TEXT NOT NULL,", "label TEXT NOT NULL UNIQUE,");
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let aisle = Uuid::now_v7();
+    let shelf = |slot: i64, label: &str| {
+        let row = Shelf {
+            aisle,
+            slot,
+            label: label.to_owned(),
+            revision: 1,
+        };
+        (key(&[&aisle.to_string(), &slot.to_string()]), json(&row))
+    };
+    let labels = || w.texts("SELECT label FROM shelves ORDER BY slot");
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "shelves",
+            vec![shelf(1, "x"), shelf(2, "y"), shelf(3, "p"), shelf(4, "q")],
+        )],
+    ))
+    .await;
+    let mut part = upserts("shelves", vec![shelf(5, "x"), shelf(2, "z"), shelf(6, "y")]);
+    part.deletes = vec![key(&[&aisle.to_string(), "1"])];
+    w.receive(&down(2, "", vec![part])).await;
+    assert_eq!(labels().await, ["z", "p", "q", "x", "y"]);
+    assert!(w.rejected().await.is_empty());
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("shelves", vec![shelf(3, "q"), shelf(4, "p")])],
+    ))
+    .await;
+    assert_eq!(labels().await, ["z", "p", "q", "x", "y"]);
+    assert_eq!(
+        w.rejected().await,
+        [format!("shelves {aisle}|3"), format!("shelves {aisle}|4")]
+    );
+}
+
 /// A row the replica's own rows point at through a key that would cascade
 /// or set them null is kept, retired, like one a key would refuse to let
 /// go: letting it go would change rows of the replica's that the server
