@@ -394,6 +394,7 @@ pub magic_sync::Settings::backoff: magic_sync::run::Backoff
 pub magic_sync::Settings::digests_every: core::time::Duration
 pub magic_sync::Settings::digests_first: core::time::Duration
 pub magic_sync::Settings::idle: core::time::Duration
+pub magic_sync::Settings::inbound: magic_sync::envelope::Limits
 pub magic_sync::Settings::lanes: alloc::vec::Vec<magic_sync::replica::Lane>
 pub magic_sync::Settings::outbox: magic_sync::replica::Outbox
 pub magic_sync::Settings::send_timeout: core::time::Duration
