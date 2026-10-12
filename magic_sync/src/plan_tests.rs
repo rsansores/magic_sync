@@ -51,7 +51,7 @@ CREATE TABLE fixture.t_families (
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_kinds (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    family_id UUID REFERENCES fixture.t_families (id),
+    family_id UUID REFERENCES fixture.t_families (id) DEFERRABLE INITIALLY DEFERRED,
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
@@ -126,6 +126,12 @@ CREATE TABLE fixture.t_task_lines (
 CREATE TABLE fixture.t_tallies (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0);
+-- A family gone before its kinds point elsewhere, in one transaction: the
+-- foreign key waits for the commit.
+CREATE FUNCTION fixture.replace_family(gone UUID, by UUID) RETURNS VOID LANGUAGE sql AS $$
+    DELETE FROM fixture.t_families WHERE id = gone;
+    UPDATE fixture.t_kinds SET family_id = by WHERE family_id = gone;
+$$;
 CREATE VIEW t_replicas AS SELECT * FROM fixture.t_replicas WHERE retired_at IS NULL;
 CREATE VIEW t_families AS SELECT * FROM fixture.t_families WHERE retired_at IS NULL;
 CREATE VIEW t_kinds AS SELECT * FROM fixture.t_kinds WHERE retired_at IS NULL;
@@ -1129,9 +1135,12 @@ impl World {
             .push("a replica's edit of a tally uploaded".to_owned());
     }
 
-    /// What a relay does once a deploy fixed what refused them: every row
-    /// set aside goes again.
+    /// What a relay does once a deploy fixed what refused them: every note
+    /// parked planned again, every row set aside sent again.
     async fn retry_quarantine(&mut self) {
+        crate::relay::unpark(&mut self.conn)
+            .await
+            .expect("unparked");
         crate::relay::retry_quarantine(&mut self.conn)
             .await
             .expect("noted again");
@@ -1410,7 +1419,16 @@ async fn wrote(
     query: sqlx::query::Query<'_, crate::Db, sqlx::postgres::PgArguments>,
 ) -> bool {
     let mut tx = conn.begin().await.expect("a transaction");
-    match query.execute(&mut *tx).await {
+    // A deferred foreign key is checked at the end of the step, which a
+    // long writer's commit would otherwise do for every step it took.
+    let done = match query.execute(&mut *tx).await {
+        Ok(done) => sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await
+            .map(|_| done),
+        failed => failed,
+    };
+    match done {
         Ok(done) => {
             tx.commit().await.expect("committed");
             done.rows_affected() > 0
@@ -1513,7 +1531,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(103);
+    let choice = walk.below(105);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1669,6 +1687,16 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         // Rows no message can carry.
         100 => write!(conn, "UPDATE fixture.t_products SET name = $2 WHERE id = $1", product, &big),
         101 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, &big),
+        // A parent deleted before what points at it points elsewhere.
+        102 => write!(conn, "SELECT fixture.replace_family($1, $2) WHERE $1 IS NOT NULL", family, walk.pick(&families)),
+        // Planning a row's changes fails, until a deploy: they are parked.
+        103 => write!(conn,
+            "UPDATE sync.notes SET parked_at = now() \
+              WHERE kind = 'row' AND done_at IS NULL AND parked_at IS NULL \
+                AND (relation, row_key) = (SELECT relation, row_key FROM sync.notes \
+                                            WHERE kind = 'row' AND done_at IS NULL AND parked_at IS NULL \
+                                            ORDER BY id OFFSET $1 LIMIT 1)",
+            i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -1823,6 +1851,11 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
                 world.settle().await;
                 world.retry_quarantine().await;
             }
+            // What is parked is not sent until a deploy: the replicas hold
+            // what they should once it is planned.
+            crate::relay::unpark(&mut world.conn)
+                .await
+                .expect("unparked");
             world.settle().await;
             world.assert_holdings(seed, n).await;
         }
@@ -3231,4 +3264,67 @@ async fn a_codec_that_writes_rows_otherwise_declares_otherwise(pool: crate::DbPo
         .expect("an engine")
         .declared();
     assert_ne!(before, after);
+}
+
+/// A replica holds a row in the version a parked change left it at, and
+/// that version points at a row since gone from the server: what that
+/// version points at stays with it, whether the change that let go of it
+/// is pending, parked or planned long ago.
+#[sqlx::test(migrations = false)]
+async fn what_a_version_held_for_a_parked_change_points_at_stays(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let partition = world.partitions[0];
+    let (family, kind, product) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for (sql, id, parent) in [
+        ("INSERT INTO fixture.t_families (id, partition_id, name) VALUES ($1, $2, 'f')", family, None),
+        ("INSERT INTO fixture.t_kinds (id, partition_id, name, family_id) VALUES ($1, $2, 'k', $3)", kind, Some(family)),
+        ("INSERT INTO fixture.t_products (id, partition_id, name, kind_id) VALUES ($1, $2, 'p', $3)", product, Some(kind)),
+    ] {
+        sqlx::query(sql)
+            .bind(id)
+            .bind(partition)
+            .bind(parent)
+            .execute(&mut *world.conn)
+            .await
+            .expect("a row");
+    }
+    world.settle().await;
+    // The product no longer points at its kind; planning that is parked,
+    // and its replicas hold it as it was.
+    for sql in [
+        "UPDATE fixture.t_products SET kind_id = NULL WHERE id = $1",
+        "UPDATE sync.notes SET parked_at = now() WHERE relation = 't_products' AND done_at IS NULL \
+           AND $1 IS NOT NULL",
+        "DELETE FROM fixture.t_kinds WHERE id = $1",
+    ] {
+        let id = if sql.contains("t_kinds") { kind } else { product };
+        sqlx::query(sql)
+            .bind(id)
+            .execute(&mut *world.conn)
+            .await
+            .expect(sql);
+    }
+    world.settle().await;
+    sqlx::query("DELETE FROM fixture.t_families WHERE id = $1")
+        .bind(family)
+        .execute(&mut *world.conn)
+        .await
+        .expect("the family gone");
+    world.settle().await;
+
+    // The parked change planned at last: everything goes.
+    crate::relay::unpark(&mut world.conn)
+        .await
+        .expect("unparked");
+    world.settle().await;
+    for (replica, model) in &world.replicas {
+        assert!(
+            !model
+                .rows
+                .keys()
+                .any(|(t, _)| t == "t_kinds" || t == "t_families"),
+            "{replica} still holds {:?}",
+            model.rows.keys().collect::<Vec<_>>()
+        );
+    }
 }

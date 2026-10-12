@@ -1495,9 +1495,12 @@ impl Engine {
     /// it keeps spreads to the parents and followers it needs, a round at a
     /// time from the rows the last round added. What it lacks of that is
     /// sent, with the rows that changed since its version; the rows in
-    /// question it does not keep are taken back. A row it holds that a
-    /// change not yet planned pointed at, before that change, stays too: the
-    /// replica still holds that change's older version.
+    /// question it does not keep are taken back. A row it holds in a version
+    /// older than the row — kept while a change of it waits, is parked, or
+    /// went where the replica could not take it — holds up what that version
+    /// pointed at, which the first change after it recorded: whatever that
+    /// change's state, one rule for every question of what a held row points
+    /// at.
     ///
     /// A row that cannot go, and every row that points at it — held, or
     /// that the plan would send — is kept by no replica: it is taken back
@@ -1759,8 +1762,8 @@ impl Engine {
                 );
                 self.add(conn, Set::Blocked, &select, round + 1).await?;
             }
-            // A version it holds that pointed there, changed since by a
-            // note not planned yet, points there still.
+            // A version it holds that pointed there, changed since, points
+            // there still.
             for (c, parent) in self
                 .pointing()
                 .into_iter()
@@ -1858,7 +1861,7 @@ impl Engine {
                 );
                 self.add(conn, Set::Suspect, &select, round + 1).await?;
             }
-            // What the version a replica holds of a row the batch changed
+            // What the version a replica holds of a row changed since
             // pointed at is in question with it, whatever the row points
             // at now, or whether it is still there.
             for (c, parent) in self
@@ -1868,8 +1871,7 @@ impl Engine {
             {
                 let select = format!(
                     "SELECT d.replica_id, {parent}, p.row_key, NULL FROM sync_suspect d {} {} \
-                      WHERE d.rel = {c} AND d.round = $1 - 1 \
-                        AND d.row_key IN (SELECT row_key FROM sync_changed WHERE rel = {c})",
+                      WHERE d.rel = {c} AND d.round = $1 - 1",
                     self.pointed_by_held(c, parent, "d"),
                     holds(
                         "JOIN",
@@ -2015,21 +2017,29 @@ impl Engine {
                 }
                 continue;
             }
+            // A row sent holds up what it points at; one kept as its
+            // replica holds it, what that version points at: the row as it
+            // is, unless it changed since — then the first change after
+            // that version says (`pointed_by_held`), whether planned, in
+            // the batch, waiting or parked.
             for (c, reference) in self.references().filter(|(c, _)| from.contains(c)) {
                 let source = format!(
                     "SELECT k.replica_id, {} FROM sync_kept k JOIN {} t ON {} \
-                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND {}",
+                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND {} \
+                        AND (k.sends OR NOT EXISTS ( \
+                              SELECT 1 FROM sync.held h JOIN sync.notes n ON n.kind = 'row' \
+                                 AND n.relation = h.relation AND n.row_key = h.row_key AND n.id > h.noted \
+                               WHERE h.replica_id = k.replica_id AND h.relation = {} \
+                                 AND h.row_key = k.row_key))",
                     key_sql("t", &reference.columns),
                     self.plans[c].relation.sql(),
                     self.row_is(c, "k.row_key"),
                     not_null("t", &reference.columns),
+                    literal(self.plans[c].table),
                 );
                 self.keep(conn, reference.parent, round + 1, &source)
                     .await?;
             }
-            // A row kept as its replica holds it, changed since by the
-            // batch — gone, or kept for a change not planned yet — holds
-            // up what its version pointed at, not what the row does now.
             for (c, parent) in self
                 .pointing()
                 .into_iter()
@@ -2037,8 +2047,7 @@ impl Engine {
             {
                 let source = format!(
                     "SELECT k.replica_id, p.row_key FROM sync_kept k {} \
-                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND NOT k.sends \
-                        AND k.row_key IN (SELECT row_key FROM sync_changed WHERE rel = {c})",
+                      WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND NOT k.sends",
                     self.pointed_by_held(c, parent, "k"),
                 );
                 self.keep(conn, parent, round + 1, &source).await?;
@@ -2058,20 +2067,10 @@ impl Engine {
     }
 
     /// Keeps, at `round`, the rows in question that a row its replica holds
-    /// still points at in the version it holds: one a change not yet planned
-    /// — beyond the batch, or parked — pointed at before. Answers whether it
-    /// kept any.
+    /// still points at in the version it holds: one the first change of it
+    /// after that version — beyond the batch, waiting, parked or planned
+    /// long ago — pointed at before. Answers whether it kept any.
     async fn keep_older(&self, conn: &mut Conn, round: i32) -> Result<bool, Error> {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM sync.pointed p JOIN sync.notes n ON n.id = p.note \
-                             WHERE n.done_at IS NULL \
-                               AND NOT EXISTS (SELECT 1 FROM sync_batch b WHERE b.id = n.id))",
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-        if !waiting {
-            return Ok(false);
-        }
         let mut kept = 0;
         for (c, parent) in self.pointing() {
             let source = format!(
@@ -2117,16 +2116,21 @@ impl Engine {
     }
 
     /// Joins `h`, the rows of `c` the replica `replica` holds in a version
-    /// that pointed at the row of `parent` whose key is the text `text`,
-    /// changed since by a note not planned yet — beyond the batch, or
-    /// parked — whose pointers `sync.pointed` keeps, by the row pointed at.
+    /// that pointed at the row of `parent` whose key is the text `text`:
+    /// what the first change of the row after that version — beyond the
+    /// batch, whether waiting, parked or planned long ago — pointed at
+    /// before, which `sync.pointed` keeps by the row pointed at. A change in
+    /// the batch is the plan's own question ([`Engine::pointed_by_held`]).
     fn held_older(&self, c: usize, parent: usize, replica: &str, text: &str) -> String {
         let child = literal(self.plans[c].table);
         format!(
             "JOIN sync.pointed p ON p.relation = {} AND p.row_key = {text} \
-             JOIN sync.notes n ON n.id = p.note AND n.done_at IS NULL AND n.relation = {child} \
+             JOIN sync.notes n ON n.id = p.note AND n.relation = {child} \
                               AND n.id NOT IN (SELECT id FROM sync_batch) \
-             {}",
+             {} \
+             JOIN LATERAL (SELECT min(m.id) AS id FROM sync.notes m \
+                            WHERE m.kind = 'row' AND m.relation = {child} AND m.row_key = n.row_key \
+                              AND m.id > h.noted) first ON first.id = n.id",
             literal(self.plans[parent].table),
             holds("JOIN", "h", replica, &child, "n.row_key"),
         )
@@ -2687,7 +2691,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Lets go of the rows set aside the plan owes no replica any more.
+    /// Lets go of the rows set aside the plan owes no replica any more; and
+    /// notes again, to be tried where they were set aside, those the server
+    /// set aside that point at a row the batch changed: what kept them from
+    /// going — that row could not go — may be gone with the change, which
+    /// the rows themselves did not see.
     pub(crate) async fn settle(&self, conn: &mut Conn) -> Result<(), Error> {
         sqlx::query(
             "DELETE FROM sync.quarantine q USING sync_settled s \
@@ -2695,6 +2703,26 @@ impl Engine {
         )
         .execute(&mut *conn)
         .await?;
+        for (c, reference) in self.references() {
+            let child = literal(self.plans[c].table);
+            sqlx::query(&format!(
+                "INSERT INTO sync.notes (kind, relation, row_key) \
+                 SELECT DISTINCT 'retry', q.relation, q.row_key FROM sync_changed x \
+                   JOIN {} t ON {} \
+                   JOIN sync.quarantine q ON q.relation = {child} AND q.row_key = {} \
+                                         AND q.cause = 'server' \
+                  WHERE x.rel = {} \
+                    AND NOT EXISTS (SELECT 1 FROM sync.notes n \
+                                     WHERE n.done_at IS NULL AND n.kind = 'retry' \
+                                       AND n.relation = q.relation AND n.row_key = q.row_key)",
+                self.plans[c].relation.sql(),
+                self.points_at(reference, "x.row_key"),
+                self.key_of_row(c),
+                reference.parent,
+            ))
+            .execute(&mut *conn)
+            .await?;
+        }
         Ok(())
     }
 

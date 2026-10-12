@@ -204,11 +204,15 @@ notes it read, the planner works out how that set moved, around what changed
    older than a change of the batch, or refused — is sent; the rows in
    question it does not keep are taken back.
 
-A row a replica holds that a change not yet planned pointed at before stays
-too — beyond the batch, or parked, that change's older version is what the
-replica holds, and it still points there. Rows that cannot go (section 4.3)
-are never kept, nor any row that points at one; a plan that would send such
-a row runs again with it among them.
+What a row a replica holds points at is what the version it holds points
+at: the row as it is, unless it changed since — then what the first change
+after that version recorded it pointed at before, whether that change waits
+beyond the batch, is parked, or was planned while the replica kept the older
+version for something that still needed it. That version's parents stay as
+long as it does. Rows that cannot go (section 4.3) are never kept, nor any
+row that points at one; a plan that would send such a row runs again with it
+among them, and a row set aside for pointing at one is tried again once that
+row changes.
 
 The plan is worked out in the database, in temporary tables of the relay's
 connection, set by set, and read a page at a time by what records it: a
