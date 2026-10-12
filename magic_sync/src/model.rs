@@ -126,9 +126,13 @@ pub(crate) struct Model {
     /// Rows a row of its own points at, in a table with nothing to retire
     /// them by: it cannot let them go.
     pub(crate) pinned: BTreeSet<Row>,
-    /// Rows a row of its own points at by their unique value: one that
-    /// changes it is refused.
+    /// Rows a row of its own points at by their unique value: a message
+    /// that leaves no row holding that value refuses the row that changed
+    /// it — the database's key, checked at commit, finds it — and is
+    /// applied again with it refused.
     pub(crate) anchored: BTreeSet<Row>,
+    /// Rows the message being applied again refuses before they are tried.
+    refusing: BTreeSet<Row>,
     /// Rows a row of its own points at, in a table it retires by: let go
     /// of, they are retired — kept, and out of what it holds.
     pub(crate) retiring: BTreeSet<Row>,
@@ -161,6 +165,7 @@ impl Model {
     /// `bytes` from the server, applied as section 4 says, in one step: the
     /// transport is acknowledged once this returns.
     pub(crate) fn receive(&mut self, bytes: &[u8], rules: &Rules) -> Received {
+        let before = self.clone();
         let Ok(message) = ToReplica::decode(bytes) else {
             return Received::Malformed;
         };
@@ -321,7 +326,11 @@ impl Model {
                         if !holds && (row.0.len() > 512 || row.1.len() > 512) {
                             continue;
                         }
-                        if !holds || beside || (rules.refuses)(&table.table, bytes) {
+                        if !holds
+                            || beside
+                            || (rules.refuses)(&table.table, bytes)
+                            || self.refusing.contains(&row)
+                        {
                             self.reject(row, "refused", sequence);
                         } else {
                             rows.push((row, bytes.clone()));
@@ -342,6 +351,26 @@ impl Model {
                 }) {}
                 for (row, _) in pending.into_iter().flat_map(|(_, rows)| rows) {
                     self.reject(row, "refused", sequence);
+                }
+                let broken: BTreeSet<Row> = before
+                    .anchored
+                    .iter()
+                    .filter_map(|row| {
+                        let value = (rules.unique)(&row.0, before.rows.get(row)?)?;
+                        let held = self.rows.iter().any(|(other, bytes)| {
+                            other.0 == row.0
+                                && (rules.unique)(&other.0, bytes) == Some(value.clone())
+                        });
+                        (!held).then(|| row.clone())
+                    })
+                    .collect();
+                if !broken.is_empty() {
+                    let refusing = before.refusing.union(&broken).cloned().collect();
+                    *self = before;
+                    self.refusing = refusing;
+                    let received = self.receive(bytes, rules);
+                    self.refusing.clear();
+                    return received;
                 }
                 self.collect(rules);
                 Received::Applied
@@ -400,13 +429,6 @@ impl Model {
         let present =
             |p: &Row| p == row || self.rows.contains_key(p) || self.retired.contains_key(p);
         if rules.checked && !(rules.parents)(&row.0, bytes).iter().all(present) {
-            return false;
-        }
-        let held = self.rows.get(row).or_else(|| self.retired.get(row));
-        if self.anchored.contains(row)
-            && held
-                .is_some_and(|held| (rules.unique)(&row.0, held) != (rules.unique)(&row.0, bytes))
-        {
             return false;
         }
         let Some(value) = (rules.unique)(&row.0, bytes) else {
