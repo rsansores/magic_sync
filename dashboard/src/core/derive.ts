@@ -11,6 +11,8 @@ import type {
   ReplicaState,
   RowState,
   TableOverview,
+  WishCounts,
+  WishState,
 } from './contract/types.js'
 import { timeOf } from './time.js'
 
@@ -52,6 +54,8 @@ export interface ReplicaRow {
   retryAt: number | null
   /** What it last said it wrote and the server has not filed, summed. */
   backlog: { unsent: number; unfiled: number; at: number | null } | null
+  /** Its settings' wishes, by where they stand. */
+  wishes: WishCounts
   source: ReplicaOverview
 }
 
@@ -136,6 +140,19 @@ const placeMoods: Record<RowState, PlaceMood> = {
   quarantined: 'set_aside',
 }
 
+const wishMoods: Record<WishState, PlaceMood> = {
+  applied: 'holds',
+  pending: 'moving',
+  waiting: 'moving',
+  refused: 'set_aside',
+  superseded: 'set_aside',
+}
+
+/** The mood of a wish's state, whatever the engine answered. */
+export function wishMoodOf(state: string): PlaceMood {
+  return Object.hasOwn(wishMoods, state) ? wishMoods[state as WishState] : 'unknown'
+}
+
 /** The mood of a row's state, whatever the engine answered. */
 export function placeMoodOf(state: string): PlaceMood {
   return Object.hasOwn(placeMoods, state) ? placeMoods[state as RowState] : 'unknown'
@@ -190,6 +207,8 @@ function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
     lastError: r.last_error,
     retryAt: timeOf(r.retry_at),
     backlog: unsent + unfiled > 0 ? { unsent, unfiled, at: timeOf(r.backlog?.at ?? null) } : null,
+    // An engine that predates wishes says nothing of them.
+    wishes: r.wishes ?? { pending: 0, waiting: 0, refused: 0, superseded: 0 },
     source: r,
   }
 }

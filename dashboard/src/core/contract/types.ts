@@ -126,7 +126,11 @@ waiting_since: string | null,
  * What it last said it wrote and the server has not filed, per table:
  * `None` until it says.
  */
-backlog: Backlog | null, };
+backlog: Backlog | null, 
+/**
+ * Its settings' wishes, by where they stand.
+ */
+wishes: WishCounts, };
 
 /**
  * How many replicas are in each state.
@@ -513,3 +517,94 @@ contract: number,
  * Each replica of the scope the row is something to.
  */
 places: Array<RowPlace>, };
+
+/**
+ * Where a wish stands: what its replica answered to it, or that it has
+ * not yet.
+ */
+export type WishState = "pending" | "waiting" | "applied" | "refused" | "superseded";
+
+/**
+ * How many of a replica's wishes stand where: those it carried out are
+ * the rest.
+ */
+export type WishCounts = { 
+/**
+ * Not answered yet.
+ */
+pending: number, 
+/**
+ * Waiting until the replica can carry them out.
+ */
+waiting: number, 
+/**
+ * Refused by the replica.
+ */
+refused: number, 
+/**
+ * Superseded: the setting changed on the replica first.
+ */
+superseded: number, };
+
+/**
+ * One wish, as `Engine::wishes` lists it.
+ */
+export type WishEntry = { 
+/**
+ * The replica it is for.
+ */
+replica: string, 
+/**
+ * The setting's table.
+ */
+table: string, 
+/**
+ * The setting row's key.
+ */
+key: string, 
+/**
+ * Where it stands.
+ */
+state: WishState, 
+/**
+ * Why, for an answer that says: refused, superseded or waiting.
+ */
+reason: string | null, 
+/**
+ * What the host said of it when it wished it.
+ */
+note: string | null, 
+/**
+ * When it was wished.
+ */
+wished_at: string, 
+/**
+ * When the replica answered it, by its clock.
+ */
+answered_at: string | null, };
+
+/**
+ * `Engine::wishes`: one page of the wishes of a scope's replicas, those
+ * that need attention first.
+ */
+export type WishListing = { 
+/**
+ * The contract this answer serializes as: `CONTRACT`.
+ */
+contract: number, 
+/**
+ * The server's time when the answer was read.
+ */
+now: string, 
+/**
+ * The state the page was asked for (`None`: every state).
+ */
+state: WishState | null, 
+/**
+ * Where in the list the page begins.
+ */
+offset: number, 
+/**
+ * The page.
+ */
+wishes: Listed<WishEntry>, };

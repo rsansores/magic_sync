@@ -164,6 +164,128 @@ pub enum RowState {
     Quarantined,
 }
 
+/// Where a wish stands: what its replica answered to it, or that it has
+/// not yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WishState {
+    /// No answer to it yet: on its way, or carried out and the answer on its
+    /// way back.
+    Pending,
+    /// The replica cannot carry it out yet — the hardware away, a build that
+    /// cannot read it — and tries again; the reason says why.
+    Waiting,
+    /// Carried out: the setting holds what was wished.
+    Applied,
+    /// The replica will not carry it out; the reason says why. Wish again to
+    /// try again.
+    Refused,
+    /// Based on a version of the setting the replica no longer held: not
+    /// carried out, and the replica's value stands.
+    Superseded,
+}
+
+/// How many of a replica's wishes stand where: those it carried out are
+/// the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
+pub struct WishCounts {
+    /// Not answered yet.
+    pub pending: i64,
+    /// Waiting until the replica can carry them out.
+    pub waiting: i64,
+    /// Refused by the replica.
+    pub refused: i64,
+    /// Superseded: the setting changed on the replica first.
+    pub superseded: i64,
+}
+
+/// One wish, as [`Engine::wishes`] lists it.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
+pub struct WishEntry {
+    /// The replica it is for.
+    pub replica: Uuid,
+    /// The setting's table.
+    pub table: String,
+    /// The setting row's key.
+    pub key: String,
+    /// Where it stands.
+    pub state: WishState,
+    /// Why, for an answer that says: refused, superseded or waiting.
+    pub reason: Option<String>,
+    /// What the host said of it when it wished it.
+    pub note: Option<String>,
+    /// When it was wished.
+    pub wished_at: DateTime<Utc>,
+    /// When the replica answered it, by its clock.
+    pub answered_at: Option<DateTime<Utc>>,
+}
+
+/// [`Engine::wishes`]: one page of the wishes of a scope's replicas, those
+/// that need attention first.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
+pub struct WishListing {
+    /// The contract this answer serializes as: `CONTRACT`.
+    pub contract: u32,
+    /// The server's time when the answer was read.
+    pub now: DateTime<Utc>,
+    /// The state the page was asked for (`None`: every state).
+    pub state: Option<WishState>,
+    /// Where in the list the page begins.
+    pub offset: u32,
+    /// The page.
+    pub wishes: Listed<WishEntry>,
+}
+
+impl WishState {
+    /// The word it is written as, in the engine's tables and in JSON.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WishState::Pending => "pending",
+            WishState::Waiting => "waiting",
+            WishState::Applied => "applied",
+            WishState::Refused => "refused",
+            WishState::Superseded => "superseded",
+        }
+    }
+
+    /// The state `word` writes; `None` for a word of no state this build
+    /// knows.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Self> {
+        [
+            WishState::Pending,
+            WishState::Waiting,
+            WishState::Applied,
+            WishState::Refused,
+            WishState::Superseded,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == word)
+    }
+
+    /// The state `word` writes, as a listing shows it: a word of no state
+    /// this build knows — an answer of a later replica's — shows as
+    /// pending, and is logged.
+    pub(crate) fn shown(word: &str) -> Self {
+        Self::of(word).unwrap_or_else(|| {
+            tracing::warn!(
+                state = word,
+                "sync: a wish in a state this build does not know — shown as pending"
+            );
+            WishState::Pending
+        })
+    }
+}
+
 /// Where a replica stands, in one word: the first of these that applies.
 /// Ordered worst first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -180,7 +302,8 @@ pub enum ReplicaState {
     Unreachable,
     /// Changes are on their way to it, or from it — or held back: by a
     /// change the planner set aside that may concern it, or by the replica,
-    /// a row of its own it deleted that waits to be sent again.
+    /// a row of its own it deleted that waits to be sent again — or a wish
+    /// of its settings it has not answered yet.
     CatchingUp,
     /// It holds what it should, and the server has filed everything it last
     /// said it wrote.
@@ -256,6 +379,8 @@ pub struct ReplicaOverview {
     /// What it last said it wrote and the server has not filed, per table:
     /// `None` until it says.
     pub backlog: Option<Backlog>,
+    /// Its settings' wishes, by where they stand.
+    pub wishes: WishCounts,
 }
 
 /// What a replica wrote and the server has not filed, as of when it said so.
@@ -508,6 +633,36 @@ mod stored {
         })
     }
 
+    /// A wish as [`Engine::wishes`](super::Engine::wishes) reads it, with
+    /// how many its listing has in all.
+    #[derive(sqlx::FromRow)]
+    pub(super) struct Wished {
+        replica: uuid::Uuid,
+        table: String,
+        key: String,
+        state: String,
+        reason: Option<String>,
+        note: Option<String>,
+        wished_at: chrono::DateTime<chrono::Utc>,
+        answered_at: Option<chrono::DateTime<chrono::Utc>>,
+        pub(super) total: i64,
+    }
+
+    impl Wished {
+        pub(super) fn entry(self) -> super::WishEntry {
+            super::WishEntry {
+                replica: self.replica,
+                table: self.table,
+                key: self.key,
+                state: super::WishState::shown(&self.state),
+                reason: self.reason,
+                note: self.note,
+                wished_at: self.wished_at,
+                answered_at: self.answered_at,
+            }
+        }
+    }
+
     pub(super) fn failing(row: PgRow) -> sqlx::Result<Failing> {
         Ok(Failing {
             replica: row.try_get("replica")?,
@@ -695,6 +850,10 @@ struct Recorded {
     awaiting: i64,
     unfiled: i64,
     owed: i64,
+    wishes_pending: i64,
+    wishes_waiting: i64,
+    wishes_refused: i64,
+    wishes_superseded: i64,
 }
 
 /// Every replica of a scope, worst first, with how many are in each state.
@@ -1000,6 +1159,76 @@ impl Engine {
         })
     }
 
+    /// The wishes of the settings of `scope`'s replicas in `state` (every
+    /// one, when `None`): the `page` of them asked for, those that need
+    /// attention first — refused, superseded, waiting, pending, then the
+    /// ones carried out — each the latest wished first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
+    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
+    /// [`Scope::Partition`] when the replicas have no partition.
+    pub async fn wishes(
+        &self,
+        conn: &mut Conn,
+        scope: Scope<'_>,
+        state: Option<WishState>,
+        page: Page,
+    ) -> Result<WishListing, Error> {
+        let Page { offset, limit } = page;
+        let mut tx = snapshot(conn).await?;
+        let now = Self::now(&mut tx).await?;
+        let scoped = self.scoped(&mut tx, scope).await?;
+        let wanted = state.map(WishState::as_str);
+        let state_sql = crate::wish::STATE;
+        let rows: Vec<stored::Wished> = sqlx::query_as(&format!(
+            "WITH w AS ( \
+                 SELECT w.replica_id AS replica, w.relation AS table, w.row_key AS key, \
+                        {state_sql} AS state, \
+                        CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN w.reason END AS reason, \
+                        w.note, w.wished_at, \
+                        CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN w.answered_at END \
+                          AS answered_at \
+                   FROM sync.sync_wishes w WHERE w.replica_id = ANY($1)) \
+             SELECT *, count(*) OVER () AS total FROM w \
+              WHERE $2::text IS NULL OR w.state = $2 \
+              ORDER BY array_position(ARRAY['refused', 'superseded', 'waiting', 'pending', 'applied'], \
+                                      w.state), w.wished_at DESC, w.replica, w.table, w.key \
+              OFFSET $3 LIMIT $4"
+        ))
+        .bind(scoped.ids())
+        .bind(wanted)
+        .bind(i64::from(offset))
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        let total = match rows.first() {
+            Some(row) => row.total,
+            None => {
+                sqlx::query_scalar(&format!(
+                    "SELECT count(*) FROM sync.sync_wishes w \
+                      WHERE w.replica_id = ANY($1) AND ($2::text IS NULL OR {state_sql} = $2)"
+                ))
+                .bind(scoped.ids())
+                .bind(wanted)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
+        Ok(WishListing {
+            contract: CONTRACT,
+            now,
+            state,
+            offset,
+            wishes: Listed {
+                total,
+                first: rows.into_iter().map(stored::Wished::entry).collect(),
+            },
+        })
+    }
+
     /// What the engine is waiting on over `scope`, with up to `limit`
     /// entries of each list.
     ///
@@ -1196,7 +1425,11 @@ impl Engine {
                     r.backlog, r.backlog_at, greatest(r.last_sent_at, r.applied_at) AS waiting_since, \
                     coalesce(q.n, 0) AS quarantined, coalesce(q.fix, 0) AS awaiting, \
                     coalesce(i.n, 0) AS unfiled, \
-                    coalesce(o.n, 0) AS owed \
+                    coalesce(o.n, 0) AS owed, \
+                    coalesce(w.pending, 0) AS wishes_pending, \
+                    coalesce(w.waiting, 0) AS wishes_waiting, \
+                    coalesce(w.refused, 0) AS wishes_refused, \
+                    coalesce(w.superseded, 0) AS wishes_superseded \
                FROM unnest($1::uuid[]) AS s(id) \
                LEFT JOIN sync.replicas r ON r.replica_id = s.id \
                LEFT JOIN sync.chains c ON c.replica_id = s.id \
@@ -1207,8 +1440,17 @@ impl Engine {
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.inbox \
                            WHERE replica_id = ANY($1) GROUP BY 1) i ON i.replica_id = s.id \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.outbox \
-                           WHERE replica_id = ANY($1) GROUP BY 1) o ON o.replica_id = s.id",
-            crate::relay::UNCONFIRMED
+                           WHERE replica_id = ANY($1) GROUP BY 1) o ON o.replica_id = s.id \
+               LEFT JOIN (SELECT replica_id, \
+                                 count(*) FILTER (WHERE state = 'pending') AS pending, \
+                                 count(*) FILTER (WHERE state = 'waiting') AS waiting, \
+                                 count(*) FILTER (WHERE state = 'refused') AS refused, \
+                                 count(*) FILTER (WHERE state = 'superseded') AS superseded \
+                            FROM (SELECT w.replica_id, {} AS state FROM sync.sync_wishes w \
+                                   WHERE w.replica_id = ANY($1)) ws \
+                           GROUP BY 1) w ON w.replica_id = s.id",
+            crate::relay::UNCONFIRMED,
+            crate::wish::STATE,
         ))
         .bind(scoped.ids())
         .fetch_all(&mut *conn)
@@ -1235,6 +1477,7 @@ impl Engine {
                     || r.unconfirmed
                     || behind
                     || r.quarantined > 0
+                    || r.wishes_pending > 0
                 {
                     ReplicaState::CatchingUp
                 } else {
@@ -1257,6 +1500,12 @@ impl Engine {
                     applied_at: r.applied_at,
                     waiting_since: r.waiting_since.filter(|_| r.unconfirmed),
                     backlog,
+                    wishes: WishCounts {
+                        pending: r.wishes_pending,
+                        waiting: r.wishes_waiting,
+                        refused: r.wishes_refused,
+                        superseded: r.wishes_superseded,
+                    },
                 }
             })
             .collect();
@@ -1404,6 +1653,10 @@ pub(crate) mod tests {
             (Progress::docs(), Progress::decl(&cfg)),
             (RowPlace::docs(), RowPlace::decl(&cfg)),
             (RowProgress::docs(), RowProgress::decl(&cfg)),
+            (WishState::docs(), WishState::decl(&cfg)),
+            (WishCounts::docs(), WishCounts::decl(&cfg)),
+            (WishEntry::docs(), WishEntry::decl(&cfg)),
+            (WishListing::docs(), WishListing::decl(&cfg)),
         ];
         let mut text = format!(
             "// Generated from magic_sync::status by its test \

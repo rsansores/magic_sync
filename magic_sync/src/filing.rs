@@ -82,6 +82,8 @@ impl Unfiled {
             upserts: vec![row.clone()],
             keys: vec![key.clone()],
             deletes: Vec::new(),
+            restated: table.restated,
+            recorded: Vec::new(),
         };
         Some(Self::of(table, Self::key(codec, key)?, part, reason))
     }
@@ -338,7 +340,7 @@ async fn file_tables<P: Sync + 'static>(
         let mut written = Vec::new();
         if !table.upserts.is_empty() {
             match codec
-                .apply_up(conn, table.upserts.clone(), sender, known)
+                .apply_up(conn, table.upserts.clone(), sender, known, table.restated)
                 .await
             {
                 Ok(taken) => {
@@ -1057,12 +1059,14 @@ async fn compare<P: Sync + 'static>(
             return Ok(Vec::new());
         }
     }
-    // A table this server does not send — of a later build's, or one it no
-    // longer sends — is the replica's own to hold: not compared.
+    // A table this server does not send, nor holds the settings of — of a
+    // later build's, or one it no longer sends — is the replica's own to
+    // hold: not compared.
+    let setting = |c: &Codec<P>| c.table.mirror == crate::row::Mirror::Setting;
     let digests: Vec<&envelope::Digest> = upload
         .digests
         .iter()
-        .filter(|d| codec_of(codecs, &d.table).is_some_and(Codec::sent_down))
+        .filter(|d| codec_of(codecs, &d.table).is_some_and(|c| c.sent_down() || setting(c)))
         .collect();
     let names: Vec<&str> = digests.iter().map(|d| d.table.as_str()).collect();
     // One statement, so the keys are those of the chain it reads.
@@ -1089,9 +1093,32 @@ async fn compare<P: Sync + 'static>(
         .execute(&mut *conn)
         .await?;
     let mut held = held.0;
+    // What the server keeps of the replica's uploads, unfiled until a fix:
+    // a setting or the answers it has not filed all of are not compared,
+    // as the replica leaves out a table of which it wrote what is not filed.
+    let kept: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT relation FROM sync.inbox WHERE replica_id = $1")
+            .bind(replica)
+            .fetch_all(&mut *conn)
+            .await?;
     let mut differ = Vec::new();
     for digest in digests {
-        let keys = held.remove(&digest.table).unwrap_or_default();
+        let mut keys = held.remove(&digest.table).unwrap_or_default();
+        // A setting is compared as the server holds the replica's rows of
+        // it, and the wishes as their answers too: either may differ after
+        // a restore no message down revealed.
+        let own = codec_of(codecs, &digest.table)
+            .is_some_and(|c| setting(c) || c.table.name == crate::wish::TABLE);
+        if own && kept.contains(&digest.table) {
+            continue;
+        }
+        match codec_of(codecs, &digest.table) {
+            Some(codec) if setting(codec) => keys = codec.versions(conn, Some(replica)).await?,
+            Some(codec) if codec.table.name == crate::wish::TABLE => {
+                keys = crate::wish::answers(conn, keys).await?;
+            }
+            _ => {}
+        }
         let count = keys.len() as u64;
         if count != digest.count || envelope::fingerprint(keys) != digest.fingerprint {
             tracing::error!(

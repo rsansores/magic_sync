@@ -508,6 +508,20 @@ impl<P: Sync + 'static> Relay<'_, P> {
             }
             writer.flush(conn, false).await?;
         }
+        // What it records of each provisioned replica's settings: the
+        // replica deletes what it no longer holds (4.2).
+        for codec in self
+            .codecs
+            .iter()
+            .filter(|c| c.table.mirror == crate::row::Mirror::Setting)
+        {
+            for replica in &snapshots {
+                for line in codec.versions(conn, Some(*replica)).await? {
+                    let key = line.split_once('\t').map_or(line.as_str(), |(key, _)| key);
+                    writer.record(*replica, codec.table.name, key);
+                }
+            }
+        }
         writer.end(&self.engine.snapshot_tables());
         writer.flush(conn, true).await?;
         let replicas: Vec<Uuid> = writer.last.keys().copied().collect();
@@ -788,6 +802,21 @@ impl Writer {
                 }
             }
             self.stuck = self.buffered;
+        }
+    }
+
+    /// Adds `key` of the setting `table` to `replica`'s snapshot: a row the
+    /// server records it holding.
+    fn record(&mut self, replica: Uuid, table: &str, key: &str) {
+        let wire = envelope::Key {
+            parts: key.split('|').map(str::to_owned).collect(),
+        };
+        let packer = self
+            .packers
+            .get_mut(&replica)
+            .expect("a packer per replica");
+        for done in packer.record(table, wire) {
+            self.ready(replica, Body::Down(done));
         }
     }
 

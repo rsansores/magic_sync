@@ -34,6 +34,14 @@ message Table {
   // The key of each upsert, in the same order, one per upsert: a side that
   // cannot read a row can still say which one it was.
   repeated Key keys = 4;
+  // Up only: the replica re-states these rows, of a setting or answers to
+  // wishes, as it holds them now (PROTOCOL.md section 7) — the server takes
+  // them whatever their version.
+  bool restated = 5;
+  // Down only, in a snapshot: the rows of a setting the server records this
+  // replica holding (PROTOCOL.md section 4.2) — the replica deletes, as its
+  // own write, each it does not hold.
+  repeated Key recorded = 6;
 }
 
 // Server to replica: rows to hold and rows to let go, in the order given —
@@ -166,4 +174,37 @@ message Digest {
   string table = 1;
   uint64 count = 2;
   uint64 fingerprint = 3;
+}
+
+// A row of the engine's table `sync_wishes`, which travels as any table
+// written on both sides does: down in a `Down`'s tables, up in an `Up`'s. It
+// is what the server wants one setting of the replica to hold: a row of a
+// table the replica owns, whose desired columns the server may wish other
+// values (PROTOCOL.md 4.5). The server owns the first fields; the replica the
+// answer, which the server never sends down.
+message Wish {
+  reserved 2;
+  reserved "replica_id";
+  // A uuid: the row's key.
+  string id = 1;
+  // The setting's table, and its row's key.
+  string table = 3;
+  Key key = 4;
+  // The row as wished, encoded as the setting's table's own row: the replica
+  // takes its desired columns, and compares its version when `if_unchanged`.
+  bytes wanted = 5;
+  // Drawn at random for every wish, from 1 to 2^63 - 1: an answer is of the
+  // wish whose version it names.
+  uint64 version = 6;
+  // Carried out only while the replica holds the version `wanted` carries.
+  bool if_unchanged = 7;
+  // The server's words on it: who asked, why.
+  string note = 8;
+  // The replica's answer: the version it answers, 0 for none yet.
+  uint64 answered = 9;
+  // "applied", "refused", "superseded" or "waiting"; empty with no answer.
+  string outcome = 10;
+  string reason = 11;
+  // When it answered, RFC 3339, by the replica's clock.
+  string answered_at = 12;
 }

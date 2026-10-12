@@ -163,9 +163,24 @@ async fn world(pool: crate::DbPool) -> World {
 
 /// The world, with a table written on both sides when `tallies`.
 async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
+    let (replicas, partition) = founded(&pool, "").await;
+    let codecs = [
+        Some(Codec::new::<Item, ItemRow>(to_wire, from_wire, None)),
+        tallies.then(|| Codec::json::<Tally>(None)),
+        tallies.then(|| Codec::json::<Pad>(None)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    provisioned(pool, codecs, replicas, partition).await
+}
+
+/// The engine's schema, the fixture's and `more`, and two live replicas of
+/// one partition.
+async fn founded(pool: &crate::DbPool, more: &str) -> ([Uuid; 2], Uuid) {
     let mut conn = pool.acquire().await.expect("a connection");
     crate::plan::tests::install(&mut conn).await;
-    sqlx::raw_sql(SCHEMA)
+    sqlx::raw_sql(&format!("{SCHEMA}{more}"))
         .execute(&mut *conn)
         .await
         .expect("schema");
@@ -179,17 +194,20 @@ async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
             .await
             .expect("a replica");
     }
-    let (items, tally, pad) = (
-        Table::of::<Item>(),
-        Table::of::<Tally>(),
-        Table::of::<Pad>(),
-    );
-    let tables: Vec<&Table> = if tallies {
-        vec![&items, &tally, &pad]
-    } else {
-        vec![&items]
-    };
-    let mut tx = conn.begin().await.expect("a transaction");
+    (replicas, partition)
+}
+
+/// The world of `codecs` — the engine's own tables added as a server adds
+/// them — over `replicas`, each provisioned, of nothing yet.
+async fn provisioned(
+    pool: crate::DbPool,
+    codecs: Vec<Codec<()>>,
+    replicas: [Uuid; 2],
+    partition: Uuid,
+) -> World {
+    let codecs = crate::wish::with_wishes(codecs).expect("the codecs");
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = pool.begin().await.expect("a transaction");
     let engine = Engine::install(&mut tx, &tables, REPLICAS)
         .await
         .expect("the engine");
@@ -197,14 +215,7 @@ async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
     let mut world = World {
         pool,
         engine,
-        codecs: [
-            Some(Codec::new::<Item, ItemRow>(to_wire, from_wire, None)),
-            tallies.then(|| Codec::json::<Tally>(None)),
-            tallies.then(|| Codec::json::<Pad>(None)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
+        codecs,
         replicas,
         partition,
         provisioned: BTreeMap::new(),
@@ -2201,6 +2212,78 @@ async fn an_uploaded_row_of_another_replica_is_left_out(pool: crate::DbPool) {
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
 
+/// A setting's upload of an older version is refused as a record's would
+/// be — two uploads may arrive out of order — but one the replica re-states,
+/// as a snapshot begins, is filed whatever its version: a replica restored
+/// from an older copy says what it holds.
+#[sqlx::test(migrations = false)]
+async fn a_setting_is_filed_newest_unless_restated(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Table as WireTable, Up};
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
+    )]
+    #[row(
+        table = "brightness",
+        schema = "fixture",
+        mirror = "setting",
+        key = "replica_id, id",
+        origin = "replica_id"
+    )]
+    struct Brightness {
+        replica_id: Uuid,
+        id: Uuid,
+        #[row(desired)]
+        level: i64,
+        #[row(version)]
+        revision: i64,
+    }
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.brightness (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         level BIGINT NOT NULL, revision BIGINT NOT NULL, PRIMARY KEY (replica_id, id))",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let codecs = vec![Codec::<()>::json::<Brightness>(None)];
+    let id = Uuid::now_v7();
+    let upload = |level: i64, revision: i64, restated: bool| {
+        let row = Brightness {
+            replica_id: a,
+            id,
+            level,
+            revision,
+        };
+        let table = Table::of::<Brightness>();
+        Up {
+            tables: vec![WireTable {
+                table: "brightness".to_owned(),
+                upserts: vec![crate::wire::json_encode("brightness", &table.columns, &row).unwrap()],
+                keys: vec![WireKey {
+                    parts: vec![a.to_string(), id.to_string()],
+                }],
+                restated,
+                ..WireTable::default()
+            }],
+            protocol: envelope::PROTOCOL,
+            ..Up::default()
+        }
+    };
+    let filed = || async {
+        sqlx::query_as::<_, (i64, i64)>("SELECT level, revision FROM fixture.brightness")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap()
+    };
+    crate::testkit::file(&world.pool, &codecs, &upload(70, 9, false), a, &()).await;
+    assert_eq!(filed().await, [(70, 9)]);
+    crate::testkit::file(&world.pool, &codecs, &upload(40, 3, false), a, &()).await;
+    assert_eq!(filed().await, [(70, 9)], "an older upload, arrived late");
+    crate::testkit::file(&world.pool, &codecs, &upload(40, 3, true), a, &()).await;
+    assert_eq!(filed().await, [(40, 3)], "the replica's present, re-stated");
+}
+
 /// What an upload said of its moment — what the replica refused, applied,
 /// held — is filed when it comes: an upload kept whole keeps only its rows.
 #[sqlx::test(migrations = false)]
@@ -2235,6 +2318,9 @@ async fn an_upload_kept_whole_keeps_only_its_rows(pool: crate::DbPool) {
 
 #[path = "status_tests.rs"]
 mod status;
+
+#[path = "wish_tests.rs"]
+mod wishes;
 
 /// Replicas are sent to side by side, as many at once as the relay says and
 /// no more, each its messages one after the other, in order.
@@ -2480,6 +2566,8 @@ fn edit(partition: Uuid, id: Uuid, title: &str, seen: i32) -> envelope::Up {
                 parts: vec![id.to_string()],
             }],
             deletes: Vec::new(),
+            restated: false,
+            recorded: Vec::new(),
         }],
         protocol: envelope::PROTOCOL,
         ..envelope::Up::default()

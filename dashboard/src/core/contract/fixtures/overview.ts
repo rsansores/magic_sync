@@ -110,7 +110,13 @@ export default {
         "state": "awaiting_fix",
         "unconfirmed": false,
         "unfiled": 1,
-        "waiting_since": null
+        "waiting_since": null,
+        "wishes": {
+          "pending": 0,
+          "refused": 0,
+          "superseded": 0,
+          "waiting": 0
+        }
       },
       {
         "applied_at": null,
@@ -127,7 +133,13 @@ export default {
         "state": "unreachable",
         "unconfirmed": true,
         "unfiled": 0,
-        "waiting_since": null
+        "waiting_since": null,
+        "wishes": {
+          "pending": 0,
+          "refused": 0,
+          "superseded": 0,
+          "waiting": 0
+        }
       },
       {
         "applied_at": null,
@@ -154,7 +166,13 @@ export default {
         "state": "catching_up",
         "unconfirmed": true,
         "unfiled": 0,
-        "waiting_since": "2026-01-01T00:00:00.123456Z"
+        "waiting_since": "2026-01-01T00:00:00.123456Z",
+        "wishes": {
+          "pending": 0,
+          "refused": 0,
+          "superseded": 0,
+          "waiting": 0
+        }
       },
       {
         "applied_at": "2026-01-01T00:00:00.123456Z",
@@ -171,7 +189,13 @@ export default {
         "state": "synced",
         "unconfirmed": false,
         "unfiled": 0,
-        "waiting_since": null
+        "waiting_since": null,
+        "wishes": {
+          "pending": 0,
+          "refused": 0,
+          "superseded": 0,
+          "waiting": 0
+        }
       }
     ],
     "total": 4

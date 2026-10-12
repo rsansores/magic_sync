@@ -61,16 +61,21 @@ pub(crate) fn parsed<P: Sync + 'static>(
 /// The engine's steps, in order, each as released and never edited: the
 /// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
 #[cfg(feature = "sqlite")]
-const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] =
-    [include_str!("../sql/sqlite/1.sql")];
+const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [
+    include_str!("../sql/sqlite/1.sql"),
+    include_str!("../sql/sqlite/2.sql"),
+];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
 /// script that also records the version it brings them to — `None` for a
 /// version no build of the engine has had yet. [`install`] runs every step a
 /// database lacks, in order; a host with migrations runs each, in one of its
-/// own: the first in the migration that creates its tables, before
-/// [`triggers`]' script, and each later one when a release brings it (its
-/// changelog says). A step is never edited once released.
+/// own: every step up to [`REPLICA_SCHEMA_VERSION`], in order, in the
+/// migration that creates its tables, before [`triggers`]' script, and each
+/// later one when a release brings it (its changelog says). A step is never
+/// edited once released.
+///
+/// [`REPLICA_SCHEMA_VERSION`]: crate::REPLICA_SCHEMA_VERSION
 #[cfg(feature = "sqlite")]
 #[must_use]
 pub fn migration(version: i32) -> Option<String> {
@@ -108,7 +113,7 @@ struct Trigger {
 /// A write the engine makes while it applies what the server sent is noted
 /// by none and refused by none.
 #[cfg(feature = "sqlite")]
-fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
+fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
     use crate::row::Mirror;
     const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
     // A row noted again is one note, written once more: a hot row goes up
@@ -119,30 +124,8 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
     for codec in codecs {
         let table = codec.table.name;
         let on = ident(table);
-        let key_columns: Vec<&crate::row::Column> = codec
-            .table
-            .key
-            .iter()
-            .filter_map(|k| codec.table.columns.iter().find(|c| c.name == *k))
-            .collect();
-        let key = |row: &str| {
-            key_columns
-                .iter()
-                .map(|c| {
-                    let value = format!("{row}.{}", ident(c.name));
-                    if c.key == Some(KeyKind::Integer) {
-                        format!("CAST({value} AS TEXT)")
-                    } else {
-                        let hex = format!("hex({value})");
-                        format!(
-                            "lower(substr({hex}, 1, 8) || '-' || substr({hex}, 9, 4) || '-' || \
-                             substr({hex}, 13, 4) || '-' || substr({hex}, 17, 4) || '-' || substr({hex}, 21))"
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" || '|' || ")
-        };
+        let key_columns = key_columns(&codec.table);
+        let key = |row: &str| key_sql(&codec.table, row);
         let readable = key_columns
             .iter()
             .map(|c| {
@@ -197,7 +180,7 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
                     out.push(refuse(event, QUIET, why));
                 }
             }
-            Mirror::Record => {
+            Mirror::Record | Mirror::Setting => {
                 out.push(noting("INSERT", "", "", format!("{guard}{}", note("NEW"))));
                 if codec.table.columns.iter().any(|c| c.version.is_some()) {
                     let body = format!("{guard}{}{gone}", note("NEW"));
@@ -258,19 +241,116 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
     out
 }
 
+/// The columns of `table`'s key, in key order.
+#[cfg(feature = "sqlite")]
+fn key_columns(table: &crate::row::Table) -> Vec<&crate::row::Column> {
+    table
+        .key
+        .iter()
+        .filter_map(|k| table.columns.iter().find(|c| c.name == *k))
+        .collect()
+}
+
+/// The key of the row `row` (an alias, `NEW` or `OLD`) of `table` as SQL
+/// writes it in the one form keys are compared in.
+#[cfg(feature = "sqlite")]
+fn key_sql(table: &crate::row::Table, row: &str) -> String {
+    key_columns(table)
+        .iter()
+        .map(|c| {
+            let value = format!("{row}.{}", ident(c.name));
+            if c.key == Some(KeyKind::Integer) {
+                format!("CAST({value} AS TEXT)")
+            } else {
+                let hex = format!("hex({value})");
+                format!(
+                    "lower(substr({hex}, 1, 8) || '-' || substr({hex}, 9, 4) || '-' || \
+                     substr({hex}, 13, 4) || '-' || substr({hex}, 17, 4) || '-' || substr({hex}, 21))"
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" || '|' || ")
+}
+
+/// Notes again every row of the replica's settings, and every answer it gave
+/// to a wish: what the server records of them may be behind — a server or a
+/// replica restored from an older copy — and a snapshot beginning is the
+/// moment the server sets out to find what this replica holds. What it notes
+/// so goes up re-stated, which the server takes whatever its version, until
+/// the upload that carries it is filed (7).
+#[cfg(feature = "sqlite")]
+async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
+    for codec in codecs {
+        let table = &codec.table;
+        let only = match table.mirror {
+            // SQLite reads an upsert's ON after a SELECT with no WHERE as a
+            // join's.
+            crate::row::Mirror::Setting => " WHERE true",
+            _ if table.name == crate::wish::TABLE => {
+                " WHERE t.answered IS NOT NULL AND t.retired_at IS NULL"
+            }
+            _ => continue,
+        };
+        sqlx::query(&format!(
+            "INSERT INTO sync_notes (relation, row_key, restated) SELECT {}, {}, 1 FROM {} t{only} \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, restated = 1, \
+                    upload = NULL, sent = NULL, sent_at = NULL",
+            literal(table.name),
+            key_sql(table, "t"),
+            ident(table.name)
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Of `recorded`, the rows of a setting the server records this replica
+/// holding, notes those it does not hold as its own deletes: the server
+/// lets go of them as it files the deletes (4.2).
+#[cfg(feature = "sqlite")]
+async fn gone_here<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+    recorded: &[Key],
+) -> Result<(), Error> {
+    let held = codec.present(conn, recorded).await?;
+    for key in recorded.iter().filter(|k| !held.contains(k)) {
+        sqlx::query(
+            "INSERT INTO sync_notes (relation, row_key) VALUES ($1, $2) \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1",
+        )
+        .bind(codec.table.name)
+        .bind(key_text(key))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
 /// The triggers a replica database needs for `codecs`, as one SQL script: a
 /// host with migrations puts it in the one that creates the tables, after
-/// the engine's first step ([`migration`]), and again whenever a table is
-/// added or changes how it travels, or a release writes them otherwise: each
-/// trigger is dropped if it exists before it is created, so the script runs
-/// again over what an earlier run wrote. [`check`] refuses a database whose triggers are not these.
+/// every step of the engine's schema up to [`REPLICA_SCHEMA_VERSION`]
+/// ([`migration`]), and again whenever a table is added or changes how it
+/// travels, or a release writes them otherwise: each trigger is dropped if it
+/// exists before it is created, so the script runs again over what an
+/// earlier run wrote. [`check`] refuses a database whose triggers are not
+/// these.
+///
+/// # Errors
+///
+/// [`Error::Misuse`] for a table of `codecs` whose name the engine keeps
+/// for its own (`sync_…`).
+///
+/// [`REPLICA_SCHEMA_VERSION`]: crate::REPLICA_SCHEMA_VERSION
 #[cfg(feature = "sqlite")]
-#[must_use]
-pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
-    generated(codecs)
+pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> Result<String, Error> {
+    let wishes = crate::wish::engines(codecs)?;
+    Ok(generated(&codecs.iter().chain(&wishes).collect::<Vec<_>>())
         .into_iter()
         .map(|t| format!("DROP TRIGGER IF EXISTS {};\n{};\n", ident(&t.name), t.sql))
-        .collect()
+        .collect())
 }
 
 /// Records which replica this is, for the triggers to know its rows by.
@@ -328,6 +408,17 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
+    let wishes = crate::wish::engines(codecs)?;
+    checked(conn, &codecs.iter().chain(&wishes).collect::<Vec<_>>()).await
+}
+
+/// [`check`] of `codecs` as the engine holds them: the engine's own tables
+/// among them.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn checked<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[&Codec<P>],
+) -> Result<(), Error> {
     let (version, needed) = (schema_version(conn).await?, crate::REPLICA_SCHEMA_VERSION);
     if version > needed {
         return Err(Error::Misuse(format!(
@@ -477,7 +568,7 @@ fn engines(name: &str) -> bool {
 ///
 /// [`Replica::new`]: crate::run::replica::Replica::new
 #[cfg(feature = "sqlite")]
-fn unknown<P: Sync + 'static>(codecs: &[Codec<P>], name: &str, table: &str) -> bool {
+fn unknown<P: Sync + 'static>(codecs: &[&Codec<P>], name: &str, table: &str) -> bool {
     name.starts_with("sync_note_")
         && !codecs
             .iter()
@@ -540,6 +631,8 @@ pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
 /// are at a later version than this build's, or [`check`] refuses what results.
 #[cfg(feature = "sqlite")]
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
+    let wishes = crate::wish::engines(codecs)?;
+    let all: &[&Codec<P>] = &codecs.iter().chain(&wishes).collect::<Vec<_>>();
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
     let version = schema_version(&mut tx).await?;
     if version > crate::REPLICA_SCHEMA_VERSION {
@@ -558,16 +651,16 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
             .await?;
     let ours = live
         .into_iter()
-        .filter(|(name, table)| engines(name) && !unknown(codecs, name, table));
+        .filter(|(name, table)| engines(name) && !unknown(all, name, table));
     for (name, _) in ours {
         sqlx::query(&format!("DROP TRIGGER {}", ident(&name)))
             .execute(&mut *tx)
             .await?;
     }
-    for trigger in generated(codecs) {
+    for trigger in generated(all) {
         sqlx::query(&trigger.sql).execute(&mut *tx).await?;
     }
-    check(&mut tx, codecs).await?;
+    checked(&mut tx, all).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -974,9 +1067,14 @@ async fn act<P: Sync + 'static>(
                 ends: false,
             };
             match chained(conn, place).await? {
-                Ok(by) => Ok(Received::Applied(
-                    apply(conn, codecs, &down, &by, care).await?,
-                )),
+                Ok(by) => {
+                    if down.previous == 0 {
+                        restate(conn, codecs).await?;
+                    }
+                    Ok(Received::Applied(
+                        apply(conn, codecs, &down, &by, care).await?,
+                    ))
+                }
                 Err(skipped) => Ok(skipped),
             }
         }
@@ -992,6 +1090,9 @@ async fn act<P: Sync + 'static>(
             };
             match chained(conn, place).await? {
                 Ok(by) => {
+                    if end.previous == 0 {
+                        restate(conn, codecs).await?;
+                    }
                     end_snapshot(conn, codecs, &end, &by, care).await?;
                     Ok(Received::SnapshotEnded)
                 }
@@ -1225,6 +1326,11 @@ async fn apply<P: Sync + 'static>(
     let mut parts = Vec::new();
     let foreign = foreign_rows(codecs, &message.tables);
     for (entry, table) in message.tables.iter().enumerate() {
+        if let Some(codec) = codec_of(codecs, &table.table)
+            .filter(|c| naming && c.table.mirror == crate::row::Mirror::Setting)
+        {
+            gone_here(conn, codec, &keys_of(codec, &table.recorded)).await?;
+        }
         let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
             continue;
         };
@@ -1977,12 +2083,18 @@ async fn filed<P: Sync + 'static>(
         .iter()
         .filter_map(|u| i64::try_from(*u).ok())
         .collect();
-    sqlx::query(
-        "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) AND writes = sent",
-    )
-    .bind(json(&uploads))
-    .execute(&mut *conn)
-    .await?;
+    // A row written again since goes again, re-stated no more: the server
+    // took it as it was re-stated, and its later writes are newer (7).
+    for sql in [
+        "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) \
+            AND writes = sent",
+        "UPDATE sync_notes SET restated = 0 WHERE upload IN (SELECT value FROM json_each($1))",
+    ] {
+        sqlx::query(sql)
+            .bind(json(&uploads))
+            .execute(&mut *conn)
+            .await?;
+    }
     let both: Vec<&str> = codecs
         .iter()
         .filter(|c| matches!(c.table.mirror, crate::row::Mirror::Both))
@@ -2226,10 +2338,10 @@ pub(crate) fn check_settings<P: Sync + 'static>(
         }
     }
     if lanes.iter().all(|l| !l.tables.is_empty()) {
-        if let Some(codec) = codecs
-            .iter()
-            .find(|c| c.goes_up() && !named.contains(c.table.name))
-        {
+        // The engine's own tables go on the first lane, unless one names them.
+        if let Some(codec) = codecs.iter().find(|c| {
+            c.goes_up() && !named.contains(c.table.name) && c.table.name != crate::wish::TABLE
+        }) {
             return misuse(format!("`{}` goes up on no lane", codec.table.name));
         }
     }
@@ -2505,6 +2617,8 @@ struct Note {
     id: i64,
     relation: String,
     row_key: String,
+    /// Re-stated when a snapshot began, and not filed since (section 7).
+    restated: bool,
 }
 
 /// Up to a message's rows of notes, and `most`, to send on `lane`, oldest
@@ -2525,6 +2639,12 @@ async fn unsent(
     let quoted = |tables: &mut dyn Iterator<Item = &&str>| {
         tables.map(|t| literal(t)).collect::<Vec<_>>().join(", ")
     };
+    // The engine's table of wishes goes where a lane names it; else with
+    // every table no lane names; else on the first lane.
+    let wishes = (std::ptr::eq(lane, &lanes[0])
+        && lanes.iter().all(|l| !l.tables.is_empty())
+        && !lanes.iter().any(|l| l.tables.contains(&crate::wish::TABLE)))
+    .then_some(&crate::wish::TABLE);
     let filter = if lane.tables.is_empty() {
         let others = quoted(&mut lanes.iter().flat_map(|l| l.tables.iter()));
         if others.is_empty() {
@@ -2533,11 +2653,14 @@ async fn unsent(
             format!("AND relation NOT IN ({others})")
         }
     } else {
-        format!("AND relation IN ({})", quoted(&mut lane.tables.iter()))
+        format!(
+            "AND relation IN ({})",
+            quoted(&mut lane.tables.iter().chain(wishes))
+        )
     };
     let now = crate::dialect::NOW;
     Ok(sqlx::query_as(&format!(
-        "SELECT id, relation, row_key FROM sync_notes \
+        "SELECT id, relation, row_key, restated FROM sync_notes \
           WHERE set_aside IS NULL \
             AND (sent_at IS NULL OR writes > sent \
                  OR sent_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{:.3} seconds') \
@@ -2581,8 +2704,9 @@ async fn gather<P: Sync + 'static>(
 ) -> Result<Gathered, Error> {
     let mut aside: Vec<(i64, String)> = Vec::new();
     let mut done: Vec<i64> = Vec::new();
-    // Per table, each key with its note, in the order first noted.
-    let mut keyed: HashMap<&str, Keyed> = HashMap::new();
+    // Per table, and whether re-stated, each key with its note, in the
+    // order first noted.
+    let mut keyed: HashMap<(&str, bool), Keyed> = HashMap::new();
     for note in &notes {
         let Some(codec) = codec_of(codecs, &note.relation).filter(|c| c.goes_up()) else {
             aside.push((note.id, "a table this build does not send up".to_owned()));
@@ -2597,7 +2721,7 @@ async fn gather<P: Sync + 'static>(
             }
         };
         keyed
-            .entry(codec.table.name)
+            .entry((codec.table.name, note.restated))
             .or_default()
             .push((key, note.id));
     }
@@ -2605,17 +2729,21 @@ async fn gather<P: Sync + 'static>(
     let mut tables = Vec::new();
     let mut gone: Vec<(&Codec<P>, Keyed)> = Vec::new();
     let mut full = false;
-    for codec in codecs {
-        let Some(keys) = keyed.remove(codec.table.name) else {
+    for (codec, restated) in codecs
+        .iter()
+        .flat_map(|codec| [(codec, true), (codec, false)])
+    {
+        let Some(keys) = keyed.remove(&(codec.table.name, restated)) else {
             continue;
         };
         let wanted: Vec<Key> = keys.iter().map(|(k, _)| k.clone()).collect();
         let encoded = codec.load(conn, &wanted).await?;
         let mut part = Table {
             table: codec.table.name.to_owned(),
+            restated,
             ..Table::default()
         };
-        let mut len = framed(part.table.len());
+        let mut len = framed(part.table.len()) + usize::from(restated) * 2;
         let mut missing = Vec::new();
         for (key, id) in keys {
             if let Some((_, e)) = encoded.failed.iter().find(|(k, _)| *k == key) {
@@ -2628,7 +2756,7 @@ async fn gather<P: Sync + 'static>(
             };
             let wire = wire_of(&key);
             let added = framed(bytes.len()) + framed(wire.encoded_len());
-            if framed(framed(part.table.len()) + added) > largest {
+            if framed(framed(part.table.len()) + usize::from(restated) * 2 + added) > largest {
                 let why = format!(
                     "a row of {} bytes, more than a message carries",
                     bytes.len()
@@ -2651,7 +2779,10 @@ async fn gather<P: Sync + 'static>(
             tables.push(part);
         }
         if codec.takes_deletes() {
-            gone.push((codec, missing));
+            match gone.last_mut() {
+                Some((last, keys)) if std::ptr::eq(*last, codec) => keys.extend(missing),
+                _ => gone.push((codec, missing)),
+            }
         } else {
             done.extend(missing.into_iter().map(|(_, id)| id));
         }
@@ -2923,7 +3054,8 @@ pub(crate) async fn held<P: Sync + 'static>(
         .fetch_optional(&mut *conn)
         .await?;
     let mut digests = Vec::new();
-    for codec in codecs.iter().filter(|c| c.sent_down()) {
+    let setting = |c: &Codec<P>| c.table.mirror == crate::row::Mirror::Setting;
+    for codec in codecs.iter().filter(|c| c.sent_down() || setting(c)) {
         // What the replica wrote of it and the server has not filed is
         // about to change what the server records: compared now, the two
         // would differ for nothing.
@@ -2942,13 +3074,18 @@ pub(crate) async fn held<P: Sync + 'static>(
                 .await?
                 .into_iter()
                 .collect();
-        let keys: Vec<String> = codec
+        let mut keys: Vec<String> = codec
             .live_keys(conn)
             .await?
             .iter()
             .map(key_text)
             .filter(|k| !rejected.contains(k))
             .collect();
+        if setting(codec) {
+            keys = codec.versions(conn, None).await?;
+        } else if codec.table.name == crate::wish::TABLE {
+            keys = crate::wish::answers(conn, keys).await?;
+        }
         digests.push(envelope::Digest {
             table: codec.table.name.to_owned(),
             count: keys.len() as u64,

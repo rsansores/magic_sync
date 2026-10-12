@@ -1,4 +1,4 @@
-error: mirror = "everywhere": expected "catalog", "record" or "both"
+error: mirror = "everywhere": expected "catalog", "record", "both" or "setting"
  --> tests/derive/fail/unknown_mirror.rs:2:34
   |
 2 | #[row(table = "things", mirror = "everywhere")]

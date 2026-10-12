@@ -43,6 +43,16 @@ pub struct Table {
     /// cannot read a row can still say which one it was.
     #[prost(message, repeated, tag = "4")]
     pub keys: ::prost::alloc::vec::Vec<Key>,
+    /// Up only: the replica re-states these rows, of a setting or answers to
+    /// wishes, as it holds them now (PROTOCOL.md section 7) — the server takes
+    /// them whatever their version.
+    #[prost(bool, tag = "5")]
+    pub restated: bool,
+    /// Down only, in a snapshot: the rows of a setting the server records this
+    /// replica holding (PROTOCOL.md section 4.2) — the replica deletes, as its
+    /// own write, each it does not hold.
+    #[prost(message, repeated, tag = "6")]
+    pub recorded: ::prost::alloc::vec::Vec<Key>,
 }
 /// Server to replica: rows to hold and rows to let go, in the order given —
 /// parents' upserts first, children's deletes first — applied in one
@@ -215,4 +225,46 @@ pub struct Digest {
     pub count: u64,
     #[prost(uint64, tag = "3")]
     pub fingerprint: u64,
+}
+/// A row of the engine's table `sync_wishes`, which travels as any table
+/// written on both sides does: down in a `Down`'s tables, up in an `Up`'s. It
+/// is what the server wants one setting of the replica to hold: a row of a
+/// table the replica owns, whose desired columns the server may wish other
+/// values (PROTOCOL.md 4.5). The server owns the first fields; the replica the
+/// answer, which the server never sends down.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Wish {
+    /// A uuid: the row's key.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// The setting's table, and its row's key.
+    #[prost(string, tag = "3")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub key: ::core::option::Option<Key>,
+    /// The row as wished, encoded as the setting's table's own row: the replica
+    /// takes its desired columns, and compares its version when `if_unchanged`.
+    #[prost(bytes = "vec", tag = "5")]
+    pub wanted: ::prost::alloc::vec::Vec<u8>,
+    /// Drawn at random for every wish, from 1 to 2^63 - 1: an answer is of the
+    /// wish whose version it names.
+    #[prost(uint64, tag = "6")]
+    pub version: u64,
+    /// Carried out only while the replica holds the version `wanted` carries.
+    #[prost(bool, tag = "7")]
+    pub if_unchanged: bool,
+    /// The server's words on it: who asked, why.
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
+    /// The replica's answer: the version it answers, 0 for none yet.
+    #[prost(uint64, tag = "9")]
+    pub answered: u64,
+    /// "applied", "refused", "superseded" or "waiting"; empty with no answer.
+    #[prost(string, tag = "10")]
+    pub outcome: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub reason: ::prost::alloc::string::String,
+    /// When it answered, RFC 3339, by the replica's clock.
+    #[prost(string, tag = "12")]
+    pub answered_at: ::prost::alloc::string::String,
 }

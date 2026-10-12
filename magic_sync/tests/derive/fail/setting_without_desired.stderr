@@ -1,0 +1,5 @@
+error: a setting needs at least one #[row(desired)] field: a column a wish may set
+ --> tests/derive/fail/setting_without_desired.rs:3:12
+  |
+3 | pub struct Screen {
+  |            ^^^^^^

@@ -1,0 +1,5 @@
+error: a #[row(desired)] column is one a wish sets: the version moves by itself, and a #[row(created)] column never moves
+ --> tests/derive/fail/desired_version.rs:6:20
+  |
+6 |     #[row(desired, version)]
+  |                    ^^^^^^^

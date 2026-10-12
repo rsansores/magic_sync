@@ -29,7 +29,7 @@
 //! replica again on demand.
 
 use crate::dialect::{ident, literal};
-use crate::row::{key_text, Column, Key, KeyPart, Mirror, Route, Table};
+use crate::row::{key_text, Column, Key, KeyPart, Route, Table};
 use crate::wire::Codec;
 use crate::Error;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -246,18 +246,22 @@ const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 
 /// The engine's steps, in order, each as released and never edited: the
 /// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
-const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] =
-    [include_str!("../sql/postgres/1.sql")];
+const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [
+    include_str!("../sql/postgres/1.sql"),
+    include_str!("../sql/postgres/2.sql"),
+];
 
 /// The engine's step to `version` of its schema on the server, as one SQL
 /// script that also records the version it brings it to — `None` for a
 /// version no build of the engine has had yet. [`Server::install`] runs every
 /// step a database lacks, in order; a host with migrations runs each, in one
-/// of its own: the first before the migration that writes
-/// [`Engine::triggers`]' script, and each later one when a release brings it
-/// (its changelog says). A step is never edited once released.
+/// of its own: every step up to [`SERVER_SCHEMA_VERSION`], in order, before
+/// the migration that writes [`Engine::triggers`]' script, and each later one
+/// when a release brings it (its changelog says). A step is never edited once
+/// released.
 ///
 /// [`Server::install`]: crate::run::server::Server::install
+/// [`SERVER_SCHEMA_VERSION`]: crate::SERVER_SCHEMA_VERSION
 #[must_use]
 pub fn migration(version: i32) -> Option<String> {
     let step = MIGRATIONS.get(usize::try_from(version.checked_sub(1)?).ok()?)?;
@@ -913,9 +917,8 @@ impl Engine {
     /// For a host that has no migrations of its own. Run it before anything
     /// writes a mirrored table — a write before its trigger is never noted —
     /// on a connection that may create triggers. A host with migrations runs
-    /// [`migration`]`(1)` in one and writes each
-    /// table's triggers in the migration that creates it, as it does its
-    /// indexes; [`Engine::new`] refuses to start while one is missing.
+    /// every [`migration`] step in one and writes each table's triggers in
+    /// the migration that creates it, as it does its indexes; [`Engine::new`] refuses to start while one is missing.
     pub(crate) async fn install(
         conn: &mut Conn,
         tables: &[&Table],
@@ -977,7 +980,7 @@ impl Engine {
     /// The statements that create every trigger the server needs for
     /// `codecs`, one per line, read off the database `conn` is on: what a
     /// host with migrations writes in the migration that creates the tables —
-    /// after the engine's first step ([`migration`]) — and what
+    /// after every step of the engine's schema ([`migration`]) — and what
     /// [`Server::install`](crate::run::server::Server::install) runs. A mirrored table
     /// notes every write that changes a column it does not leave to the
     /// replicas, and refuses a truncate; a group table notes every write.
@@ -1013,7 +1016,8 @@ impl Engine {
         codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        let wishes = crate::wish::engines(codecs)?;
+        let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
         let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine
             .triggers_needed()
@@ -1043,7 +1047,8 @@ impl Engine {
         codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        let wishes = crate::wish::engines(codecs)?;
+        let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
         let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine
             .indexes_missing(conn)
@@ -1191,7 +1196,7 @@ impl Engine {
         let tables: Vec<&Table> = tables
             .iter()
             .copied()
-            .filter(|t| matches!(t.mirror, Mirror::Catalog | Mirror::Both))
+            .filter(|t| t.mirror.sent_down())
             .collect();
         let mut by_name: HashMap<&'static str, usize> = HashMap::new();
         for (i, t) in tables.iter().enumerate() {
@@ -3578,9 +3583,11 @@ pub(crate) mod tests {
             .execute(&mut *conn)
             .await
             .expect("drop the schema");
-        sqlx::raw_sql(&migration(1).expect("the first step"))
-            .execute(&mut *conn)
-            .await
-            .expect("the schema");
+        for step in 1..=crate::SERVER_SCHEMA_VERSION {
+            sqlx::raw_sql(&migration(step).expect("a step of this build"))
+                .execute(&mut *conn)
+                .await
+                .expect("the schema");
+        }
     }
 }

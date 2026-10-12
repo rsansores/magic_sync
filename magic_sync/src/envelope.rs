@@ -27,7 +27,7 @@ pub(crate) use sync::to_replica::Body;
 #[cfg(any(feature = "sqlite", test))]
 pub(crate) use sync::TableBacklog;
 pub(crate) use sync::{
-    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, ToReplica, Up,
+    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, ToReplica, Up, Wish,
 };
 
 #[cfg(any(feature = "postgres", test))]
@@ -354,8 +354,21 @@ impl Packer {
     /// and answers the messages it completed, when there was no room left
     /// for it in the current one.
     pub(crate) fn push(&mut self, table: &str, row: Option<Vec<u8>>, key: Key) -> Vec<Down> {
+        self.add(table, Some(row), key)
+    }
+
+    /// Adds the key of a row of the setting `table` the server records the
+    /// replica holding, as [`push`](Self::push) adds a row.
+    pub(crate) fn record(&mut self, table: &str, key: Key) -> Vec<Down> {
+        self.add(table, None, key)
+    }
+
+    /// A row to hold or let go of (`Some`), or a key recorded (`None`).
+    fn add(&mut self, table: &str, entry: Option<Option<Vec<u8>>>, key: Key) -> Vec<Down> {
         use prost::Message as _;
-        if row.is_none() {
+        let recorded = entry.is_none();
+        let row = entry.flatten();
+        if row.is_none() && !recorded {
             self.spans.retain(|s| !s.deleting || s.table == table);
             for span in self.spans.iter_mut().filter(|s| s.table == table) {
                 span.deleting = true;
@@ -393,6 +406,7 @@ impl Packer {
                 part.upserts.push(row);
                 part.keys.push(key);
             }
+            None if recorded => part.recorded.push(key),
             None => part.deletes.push(key),
         }
         done
@@ -527,6 +541,8 @@ mod tests {
             table: table.to_owned(),
             upserts: sizes.iter().map(|n| vec![0; *n]).collect(),
             deletes: Vec::new(),
+            restated: false,
+            recorded: Vec::new(),
             keys: (0..sizes.len())
                 .map(|n| Key {
                     parts: vec![n.to_string()],
@@ -681,6 +697,8 @@ mod tests {
                         upserts: (0..n).map(|_| vec![7; next(400)]).collect(),
                         keys: (0..n).map(key).collect(),
                         deletes: (0..next(20)).map(key).collect(),
+                        restated: false,
+                        recorded: Vec::new(),
                     }
                 })
                 .collect();
@@ -739,6 +757,8 @@ mod tests {
                         upserts: (0..n).map(|_| vec![7; walk.below(60)]).collect(),
                         keys: (0..n).map(key).collect(),
                         deletes: (n..n + walk.below(4)).map(key).collect(),
+                        restated: false,
+                        recorded: Vec::new(),
                     }
                 })
                 .collect();

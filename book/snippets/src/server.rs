@@ -2,10 +2,11 @@
 
 pub mod partitioned;
 
+use crate::rows::RegisterSetting;
 use magic_sync::envelope::Limits;
 use magic_sync::plan::Engine;
-use magic_sync::run::server::{Senders, Settings};
-use magic_sync::status::{ReplicaState, RowState, Scope};
+use magic_sync::run::server::{Senders, Server, Settings, Transport, Wished};
+use magic_sync::status::{ReplicaState, RowState, Scope, WishState};
 use magic_sync::Error;
 use magic_sync::Row;
 use shop_rows::{codecs, Product, REGISTERS};
@@ -166,3 +167,89 @@ pub async fn who_holds(engine: &Engine, pool: &PgPool, product: &Product) -> Res
     Ok(())
 }
 // ANCHOR_END: row
+
+// ANCHOR: desire
+/// An operator sets a register's setting from the page that showed it: the
+/// row as the page read it, with the value they typed. The register carries
+/// the wish out only while the setting is still what the operator saw.
+pub async fn set_from_the_page<S: Senders, T: Transport>(
+    server: &Server<S, T>,
+    seen: RegisterSetting,
+    value: String,
+    operator: &str,
+) -> Result<Wished, Error> {
+    let mut tx = server.begin().await?;
+    let wished = server
+        .desire(&mut tx, RegisterSetting { value, ..seen }, Some(operator))
+        .await?;
+    // … the host's own audit row, in the same transaction …
+    tx.commit().await?;
+    Ok(wished)
+}
+// ANCHOR_END: desire
+
+// ANCHOR: wishes
+pub async fn where_the_wishes_stand<S: Senders, T: Transport>(
+    server: &Server<S, T>,
+    pool: &PgPool,
+    settings: &[RegisterSetting],
+) -> Result<(), Error> {
+    let mut conn = pool.acquire().await?;
+    let keys: Vec<_> = settings.iter().map(Row::key).collect();
+    for wish in server.wishes::<RegisterSetting>(&mut conn, &keys).await? {
+        let state = match wish.state {
+            WishState::Pending => "on its way",
+            WishState::Waiting => "waiting for the register",
+            WishState::Applied => "applied",
+            WishState::Refused => "refused",
+            WishState::Superseded => "superseded: the register changed it first",
+            _ => "in a state of a later version",
+        };
+        println!(
+            "{} → {}: {state} {:?}",
+            wish.wanted.name, wish.wanted.value, wish.reason
+        );
+    }
+    Ok(())
+}
+// ANCHOR_END: wishes
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The triggers the book shows a host's migrations writing for the shop
+    /// (`book/src/guide/shop-triggers.sql`) are the ones the engine prints
+    /// for the shop's codecs. `MAGIC_SYNC_BLESS=1` writes them anew.
+    #[sqlx::test(migrations = false)]
+    async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: PgPool) {
+        let mut conn = pool.acquire().await.expect("a connection");
+        for version in 1..=magic_sync::SERVER_SCHEMA_VERSION {
+            let step = magic_sync::plan::migration(version).expect("a step");
+            sqlx::raw_sql(&step)
+                .execute(&mut *conn)
+                .await
+                .expect("the engine's step");
+        }
+        let root = env!("CARGO_MANIFEST_DIR");
+        let shop = std::fs::read_to_string(format!("{root}/../../examples/shop/server/schema.sql"))
+            .expect("the shop's schema");
+        sqlx::raw_sql(&shop)
+            .execute(&mut *conn)
+            .await
+            .expect("the shop's tables");
+        let printed = Engine::triggers(&mut conn, &codecs(), REGISTERS)
+            .await
+            .expect("the triggers");
+        let path = format!("{root}/../src/guide/shop-triggers.sql");
+        if std::env::var_os("MAGIC_SYNC_BLESS").is_some() {
+            std::fs::write(&path, format!("{printed}\n")).expect("write the book's triggers");
+        }
+        let shown = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            shown == format!("{printed}\n"),
+            "book/src/guide/shop-triggers.sql is not what the engine prints for the shop: \
+             run this test with MAGIC_SYNC_BLESS=1 and commit the result"
+        );
+    }
+}

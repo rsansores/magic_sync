@@ -9,6 +9,8 @@ use crate::envelope::Limits;
 use crate::replica::{self, Care, Lane, Outbox, Received, Stop};
 use crate::run::Backoff;
 use crate::wire::Codec;
+pub use crate::wish::{CarryOut, Direct, Outcome, Wish, Wishes};
+use crate::wish::{Offered, Run};
 use crate::{Conn, Error};
 use sqlx::SqlitePool;
 use std::future::Future;
@@ -95,6 +97,15 @@ pub struct Settings {
     pub digests_first: Duration,
     /// How often digests go after that.
     pub digests_every: Duration,
+    /// The handlers that carry out the wishes of the replica's settings: one
+    /// per setting table, and none for another.
+    pub wishes: Wishes,
+    /// How often a wish its handler could not carry out yet is offered
+    /// again, besides when [`Replica::offer_wishes`] asks.
+    pub wishes_every: Duration,
+    /// How long a handler has to carry a wish out: one that takes longer
+    /// has the wish wait, and offered again.
+    pub wishes_timeout: Duration,
 }
 
 impl Default for Settings {
@@ -108,6 +119,9 @@ impl Default for Settings {
             send_timeout: Duration::from_secs(30),
             digests_first: Duration::from_secs(5 * 60),
             digests_every: Duration::from_secs(60 * 60),
+            wishes: Wishes::new(),
+            wishes_every: Duration::from_secs(60),
+            wishes_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -153,6 +167,9 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     settings: Settings,
     /// Per lane, something new to say: a message applied, or a write noted.
     wake: Vec<Notify>,
+    /// Wishes to offer their handlers: a message changed one, or the host
+    /// asked.
+    offer: Notify,
     /// Whether [`Replica::run`] runs: one at a time, or two would send the
     /// same rows under two numbers.
     running: AtomicBool,
@@ -205,13 +222,17 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         uplink: U,
         settings: Settings,
     ) -> Result<Self, Error> {
+        let codecs = crate::wish::with_wishes(codecs)?;
         replica::check_settings(&codecs, &settings.lanes)?;
+        settings.wishes.check(&codecs)?;
         settings.backoff.check("backoff")?;
         let zero = [
             ("idle", settings.idle),
             ("send_timeout", settings.send_timeout),
             ("digests_first", settings.digests_first),
             ("digests_every", settings.digests_every),
+            ("wishes_every", settings.wishes_every),
+            ("wishes_timeout", settings.wishes_timeout),
             ("outbox.resend_after", settings.outbox.resend_after),
             ("outbox.backlog_every", settings.outbox.backlog_every),
         ];
@@ -221,7 +242,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             )));
         }
         let mut conn = pool.acquire().await?;
-        replica::check(&mut conn, &codecs).await?;
+        replica::checked(&mut conn, &codecs.iter().collect::<Vec<_>>()).await?;
         let offered = replica::retry_set_aside(&mut conn).await?;
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");
@@ -240,6 +261,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 .collect(),
             skips: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
             wake: settings.lanes.iter().map(|_| Notify::new()).collect(),
+            offer: Notify::new(),
             running: AtomicBool::new(false),
             #[cfg(test)]
             again: AtomicUsize::new(0),
@@ -307,6 +329,14 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 );
             }
         }
+        let wished = match &received {
+            Received::Applied(applied) => applied.iter().any(|a| a.table == crate::wish::TABLE),
+            Received::SnapshotEnded => true,
+            _ => false,
+        };
+        if wished {
+            self.offer_wishes();
+        }
         if matches!(
             received,
             Received::Applied(_) | Received::SnapshotEnded | Received::Gap
@@ -318,6 +348,78 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         Ok(received)
     }
 
+    /// Offers every wish not carried out yet to its handler now, rather than
+    /// at the next message or `wishes_every`: for a host whose handler said
+    /// [`Later`](Outcome::Later) and can now — a module came
+    /// back. Wishes are offered while [`Replica::run`] runs.
+    pub fn offer_wishes(&self) {
+        self.offer.notify_one();
+    }
+
+    /// Offers every wish not carried out yet, or waiting, to its handler,
+    /// one after another, and sends up what that wrote.
+    pub(crate) async fn carry_out_wishes(&self) -> Result<Offered, Error> {
+        let Some(me) = self.identity.id(&mut *self.pool.acquire().await?).await? else {
+            return Ok(Offered::default());
+        };
+        let run = Run {
+            pool: self.pool.clone(),
+            me,
+            timeout: self.settings.wishes_timeout,
+        };
+        let offered = self.settings.wishes.offer(&run, &self.codecs).await?;
+        if offered.wrote {
+            self.nudge();
+        }
+        Ok(offered)
+    }
+
+    /// The wishes' loop, until `stopped`: at start, whenever a message
+    /// changed one or the host asks, and every `wishes_every` while one
+    /// waits. A handler under way when it stops is dropped: nothing of it is
+    /// recorded, and it is offered again at the next start.
+    async fn wishes(&self, mut stopped: watch::Receiver<bool>) {
+        if !self
+            .codecs
+            .iter()
+            .any(|c| c.table.name == crate::wish::TABLE)
+        {
+            return;
+        }
+        let first = self.settings.backoff.first;
+        let mut backoff = first;
+        while !*stopped.borrow() {
+            let offered = tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stop| *stop) => return,
+                offered = self.carry_out_wishes() => offered,
+            };
+            let wait = match offered {
+                Ok(offered) => {
+                    backoff = first;
+                    offered.waiting.then_some(self.settings.wishes_every)
+                }
+                Err(e) => {
+                    tracing::warn!("sync: wishes not offered, and offered again: {e}");
+                    let wait = backoff;
+                    backoff = self.settings.backoff.after(wait);
+                    Some(wait)
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stop| *stop) => return,
+                () = self.offer.notified() => {}
+                () = async {
+                    match wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+        }
+    }
+
     /// Wakes every lane now rather than at its next turn — but one waiting
     /// out a failure: for a host that just wrote something it wants to see
     /// go up.
@@ -327,8 +429,9 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         }
     }
 
-    /// Sends up what the replica has to say, until `shutdown` resolves,
-    /// finishing what it is sending. Each lane runs on its own: one whose
+    /// Sends up what the replica has to say, and offers the wishes of its
+    /// settings to their handlers, until `shutdown` resolves, finishing what
+    /// it is sending. Each lane runs on its own: one whose
     /// uplink fails, or hangs (for `send_timeout` at most), waits out its own
     /// backoff while the others go on; one with more to say goes again at
     /// once. A second `run` of the same replica while one runs returns at
@@ -343,6 +446,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let mut lanes: Vec<Option<Pin<Box<dyn Future<Output = ()> + Send + '_>>>> =
             (0..self.settings.lanes.len())
                 .map(|lane| Some(Box::pin(self.lane(lane, stopped.clone())) as Pin<Box<_>>))
+                .chain([Some(Box::pin(self.wishes(stopped.clone())) as Pin<Box<_>>)])
                 .collect();
         let all = std::future::poll_fn(|cx| {
             for lane in &mut lanes {

@@ -1,0 +1,5 @@
+error: a #[row(generated)] column is computed by the database: nothing writes it
+ --> tests/derive/fail/desired_generated.rs:6:22
+  |
+6 |     #[row(generated, desired)]
+  |                      ^^^^^^^

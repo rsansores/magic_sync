@@ -35,6 +35,7 @@ pub async fn magic_sync::plan::Engine::listing(&self, &mut magic_sync::Conn, mag
 pub async fn magic_sync::plan::Engine::overview(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, u32) -> core::result::Result<magic_sync::status::Overview, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>) -> core::result::Result<magic_sync::status::Progress, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::row_progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, &str, &str) -> core::result::Result<magic_sync::status::RowProgress, magic_sync::Error>
+pub async fn magic_sync::plan::Engine::wishes(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, core::option::Option<magic_sync::status::WishState>, magic_sync::status::Page) -> core::result::Result<magic_sync::status::WishListing, magic_sync::Error>
 impl magic_sync::plan::Engine
 pub async fn magic_sync::plan::Engine::indexes<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>], magic_sync::plan::Replicas) -> core::result::Result<alloc::string::String, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::triggers<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>], magic_sync::plan::Replicas) -> core::result::Result<alloc::string::String, magic_sync::Error>
@@ -67,6 +68,25 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::plan::Replicas
 pub fn magic_sync::plan::migration(i32) -> core::option::Option<alloc::string::String>
 pub async fn magic_sync::plan::note_resync(&mut magic_sync::Conn, uuid::Uuid, core::option::Option<uuid::Uuid>) -> core::result::Result<(), magic_sync::Error>
 pub mod magic_sync::row
+#[non_exhaustive] pub enum magic_sync::row::Apply
+pub magic_sync::row::Apply::Always
+pub magic_sync::row::Apply::IfUnchanged
+impl core::clone::Clone for magic_sync::row::Apply
+pub fn magic_sync::row::Apply::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::row::Apply
+impl core::cmp::PartialEq for magic_sync::row::Apply
+pub fn magic_sync::row::Apply::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::row::Apply
+pub fn magic_sync::row::Apply::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::row::Apply
+impl core::marker::StructuralPartialEq for magic_sync::row::Apply
+impl core::marker::Freeze for magic_sync::row::Apply
+impl core::marker::Send for magic_sync::row::Apply
+impl core::marker::Sync for magic_sync::row::Apply
+impl core::marker::Unpin for magic_sync::row::Apply
+impl core::marker::UnsafeUnpin for magic_sync::row::Apply
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::row::Apply
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::Apply
 #[non_exhaustive] pub enum magic_sync::row::KeyKind
 pub magic_sync::row::KeyKind::Integer
 pub magic_sync::row::KeyKind::Uuid
@@ -117,6 +137,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::KeyPart
 pub magic_sync::row::Mirror::Both
 pub magic_sync::row::Mirror::Catalog
 pub magic_sync::row::Mirror::Record
+pub magic_sync::row::Mirror::Setting
 impl core::clone::Clone for magic_sync::row::Mirror
 pub fn magic_sync::row::Mirror::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::row::Mirror
@@ -175,18 +196,31 @@ pub const magic_sync::row::Row::SCHEMA: &'static str
 pub const magic_sync::row::Row::TABLE: &'static str
 pub fn magic_sync::row::Row::key(&self) -> magic_sync::row::Key
 pub fn magic_sync::row::Row::key_text(&self) -> alloc::string::String
-pub trait magic_sync::row::Version
+pub trait magic_sync::row::Setting: magic_sync::row::Row + core::clone::Clone + core::marker::Sync
+pub trait magic_sync::row::Version: core::marker::Sized
 pub const magic_sync::row::Version::KIND: magic_sync::row::VersionKind
+pub fn magic_sync::row::Version::raised(&self) -> Self
+pub fn magic_sync::row::Version::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for chrono::naive::datetime::NaiveDateTime
 pub const chrono::naive::datetime::NaiveDateTime::KIND: magic_sync::row::VersionKind
+pub fn chrono::naive::datetime::NaiveDateTime::raised(&self) -> Self
+pub fn chrono::naive::datetime::NaiveDateTime::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for i16
 pub const i16::KIND: magic_sync::row::VersionKind
+pub fn i16::raised(&self) -> Self
+pub fn i16::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for i32
 pub const i32::KIND: magic_sync::row::VersionKind
+pub fn i32::raised(&self) -> Self
+pub fn i32::text(&self) -> alloc::string::String
 impl magic_sync::row::Version for i64
 pub const i64::KIND: magic_sync::row::VersionKind
+pub fn i64::raised(&self) -> Self
+pub fn i64::text(&self) -> alloc::string::String
 impl<Tz: chrono::offset::TimeZone> magic_sync::row::Version for chrono::datetime::DateTime<Tz>
 pub const chrono::datetime::DateTime<Tz>::KIND: magic_sync::row::VersionKind
+pub fn chrono::datetime::DateTime<Tz>::raised(&self) -> Self
+pub fn chrono::datetime::DateTime<Tz>::text(&self) -> alloc::string::String
 pub type magic_sync::row::Key = alloc::vec::Vec<magic_sync::row::KeyPart>
 pub mod magic_sync::run
 pub mod magic_sync::run::server
@@ -222,12 +256,15 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Filed
 pub struct magic_sync::run::server::Server<S: magic_sync::run::server::Senders, T: magic_sync::run::server::Transport>
 impl<S: magic_sync::run::server::Senders, T: magic_sync::run::server::Transport> magic_sync::run::server::Server<S, T>
 pub async fn magic_sync::run::server::Server<S, T>::begin(&self) -> core::result::Result<sqlx_core::transaction::Transaction<'static, sqlx_postgres::database::Postgres>, magic_sync::Error>
+pub async fn magic_sync::run::server::Server<S, T>::desire<R: magic_sync::row::Setting>(&self, &mut magic_sync::Conn, R, core::option::Option<&str>) -> core::result::Result<magic_sync::run::server::Wished, magic_sync::Error>
 pub fn magic_sync::run::server::Server<S, T>::engine(&self) -> &magic_sync::plan::Engine
 pub async fn magic_sync::run::server::Server<S, T>::install(sqlx_postgres::PgPool, alloc::vec::Vec<magic_sync::wire::Codec<<S as magic_sync::run::server::Senders>::Known>>, magic_sync::plan::Replicas, T, S, magic_sync::run::server::Settings) -> core::result::Result<Self, magic_sync::Error>
 pub async fn magic_sync::run::server::Server<S, T>::new(sqlx_postgres::PgPool, alloc::vec::Vec<magic_sync::wire::Codec<<S as magic_sync::run::server::Senders>::Known>>, magic_sync::plan::Replicas, T, S, magic_sync::run::server::Settings) -> core::result::Result<Self, magic_sync::Error>
 pub async fn magic_sync::run::server::Server<S, T>::pass_now(&self) -> core::result::Result<core::option::Option<usize>, magic_sync::Error>
 pub async fn magic_sync::run::server::Server<S, T>::receive(&self, uuid::Uuid, &[u8]) -> core::result::Result<alloc::vec::Vec<magic_sync::run::server::Filed>, magic_sync::Error>
 pub async fn magic_sync::run::server::Server<S, T>::run(&self, impl core::future::future::Future<Output = ()>)
+pub async fn magic_sync::run::server::Server<S, T>::wishes<R: magic_sync::row::Setting>(&self, &mut magic_sync::Conn, &[magic_sync::row::Key]) -> core::result::Result<alloc::vec::Vec<magic_sync::run::server::WishOf<R>>, magic_sync::Error>
+pub async fn magic_sync::run::server::Server<S, T>::withdraw<R: magic_sync::row::Setting>(&self, &mut magic_sync::Conn, &magic_sync::row::Key) -> core::result::Result<bool, magic_sync::Error>
 impl<S: magic_sync::run::server::Senders, T: magic_sync::run::server::Transport> core::fmt::Debug for magic_sync::run::server::Server<S, T>
 pub fn magic_sync::run::server::Server<S, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<S, T> core::marker::Freeze for magic_sync::run::server::Server<S, T> where alloc::vec::Vec<magic_sync::wire::Codec<<S as magic_sync::run::server::Senders>::Known>>: core::marker::Freeze, T: core::marker::Freeze, S: core::marker::Freeze
@@ -268,6 +305,45 @@ impl core::marker::Unpin for magic_sync::run::server::Settings
 impl core::marker::UnsafeUnpin for magic_sync::run::server::Settings
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::server::Settings
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Settings
+#[non_exhaustive] pub struct magic_sync::run::server::WishOf<R>
+pub magic_sync::run::server::WishOf::answered_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::run::server::WishOf::key: magic_sync::row::Key
+pub magic_sync::run::server::WishOf::note: core::option::Option<alloc::string::String>
+pub magic_sync::run::server::WishOf::reason: core::option::Option<alloc::string::String>
+pub magic_sync::run::server::WishOf::state: magic_sync::status::WishState
+pub magic_sync::run::server::WishOf::version: i64
+pub magic_sync::run::server::WishOf::wanted: R
+pub magic_sync::run::server::WishOf::wished_at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+impl<R: core::clone::Clone> core::clone::Clone for magic_sync::run::server::WishOf<R>
+pub fn magic_sync::run::server::WishOf<R>::clone(&self) -> Self
+impl<R: core::fmt::Debug> core::fmt::Debug for magic_sync::run::server::WishOf<R>
+pub fn magic_sync::run::server::WishOf<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<R> core::marker::Freeze for magic_sync::run::server::WishOf<R> where R: core::marker::Freeze
+impl<R> core::marker::Send for magic_sync::run::server::WishOf<R> where R: core::marker::Send
+impl<R> core::marker::Sync for magic_sync::run::server::WishOf<R> where R: core::marker::Sync
+impl<R> core::marker::Unpin for magic_sync::run::server::WishOf<R> where R: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for magic_sync::run::server::WishOf<R> where R: core::marker::UnsafeUnpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::server::WishOf<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::WishOf<R> where R: core::panic::unwind_safe::UnwindSafe
+#[non_exhaustive] pub struct magic_sync::run::server::Wished
+pub magic_sync::run::server::Wished::id: uuid::Uuid
+pub magic_sync::run::server::Wished::version: i64
+impl core::clone::Clone for magic_sync::run::server::Wished
+pub fn magic_sync::run::server::Wished::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::run::server::Wished
+impl core::cmp::PartialEq for magic_sync::run::server::Wished
+pub fn magic_sync::run::server::Wished::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::run::server::Wished
+pub fn magic_sync::run::server::Wished::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::run::server::Wished
+impl core::marker::StructuralPartialEq for magic_sync::run::server::Wished
+impl core::marker::Freeze for magic_sync::run::server::Wished
+impl core::marker::Send for magic_sync::run::server::Wished
+impl core::marker::Sync for magic_sync::run::server::Wished
+impl core::marker::Unpin for magic_sync::run::server::Wished
+impl core::marker::UnsafeUnpin for magic_sync::run::server::Wished
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::server::Wished
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Wished
 pub const magic_sync::run::server::LOCK_KEY: i64
 pub trait magic_sync::run::server::Senders: core::marker::Send + core::marker::Sync + 'static
 pub type magic_sync::run::server::Senders::Known: core::marker::Send + core::marker::Sync + 'static
@@ -400,6 +476,37 @@ impl<'a> core::marker::Unpin for magic_sync::status::Scope<'a>
 impl<'a> core::marker::UnsafeUnpin for magic_sync::status::Scope<'a>
 impl<'a> core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::Scope<'a>
 impl<'a> core::panic::unwind_safe::UnwindSafe for magic_sync::status::Scope<'a>
+#[non_exhaustive] pub enum magic_sync::status::WishState
+pub magic_sync::status::WishState::Applied
+pub magic_sync::status::WishState::Pending
+pub magic_sync::status::WishState::Refused
+pub magic_sync::status::WishState::Superseded
+pub magic_sync::status::WishState::Waiting
+impl magic_sync::status::WishState
+pub fn magic_sync::status::WishState::as_str(self) -> &'static str
+pub fn magic_sync::status::WishState::of(&str) -> core::option::Option<Self>
+impl core::clone::Clone for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::status::WishState
+impl core::cmp::PartialEq for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for magic_sync::status::WishState
+impl core::marker::StructuralPartialEq for magic_sync::status::WishState
+impl serde_core::ser::Serialize for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for magic_sync::status::WishState
+impl core::marker::Send for magic_sync::status::WishState
+impl core::marker::Sync for magic_sync::status::WishState
+impl core::marker::Unpin for magic_sync::status::WishState
+impl core::marker::UnsafeUnpin for magic_sync::status::WishState
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::WishState
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::WishState
 #[non_exhaustive] pub struct magic_sync::status::Backlog
 pub magic_sync::status::Backlog::at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
 pub magic_sync::status::Backlog::tables: alloc::vec::Vec<magic_sync::status::UpProgress>
@@ -635,6 +742,7 @@ pub magic_sync::status::ReplicaOverview::state: magic_sync::status::ReplicaState
 pub magic_sync::status::ReplicaOverview::unconfirmed: bool
 pub magic_sync::status::ReplicaOverview::unfiled: i64
 pub magic_sync::status::ReplicaOverview::waiting_since: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::status::ReplicaOverview::wishes: magic_sync::status::WishCounts
 impl core::clone::Clone for magic_sync::status::ReplicaOverview
 pub fn magic_sync::status::ReplicaOverview::clone(&self) -> Self
 impl core::fmt::Debug for magic_sync::status::ReplicaOverview
@@ -803,6 +911,72 @@ impl core::marker::Unpin for magic_sync::status::UpProgress
 impl core::marker::UnsafeUnpin for magic_sync::status::UpProgress
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::UpProgress
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::UpProgress
+#[non_exhaustive] pub struct magic_sync::status::WishCounts
+pub magic_sync::status::WishCounts::pending: i64
+pub magic_sync::status::WishCounts::refused: i64
+pub magic_sync::status::WishCounts::superseded: i64
+pub magic_sync::status::WishCounts::waiting: i64
+impl core::clone::Clone for magic_sync::status::WishCounts
+pub fn magic_sync::status::WishCounts::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::status::WishCounts
+impl core::cmp::PartialEq for magic_sync::status::WishCounts
+pub fn magic_sync::status::WishCounts::eq(&self, &Self) -> bool
+impl core::default::Default for magic_sync::status::WishCounts
+pub fn magic_sync::status::WishCounts::default() -> Self
+impl core::fmt::Debug for magic_sync::status::WishCounts
+pub fn magic_sync::status::WishCounts::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::status::WishCounts
+impl core::marker::StructuralPartialEq for magic_sync::status::WishCounts
+impl serde_core::ser::Serialize for magic_sync::status::WishCounts
+pub fn magic_sync::status::WishCounts::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::WishCounts
+impl core::marker::Send for magic_sync::status::WishCounts
+impl core::marker::Sync for magic_sync::status::WishCounts
+impl core::marker::Unpin for magic_sync::status::WishCounts
+impl core::marker::UnsafeUnpin for magic_sync::status::WishCounts
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::WishCounts
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::WishCounts
+#[non_exhaustive] pub struct magic_sync::status::WishEntry
+pub magic_sync::status::WishEntry::answered_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::status::WishEntry::key: alloc::string::String
+pub magic_sync::status::WishEntry::note: core::option::Option<alloc::string::String>
+pub magic_sync::status::WishEntry::reason: core::option::Option<alloc::string::String>
+pub magic_sync::status::WishEntry::replica: uuid::Uuid
+pub magic_sync::status::WishEntry::state: magic_sync::status::WishState
+pub magic_sync::status::WishEntry::table: alloc::string::String
+pub magic_sync::status::WishEntry::wished_at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+impl core::clone::Clone for magic_sync::status::WishEntry
+pub fn magic_sync::status::WishEntry::clone(&self) -> Self
+impl core::fmt::Debug for magic_sync::status::WishEntry
+pub fn magic_sync::status::WishEntry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for magic_sync::status::WishEntry
+pub fn magic_sync::status::WishEntry::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::WishEntry
+impl core::marker::Send for magic_sync::status::WishEntry
+impl core::marker::Sync for magic_sync::status::WishEntry
+impl core::marker::Unpin for magic_sync::status::WishEntry
+impl core::marker::UnsafeUnpin for magic_sync::status::WishEntry
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::WishEntry
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::WishEntry
+#[non_exhaustive] pub struct magic_sync::status::WishListing
+pub magic_sync::status::WishListing::contract: u32
+pub magic_sync::status::WishListing::now: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+pub magic_sync::status::WishListing::offset: u32
+pub magic_sync::status::WishListing::state: core::option::Option<magic_sync::status::WishState>
+pub magic_sync::status::WishListing::wishes: magic_sync::status::Listed<magic_sync::status::WishEntry>
+impl core::clone::Clone for magic_sync::status::WishListing
+pub fn magic_sync::status::WishListing::clone(&self) -> Self
+impl core::fmt::Debug for magic_sync::status::WishListing
+pub fn magic_sync::status::WishListing::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for magic_sync::status::WishListing
+pub fn magic_sync::status::WishListing::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::WishListing
+impl core::marker::Send for magic_sync::status::WishListing
+impl core::marker::Sync for magic_sync::status::WishListing
+impl core::marker::Unpin for magic_sync::status::WishListing
+impl core::marker::UnsafeUnpin for magic_sync::status::WishListing
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::WishListing
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::WishListing
 pub const magic_sync::status::CONTRACT: u32
 pub mod magic_sync::wire
 pub struct magic_sync::wire::Codec<P>

@@ -45,7 +45,7 @@ pub fn derive_columns(input: Tokens) -> Tokens {
 
 /// The keys `#[row(…)]` takes on a struct that derives `Row`.
 const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `retired`, \
-                        `origin`, `unmirrored` or `crate`";
+                        `origin`, `unmirrored`, `apply` or `crate`";
 
 /// PostgreSQL keeps the first 63 bytes of a longer name, and would answer
 /// for a table or column the row does not name.
@@ -62,6 +62,7 @@ struct Args {
     retired: Option<LitStr>,
     origin: Option<LitStr>,
     unmirrored: Option<LitStr>,
+    apply: Option<LitStr>,
     krate: Option<LitStr>,
 }
 
@@ -85,6 +86,7 @@ fn parse_args(input: &DeriveInput, only_crate: bool) -> syn::Result<Args> {
                 Some("retired") => &mut args.retired,
                 Some("origin") => &mut args.origin,
                 Some("unmirrored") => &mut args.unmirrored,
+                Some("apply") => &mut args.apply,
                 _ => return Err(meta.error(format!("expected {ROW_KEYS}"))),
             };
             once(slot, &meta)
@@ -249,6 +251,7 @@ struct RowField {
     replica_owned: Option<Span>,
     version: Option<Span>,
     created: Option<Span>,
+    desired: Option<Span>,
 }
 
 impl RowField {
@@ -257,6 +260,7 @@ impl RowField {
             .or(self.replica_owned)
             .or(self.version)
             .or(self.created)
+            .or(self.desired)
     }
 }
 
@@ -264,17 +268,17 @@ fn row_field(field: &Field) -> syn::Result<RowField> {
     let mut out = RowField::default();
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("row")) {
         attr.parse_nested_meta(|meta| {
-            let flag = match meta.path.get_ident().map(Ident::to_string).as_deref() {
-                Some("generated") => &mut out.generated,
-                Some("replica_owned") => &mut out.replica_owned,
-                Some("version") => &mut out.version,
-                Some("created") => &mut out.created,
-                _ => {
-                    return Err(
-                        meta.error("expected `version`, `created`, `replica_owned` or `generated`")
-                    )
-                }
-            };
+            let flag =
+                match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                    Some("generated") => &mut out.generated,
+                    Some("replica_owned") => &mut out.replica_owned,
+                    Some("version") => &mut out.version,
+                    Some("created") => &mut out.created,
+                    Some("desired") => &mut out.desired,
+                    _ => return Err(meta.error(
+                        "expected `version`, `created`, `replica_owned`, `generated` or `desired`",
+                    )),
+                };
             let name = meta.path.to_token_stream().to_string();
             if flag.is_some() {
                 return Err(meta.error(format!("`{name}` is given twice")));
@@ -292,8 +296,18 @@ fn row_field(field: &Field) -> syn::Result<RowField> {
     };
     if out.generated.is_some() {
         refuse(
-            out.version.or(out.created).or(out.replica_owned),
+            out.version
+                .or(out.created)
+                .or(out.replica_owned)
+                .or(out.desired),
             "a #[row(generated)] column is computed by the database: nothing writes it",
+        )?;
+    }
+    if out.desired.is_some() {
+        refuse(
+            out.version.or(out.created),
+            "a #[row(desired)] column is one a wish sets: the version moves by itself, and a \
+             #[row(created)] column never moves",
         )?;
     }
     if out.version.is_some() {
@@ -434,6 +448,7 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
         };
         let generated = flags.generated.is_some();
         let replica_owned = flags.replica_owned.is_some();
+        let desired = flags.desired.is_some();
         push.push(quote! {
             out.push(#private::Column {
                 name: #name,
@@ -441,6 +456,7 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
                 nullable: #nullable,
                 generated: #generated,
                 replica_owned: #replica_owned,
+                desired: #desired,
                 key: #key,
                 version: #version,
                 int64: #private::is_int64::<#ty>(),
@@ -528,7 +544,14 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
 
 fn columns_only(input: &DeriveInput) -> syn::Result<TokenStream> {
     let args = parse_args(input, true)?;
-    Ok(declared(input, &krate(&args)?, &[])?.tokens)
+    let declared = declared(input, &krate(&args)?, &[])?;
+    if let Some(at) = declared.direct.iter().find_map(|d| d.flags.desired) {
+        return Err(syn::Error::new(
+            at,
+            "#[row(desired)] is a field of the setting itself, not of a part flattened in",
+        ));
+    }
+    Ok(declared.tokens)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,6 +559,7 @@ enum Mirror {
     Catalog,
     Record,
     Both,
+    Setting,
 }
 
 impl Mirror {
@@ -544,10 +568,13 @@ impl Mirror {
             "catalog" => Mirror::Catalog,
             "record" => Mirror::Record,
             "both" => Mirror::Both,
+            "setting" => Mirror::Setting,
             other => {
                 return Err(syn::Error::new_spanned(
                     lit,
-                    format!("mirror = \"{other}\": expected \"catalog\", \"record\" or \"both\""),
+                    format!(
+                        "mirror = \"{other}\": expected \"catalog\", \"record\", \"both\" or \"setting\""
+                    ),
                 ))
             }
         })
@@ -558,12 +585,18 @@ impl Mirror {
             Mirror::Catalog => quote!(Catalog),
             Mirror::Record => quote!(Record),
             Mirror::Both => quote!(Both),
+            Mirror::Setting => quote!(Setting),
         }
     }
 
     /// Whether the server sends the table's rows down.
     fn sent_down(self) -> bool {
         matches!(self, Mirror::Catalog | Mirror::Both)
+    }
+
+    /// Whether a replica's rows of the table go up, ordered by a version.
+    fn versioned(self) -> bool {
+        matches!(self, Mirror::Record | Mirror::Setting)
     }
 }
 
@@ -615,12 +648,27 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             ));
         }
     }
-    if mirror != Mirror::Record {
+    if !mirror.versioned() {
         if let Some(at) = direct.iter().find_map(|d| d.flags.version) {
             return Err(syn::Error::new(
                 at,
-                "#[row(version)] orders the reports of a replica's table: only a `record` has one, \
-                 and a replica takes what the server sends whatever its version",
+                "#[row(version)] orders the reports of a replica's table: only a `record` or a \
+                 `setting` has one, and a replica takes what the server sends whatever its version",
+            ));
+        }
+    }
+    if mirror != Mirror::Setting {
+        if let Some(at) = direct.iter().find_map(|d| d.flags.desired) {
+            return Err(syn::Error::new(
+                at,
+                "#[row(desired)] is a column the server may wish a replica's setting to hold: \
+                 needs `mirror = \"setting\"`",
+            ));
+        }
+        if let Some(lit) = &args.apply {
+            return Err(syn::Error::new_spanned(
+                lit,
+                "only a `setting` has an `apply` rule: it says which wish a replica carries out",
             ));
         }
     }
@@ -646,7 +694,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             return Err(syn::Error::new(
                 at,
                 "a key column is the row's identity: it is not generated, owned by a replica, \
-                 a version or a creation time",
+                 a version, a creation time or desired",
             ));
         }
         key_columns.push(column);
@@ -654,10 +702,10 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
 
     if let Some(lit) = &args.origin {
         let origin = identifier(&lit.value(), lit.span())?;
-        if !matches!(mirror, Mirror::Record | Mirror::Both) {
+        if matches!(mirror, Mirror::Catalog) {
             return Err(syn::Error::new_spanned(
                 lit,
-                "only a table a replica writes (`record` or `both`) has an `origin`",
+                "only a table a replica writes (`record`, `both` or `setting`) has an `origin`",
             ));
         }
         let Some(column) = key_columns.iter().find(|c| c.name == origin) else {
@@ -718,9 +766,9 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         }
         None => None,
     };
-    if mirror != Mirror::Record {
+    if !mirror.versioned() {
         let refusal = "#[row(version)] in a part flattened in orders the reports of a replica's \
-                       table: only a `record` has one";
+                       table: only a `record` or a `setting` has one";
         checks.extend(flattened.iter().map(|part| {
             quote_spanned! {part.span()=>
                 const _: () = ::core::assert!(<#part as #private::Columns>::VERSION.is_none(), #refusal);
@@ -737,11 +785,23 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         }));
     }
 
+    let setting = if mirror == Mirror::Setting {
+        Some(setting(&args, ident, &direct, &krate)?)
+    } else {
+        None
+    };
+
     let active = option(active);
     let retired = option(retired);
     let origin = option(args.origin.as_ref().map(LitStr::value));
     let variant = mirror.variant();
     let (quoted_schema, quoted_table) = (quoted(&schema), quoted(&table));
+    let version_text = match direct.iter().find(|d| d.flags.version.is_some()) {
+        Some(Direct { ident, ty, .. }) => quote_spanned! {ty.span()=>
+            ::core::option::Option::Some(<#ty as #krate::row::Version>::text(&self.#ident))
+        },
+        None => quote!(::core::option::Option::None),
+    };
     let key_parts = key_columns.iter().map(|c| {
         let (ident, ty) = (&c.ident, &c.ty);
         quote_spanned! {ty.span()=>
@@ -767,9 +827,77 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             fn key(&self) -> #krate::row::Key {
                 ::std::vec![#(#key_parts),*]
             }
+
+            fn version_text(&self) -> ::core::option::Option<::std::string::String> {
+                #version_text
+            }
         }
 
         #(#checks)*
+
+        #setting
+    })
+}
+
+/// A setting's `Setting` impl: its desired columns, its `apply` rule, and
+/// what the engine does to a row of it when a wish is carried out. A setting
+/// needs an `origin` (where a wish goes), a version of its own (what a wish
+/// is based on) and at least one desired column.
+fn setting(
+    args: &Args,
+    ident: &Ident,
+    direct: &[Direct],
+    krate: &syn::Path,
+) -> syn::Result<TokenStream> {
+    let refuse = |why: &str| syn::Error::new_spanned(ident, why);
+    if args.origin.is_none() {
+        return Err(refuse(
+            "a setting needs `origin = \"…\"`: the key column naming the replica it belongs to, \
+             which is where a wish of it goes",
+        ));
+    }
+    let Some(version) = direct.iter().find(|d| d.flags.version.is_some()) else {
+        return Err(refuse(
+            "a setting needs a #[row(version)] field of its own: what a wish is based on, and what \
+             moves when one is carried out",
+        ));
+    };
+    let desired: Vec<&Direct> = direct
+        .iter()
+        .filter(|d| d.flags.desired.is_some())
+        .collect();
+    if desired.is_empty() {
+        return Err(refuse(
+            "a setting needs at least one #[row(desired)] field: a column a wish may set",
+        ));
+    }
+    let apply = match &args.apply {
+        None => quote!(Always),
+        Some(lit) => match lit.value().as_str() {
+            "always" => quote!(Always),
+            "if_unchanged" => quote!(IfUnchanged),
+            other => {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("apply = \"{other}\": expected \"always\" or \"if_unchanged\""),
+                ))
+            }
+        },
+    };
+    let fields = desired.iter().map(|d| &d.ident);
+    let (version_ident, version_ty) = (&version.ident, &version.ty);
+    Ok(quote! {
+        impl #krate::row::Setting for #ident {
+            const APPLY: #krate::row::Apply = #krate::row::Apply::#apply;
+
+            fn take_desired(&mut self, from: Self) {
+                #(self.#fields = from.#fields;)*
+            }
+
+            fn raise_version(&mut self) {
+                self.#version_ident = <#version_ty as #krate::row::Version>::raised(&self.#version_ident);
+            }
+        }
     })
 }
 

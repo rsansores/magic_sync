@@ -698,6 +698,296 @@ impl Model {
     }
 }
 
+/// What a replica's handler says of a wish (PROTOCOL.md 4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Handled {
+    Applied,
+    Refused,
+    Later,
+}
+
+/// A setting row as the model reads it out of the bytes that carry it: its
+/// key, its desired value and its version.
+pub(crate) type Read = fn(&str, &[u8]) -> Option<(String, i64, i64)>;
+
+/// A setting row as the model writes it: its table, key, value and version,
+/// in the table's encoding.
+pub(crate) type Write = fn(&str, &str, i64, i64) -> Vec<u8>;
+
+/// One wish handed to its handler: the wish's id and version.
+pub(crate) type Handed = (String, u64);
+
+/// A replica's own settings and its answers to the server's wishes, as
+/// PROTOCOL.md 4.5 and 7 say a replica keeps them: the other half of a
+/// [`Model`], which holds the wishes the server sent among its rows.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Holder {
+    /// Each setting row it holds: its value and its version.
+    pub(crate) settings: BTreeMap<Row, (i64, i64)>,
+    /// Its answer to each wish, by the wish's id: the version it answers,
+    /// the outcome, why.
+    pub(crate) answers: BTreeMap<String, (u64, String, String)>,
+    /// What it wrote that the server has not filed — setting rows, and
+    /// answers as `sync_wishes` rows — each with how many writes it has had.
+    noted: BTreeMap<Row, u64>,
+    /// The upload that last carried each note, and the writes it carried.
+    sent: BTreeMap<Row, (u64, u64)>,
+    /// The notes re-stated when a snapshot began, until filed: the server
+    /// takes them whatever their version (7).
+    restated: BTreeSet<Row>,
+    /// Each wish as it was when last answered: the answer goes up as that
+    /// row, even once the server let go of the wish (4.3).
+    wishes: BTreeMap<String, crate::envelope::Wish>,
+}
+
+/// Upload numbers: a fresh one on every send, never repeated — not even by
+/// a copy of a replica restored, which section 7's random numbers ensure.
+static UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Holder {
+    fn note(&mut self, row: Row) {
+        *self.noted.entry(row).or_default() += 1;
+    }
+
+    /// The replica writes a setting row of its own: its value, its version
+    /// one on.
+    pub(crate) fn write(&mut self, row: &Row, value: i64) {
+        let version = self.settings.get(row).map_or(1, |(_, v)| v + 1);
+        self.settings.insert(row.clone(), (value, version));
+        self.note(row.clone());
+    }
+
+    /// A snapshot began: every setting, and every answer to a wish it holds,
+    /// is noted again (7).
+    pub(crate) fn began(&mut self, model: &Model) {
+        let mut rows: Vec<Row> = self.settings.keys().cloned().collect();
+        for wish in held_wishes(model) {
+            if self.answers.contains_key(&wish.id) {
+                rows.push((crate::wish::TABLE.to_owned(), wish.id.clone()));
+            }
+        }
+        for row in rows {
+            // Noted afresh: an upload that carried it before files it no more.
+            self.sent.remove(&row);
+            self.restated.insert(row.clone());
+            self.note(row);
+        }
+    }
+
+    /// `down`, applied: in a snapshot, the rows of a setting the server
+    /// records it holding — each it does not hold it notes, as its delete
+    /// (4.2).
+    pub(crate) fn recorded(&mut self, down: &crate::envelope::Down) {
+        if down.snapshot_id.is_empty() {
+            return;
+        }
+        for part in &down.tables {
+            for key in &part.recorded {
+                let row = (part.table.clone(), key.parts.join("|"));
+                if !self.settings.contains_key(&row) {
+                    self.note(row);
+                }
+            }
+        }
+    }
+
+    /// Every wish it holds and has not answered, or answered `waiting`,
+    /// carried out as 4.5 says, each `handle` decides how. Answers the ones
+    /// it handed its handler.
+    pub(crate) fn carry(
+        &mut self,
+        model: &Model,
+        read: Read,
+        mut handle: impl FnMut(&crate::envelope::Wish) -> Handled,
+    ) -> Vec<Handed> {
+        let mut carried = Vec::new();
+        for wish in held_wishes(model) {
+            let answered = self.answers.get(&wish.id).cloned();
+            if answered.as_ref().is_some_and(|(version, outcome, _)| {
+                *version == wish.version && outcome != "waiting"
+            }) {
+                continue;
+            }
+            let row = (
+                wish.table.clone(),
+                wish.key.clone().unwrap_or_default().parts.join("|"),
+            );
+            let held = self.settings.get(&row).map(|(_, v)| *v);
+            let answer = match read(&wish.table, &wish.wanted) {
+                None => ("waiting", "unread"),
+                Some((key, _, _)) if key != row.1 => ("refused", "another row"),
+                Some(_) if held.is_none() => ("waiting", "no such row"),
+                Some((_, _, based)) if wish.if_unchanged && held != Some(based) => {
+                    ("superseded", "changed here")
+                }
+                Some((_, value, _)) => {
+                    carried.push((wish.id.clone(), wish.version));
+                    match handle(&wish) {
+                        Handled::Applied => {
+                            let (held, version) =
+                                self.settings.get_mut(&row).expect("a row it holds");
+                            *held = value;
+                            *version += 1;
+                            self.note(row.clone());
+                            ("applied", "")
+                        }
+                        Handled::Refused => ("refused", "no"),
+                        Handled::Later => ("waiting", "away"),
+                    }
+                }
+            };
+            let new = (wish.version, answer.0.to_owned(), answer.1.to_owned());
+            if answered.as_ref() != Some(&new) {
+                self.answers.insert(wish.id.clone(), new);
+                self.wishes.insert(wish.id.clone(), wish.clone());
+                self.note((crate::wish::TABLE.to_owned(), wish.id));
+            }
+        }
+        carried
+    }
+
+    /// What it has written and the server has not filed, as one upload
+    /// under a fresh number, `encode` writing a setting row; `None` when
+    /// nothing waits.
+    pub(crate) fn up(&mut self, encode: Write) -> Option<Up> {
+        if self.noted.is_empty() {
+            return None;
+        }
+        let number = UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut parts: BTreeMap<(String, bool), crate::envelope::Table> = BTreeMap::new();
+        for (row, writes) in &self.noted {
+            // A delete re-states nothing: it goes up in the ordinary part.
+            let deleted = row.0 != crate::wish::TABLE && !self.settings.contains_key(row);
+            let restated = !deleted && self.restated.contains(row);
+            let part =
+                parts
+                    .entry((row.0.clone(), restated))
+                    .or_insert_with(|| crate::envelope::Table {
+                        table: row.0.clone(),
+                        restated,
+                        ..crate::envelope::Table::default()
+                    });
+            let key = crate::envelope::Key {
+                parts: row.1.split('|').map(str::to_owned).collect(),
+            };
+            if row.0 == crate::wish::TABLE {
+                let (answered, outcome, reason) = self.answers[&row.1].clone();
+                let wish = crate::envelope::Wish {
+                    answered,
+                    outcome,
+                    reason,
+                    answered_at: "2026-10-12T10:00:00.000000Z".to_owned(),
+                    ..self.wishes[&row.1].clone()
+                };
+                part.upserts.push(wish.encode_to_vec());
+                part.keys.push(key);
+            } else if let Some((value, version)) = self.settings.get(row) {
+                part.upserts.push(encode(&row.0, &row.1, *value, *version));
+                part.keys.push(key);
+            } else {
+                // A row of its own it deleted: its delete goes up (7).
+                part.deletes.push(key);
+            }
+            self.sent.insert(row.clone(), (number, *writes));
+        }
+        Some(Up {
+            protocol: crate::envelope::PROTOCOL,
+            tables: parts.into_values().collect(),
+            uploads: vec![number],
+            ..Up::default()
+        })
+    }
+
+    /// The replica deletes a setting row of its own.
+    pub(crate) fn delete(&mut self, row: &Row) {
+        if self.settings.remove(row).is_some() {
+            self.note(row.clone());
+        }
+    }
+
+    /// What it holds of its settings and of its answers, as section 8
+    /// fingerprints them — each table left out while a write of it is not
+    /// filed.
+    pub(crate) fn digests(&self, model: &Model, tables: &[&str]) -> Vec<crate::envelope::Digest> {
+        let unfiled = |table: &str| self.noted.keys().any(|(t, _)| t == table);
+        let mut out = Vec::new();
+        for table in tables.iter().copied().filter(|t| !unfiled(t)) {
+            let lines: Vec<String> = if table == crate::wish::TABLE {
+                held_wishes(model)
+                    .into_iter()
+                    .map(|wish| {
+                        let (answered, outcome) = self
+                            .answers
+                            .get(&wish.id)
+                            .map(|(a, o, _)| (a.to_string(), o.clone()))
+                            .unwrap_or_default();
+                        format!("{}\t{answered}\t{outcome}", wish.id)
+                    })
+                    .collect()
+            } else {
+                self.settings
+                    .iter()
+                    .filter(|((t, _), _)| t == table)
+                    .map(|((_, key), (_, version))| format!("{key}\t{version}"))
+                    .collect()
+            };
+            out.push(crate::envelope::Digest {
+                table: table.to_owned(),
+                count: lines.len() as u64,
+                fingerprint: crate::envelope::fingerprint(lines),
+            });
+        }
+        out
+    }
+
+    /// The server filed `uploads`: their notes are done, but for a row
+    /// written again since (4.4).
+    pub(crate) fn filed(&mut self, uploads: &[u64]) {
+        let carried: Vec<Row> = self
+            .sent
+            .iter()
+            .filter(|(_, (number, _))| uploads.contains(number))
+            .map(|(row, _)| row.clone())
+            .collect();
+        for row in carried {
+            // Written again since, it goes again, re-stated no more.
+            self.restated.remove(&row);
+            if self.noted.get(&row) == self.sent.get(&row).map(|(_, writes)| writes) {
+                self.noted.remove(&row);
+                self.sent.remove(&row);
+            }
+        }
+    }
+
+    /// Forgets its answers to wishes it no longer holds, once each is filed:
+    /// an answer is a column of the wish's row, which a replica keeps,
+    /// retired, only until its edit is filed (4.3).
+    pub(crate) fn forget(&mut self, model: &Model) {
+        let held: BTreeSet<String> = held_wishes(model).into_iter().map(|w| w.id).collect();
+        let noted = &self.noted;
+        let gone = |id: &String| {
+            !held.contains(id) && !noted.contains_key(&(crate::wish::TABLE.to_owned(), id.clone()))
+        };
+        self.answers.retain(|id, _| !gone(id));
+        self.wishes.retain(|id, _| !gone(id));
+    }
+
+    /// The rows it wrote that the server has not filed.
+    pub(crate) fn noted(&self) -> BTreeSet<Row> {
+        self.noted.keys().cloned().collect()
+    }
+}
+
+/// The wishes a modelled replica holds, as the server sent them.
+pub(crate) fn held_wishes(model: &Model) -> Vec<crate::envelope::Wish> {
+    model
+        .rows
+        .iter()
+        .filter(|((table, _), _)| table == crate::wish::TABLE)
+        .map(|(_, bytes)| crate::envelope::Wish::decode(bytes.as_slice()).expect("a wish"))
+        .collect()
+}
+
 /// How the transport misbehaves, out of 100 sends.
 #[cfg(feature = "postgres")]
 #[derive(Clone, Copy, Debug, Default)]

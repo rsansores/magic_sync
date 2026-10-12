@@ -11,10 +11,10 @@ use crate::envelope::{self, Body, Limits, Up};
 use crate::filing;
 use crate::plan::{Engine, Replicas};
 use crate::relay::{self, Relay};
-use crate::row::Table;
+use crate::row::{Key, Setting, Table};
 use crate::run::Backoff;
 use crate::wire::Codec;
-use crate::Error;
+use crate::{Conn, Error};
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 pub use crate::filing::Filed;
 pub use crate::relay::Transport;
+pub use crate::wish::{WishOf, Wished};
 
 /// What the host knows about the replicas that send something up.
 pub trait Senders: Send + Sync + 'static {
@@ -271,6 +272,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         settings: Settings,
     ) -> Result<Self, Error> {
         settings.check()?;
+        let codecs = crate::wish::with_wishes(codecs)?;
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::new(&mut tx, &tables, replicas).await?;
@@ -304,6 +306,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         settings: Settings,
     ) -> Result<Self, Error> {
         settings.check()?;
+        let codecs = crate::wish::with_wishes(codecs)?;
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::install(&mut tx, &tables, replicas).await?;
@@ -335,6 +338,60 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// are, where a row is ([`status`](crate::status)).
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Wishes the `#[row(desired)]` columns of `wanted` on the replica its
+    /// origin names, in the caller's transaction, so the wish commits with
+    /// whatever else the host writes beside it: it replaces any wish of that
+    /// row, under a version of its own, and goes to the replica with the next
+    /// pass. The replica carries it out through its handler for the table,
+    /// and answers. With `apply = "if_unchanged"`, `wanted`'s version is the
+    /// one the caller saw — the row as the server holds it, its desired
+    /// columns set — and the replica carries the wish out only while it still
+    /// holds that version; with `always`, its other columns are not read.
+    ///
+    /// `note` is the host's to say who asked, or why: the replica's handler
+    /// is handed it. Wishing the same values again is a new wish, carried
+    /// out again. A wish of a replica that is not live waits for it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Misuse`] when `R` is not one of the server's tables, or a row
+    /// that does not encode; [`Error::Database`] when the database fails.
+    pub async fn desire<R: Setting>(
+        &self,
+        conn: &mut Conn,
+        wanted: R,
+        note: Option<&str>,
+    ) -> Result<Wished, Error> {
+        crate::wish::desire(conn, &self.engine, &self.codecs, wanted, note).await
+    }
+
+    /// Withdraws the wish of the setting row `key`, answered or not, in the
+    /// caller's transaction: the replica lets go of it, and carries it out no
+    /// more if it has not. Answers whether there was one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`] when the database fails.
+    pub async fn withdraw<R: Setting>(&self, conn: &mut Conn, key: &Key) -> Result<bool, Error> {
+        crate::wish::withdraw::<R, _>(conn, &self.codecs, key).await
+    }
+
+    /// The wishes of the setting rows `keys` — those that have one — with
+    /// where each stands.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Misuse`] when `R` is not one of the server's tables;
+    /// [`Error::Malformed`] for a wish that no longer decodes as `R`;
+    /// [`Error::Database`] when the database fails.
+    pub async fn wishes<R: Setting>(
+        &self,
+        conn: &mut Conn,
+        keys: &[Key],
+    ) -> Result<Vec<WishOf<R>>, Error> {
+        crate::wish::wishes(conn, &self.codecs, keys).await
     }
 
     /// A transaction as the engine's own begin — assuming the settings'

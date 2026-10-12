@@ -1,0 +1,5 @@
+error: #[row(desired)] is a field of the setting itself, not of a part flattened in
+ --> tests/derive/fail/desired_in_a_part.rs:3:11
+  |
+3 |     #[row(desired)]
+  |           ^^^^^^^

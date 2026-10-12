@@ -1,4 +1,4 @@
-error[E0080]: evaluation panicked: #[row(version)] in a part flattened in orders the reports of a replica's table: only a `record` has one
+error[E0080]: evaluation panicked: #[row(version)] in a part flattened in orders the reports of a replica's table: only a `record` or a `setting` has one
   --> tests/derive/fail/version_in_a_part_off_record.rs:12:17
    |
 12 |     pub stamps: Stamps,

@@ -20,6 +20,14 @@ pub struct Revision(i64);
 
 impl Version for Revision {
     const KIND: VersionKind = VersionKind::Integer;
+
+    fn text(&self) -> String {
+        self.0.text()
+    }
+
+    fn raised(&self) -> Self {
+        Revision(self.0.raised())
+    }
 }
 
 #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
@@ -27,6 +35,18 @@ impl Version for Revision {
 pub struct Region {
     pub id: RegionId,
     pub name: String,
+    #[row(version)]
+    pub revision: Revision,
+}
+
+/// A setting versioned by a newtype.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(table = "dials", mirror = "setting", key = "replica_id, id", origin = "replica_id")]
+pub struct Dial {
+    pub replica_id: uuid::Uuid,
+    pub id: RegionId,
+    #[row(desired)]
+    pub value: i64,
     #[row(version)]
     pub revision: Revision,
 }

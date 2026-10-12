@@ -32,6 +32,57 @@ pub enum Mirror {
     /// Written on both, column by column (`mirror = "both"`): the columns the
     /// replicas own travel up, the others down.
     Both,
+    /// A value a replica holds and acts on, written there and held by the
+    /// server (`mirror = "setting"`), which may wish its desired columns
+    /// other values ([`Setting`]).
+    Setting,
+}
+
+impl Mirror {
+    /// Whether a replica writes the table's rows and they go up.
+    pub(crate) fn goes_up(self) -> bool {
+        matches!(self, Mirror::Record | Mirror::Both | Mirror::Setting)
+    }
+
+    /// Whether the server writes the table's rows and sends them down.
+    pub(crate) fn sent_down(self) -> bool {
+        matches!(self, Mirror::Catalog | Mirror::Both)
+    }
+}
+
+/// Which wish a replica carries out: a setting's `apply = "…"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Apply {
+    /// Every wish, whatever the replica did to the setting before it
+    /// arrived (`apply = "always"`): the last wish carried out wins over a
+    /// change made on the replica before it, and one made after it wins
+    /// until the next wish.
+    Always,
+    /// Only while the replica still holds the version the wish is based on
+    /// (`apply = "if_unchanged"`): one based on a version it no longer holds
+    /// is superseded, and the replica's value stands. The version is compared
+    /// as the handler is handed the wish: a write the replica makes of the row
+    /// while the handler runs is overwritten by the wished columns.
+    IfUnchanged,
+}
+
+/// A table that is a setting (`mirror = "setting"`): a row the replica owns,
+/// as a record, whose `#[row(desired)]` columns the server may wish other
+/// values. Implemented by [`#[derive(Row)]`](crate::Row) for such a row,
+/// and only by it.
+pub trait Setting: Row + Clone + Sync {
+    /// Which wish a replica carries out.
+    #[doc(hidden)]
+    const APPLY: Apply;
+
+    /// Takes the desired columns of `from`, leaving the rest.
+    #[doc(hidden)]
+    fn take_desired(&mut self, from: Self);
+
+    /// Moves the version past what it is ([`Version::raised`]).
+    #[doc(hidden)]
+    fn raise_version(&mut self);
 }
 
 /// Which replicas hold which rows of a table the server sends down: the
@@ -68,6 +119,8 @@ pub struct Column {
     pub generated: bool,
     /// Written only by a replica, in a table that syncs both ways.
     pub replica_owned: bool,
+    /// A column a wish of a setting sets.
+    pub desired: bool,
     /// A key column's kind, read off its type.
     pub key: Option<KeyKind>,
     /// The version column's kind, read off its type.
@@ -173,6 +226,11 @@ pub trait Row:
     /// The row's key values, in [`Row::KEY`] order.
     fn key(&self) -> Key;
 
+    /// Its `#[row(version)]` field's value, as [`Version::text`] writes it:
+    /// `None` for a row with no version field of its own.
+    #[doc(hidden)]
+    fn version_text(&self) -> Option<String>;
+
     /// The row's key as the engine writes it where a key is text — the `key`
     /// of `plan::Engine::row_progress`, a key in the engine's tables and in a
     /// log: its parts joined by `|`, a uuid lowercase and hyphenated, an
@@ -261,36 +319,103 @@ pub enum VersionKind {
     Instant,
 }
 
-/// A type a `#[row(version)]` column can have: an integer or an instant. A
-/// host's newtype around one implements it the way its inner type does.
+/// A type a `#[row(version)]` column can have: an integer or an instant — a
+/// `NaiveDateTime` is read as UTC. A host's newtype around one implements it
+/// the way its inner type does.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be a #[row(version)] column",
     label = "a version is an integer or a `chrono` instant",
     note = "a newtype around one of them implements `magic_sync::row::Version` as its inner type does"
 )]
-pub trait Version {
+pub trait Version: Sized {
     /// What the column holds.
     const KIND: VersionKind;
+
+    /// The version as text, the one form two versions of a setting are
+    /// compared in: an integer decimal; an instant in UTC, RFC 3339, to the
+    /// microsecond — what PostgreSQL keeps, so a version that went to the
+    /// server and came back compares equal to the one it was.
+    fn text(&self) -> String;
+
+    /// The version after this one, for a write the engine makes: an integer
+    /// one more, or itself at its type's maximum — a version that cannot
+    /// move, so the replica refuses a wish then; an instant now, or a
+    /// microsecond past this one when the clock is behind it.
+    #[must_use]
+    fn raised(&self) -> Self;
 }
 
 impl Version for i16 {
     const KIND: VersionKind = VersionKind::Integer;
+
+    fn text(&self) -> String {
+        self.to_string()
+    }
+
+    fn raised(&self) -> Self {
+        self.saturating_add(1)
+    }
 }
 
 impl Version for i32 {
     const KIND: VersionKind = VersionKind::Integer;
+
+    fn text(&self) -> String {
+        self.to_string()
+    }
+
+    fn raised(&self) -> Self {
+        self.saturating_add(1)
+    }
 }
 
 impl Version for i64 {
     const KIND: VersionKind = VersionKind::Integer;
+
+    fn text(&self) -> String {
+        self.to_string()
+    }
+
+    fn raised(&self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+/// `at` to the microsecond, and the instant after it a version takes.
+fn raised_utc(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::SubsecRound;
+    let past = at.trunc_subsecs(6) + chrono::TimeDelta::microseconds(1);
+    chrono::Utc::now().trunc_subsecs(6).max(past)
+}
+
+fn instant_text(at: chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::SubsecRound;
+    at.trunc_subsecs(6)
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 impl<Tz: chrono::TimeZone> Version for chrono::DateTime<Tz> {
     const KIND: VersionKind = VersionKind::Instant;
+
+    fn text(&self) -> String {
+        instant_text(self.with_timezone(&chrono::Utc))
+    }
+
+    fn raised(&self) -> Self {
+        raised_utc(self.with_timezone(&chrono::Utc)).with_timezone(&self.timezone())
+    }
 }
 
 impl Version for chrono::NaiveDateTime {
     const KIND: VersionKind = VersionKind::Instant;
+
+    fn text(&self) -> String {
+        instant_text(self.and_utc())
+    }
+
+    fn raised(&self) -> Self {
+        raised_utc(self.and_utc()).naive_utc()
+    }
 }
 
 impl KeyPart {
@@ -1238,6 +1363,119 @@ pub(crate) async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<
     write_keys(exec, rows, &newest::<R>(update_clause_where::<R>(|_| true))).await
 }
 
+/// `row` as PostgreSQL writes it as JSON (`to_jsonb`): its written columns
+/// by name, each value as its column's type writes it — the row in the
+/// table's own shape, which [`wanted`] reads back.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails or refuses a value.
+#[cfg(feature = "postgres")]
+pub(crate) async fn as_json<R: Row>(exec: &mut Conn, row: R) -> Result<serde_json::Value, Error> {
+    let names = written_names::<R>();
+    let mut qb = sqlx::QueryBuilder::new("SELECT to_jsonb(v) FROM (VALUES (");
+    let mut sep = qb.separated(", ");
+    row.push_binds(&mut sep);
+    qb.push(format!(")) AS v({})", listed(&names)));
+    Ok(qb.build_query_scalar().fetch_one(&mut *exec).await?)
+}
+
+/// The row a wish of `key` (as its text) wants: the row as the table holds
+/// it now — or, when it holds none, as `whole` (from [`as_json`]) is — with
+/// `whole`'s desired, key and version columns laid over it. Whatever
+/// columns the table has gained since `whole` was written come from its own
+/// row.
+///
+/// # Errors
+///
+/// [`Error::Malformed`] for a key that is not the table's;
+/// [`Error::Database`] when the database fails, or the row does not decode
+/// as `R` — one the table does not hold, and a column it gained since
+/// `whole` was written is NULL in.
+#[cfg(feature = "postgres")]
+pub(crate) async fn wanted<R: Row>(
+    exec: &mut Conn,
+    key: &str,
+    whole: &serde_json::Value,
+) -> Result<R, Error> {
+    let table = Table::of::<R>();
+    let key_columns: Vec<Column> = table
+        .key
+        .iter()
+        .filter_map(|k| table.columns.iter().find(|c| c.name == *k).copied())
+        .collect();
+    let key = crate::plan::parse_key(&key_columns, key)?;
+    let laid: serde_json::Map<String, serde_json::Value> = whole
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| {
+            table.columns.iter().any(|c| {
+                c.name == name.as_str() && (c.desired || c.key.is_some() || c.version.is_some())
+            })
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
+    let mut qb = sqlx::QueryBuilder::new(format!(
+        "SELECT {} FROM (SELECT (jsonb_populate_record(coalesce(\
+           (SELECT t FROM {} t",
+        listed(&names),
+        R::QUALIFIED
+    ));
+    key_filter::<R>(&mut qb, std::slice::from_ref(&key));
+    qb.push(format!("), jsonb_populate_record(NULL::{}, ", R::QUALIFIED));
+    qb.push_bind(whole.clone());
+    qb.push(")), ");
+    qb.push_bind(serde_json::Value::Object(laid));
+    qb.push(")).*) w");
+    Ok(qb.build_query_as::<R>().fetch_one(&mut *exec).await?)
+}
+
+/// Every row of the table — of the replica `of`, by the table's origin,
+/// when given — as `key \t version` lines: what a digest of a setting
+/// fingerprints.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or a row does not decode.
+pub(crate) async fn versions<R: Row>(
+    exec: &mut Conn,
+    of: Option<Uuid>,
+) -> Result<Vec<String>, Error> {
+    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
+    let mut qb =
+        sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(&names), R::QUALIFIED));
+    if let (Some(replica), Some(origin)) = (of, R::ORIGIN) {
+        qb.push(format!(" WHERE {} = ", ident(origin)));
+        qb.push_bind(replica);
+    }
+    Ok(qb
+        .build_query_as::<R>()
+        .fetch_all(&mut *exec)
+        .await?
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}",
+                row.key_text(),
+                row.version_text().unwrap_or_default()
+            )
+        })
+        .collect())
+}
+
+/// Inserts every row, or overwrites the one the table holds, whatever its
+/// version. Answers the keys it wrote.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails or refuses a row.
+#[cfg(feature = "postgres")]
+pub(crate) async fn overwrite<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<Key>, Error> {
+    write_keys(exec, rows, &update_clause_where::<R>(|_| true)).await
+}
+
 /// Inserts every row whose key is new; one the table holds is left as it
 /// was. Answers the keys it inserted.
 ///
@@ -1550,6 +1788,98 @@ mod tests {
             .unwrap();
         assert_eq!(inserted, [other.key()], "the one it held left as it was");
         assert_eq!(by_key(&mut conn, &first).await, [newer]);
+    }
+
+    /// A setting: the replica's, whose level the server may wish.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(
+        table = "screens",
+        mirror = "setting",
+        key = "replica_id, id",
+        origin = "replica_id",
+        apply = "if_unchanged"
+    )]
+    struct Screen {
+        replica_id: Uuid,
+        id: Uuid,
+        name: String,
+        #[row(desired)]
+        level: i64,
+        #[row(version)]
+        at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[test]
+    fn a_setting_takes_only_its_desired_columns_and_moves_its_version() {
+        let at = chrono::DateTime::from_timestamp_micros(1_700_000_000_000_001).unwrap();
+        let held = Screen {
+            replica_id: Uuid::now_v7(),
+            id: Uuid::now_v7(),
+            name: "front".into(),
+            level: 40,
+            at,
+        };
+        let wanted = Screen {
+            replica_id: Uuid::nil(),
+            id: Uuid::nil(),
+            name: "anything".into(),
+            level: 70,
+            at: at - chrono::Duration::days(1),
+        };
+        assert_eq!(
+            Table::of::<Screen>()
+                .columns
+                .iter()
+                .filter(|c| c.desired)
+                .map(|c| c.name)
+                .collect::<Vec<_>>(),
+            ["level"]
+        );
+        assert_eq!(Screen::APPLY, Apply::IfUnchanged);
+        let mut row = held.clone();
+        row.take_desired(wanted);
+        assert_eq!(
+            row,
+            Screen {
+                level: 70,
+                ..held.clone()
+            }
+        );
+        assert_eq!(
+            row.version_text().as_deref(),
+            Some("2023-11-14T22:13:20.000001Z")
+        );
+        row.raise_version();
+        assert!(row.at > at, "moved past what it was");
+        assert_eq!(
+            row.at.timestamp_subsec_nanos() % 1_000,
+            0,
+            "to the microsecond"
+        );
+    }
+
+    #[test]
+    fn a_version_is_compared_as_its_text_to_the_microsecond() {
+        let nanos = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        let micros = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000).unwrap();
+        assert_eq!(nanos.text(), micros.text(), "what PostgreSQL keeps of it");
+        assert_eq!(micros.text(), "2023-11-14T22:13:20.123456Z");
+        let east = micros.with_timezone(&chrono::FixedOffset::east_opt(3_600).unwrap());
+        assert_eq!(east.text(), micros.text(), "the same instant, in UTC");
+        assert_eq!(micros.naive_utc().text(), micros.text());
+        assert_eq!(41_i64.text(), "41");
+        assert_eq!(41_i16.raised(), 42);
+        assert_eq!(i32::MAX.raised(), i32::MAX);
+        let future = chrono::Utc::now() + chrono::Duration::days(1);
+        assert_eq!(
+            future.raised().text(),
+            (future + chrono::Duration::microseconds(1)).text(),
+            "a microsecond past a clock that is behind"
+        );
+        assert!(
+            micros.raised() > chrono::Utc::now() - chrono::Duration::seconds(5),
+            "now"
+        );
     }
 
     /// Two parts that bring in the same column, and one that brings in a

@@ -22,7 +22,9 @@ And the same tables, minus `registers`, on every register's SQLite.
 head office sends, whatever its version, because the order of the messages —
 not a column — says which is the latest. A column that orders versions
 (`#[row(version)]`) belongs to a table a register edits and the head office
-files, such as a record a register corrects.
+files, such as a record a register corrects, or a setting of its own — the
+footer each register prints, which the head office may wish another
+([Settings and wishes](settings.md)).
 
 ### The engine's part: installed for you, or in your migrations
 
@@ -32,8 +34,10 @@ schema of yours by that name needs another: the server refuses to install
 into it, or to read it as its own. There are two ways to get them there.
 
 > **You write**, if you have migrations — the way a system in production
-> should — the engine's schema in one of them: its first step,
-> [`magic_sync::plan::migration`]`(1)`, one SQL script. Then the triggers, in the
+> should — the engine's schema in one of them: its steps,
+> [`magic_sync::plan::migration`]`(1)` up to
+> `migration(`[`SERVER_SCHEMA_VERSION`]`)`, one SQL script each, in order.
+> Then the triggers, in the
 > migration that creates the tables, as you would their indexes. You do not
 > write them by hand: [`Engine::triggers`] prints them, from the same
 > declarations the server starts from, one `CREATE TRIGGER` per line:
@@ -128,7 +132,8 @@ table, live or retired, points at them — and lets them go, children first:
 on a table of many rows, an index on its retired column keeps that cheap.
 
 Same two ways for the engine's part: your migrations run the engine's
-first step, [`magic_sync::replica::migration`]`(1)`, and the script
+steps, [`magic_sync::replica::migration`]`(1)` up to
+`migration(`[`REPLICA_SCHEMA_VERSION`]`)` in order, and the script
 [`magic_sync::replica::triggers`] writes for your codecs — print them once
 and paste them into the migration that creates the tables, and the triggers
 again when a table is added or changes how it travels:
@@ -149,9 +154,11 @@ a database whose triggers are not exactly these; a test of yours runs it too,
 over the database your migrations build.
 
 [`magic_sync::plan::migration`]: ../api/server/magic_sync/plan/fn.migration.html
+[`SERVER_SCHEMA_VERSION`]: ../api/server/magic_sync/constant.SERVER_SCHEMA_VERSION.html
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers
 [`Engine::indexes`]: ../api/server/magic_sync/plan/struct.Engine.html#method.indexes
 [`magic_sync::replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
+[`REPLICA_SCHEMA_VERSION`]: ../api/replica/magic_sync/constant.REPLICA_SCHEMA_VERSION.html
 [`magic_sync::replica::install`]: ../api/replica/magic_sync/replica/fn.install.html
 [`magic_sync::replica::check`]: ../api/replica/magic_sync/replica/fn.check.html
 [`magic_sync::replica::triggers`]: ../api/replica/magic_sync/replica/fn.triggers.html

@@ -5,7 +5,7 @@
 The first release. `magic_sync` keeps partial copies of PostgreSQL tables on
 SQLite replicas and brings back what the replicas write, offline-first: for
 every replica the server records what it holds, works out what it should hold,
-and sends the difference. Schemas: server 1, replica 1. Protocol 1. Dashboard
+and sends the difference. Schemas: server 2, replica 2. Protocol 1. Dashboard
 contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 
 ### What it is
@@ -14,7 +14,9 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   is the server, the `sqlite` feature a replica, and a build with both (or
   neither) does not compile. `magic_sync_derive` is the derive, re-exported as
   `magic_sync::Row` and `magic_sync::Columns`. `magic_sync_dashboard` (npm) is
-  the dashboard for Vue 3, released at the same version.
+  the dashboard for Vue 3, released at the same version: `SyncDashboard`,
+  `RowPlaces` for where one row is, `WishList` for the wishes of the
+  replicas' settings, and each headless (`use…`) for a host's own components.
 - **Tables are declared once**, as the struct that is the row
   (`#[derive(Row)]`): where it lives, which way it travels (`catalog`,
   `record`, `both`), which replicas hold which rows (`broadcast`,
@@ -22,6 +24,24 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   travels points at it, read from the foreign keys). A misuse is a compile
   error; a table that is not its row, a missing or different trigger, or a
   missing index is refused when the server or a replica starts.
+- **Settings and wishes.** A `setting` is a row a replica owns and acts on;
+  the server may wish its `#[row(desired)]` columns other values
+  (`Server::desire`, `withdraw`, `wishes`). The replica carries each wish out
+  once through the host's handler (`run::replica::CarryOut`, `Settings::wishes`) —
+  outside any transaction, so it may reach hardware — and answers `applied`
+  (the engine writes the row and the answer together), `refused`, `waiting`,
+  or `superseded` when `apply = "if_unchanged"` and the setting changed on
+  the replica since the wish was based on it. Wishes travel as rows of the
+  engine's own two-way table `sync_wishes` (schema step 2 on each side), so
+  every guarantee below holds for them. The server files a setting as a
+  record, the newer version winning; a replica says its settings and answers
+  again whenever a snapshot begins, which the server takes whatever their
+  version, and its digests fingerprint them; a snapshot names the settings
+  the server records it holding, and the replica deletes those it no longer
+  holds — so once the system settles, both sides show the same value, after
+  a restore of either too. A handler has `Settings::wishes_timeout` to
+  answer; `Wish::new` lets a host test its own. Table names beginning
+  `sync_` are the engine's.
 - **Codecs.** `Codec::json` (an object of the row's columns, 64-bit integers
   as text) and `Codec::new` (a protobuf message of your own).
 - **Runners.** `Server` and `Replica` run what a host builds; the host
@@ -33,12 +53,15 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   `Engine::indexes`, `replica::triggers`); `check` holds a database to exactly
   those.
 - **Status.** `status` answers for a dashboard, over a scope, in one
-  snapshot: the overview, a paged listing, health, progress, and where one row
-  is. Every answer serializes as JSON of a versioned contract.
+  snapshot: the overview, a paged listing, health, progress, where one row
+  is, and the wishes of the replicas' settings (`Engine::wishes`; each
+  replica counts its own, and one with a wish it has not answered is
+  catching up). Every answer serializes as JSON of a versioned contract.
 - **The replica protocol** (`PROTOCOL.md`, `proto/sync.proto`) is written for
   a replica in any language, with test vectors (`tests/golden`) that the
   engine's own replica is held to.
-- **The shop** example, a head office and its registers with a page each, and
+- **The shop** example, a head office and its registers with a page each — a
+  footer of each register's the head office may wish another among them — and
   **the book**, which builds it step by step, explains the engine and carries
   the protocol; both sides' API reference is published with it.
 
@@ -58,7 +81,10 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 - What a replica writes is filed under the replica that sent it, whatever the
   rows claim; an upload is answered only once filed, and a replica forgets a
   write only on that answer.
-- Progress counts only what a replica confirmed it applied.
+- Progress counts only what a replica confirmed it applied. A row a replica
+  did not take because it deleted it and the delete is not filed yet is
+  reported held back (`Rejected.held_back`): no fault, no alarm, and sent
+  again should the server keep it.
 - An hourly fingerprint of what each replica holds catches what nothing
   foresaw.
 

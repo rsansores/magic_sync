@@ -84,6 +84,20 @@ listing: ask `Engine::row_progress` with its key, and show the answer with
 <RowPlaces :places="rowProgress" :names="registerNames" />
 ```
 
+## Wishes
+
+What the head office wished of the replicas' settings, and how each replica
+answered: ask `Engine::wishes` for a page of them, and show it with
+`WishList` (or `useWishes`, without looks). A wish's table and key are the
+engine's; `setting` names it for a person:
+
+```vue
+<WishList :wishes="wishListing" :names="registerNames" :setting="(w) => settingNames[w.key]" />
+```
+
+Each replica's line on the dashboard already counts its wishes not carried
+out, waiting, refused and changed there first.
+
 ### Its look
 
 Every colour and size is a CSS variable; set them on `.msd` or any ancestor:

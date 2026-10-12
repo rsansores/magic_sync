@@ -15,10 +15,12 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use magic_sync::run::server::{Anyone, Server, Settings, Transport};
-use magic_sync::status::{Listing, Overview, Progress, ReplicaState, RowProgress, Scope};
+use magic_sync::status::{
+    Listing, Overview, Progress, ReplicaState, RowProgress, Scope, WishListing,
+};
 use magic_sync::Error;
 use serde::{Deserialize, Serialize};
-use shop_rows::{codecs, Product, Receipt, REGISTERS};
+use shop_rows::{codecs, Footer, Product, Receipt, REGISTERS};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -142,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sync/replicas", get(listing))
         .route("/api/sync/progress/{register}", get(progress))
         .route("/api/sync/rows/{table}/{key}", get(row))
+        .route("/api/sync/wishes", get(wishes))
         .route("/api/products", post(add_product))
         .route(
             "/api/products/{id}",
@@ -149,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/registers", post(register))
         .route("/api/registers/{register}/line", post(line))
+        .route("/api/registers/{register}/footer", post(wish_footer))
         .route("/sync/{register}/next", get(next))
         .route("/sync/{register}/ack/{id}", post(ack))
         .route("/sync/{register}/up", post(up))
@@ -249,6 +253,8 @@ struct ShopState {
     products: Vec<Product>,
     receipts: Vec<Receipt>,
     registers: Vec<RegisterState>,
+    /// Each register's footer, as it last said.
+    footers: Vec<Footer>,
 }
 
 async fn state(State(app): State<App>) -> Result<Json<ShopState>, Failure> {
@@ -265,10 +271,14 @@ async fn state(State(app): State<App>) -> Result<Json<ShopState>, Failure> {
     for register in &mut registers {
         register.cut = app.deliveries.is_cut(register.id);
     }
+    let footers = sqlx::query_as("SELECT * FROM shop.footers")
+        .fetch_all(&app.pool)
+        .await?;
     Ok(Json(ShopState {
         products,
         receipts,
         registers,
+        footers,
     }))
 }
 
@@ -346,6 +356,20 @@ async fn row(
             }
         })?;
     Ok(Json(places))
+}
+async fn wishes(State(app): State<App>) -> Result<Json<WishListing>, Failure> {
+    let mut conn = app.pool.acquire().await?;
+    let wishes = app
+        .server
+        .engine()
+        .wishes(
+            &mut conn,
+            Scope::All,
+            None,
+            magic_sync::status::Page::new(0, 50),
+        )
+        .await?;
+    Ok(Json(wishes))
 }
 // ANCHOR_END: dashboard
 
@@ -501,3 +525,36 @@ async fn up(
     Ok(StatusCode::NO_CONTENT)
 }
 // ANCHOR_END: up
+
+// ANCHOR: wish
+/// A register's footer as the head office's page showed it, with the text
+/// asked for in its place.
+#[derive(Deserialize)]
+struct FooterWish {
+    /// The footer the page showed: its version, which the wish is based on.
+    seen: Footer,
+    text: String,
+}
+
+/// The head office wishes a register's footer another text. The register
+/// prints it once its printer takes it — unless it changed its footer since
+/// the page showed it: then the wish is superseded, and the register's
+/// stands.
+async fn wish_footer(
+    State(app): State<App>,
+    Path(register): Path<Uuid>,
+    Json(form): Json<FooterWish>,
+) -> Result<StatusCode, Failure> {
+    let wanted = Footer {
+        register_id: register,
+        text: form.text,
+        ..form.seen
+    };
+    let mut tx = app.pool.begin().await?;
+    app.server
+        .desire(&mut tx, wanted, Some("the head office"))
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+// ANCHOR_END: wish

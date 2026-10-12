@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import type { NoteKind, ReplicaState, RowState } from './contract/types.js'
+import type { NoteKind, ReplicaState, RowState, WishState } from './contract/types.js'
 import overview from './contract/fixtures/overview.js'
 import listing from './contract/fixtures/listing.js'
 import progress from './contract/fixtures/progress.js'
 import rows from './contract/fixtures/rows.js'
+import wishes from './contract/fixtures/wishes.js'
 import { parseTimestamp } from './time.js'
 
 // The fixtures are checked field for field against the generated types by
@@ -24,6 +25,10 @@ const rowStates = {
   quarantined: 1,
 } satisfies Record<RowState, 1>
 const noteKinds = { row: 1, members: 1, assigned: 1, resync: 1 } satisfies Record<NoteKind, 1>
+const wishStates = { pending: 1, waiting: 1, applied: 1, refused: 1, superseded: 1 } satisfies Record<
+  WishState,
+  1
+>
 
 const TIME_FIELDS = /(_at|^now|^oldest|^waiting_since|^at)$/
 
@@ -42,8 +47,12 @@ describe('the contract fixtures', () => {
     expect(new Set(overview.health.parked.first.map((p) => p.kind))).toEqual(new Set(Object.keys(noteKinds)))
   })
 
+  it('hold every state of a wish', () => {
+    expect(new Set(wishes.wishes.first.map((w) => w.state))).toEqual(new Set(Object.keys(wishStates)))
+  })
+
   it('write every time as the engine does, and every one reads', () => {
-    const all = [overview, listing, progress, rows].flatMap((answer) => times(answer))
+    const all = [overview, listing, progress, rows, wishes].flatMap((answer) => times(answer))
     expect(all.length).toBeGreaterThan(10)
     for (const [field, time] of all)
       expect([field, parseTimestamp(String(time))]).toEqual([field, expect.any(Number)])

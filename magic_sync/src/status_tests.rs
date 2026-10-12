@@ -646,12 +646,12 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
 /// appears, in the order it first does, and every time the same moment, in
 /// the format the engine writes.
 #[derive(Default)]
-struct Stable {
+pub(super) struct Stable {
     ids: BTreeMap<String, String>,
 }
 
 impl Stable {
-    fn of(&mut self, value: serde_json::Value) -> serde_json::Value {
+    pub(super) fn of(&mut self, value: serde_json::Value) -> serde_json::Value {
         use serde_json::Value;
         match value {
             Value::String(s) => Value::String(self.text(&s)),

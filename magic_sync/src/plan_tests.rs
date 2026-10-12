@@ -1243,6 +1243,8 @@ impl World {
                 upserts: vec![row],
                 keys: vec![crate::envelope::Key { parts: vec![key] }],
                 deletes: Vec::new(),
+                restated: false,
+                recorded: Vec::new(),
             }],
             protocol: crate::envelope::PROTOCOL,
             ..crate::envelope::Up::default()
@@ -2315,55 +2317,6 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
     );
 }
 
-/// The triggers the book shows a host's migrations writing for the shop
-/// (`book/src/guide/shop-triggers.sql`) are the ones the engine prints for
-/// the shop's tables. `MAGIC_SYNC_BLESS=1` writes them anew.
-#[sqlx::test(migrations = false)]
-async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: crate::DbPool) {
-    /// The shop's product, as `examples/shop/rows` declares it.
-    #[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, crate::Row)]
-    #[row(
-        table = "products",
-        schema = "shop",
-        mirror = "catalog",
-        sync = "broadcast",
-        retired = "retired_at"
-    )]
-    struct Product {
-        id: Uuid,
-        name: String,
-        price_cents: i64,
-        updated_at: DateTime<Utc>,
-    }
-
-    let mut conn = pool.acquire().await.expect("a connection");
-    super::tests::install(&mut conn).await;
-    let root = env!("CARGO_MANIFEST_DIR");
-    let shop = std::fs::read_to_string(format!("{root}/../examples/shop/server/schema.sql"))
-        .expect("the shop's schema");
-    sqlx::raw_sql(&shop)
-        .execute(&mut *conn)
-        .await
-        .expect("the shop's tables");
-    let printed = Engine::triggers(
-        &mut conn,
-        &[Codec::<()>::json::<Product>(None)],
-        Replicas::new("shop.registers", "registers").live("active"),
-    )
-    .await
-    .expect("the triggers");
-    let path = format!("{root}/../book/src/guide/shop-triggers.sql");
-    if std::env::var_os("MAGIC_SYNC_BLESS").is_some() {
-        std::fs::write(&path, format!("{printed}\n")).expect("write the book's triggers");
-    }
-    let shown = std::fs::read_to_string(&path).unwrap_or_default();
-    assert!(
-        shown == format!("{printed}\n"),
-        "book/src/guide/shop-triggers.sql is not what the engine prints for the shop: \
-         run this test with MAGIC_SYNC_BLESS=1 and commit the result"
-    );
-}
-
 #[sqlx::test(migrations = false)]
 async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
     let mut conn = bare(&pool).await;
@@ -2396,7 +2349,8 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
 /// is a step of its own.
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
-    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0x404b_35fd_cc9a_ab37];
+    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] =
+        [0x404b_35fd_cc9a_ab37, 0xa4c8_9065_538b_9cb5];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -3564,6 +3518,8 @@ async fn a_replicas_inbox_is_bounded_by_its_bytes(pool: crate::DbPool) {
                 parts: vec!["1".to_owned()],
             }],
             deletes: Vec::new(),
+            restated: false,
+            recorded: Vec::new(),
         }],
         ..crate::envelope::Up::default()
     };

@@ -1,4 +1,4 @@
-error: a key column is the row's identity: it is not generated, owned by a replica, a version or a creation time
+error: a key column is the row's identity: it is not generated, owned by a replica, a version, a creation time or desired
  --> tests/derive/fail/key_generated.rs:4:11
   |
 4 |     #[row(generated)]

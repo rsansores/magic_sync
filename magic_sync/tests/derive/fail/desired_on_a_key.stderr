@@ -1,0 +1,5 @@
+error: a key column is the row's identity: it is not generated, owned by a replica, a version, a creation time or desired
+ --> tests/derive/fail/desired_on_a_key.rs:5:11
+  |
+5 |     #[row(desired)]
+  |           ^^^^^^^

@@ -69,6 +69,31 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A replica's setting, whose level the server may wish: carried out only
+/// while the replica holds the version the wish is based on.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(
+    table = "screens",
+    mirror = "setting",
+    key = "replica_id, id",
+    origin = "replica_id",
+    apply = "if_unchanged",
+    unmirrored = "installed_at"
+)]
+pub struct Screen {
+    pub replica_id: Uuid,
+    pub id: Uuid,
+    #[row(desired)]
+    pub level: i32,
+    #[row(desired)]
+    #[sqlx(rename = "Mode")]
+    pub mode: Option<String>,
+    #[row(version)]
+    pub at: NaiveDateTime,
+    #[sqlx(flatten)]
+    pub stamps: Stamps,
+}
+
 /// A row that goes wherever its parent goes.
 #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
 #[row(table = "task_notes", mirror = "catalog", key = "task_id", sync = "follows(task_id)")]

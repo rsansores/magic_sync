@@ -1,0 +1,5 @@
+error: #[row(desired)] is a column the server may wish a replica's setting to hold: needs `mirror = "setting"`
+ --> tests/derive/fail/desired_off_a_setting.rs:5:11
+  |
+5 |     #[row(desired)]
+  |           ^^^^^^^

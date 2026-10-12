@@ -1,0 +1,5 @@
+error: only a `setting` has an `apply` rule: it says which wish a replica carries out
+ --> tests/derive/fail/apply_off_a_setting.rs:2:53
+  |
+2 | #[row(table = "screens", mirror = "record", apply = "always")]
+  |                                                     ^^^^^^^^

@@ -1,7 +1,14 @@
 // What the page asks the head office. The sync reads answer the engine's
 // JSON as it is, so their types are the dashboard's.
 
-import type { Listing, Overview, Progress, ReplicaState, RowProgress } from 'magic_sync_dashboard'
+import type {
+  Listing,
+  Overview,
+  Progress,
+  ReplicaState,
+  RowProgress,
+  WishListing,
+} from 'magic_sync_dashboard'
 
 export interface Product {
   id: string
@@ -24,10 +31,18 @@ export interface Register {
   cut: boolean
 }
 
+/** What a register prints under its receipts, as it last said. */
+export interface Footer {
+  register_id: string
+  text: string
+  changed_at: string
+}
+
 export interface ShopState {
   products: Product[]
   receipts: Receipt[]
   registers: Register[]
+  footers: Footer[]
 }
 
 async function ask<T>(method: string, url: string, body?: unknown): Promise<T> {
@@ -52,6 +67,9 @@ export const api = {
   listing: (state: ReplicaState | null, offset: number) =>
     ask<Listing>('GET', `/api/sync/replicas?offset=${offset}${state ? `&state=${state}` : ''}`),
   progress: (register: string) => ask<Progress>('GET', `/api/sync/progress/${register}`),
+  wishes: () => ask<WishListing>('GET', '/api/sync/wishes'),
+  wishFooter: (seen: Footer, text: string) =>
+    ask<void>('POST', `/api/registers/${seen.register_id}/footer`, { seen, text }),
   row: (table: string, key: string) =>
     ask<RowProgress>('GET', `/api/sync/rows/${encodeURIComponent(table)}/${encodeURIComponent(key)}`),
 }

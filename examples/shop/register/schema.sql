@@ -21,4 +21,12 @@ CREATE TABLE IF NOT EXISTS receipts (
     total_cents INTEGER NOT NULL,
     created_at  TEXT NOT NULL
 );
+
+-- What it prints under every receipt: its own, which the head office may
+-- wish another.
+CREATE TABLE IF NOT EXISTS footers (
+    register_id BLOB PRIMARY KEY NOT NULL,
+    text        TEXT NOT NULL,
+    changed_at  TEXT NOT NULL
+);
 -- ANCHOR_END: tables

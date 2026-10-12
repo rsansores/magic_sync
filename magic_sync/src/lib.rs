@@ -75,6 +75,7 @@ pub mod status;
 #[cfg(test)]
 mod testkit;
 pub mod wire;
+mod wish;
 
 pub use error::Error;
 pub use row::{Columns, Row};
@@ -117,12 +118,13 @@ pub use row::{Columns, Row};
 /// |---|---|
 /// | `table` | the table's name (required) |
 /// | `schema` | its PostgreSQL schema; `public` when left out |
-/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server) or `both` (each side its own columns) — required |
+/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server), `both` (each side its own columns) or `setting` (a value a replica holds and acts on, held by the server, which may wish its `desired` columns other values) — required |
 /// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names: a uuid, or an `Option` of one), `follows(col)` (wherever the row `col` points at goes: one column, the whole of a foreign key into a mirrored table) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
 /// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]), and a field of the row itself — not of a part flattened in |
 /// | `active` | for `catalog` and `both`, the relation the rows the table's rule sends are read through on the server — `view` or `schema.view` (a name has no dot), a view that leaves out the rows no replica is sent for their own sake; one it leaves out still travels while a row a replica holds points at it |
 /// | `retired` | for `catalog` and `both`, the column a replica sets on a row it lets go of but must keep, because a row of its own points at it. It is left out of the row as a rule; a row that has it as a field too gets it back as the server sends it, which is live |
-/// | `origin` | for `record` and `both`, the uuid key column naming the replica a row belongs to: a replica deletes only its own rows |
+/// | `origin` | for `record`, `both` and `setting` — required for a `setting`, where it is the replica a wish of the row goes to — the uuid key column naming the replica a row belongs to: a replica deletes only its own rows |
+/// | `apply` | for a `setting`, which wish its replica carries out ([`row::Apply`]): `always` (the default) or `if_unchanged`, only while it still holds the version the wish is based on |
 /// | `unmirrored` | columns one side's table has that the row leaves out: `unmirrored = "archived_at, notes"` |
 /// | `crate` | the path to this crate, when a host reaches it through another: `crate = "platform::sync"` |
 ///
@@ -130,7 +132,8 @@ pub use row::{Columns, Row};
 ///
 /// | flag | means |
 /// |---|---|
-/// | `#[row(version)]` | the column whose value only moves forward: an older report of a replica's record never overwrites a newer one on the server. An integer or a `chrono` instant ([`row::Version`]), never NULL. Only a `record` has one: a replica takes what the server sends whatever its version |
+/// | `#[row(version)]` | the column whose value only moves forward: an older report of a replica's record never overwrites a newer one on the server. An integer or a `chrono` instant ([`row::Version`]), never NULL. Only a `record` or a `setting` has one — a setting must, a field of its own: what a wish is based on. The server files a setting as a record, the newer version winning, but one its replica re-states as a snapshot begins whatever its version: a replica restored from an older copy holds what it holds. A replica takes what the server sends whatever its version |
+/// | `#[row(desired)]` | in a `setting`, a column the server may wish other values ([`row::Setting`]); at least one, a field of the row itself, never its key or version |
 /// | `#[row(created)]` | written once, when the row is created; never by an update |
 /// | `#[row(replica_owned)]` | in a `both` table, a column only replicas write: it goes up, the rest come down |
 /// | `#[row(generated)]` | computed by the database: read, never written |
@@ -191,13 +194,13 @@ pub type Conn = sqlx::SqliteConnection;
 /// refuses to run against a database that installed another. It counts the
 /// server's own steps, independent of the replicas' version.
 #[cfg(feature = "postgres")]
-pub const SERVER_SCHEMA_VERSION: i32 = 1;
+pub const SERVER_SCHEMA_VERSION: i32 = 2;
 
 /// The version of the engine's tables on a replica: the replica refuses to
 /// run against a database that installed another. It counts the replica's own
 /// steps (`replica::migration`), independent of the server's version.
 #[cfg(feature = "sqlite")]
-pub const REPLICA_SCHEMA_VERSION: i32 = 1;
+pub const REPLICA_SCHEMA_VERSION: i32 = 2;
 
 use __private::Db;
 
