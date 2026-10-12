@@ -129,7 +129,10 @@ CREATE VIEW shop.live_products AS SELECT * FROM shop.products WHERE archived_at 
 ```
 
 Archiving a product takes it back from every register — retired where a
-receipt still points at it. Leave `active` out and archived products travel
+receipt still points at it. The view decides what is sent for its own sake,
+not what may travel: an archived product a row the register holds points at
+still goes there, as that row's parent, and leaves once nothing points at it.
+Leave `active` out and archived products travel
 like any other, with their `archived_at` as data, for the register to show as
 archived.
 

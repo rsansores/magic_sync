@@ -153,9 +153,11 @@ pub trait Row:
     const QUALIFIED: &'static str;
     #[doc(hidden)]
     const ROUTE: Route;
-    /// The relation, as SQL, the rows replicas hold are read through on the
-    /// server: a view that leaves out the rows no replica should hold.
-    /// `None`: the table itself, every row of it.
+    /// The relation, as SQL, the rows the table's rule sends are read
+    /// through on the server: a view that leaves out the rows no replica is
+    /// sent for their own sake. A row it leaves out still travels while a
+    /// row a replica holds points at it. `None`: the table itself, every row
+    /// of it.
     #[doc(hidden)]
     const ACTIVE: Option<&'static str>;
     /// The column a replica sets on a row it lets go of but cannot delete,
