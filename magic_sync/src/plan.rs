@@ -151,6 +151,9 @@ pub(crate) struct Plan {
     owned: Vec<&'static str>,
     /// Every column a row of it carries.
     columns: Vec<&'static str>,
+    /// How large a row aliased `t` is, as SQL: every column it carries, as
+    /// long as it is rather than as the database stores it.
+    size: String,
     /// How its codec writes a row.
     encoding: &'static str,
 }
@@ -1066,6 +1069,7 @@ impl Engine {
                     .map(|c| c.name)
                     .collect(),
                 columns: t.columns.iter().map(|c| c.name).collect(),
+                size: String::new(),
                 encoding: t.encoding,
             });
         }
@@ -1188,7 +1192,7 @@ impl Engine {
                 )));
             }
         }
-        for plan in &plans {
+        for plan in &mut plans {
             readable(
                 conn,
                 &format!("SELECT 1 FROM {} LIMIT 0", plan.active),
@@ -1196,6 +1200,20 @@ impl Engine {
             )
             .await?;
             let columns = typed_columns(conn, &plan.relation.sql()).await?;
+            // The length of text and bytes is read off the stored value
+            // without decompressing it; anything else, as its text.
+            plan.size = plan
+                .columns
+                .iter()
+                .map(|c| match type_of(&columns, c).as_deref() {
+                    Some("text" | "bytea" | "character varying" | "character") => {
+                        format!("coalesce(octet_length(t.{}), 0)", ident(c))
+                    }
+                    _ => format!("coalesce(octet_length(t.{}::text), 0)", ident(c)),
+                })
+                .chain(["0".to_owned()])
+                .collect::<Vec<_>>()
+                .join(" + ");
             let has = |column: &str| type_of(&columns, column).is_some();
             let missing = match plan.route {
                 Route::Broadcast => replicas.partition.filter(|p| !has(p)),
@@ -2755,9 +2773,9 @@ impl Engine {
     }
 
     /// How many of `keys` of table `i`, from the first, hold no more than
-    /// `budget` bytes between them as the database stores them — one at
-    /// least: what a pass loads and encodes at once stays bounded however
-    /// large the rows.
+    /// `budget` bytes between them, each as long as it is, not as the
+    /// database stores it — one at least: what a pass loads and encodes at
+    /// once stays bounded however large the rows.
     pub(crate) async fn fitting(
         &self,
         conn: &mut Conn,
@@ -2767,9 +2785,10 @@ impl Engine {
     ) -> Result<usize, Error> {
         let plan = &self.plans[i];
         let sizes: Vec<i64> = sqlx::query_scalar(&format!(
-            "SELECT coalesce(pg_column_size(t.*), 0)::int8 \
+            "SELECT ({})::int8 \
                FROM unnest($1::text[]) WITH ORDINALITY AS k(row_key, n) \
                LEFT JOIN {} t ON {} ORDER BY k.n",
+            plan.size,
             plan.relation.sql(),
             self.row_is(i, "k.row_key"),
         ))

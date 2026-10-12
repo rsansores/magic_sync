@@ -521,6 +521,10 @@ fn parents(table: &str, bytes: &[u8]) -> Vec<Row> {
 /// or a fix of the data, cures.
 const REFUSED: &str = "refused";
 
+/// The title a replica's upload of a two-way row carries: never one the
+/// server's rows have.
+const UPLOADED: &str = "uploaded";
+
 /// The replicas of the walk: their foreign keys, and the rows they refuse.
 const RULES: Rules = Rules {
     refuses: |_, bytes| {
@@ -991,6 +995,18 @@ impl World {
     /// now — but a row it refused to take or to let go of, which it holds as
     /// it had it, or not at all, and the columns it owns, which are its own.
     async fn assert_holdings(&mut self, seed: u64, step: usize) {
+        let made: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM fixture.t_tallies WHERE name = $1")
+                .bind(UPLOADED)
+                .fetch_one(&mut *self.conn)
+                .await
+                .expect("tallies");
+        assert_eq!(
+            made,
+            0,
+            "seed {seed:#x}, after step {step}: a replica's upload made a two-way row, or brought one back; last steps: {:#?}",
+            self.last_steps()
+        );
         let oracle = Oracle::read(&mut self.conn).await;
         let replicas: Vec<Uuid> =
             sqlx::query_scalar("SELECT id FROM t_replicas WHERE live ORDER BY id")
@@ -1062,6 +1078,55 @@ impl World {
         let encoded = codec.load(&mut self.conn, &[key]).await.expect("load");
         let (_, bytes) = encoded.rows.first()?;
         Some(serde_json::from_slice(bytes).expect("JSON"))
+    }
+
+    /// A replica's edit of its column of a two-way row, uploaded and filed:
+    /// of one it was sent — which the server may have deleted since — or,
+    /// now and then, of one it never was. The title it uploads is never the
+    /// server's, which takes only the replica's column of a row it has.
+    async fn upload_edit(&mut self, walk: &mut Walk) {
+        let held: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT replica_id, row_key FROM sync.held WHERE relation = 't_tallies' ORDER BY 1, 2",
+        )
+        .fetch_all(&mut *self.conn)
+        .await
+        .expect("held");
+        let picked = (!held.is_empty()).then(|| held[walk.below(held.len())].clone());
+        let (replica, key) = match picked {
+            Some(held) if walk.below(4) > 0 => held,
+            _ => match walk.pick(&self.replicas.keys().copied().collect::<Vec<_>>()) {
+                Some(replica) => (replica, walk.uuid().to_string()),
+                None => return,
+            },
+        };
+        let tally = Tally {
+            id: key.parse().expect("a uuid"),
+            partition_id: self.partitions[0],
+            kind_id: None,
+            name: UPLOADED.to_owned(),
+            seen: i32::try_from(walk.below(1000)).expect("small"),
+        };
+        let row = crate::wire::json_encode("t_tallies", &Table::of::<Tally>().columns, &tally)
+            .expect("a tally");
+        let up = crate::envelope::Up {
+            tables: vec![crate::envelope::Table {
+                table: "t_tallies".to_owned(),
+                upserts: vec![row],
+                keys: vec![crate::envelope::Key { parts: vec![key] }],
+                deletes: Vec::new(),
+            }],
+            protocol: crate::envelope::PROTOCOL,
+            ..crate::envelope::Up::default()
+        };
+        let mut tx = self.conn.begin().await.expect("a transaction");
+        match crate::filing::file(&mut tx, &self.codecs, &up, replica, &(), i64::MAX).await {
+            Ok(_) => tx.commit().await.expect("filed"),
+            // It waited on the long writer's lock: it comes again.
+            Err(e) if e.is_transient() => return,
+            Err(e) => panic!("an upload: {e}"),
+        }
+        self.history
+            .push("a replica's edit of a tally uploaded".to_owned());
     }
 
     /// What a relay does once a deploy fixed what refused them: every row
@@ -1721,6 +1786,9 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
                 world.history.push("the fix".to_owned());
                 world.retry_quarantine().await;
             }
+        }
+        if walk.below(12) == 0 {
+            world.upload_edit(&mut walk).await;
         }
         if let Some((_, passes)) = &mut world.writer {
             *passes = passes.saturating_sub(1);
@@ -3064,7 +3132,8 @@ async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
 }
 
 /// A pass loads and encodes as many rows at once as fit a byte budget, so
-/// what it holds stays bounded however large the rows: never none.
+/// what it holds stays bounded however large the rows: never none. A row is
+/// as large as it is, however small the database stores it.
 #[sqlx::test(migrations = false)]
 async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) {
     let mut world = world(pool).await;
@@ -3072,10 +3141,10 @@ async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) 
     let mut keys = Vec::new();
     for _ in 0..3 {
         let id = Uuid::now_v7();
-        // Random, so it does not compress: a megabyte stored.
+        // A megabyte the database stores in a few kilobytes.
         sqlx::query(
             "INSERT INTO fixture.t_products (id, partition_id, name) \
-             SELECT $1, $2, string_agg(md5(random()::text), '') FROM generate_series(1, 32768)",
+             VALUES ($1, $2, repeat('o', 1 << 20))",
         )
         .bind(id)
         .bind(world.partitions[0])

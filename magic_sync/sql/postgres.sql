@@ -110,7 +110,9 @@ CREATE TABLE sync.held (
     PRIMARY KEY (replica_id, relation, row_key)
 );
 
-CREATE INDEX held_row ON sync.held (relation, row_key);
+-- Who holds a row, and — the prune's question of a note — whether anyone
+-- holds it at a version older than the note: the first entry answers.
+CREATE INDEX held_row ON sync.held (relation, row_key, noted);
 -- What a replica has on its way: the rows past the last message it
 -- confirmed, however many it holds.
 CREATE INDEX held_sent ON sync.held (replica_id, sequence);
@@ -264,6 +266,7 @@ CREATE TABLE sync.replicas (
     backlog_at       TIMESTAMPTZ,
     drifted_at       TIMESTAMPTZ,
     asked_at         TIMESTAMPTZ,
+    compared_at      TIMESTAMPTZ,
     asks             INTEGER     NOT NULL DEFAULT 0
 );
 
@@ -290,6 +293,9 @@ COMMENT ON COLUMN sync.replicas.asked_at IS
     'When it was last provisioned again for what it says of itself — it missed a message, or '
     'holds less than recorded — which no seal proves: asks counts those since it was last quiet '
     'a while, and each waits twice as long as the one before, up to 32 times the first.';
+COMMENT ON COLUMN sync.replicas.compared_at IS
+    'When its digests were last compared with what the server records: not again for ten '
+    'minutes, however often it sends them.';
 COMMENT ON COLUMN sync.replicas.drifted_at IS
     'When its digests last differed from what the server records and it was provisioned '
     'again for it. Digests that differ again within a day are a bug no provisioning cures: '

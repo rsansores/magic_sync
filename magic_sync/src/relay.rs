@@ -1213,7 +1213,8 @@ pub(crate) async fn retry_quarantine(conn: &mut Conn) -> Result<u64, Error> {
 /// as `c`, has a message it has not said it applied: one written for it in
 /// this epoch past the last it confirmed. Read from what each writer
 /// records of its own — the relay its chain, a filing what was confirmed —
-/// never from a flag the two would race to set.
+/// never from a flag the two would race to set. What the status shows and
+/// what heals a silent replica ask this one question.
 pub(crate) const UNCONFIRMED: &str = "(c.last_sequence IS NOT NULL \
      AND (r.applied_epoch IS DISTINCT FROM (SELECT epoch FROM sync.epoch) \
           OR coalesce(r.applied_sequence, 0) < c.last_sequence))";

@@ -8,6 +8,7 @@ use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, Readi
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use crate::wire::MapError;
 use prost::Message as _;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 const SCHEMA: &str = "
@@ -30,17 +31,21 @@ const REPLICAS: Replicas = Replicas {
     partition: Some("partition_id"),
 };
 
-/// What every replica was sent, in order.
+/// What every replica was sent, in order: each message once, by its id, as a
+/// transport that deduplicates delivers it — a relay stopped between a send
+/// and the trim of its outbox sends that message again.
 #[derive(Clone, Default)]
-struct Wire(Arc<Mutex<Vec<(Uuid, Body)>>>);
+struct Wire(Arc<Mutex<Vec<(Uuid, Body)>>>, Arc<Mutex<BTreeSet<String>>>);
 
 impl Transport for Wire {
-    async fn send(&self, replica: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
+    async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
         let message = ToReplica::decode(message.as_slice()).expect("a message");
-        self.0
-            .lock()
-            .unwrap()
-            .push((replica, message.body.expect("a body")));
+        if self.1.lock().unwrap().insert(id.to_owned()) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((replica, message.body.expect("a body")));
+        }
         Ok(())
     }
 }

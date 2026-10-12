@@ -148,6 +148,8 @@ struct Standing {
     /// And the one that ended it.
     snapshot_end: Option<i64>,
     drifted_at: Option<DateTime<Utc>>,
+    /// When its digests were last compared.
+    compared_at: Option<DateTime<Utc>>,
 }
 
 /// The server filing what `sender` uploaded, in the caller's transaction:
@@ -447,6 +449,7 @@ struct Recorded {
     snapshot: Option<i64>,
     snapshot_end: Option<i64>,
     drifted_at: Option<DateTime<Utc>>,
+    compared_at: Option<DateTime<Utc>>,
 }
 
 /// Takes `sender`'s row of the replicas for the caller's transaction, so its
@@ -477,7 +480,7 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
         "SELECT c.last_sequence AS last, c.last_nonce, \
                 CASE WHEN r.applied_epoch = $2 THEN r.applied_sequence END AS applied, \
                 CASE WHEN r.applied_epoch = $2 THEN r.applied_nonce END AS applied_nonce, \
-                c.snapshot_sequence AS snapshot, c.snapshot_end, r.drifted_at \
+                c.snapshot_sequence AS snapshot, c.snapshot_end, r.drifted_at, r.compared_at \
            FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
           WHERE r.replica_id = $1 FOR UPDATE OF r",
     )
@@ -496,6 +499,7 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
         snapshot: recorded.snapshot,
         snapshot_end: recorded.snapshot_end,
         drifted_at: recorded.drifted_at,
+        compared_at: recorded.compared_at,
     })
 }
 
@@ -868,7 +872,9 @@ async fn asked(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error> {
 /// comparison waits for the next digests. Rows it refused are left out, as
 /// it leaves them out. Digests that differ again within a day of the last
 /// provisioning they caused are a bug another one would not cure: logged,
-/// not acted on. Answers the tables that differed.
+/// not acted on. Digests come hourly, and reading what a replica holds is
+/// read whole: a replica's are compared once per [`COMPARED`] at most.
+/// Answers the tables that differed.
 async fn compare<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -878,6 +884,13 @@ async fn compare<P: Sync + 'static>(
     applied: i64,
 ) -> Result<Vec<String>, Error> {
     if upload.digests.is_empty() {
+        return Ok(Vec::new());
+    }
+    if standing
+        .compared_at
+        .is_some_and(|at| Utc::now() - at < COMPARED)
+    {
+        tracing::debug!(%replica, "sync: digests compared a moment ago — not again yet");
         return Ok(Vec::new());
     }
     let mut tables = std::collections::BTreeSet::new();
@@ -914,6 +927,10 @@ async fn compare<P: Sync + 'static>(
         tracing::debug!(%replica, "sync: digests taken with messages still on their way — not compared");
         return Ok(Vec::new());
     }
+    sqlx::query("UPDATE sync.replicas SET compared_at = now() WHERE replica_id = $1")
+        .bind(replica)
+        .execute(&mut *conn)
+        .await?;
     let mut held = held.0;
     let mut differ = Vec::new();
     for digest in digests {
@@ -947,6 +964,10 @@ async fn compare<P: Sync + 'static>(
         .await?;
     Ok(differ)
 }
+
+/// How long after comparing a replica's digests the server compares them
+/// again, however often it sends them.
+const COMPARED: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
 /// Tables a backlog may name: more than any server mirrors.
 const BACKLOG_TABLES: usize = 1024;

@@ -929,7 +929,16 @@ mod server {
                         i64::try_from(up.rejected.len()).unwrap(),
                         "{name}: what it refused, set aside"
                     ),
-                    "agrees" | "ignored" => {}
+                    "agrees" => assert_eq!(
+                        scalar(
+                            "SELECT count(*) FROM sync.replicas \
+                              WHERE replica_id = $1 AND compared_at IS NOT NULL"
+                        )
+                        .await,
+                        1,
+                        "{name}: its digests compared"
+                    ),
+                    "ignored" => {}
                     other => panic!("{name}: an outcome this suite does not know: {other}"),
                 }
             }

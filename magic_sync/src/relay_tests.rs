@@ -1080,9 +1080,14 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
         ..confirmation
     };
     let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
+    // Each later than the last comparison by more than the server waits.
     let file = |up: Up| {
         let world = &world;
         async move {
+            sqlx::query("UPDATE sync.replicas SET compared_at = now() - interval '11 minutes'")
+                .execute(&world.pool)
+                .await
+                .unwrap();
             crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
         }
     };
@@ -1102,6 +1107,13 @@ async fn a_replica_that_holds_other_than_recorded_is_provisioned_again(pool: cra
     ))
     .await;
     assert_eq!(world.count(resyncs).await, 0, "it holds what is recorded");
+    let differing = digests_of(&[("items", &[one])], confirming(last).await);
+    crate::testkit::file(&world.pool, &world.codecs, &differing, a, &()).await;
+    assert_eq!(
+        world.count(resyncs).await,
+        0,
+        "compared a moment ago: not again yet"
+    );
 
     // Digests of one table twice are no report.
     file(digests_of(

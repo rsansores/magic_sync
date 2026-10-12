@@ -167,7 +167,7 @@ message it applied, and checks, in order:
 
 - `sequence` 0 or above 2^63 − 1, an `epoch` that is not a UUID, a
   `previous` at or past `sequence`, a `nonce` 0 or above 2^63 − 1, a
-  `mac` of other than 16 bytes, a
+  `mac` of other than 16 bytes, a `previous_nonce` above 2^63 − 1, a
   `previous` of 0 with a `previous_nonce`, or another `previous` without
   one, or a `previous` of 0 on a message that begins no snapshot: no server
   numbers a message so; nor sends a table whose `keys` are not one per
@@ -364,7 +364,8 @@ recorded sending the replica:
   the sequence of the last it sent it, or of the last it heard applied,
   with another nonce: the server sealed it, and has no record of it. Its
   own database was restored from a copy older than what the replica
-  applied. It takes a new epoch, with a new secret, drops what it was about
+  applied. It raises an alarm — whoever runs it should know the database
+  went back — takes a new epoch, with a new secret, drops what it was about
   to send, and provisions every replica again;
 - a message older than the last it heard the replica applied: the replica
   was restored from an older copy, and holds less than the server records.
@@ -396,7 +397,8 @@ A row the replica could not take, or could not let go of (4.1), is a
 **rejection**: the table, the key — **required**, in the form of section 3:
 the one the row came beside, `keys[i]`, or its delete's — why,
 and the `(epoch, sequence)` of the message that carried the row, or its
-delete. A row whose key cannot be told is logged and not reported.
+delete — for a row the end of a snapshot could not let go of, the
+`EndSnapshot`'s. A row whose key cannot be told is logged and not reported.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.
@@ -556,8 +558,9 @@ within a day of the provisioning they caused are a bug no provisioning cures:
 the server logs them and does not act on them. A digest of a table the server
 does not send the replica — a later build's, or one it no longer sends — is
 skipped. Two digests of one table are malformed: none of that `Up`'s digests
-is compared. A replica that skips digests loses only
-this safety net.
+is compared. The server compares a replica's digests at most once every ten
+minutes: those that come sooner are not compared. A replica that skips
+digests loses only this safety net.
 
 ---
 
