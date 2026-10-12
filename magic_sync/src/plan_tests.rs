@@ -3450,7 +3450,7 @@ async fn a_parent_held_for_an_older_version_brings_no_new_follower(pool: crate::
         "UPDATE sync.notes SET parked_at = now() WHERE relation = 't_orders' AND done_at IS NULL \
            AND $1 = $1 AND $2 = $2",
         "INSERT INTO fixture.t_emails (id, partition_id, customer_id, address) \
-         VALUES (uuidv7(), (SELECT partition_id FROM fixture.t_orders WHERE id = $1), $2, 'e')",
+         VALUES (gen_random_uuid(), (SELECT partition_id FROM fixture.t_orders WHERE id = $1), $2, 'e')",
     ] {
         let parent = if sql.contains("t_emails") {
             customer

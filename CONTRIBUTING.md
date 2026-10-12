@@ -45,7 +45,8 @@ fix.
 ## The benchmarks
 
 The operations that move many rows at once, and the dashboard's reads over
-200 replicas holding 3 million rows:
+200 replicas holding 3 million rows. They seed with `uuidv7()`, so they need
+PostgreSQL 18; the suite itself runs on 14 and later:
 
 ```sh
 cargo test -p magic_sync --features postgres bench_ -- --ignored --nocapture --test-threads 1
