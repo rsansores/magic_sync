@@ -1034,14 +1034,25 @@ async fn apply<P: Sync + 'static>(
         let deletes = keys_of(codec, &table.deletes);
         let_go(conn, codecs, codec, &deletes, Some(sequence), care).await?;
         let beside = parsed(codec, &table.keys);
+        // A key twice in a part: the last row beside it is the one.
+        let mut last = HashMap::new();
+        for (at, key) in beside.iter().enumerate() {
+            if let Some(key) = key {
+                last.insert(key, at);
+            }
+        }
+        let rows: Vec<usize> = (0..beside.len())
+            .filter(|at| beside[*at].as_ref().is_none_or(|key| last[key] == *at))
+            .collect();
         let mut held = Vec::new();
         if care.careful {
             let mut pending = Vec::new();
-            for (at, key) in beside.iter().enumerate() {
+            for at in rows {
+                let key = beside[at].as_ref();
                 match care.culprit(&table.table, &Spot::Upsert { entry, at }) {
                     Some(culprit) => {
                         let why = &culprit.why;
-                        refuse(conn, codec, key.as_ref(), why, naming, sequence).await?;
+                        refuse(conn, codec, key, why, naming, sequence).await?;
                     }
                     None => pending.push(at),
                 }
@@ -1070,8 +1081,7 @@ async fn apply<P: Sync + 'static>(
                 pending = again;
             }
         } else {
-            let every: Vec<usize> = (0..table.upserts.len()).collect();
-            held = take(conn, codec, table, &beside, &every, naming, sequence).await?;
+            held = take(conn, codec, table, &beside, &rows, naming, sequence).await?;
         }
         taken.push(Applied {
             table: table.table.clone(),
@@ -1437,13 +1447,6 @@ async fn end_snapshot<P: Sync + 'static>(
     let mut seen = HashSet::new();
     let tables: Vec<&String> = message.tables.iter().filter(|t| seen.insert(*t)).collect();
     for table in tables.into_iter().rev() {
-        let Some(codec) = codec_of(codecs, table).filter(|c| c.sent_down()) else {
-            tracing::error!(
-                table,
-                "sync: a snapshot of a table this replica does not hold from the server — not swept"
-            );
-            continue;
-        };
         sqlx::query(
             "DELETE FROM sync_rejections WHERE table_name = $1 \
                AND (sequence < $2 OR epoch <> (SELECT epoch FROM sync_applied WHERE id = 1))",
@@ -1452,6 +1455,13 @@ async fn end_snapshot<P: Sync + 'static>(
         .bind(began)
         .execute(&mut *conn)
         .await?;
+        let Some(codec) = codec_of(codecs, table).filter(|c| c.sent_down()) else {
+            tracing::error!(
+                table = capped(table),
+                "sync: a snapshot of a table this replica does not hold from the server — not swept"
+            );
+            continue;
+        };
         let named: HashSet<String> =
             sqlx::query_scalar("SELECT row_key FROM sync_snapshot_keys WHERE table_name = $1")
                 .bind(table)

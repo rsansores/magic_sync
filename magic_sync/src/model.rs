@@ -27,6 +27,8 @@ pub(crate) type Row = (String, String);
 pub(crate) struct Rules {
     /// Whether the replica's database refuses this row of `table`.
     pub(crate) refuses: fn(&str, &[u8]) -> bool,
+    /// Whether it refuses to let this row of `table` go, as it holds it.
+    pub(crate) keeps: fn(&str, &[u8]) -> bool,
     /// The rows a row of `table` points at.
     pub(crate) parents: fn(&str, &[u8]) -> Vec<Row>,
     /// Whether rows of `table` can be retired (4.3).
@@ -34,15 +36,28 @@ pub(crate) struct Rules {
     /// The key a row of `table` holds, read off the row: `None` takes the
     /// key beside it on trust.
     pub(crate) key: fn(&str, &[u8]) -> Option<String>,
+    /// Whether the replica holds `table` from the server: rows of any other
+    /// are rejected, and their deletes ignored (4.1).
+    pub(crate) holds: fn(&str) -> bool,
+    /// The value of a row of `table` no other row of it may hold.
+    pub(crate) unique: fn(&str, &[u8]) -> Option<String>,
+    /// Whether the database refuses, as it writes it, a row whose parents
+    /// it does not hold: off, the model takes it, for a test to see that
+    /// no server sends one.
+    pub(crate) checked: bool,
 }
 
 impl Rules {
     /// A replica that takes everything, of rows that point at nothing.
     pub(crate) const ANY: Rules = Rules {
         refuses: |_, _| false,
+        keeps: |_, _| false,
         parents: |_, _| Vec::new(),
         retires: |_| false,
         key: |_, _| None,
+        holds: |_| true,
+        unique: |_, _| None,
+        checked: false,
     };
 }
 
@@ -72,6 +87,9 @@ pub(crate) enum Received {
     Already,
     Gap,
     Malformed,
+    /// Of a later protocol: not acted on, nor acknowledged, until the
+    /// replica is updated (4.0).
+    Waits,
 }
 
 impl Received {
@@ -84,6 +102,7 @@ impl Received {
             Received::Already => "already",
             Received::Gap => "gap",
             Received::Malformed => "malformed",
+            Received::Waits => "waits",
         }
     }
 }
@@ -108,8 +127,7 @@ pub(crate) struct Model {
     gap_told: u64,
     pub(crate) rejections: BTreeMap<Row, Rejection>,
     /// Rows a row of its own points at, in a table with nothing to retire
-    /// them by — or that its database refuses to delete: it cannot let them
-    /// go.
+    /// them by: it cannot let them go.
     pub(crate) pinned: BTreeSet<Row>,
     /// Rows a row of its own points at, in a table it retires by: let go
     /// of, they are retired — kept, and out of what it holds.
@@ -143,6 +161,9 @@ impl Model {
         let Ok(message) = ToReplica::decode(bytes) else {
             return Received::Malformed;
         };
+        if message.protocol > crate::envelope::PROTOCOL {
+            return Received::Waits;
+        }
         if message.protocol == 0 {
             return Received::Malformed;
         }
@@ -232,15 +253,28 @@ impl Model {
                 let naming = !down.snapshot_id.is_empty();
                 self.taken.clear();
                 for table in down.tables {
-                    let gone = table
-                        .deletes
+                    let holds = (rules.holds)(&table.table);
+                    if holds {
+                        let gone = table
+                            .deletes
+                            .iter()
+                            .map(|key| (table.table.clone(), key.parts.join("|")))
+                            .collect();
+                        self.let_go(gone, sequence, rules);
+                    }
+                    let mut pending = Vec::new();
+                    // A key twice in a part: the last row beside it is the one.
+                    let rows: BTreeMap<String, usize> = table
+                        .keys
                         .iter()
-                        .map(|key| (table.table.clone(), key.parts.join("|")))
+                        .enumerate()
+                        .map(|(at, key)| (key.parts.join("|"), at))
                         .collect();
-                    self.let_go(gone, sequence, rules);
-                    let mut taken = Vec::new();
-                    for (bytes, key) in table.upserts.iter().zip(&table.keys) {
+                    for (at, (bytes, key)) in table.upserts.iter().zip(&table.keys).enumerate() {
                         let row = (table.table.clone(), key.parts.join("|"));
+                        if rows[&row.1] != at {
+                            continue;
+                        }
                         if naming {
                             if let Some(snapshot) = &mut self.snapshot {
                                 snapshot.named.insert(row.clone());
@@ -248,16 +282,40 @@ impl Model {
                         }
                         let beside =
                             (rules.key)(&table.table, bytes).is_some_and(|own| own != row.1);
-                        if beside || (rules.refuses)(&table.table, bytes) {
+                        if !holds || beside || (rules.refuses)(&table.table, bytes) {
                             self.reject(row, "refused", sequence);
-                            continue;
+                        } else {
+                            pending.push((row, bytes.clone()));
                         }
-                        self.rejections.remove(&row);
-                        taken.push(row.1.clone());
-                        self.retired.remove(&row);
-                        self.rows.insert(row, bytes.clone());
                     }
-                    self.taken.push((table.table, taken));
+                    // One refused for what the replica holds is tried again
+                    // once the rest are in, while that takes one more.
+                    let mut taken = Vec::new();
+                    loop {
+                        let mut again = Vec::new();
+                        let mut took = false;
+                        for (row, bytes) in std::mem::take(&mut pending) {
+                            if !self.fits(&row, &bytes, rules) {
+                                again.push((row, bytes));
+                                continue;
+                            }
+                            took = true;
+                            self.rejections.remove(&row);
+                            taken.push(row.1.clone());
+                            self.retired.remove(&row);
+                            self.rows.insert(row, bytes);
+                        }
+                        if again.is_empty() || !took {
+                            for (row, _) in again {
+                                self.reject(row, "refused", sequence);
+                            }
+                            break;
+                        }
+                        pending = again;
+                    }
+                    if holds {
+                        self.taken.push((table.table, taken));
+                    }
                 }
                 Received::Applied
             }
@@ -278,9 +336,31 @@ impl Model {
                         .collect();
                     self.let_go(stale, sequence, rules);
                 }
+                // No snapshot names a table it does not hold from the
+                // server: one of a new epoch clears what one gone refused.
+                let epoch = self.applied.as_ref().map(|(e, _)| e.clone());
+                self.rejections
+                    .retain(|(t, _), r| (rules.holds)(t) || Some(&r.epoch) == epoch.as_ref());
                 Received::Ended
             }
         }
+    }
+
+    /// Whether the database takes `row` as it stands: no other row holds
+    /// its unique value, and — where it checks them — it holds what the row
+    /// points at, or the row points at itself.
+    fn fits(&self, row: &Row, bytes: &[u8], rules: &Rules) -> bool {
+        let present =
+            |p: &Row| p == row || self.rows.contains_key(p) || self.retired.contains_key(p);
+        if rules.checked && !(rules.parents)(&row.0, bytes).iter().all(present) {
+            return false;
+        }
+        let Some(value) = (rules.unique)(&row.0, bytes) else {
+            return true;
+        };
+        !self.rows.iter().chain(&self.retired).any(|(other, b)| {
+            other.0 == row.0 && other != row && (rules.unique)(&other.0, b).as_ref() == Some(&value)
+        })
     }
 
     /// Lets go of `rows`, together (4.1): one that a row staying for the
@@ -329,7 +409,15 @@ impl Model {
         let mut going: BTreeSet<Row> = held
             .iter()
             .filter(|row| {
-                !retiring.contains(*row) && !kept.contains(*row) && !self.pinned.contains(*row)
+                let keeps = self
+                    .rows
+                    .get(*row)
+                    .or_else(|| self.retired.get(*row))
+                    .is_some_and(|bytes| (rules.keeps)(&row.0, bytes));
+                !retiring.contains(*row)
+                    && !kept.contains(*row)
+                    && !self.pinned.contains(*row)
+                    && !keeps
             })
             .cloned()
             .collect();

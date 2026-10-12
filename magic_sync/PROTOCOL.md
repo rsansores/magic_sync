@@ -239,7 +239,7 @@ their deletes ignored.
    - a row the replica had retired (4.3) becomes live again.
 
    A key both let go of and upserted in one part is held: its upsert comes
-   after. A row the database refuses is tried again once the rest of the
+   after. A key upserted twice in one part is the last row beside it. A row the database refuses is tried again once the rest of the
    part are in, while that takes one more: it may point at a row after it,
    or take a unique value a row after it gives up. Two rows that swap a
    unique value cannot be taken one at a time — the database checks each

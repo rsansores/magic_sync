@@ -1,6 +1,9 @@
 //! A replica walked at random against a model of it: a server sends what a
-//! server sends — rows, deletes, snapshots, new epochs — through a transport
-//! that loses and redelivers; the host writes, rewrites and deletes its own
+//! server sends — rows of a tree that points at itself, under a unique
+//! name, deletes, snapshots, new epochs — and now and then what none sends:
+//! a row beside another's key, one that does not decode, a key twice, rows
+//! of a table the replica does not hold from it; through a transport that
+//! loses, and redelivers, of this epoch or an earlier one; the host writes, rewrites and deletes its own
 //! rows; the uplink fails for a while and for good; and the power goes, in
 //! the middle of a message, of an upload, of a write, after a send. After
 //! every step the replica holds what the protocol's model of it holds,
@@ -20,9 +23,19 @@ const PRICES: u128 = 3;
 const READINGS: u128 = 4;
 const TASKS: u128 = 3;
 
+/// The walk's tables: the suite's, its items a tree — each under a parent,
+/// the root under itself — named uniquely.
+fn tables() -> String {
+    tree_tables().replace(
+        "name TEXT NOT NULL, retired_at",
+        "name TEXT NOT NULL UNIQUE, retired_at",
+    )
+}
+
 /// What the replica's database refuses: an item named `bad…` (with `ABORT`)
 /// or `doom…` (with `ROLLBACK`, the whole message), and the let-go of one
-/// named `keep…`; and a price a quote of its own points at.
+/// named `keep…` (with `ABORT`) or `gone…` (with `ROLLBACK`); and a price a
+/// quote of its own points at.
 const BUGS: &str = "
 CREATE TRIGGER bad_item BEFORE INSERT ON items WHEN NEW.name LIKE 'bad%'
 BEGIN SELECT RAISE(ABORT, 'a bad item'); END;
@@ -34,6 +47,8 @@ CREATE TRIGGER doomed_item_again BEFORE UPDATE ON items WHEN NEW.name LIKE 'doom
 BEGIN SELECT RAISE(ROLLBACK, 'a doomed item'); END;
 CREATE TRIGGER kept_item BEFORE DELETE ON items WHEN OLD.name LIKE 'keep%'
 BEGIN SELECT RAISE(ABORT, 'an item kept'); END;
+CREATE TRIGGER doomed_delete BEFORE DELETE ON items WHEN OLD.name LIKE 'gone%'
+BEGIN SELECT RAISE(ROLLBACK, 'an item doomed to stay'); END;
 ";
 
 fn name_of(bytes: &[u8]) -> String {
@@ -56,17 +71,44 @@ fn cents_of(bytes: &[u8]) -> i64 {
         .unwrap()
 }
 
-/// The model's rules: what the walk's triggers and quotes refuse.
+/// An item, as the walk's server sends it: `None` when the bytes are none.
+fn item_of(bytes: &[u8]) -> Option<ItemRow> {
+    ItemRow::decode(bytes).ok()
+}
+
+/// The model's rules: what the walk's triggers, keys and quotes refuse.
 const RULES: Rules = Rules {
     refuses: |table, bytes| {
-        table == "items" && {
-            let name = name_of(bytes);
-            name.starts_with("bad") || name.starts_with("doom")
+        table == "items"
+            && item_of(bytes)
+                .is_none_or(|row| row.name.starts_with("bad") || row.name.starts_with("doom"))
+    },
+    keeps: |table, bytes| {
+        table == "items"
+            && item_of(bytes)
+                .is_some_and(|row| row.name.starts_with("keep") || row.name.starts_with("gone"))
+    },
+    parents: |table, bytes| match item_of(bytes) {
+        Some(row) if table == "items" => vec![("items".to_owned(), row.partition_id)],
+        _ => Vec::new(),
+    },
+    retires: |table| matches!(table, "items" | "tasks"),
+    key: |table, bytes| {
+        if table == "items" {
+            item_of(bytes).map(|row| row.id)
+        } else {
+            None
         }
     },
-    parents: |_, _| Vec::new(),
-    retires: |table| matches!(table, "items" | "tasks"),
-    ..Rules::ANY
+    holds: |table| matches!(table, "items" | "prices" | "tasks"),
+    unique: |table, bytes| {
+        if table == "items" {
+            item_of(bytes).map(|row| row.name)
+        } else {
+            None
+        }
+    },
+    checked: true,
 };
 
 /// The walk's server: what it holds, what it sent this replica, and the
@@ -81,15 +123,17 @@ struct Server {
     salt: u64,
     /// The message that began the last snapshot it wrote the replica.
     began: u64,
-    items: BTreeMap<Uuid, String>,
+    /// Items: their name and parent.
+    items: BTreeMap<Uuid, (String, Uuid)>,
     prices: BTreeMap<Uuid, (i64, i64)>,
     /// Tasks, written on both sides: their title and version, here.
     tasks: BTreeMap<Uuid, (String, i64)>,
     /// What the transport holds for the replica, in order.
     queue: VecDeque<Vec<u8>>,
-    /// Everything delivered of its epoch, to deliver again: one of an
-    /// installation since replaced is no message a replica must follow.
+    /// Everything delivered of its epoch, to deliver again; and of the
+    /// epochs before it, which a transport may deliver again too.
     delivered: Vec<Vec<u8>>,
+    past: Vec<Vec<u8>>,
     /// A snapshot is owed: the replica said it has a gap, or that it
     /// applied less than it said before.
     owed: bool,
@@ -158,29 +202,65 @@ impl Server {
         (key(&[&id.to_string()]), json(&task))
     }
 
-    /// A message of changes, as a pass would send them.
+    /// A message of changes, as a pass would send them — and now and then
+    /// what no server sends.
     fn changes(&mut self, walk: &mut Walk) {
         let mut items = Vec::new();
         let mut gone = Vec::new();
         for _ in 0..1 + walk.below(3) {
-            let id = Uuid::from_u128(1 + walk.below(ITEMS as usize) as u128);
+            let n = 1 + walk.below(ITEMS as usize);
+            let id = Uuid::from_u128(n as u128);
             if walk.below(4) == 0 {
-                self.items.remove(&id);
                 gone.push(key(&[&id.to_string()]));
                 continue;
             }
-            let name = ["fine", "fine", "fine", "bad", "doom", "keep"][walk.below(6)];
+            let name = ["fine", "fine", "fine", "bad", "doom", "keep", "gone"][walk.below(7)];
             let name = format!("{name}{}", walk.below(100));
-            self.items.insert(id, name.clone());
-            gone.retain(|k| k.parts[0] != id.to_string());
-            items.push(item(id, &name));
+            // Under an item named before it, or itself: a tree.
+            let parent = Uuid::from_u128(1 + walk.below(n) as u128);
+            items.push((id, name, parent));
         }
-        // One row a message, at most, so the order of a row's own changes
-        // is the order of the message.
-        items.dedup_by_key(|(k, _)| k.parts.clone());
-        let mut seen = BTreeSet::new();
-        items.retain(|(k, _)| seen.insert(k.parts.clone()));
-        items.retain(|(k, _)| !gone.iter().any(|g| g.parts == k.parts));
+        // Its deletes in the part of its rows — so before them — or after
+        // every table, children first.
+        let together = walk.below(2) == 0;
+        for key in &gone {
+            self.items.remove(&key.parts[0].parse().unwrap());
+        }
+        for (id, name, parent) in &items {
+            if together || !gone.iter().any(|g| g.parts[0] == id.to_string()) {
+                self.items.insert(*id, (name.clone(), *parent));
+            }
+        }
+        let mut items: Vec<(WireKey, Vec<u8>)> = items
+            .iter()
+            .map(|(id, name, parent)| node(*id, *parent, name))
+            .collect();
+        if walk.below(10) == 0 {
+            if let Some(first) = items.first_mut() {
+                let other = Uuid::from_u128(1 + walk.below(ITEMS as usize) as u128);
+                first.0 = key(&[&other.to_string()]);
+            }
+        }
+        if walk.below(12) == 0 {
+            let id = Uuid::from_u128(1 + walk.below(ITEMS as usize) as u128);
+            items.push((key(&[&id.to_string()]), vec![0xff, 0xff]));
+        }
+        let mut strays = Vec::new();
+        if walk.below(8) == 0 {
+            let ghost =
+                |walk: &mut Walk| key(&[&Uuid::from_u128(500 + walk.below(3) as u128).to_string()]);
+            let mut part = upserts("ghosts", vec![(ghost(walk), vec![1, 2, 3])]);
+            part.deletes = vec![ghost(walk)];
+            strays.push(part);
+        }
+        if walk.below(8) == 0 {
+            let id = Uuid::from_u128(600 + walk.below(3) as u128);
+            let reading = (
+                key(&[&Uuid::nil().to_string(), &id.to_string()]),
+                b"{}".to_vec(),
+            );
+            strays.push(upserts("readings", vec![reading]));
+        }
         let mut prices = Vec::new();
         let mut unpriced = Vec::new();
         if walk.below(2) == 0 {
@@ -216,14 +296,21 @@ impl Server {
                 tasks.push(Self::task(id, &title, version));
             }
         }
-        let tables = vec![
-            upserts("items", items),
+        let mut part = upserts("items", items);
+        let mut tables = vec![part.clone()];
+        if together {
+            part.deletes = gone;
+            tables = vec![part];
+            gone = Vec::new();
+        }
+        tables.extend([
             upserts("prices", prices),
             upserts("tasks", tasks),
             deletes("tasks", untasked),
             deletes("prices", unpriced),
             deletes("items", gone),
-        ];
+        ]);
+        tables.extend(strays);
         let bytes = self.numbered("", tables, false);
         self.queue.push_back(bytes);
     }
@@ -236,7 +323,7 @@ impl Server {
         let mut rows: Vec<Table> = self
             .items
             .iter()
-            .map(|(id, name)| upserts("items", vec![item(*id, name)]))
+            .map(|(id, (name, parent))| upserts("items", vec![node(*id, *parent, name)]))
             .chain(
                 self.prices
                     .iter()
@@ -260,7 +347,10 @@ impl Server {
         let (sequence, nonce, previous, previous_nonce) = self.next(begins);
         let end = Body::EndSnapshot(EndSnapshot {
             snapshot_id: id.clone(),
-            tables: vec!["prices".to_owned(), "items".to_owned(), "tasks".to_owned()],
+            tables: ["prices", "items", "tasks", "ghosts"][..3 + usize::from(walk.below(4) == 0)]
+                .iter()
+                .map(|t| (*t).to_owned())
+                .collect(),
             sequence,
             epoch: self.epoch.clone(),
             previous,
@@ -278,7 +368,7 @@ impl Server {
     fn anew(&mut self, walk: &mut Walk) {
         self.epoch = walk.uuid().to_string();
         self.queue.clear();
-        self.delivered.clear();
+        self.past.append(&mut self.delivered);
         (self.confirmed, self.restored) = (0, false);
         self.snapshot(walk);
     }
@@ -427,9 +517,9 @@ fn same(model: &Model, made: &model::Received, real: &Received) -> bool {
     }
 }
 
-/// The rows the model says the replica pins — an item named `keep…`, which
-/// its database refuses to delete, a price a quote points at — and retires:
-/// an item a receipt points at, retired before it is ever deleted.
+/// The rows the replica's own keep, as the model is told: a price a quote
+/// points at, which it cannot let go; and what it retires — an item a
+/// receipt points at, a task whose edit has not reached the server.
 async fn pins(pool: &SqlitePool, model: &mut Model) {
     let ids = |sql: &'static str| async move {
         sqlx::query_scalar::<_, Uuid>(sql)
@@ -440,24 +530,50 @@ async fn pins(pool: &SqlitePool, model: &mut Model) {
             .map(|id| id.to_string())
             .collect::<BTreeSet<String>>()
     };
-    model.pinned = model
-        .rows
-        .iter()
-        .chain(&model.retired)
-        .filter(|((table, _), bytes)| table == "items" && name_of(bytes).starts_with("keep"))
-        .map(|(row, _)| row.clone())
-        .chain(
-            ids("SELECT price_id FROM quotes")
-                .await
-                .into_iter()
-                .map(|id| ("prices".to_owned(), id)),
-        )
+    model.pinned = ids("SELECT price_id FROM quotes")
+        .await
+        .into_iter()
+        .map(|id| ("prices".to_owned(), id))
         .collect();
     model.retiring = ids("SELECT item_id FROM receipts")
         .await
         .into_iter()
         .map(|id| ("items".to_owned(), id))
+        .chain(
+            noted_tasks(pool)
+                .await
+                .into_iter()
+                .map(|id| ("tasks".to_owned(), id)),
+        )
         .collect();
+}
+
+/// The tasks whose edits have not reached the server: let go of, they are
+/// retired until it files them (4.3).
+async fn noted_tasks(pool: &SqlitePool) -> BTreeSet<String> {
+    sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = 'tasks'")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+/// `bytes` delivered to the replica and to the model, the model told what
+/// the replica's own rows keep: what each made of it. Once the server
+/// filed what the replica wrote, a task retired for its edits goes when no
+/// edit of it is left to file (4.4).
+async fn deliver(node: &Node, model: &mut Model, bytes: &[u8]) -> (model::Received, Received) {
+    pins(&node.pool, model).await;
+    let expected = model.receive(bytes, &RULES);
+    let received = node.replica.receive(bytes).await.expect("applied");
+    if expected == model::Received::Filed {
+        let noted = noted_tasks(&node.pool).await;
+        model
+            .retired
+            .retain(|(table, key), _| table != "tasks" || noted.contains(key));
+    }
+    (expected, received)
 }
 
 /// The uplink took `up`: the engine forgets a rejection it told of a row
@@ -479,50 +595,55 @@ fn forgets_what_it_told(model: &mut Model, up: &Up) {
     }
 }
 
+/// The server's rows the replica holds, live or `retired`, each with what
+/// tells it: an item's name, a price's cents, a task's title.
+async fn held_rows(pool: &SqlitePool, retired: bool) -> BTreeMap<model::Row, String> {
+    let which = if retired { "IS NOT NULL" } else { "IS NULL" };
+    let mut held = BTreeMap::new();
+    for (table, column, retires) in [
+        ("items", "name", true),
+        ("prices", "CAST(cents AS TEXT)", false),
+        ("tasks", "title", true),
+    ] {
+        if retired && !retires {
+            continue;
+        }
+        let filter = if retires {
+            format!(" WHERE retired_at {which}")
+        } else {
+            String::new()
+        };
+        let rows: Vec<(Uuid, String)> =
+            sqlx::query_as(&format!("SELECT id, {column} FROM {table}{filter}"))
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        held.extend(
+            rows.into_iter()
+                .map(|(id, content)| ((table.to_owned(), id.to_string()), content)),
+        );
+    }
+    held
+}
+
 /// What the replica holds of the server's rows, its rejections, and where
 /// it stands, against the model.
 async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) {
-    let items: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, name FROM items WHERE retired_at IS NULL")
-            .fetch_all(pool)
-            .await
-            .unwrap();
-    let prices: Vec<(Uuid, i64)> = sqlx::query_as("SELECT id, cents FROM prices")
-        .fetch_all(pool)
-        .await
-        .unwrap();
-    let tasks: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, title FROM tasks WHERE retired_at IS NULL")
-            .fetch_all(pool)
-            .await
-            .unwrap();
-    let held: BTreeMap<model::Row, String> = items
-        .into_iter()
-        .map(|(id, name)| (("items".to_owned(), id.to_string()), name))
-        .chain(
-            prices
-                .into_iter()
-                .map(|(id, cents)| (("prices".to_owned(), id.to_string()), cents.to_string())),
-        )
-        .chain(
-            tasks
-                .into_iter()
-                .map(|(id, title)| (("tasks".to_owned(), id.to_string()), title)),
-        )
-        .collect();
-    let modelled: BTreeMap<model::Row, String> = model
-        .rows
-        .iter()
-        .map(|(row, bytes)| {
-            let content = match row.0.as_str() {
-                "items" => name_of(bytes),
-                "prices" => cents_of(bytes).to_string(),
-                _ => title_of(bytes),
-            };
-            (row.clone(), content)
-        })
-        .collect();
-    assert_eq!(held, modelled, "{at}: the rows held");
+    for (retired, modelled) in [(false, &model.rows), (true, &model.retired)] {
+        let held = held_rows(pool, retired).await;
+        let modelled: BTreeMap<model::Row, String> = modelled
+            .iter()
+            .map(|(row, bytes)| {
+                let content = match row.0.as_str() {
+                    "items" => name_of(bytes),
+                    "prices" => cents_of(bytes).to_string(),
+                    _ => title_of(bytes),
+                };
+                (row.clone(), content)
+            })
+            .collect();
+        assert_eq!(held, modelled, "{at}: the rows held, retired {retired}");
+    }
     let rejected: BTreeSet<model::Row> =
         sqlx::query_as("SELECT table_name, row_key FROM sync_rejections")
             .fetch_all(pool)
@@ -631,7 +752,7 @@ async fn count(pool: &SqlitePool, sql: &str) -> i64 {
 
 /// One seeded walk.
 async fn walk(pool: SqlitePool, seed: u64) {
-    let w = world(pool).await;
+    let w = world_over(pool, &tables(), Settings::default()).await;
     w.exec(BUGS).await.unwrap();
     let file = (*w.pool.connect_options()).clone();
     let (me, uplink) = (w.me, w.uplink.clone());
@@ -652,6 +773,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
         tasks: BTreeMap::new(),
         queue: VecDeque::new(),
         delivered: vec![provisioned],
+        past: Vec::new(),
         owed: false,
         restored: false,
         readings: BTreeMap::new(),
@@ -683,7 +805,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
         let action = if quiet {
             20 + walk.below(4)
         } else {
-            walk.below(29)
+            walk.below(30)
         };
         if matches!(action, 6..=9 | 24) {
             copy = None;
@@ -700,10 +822,19 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 server.queue.pop_front();
             }
             4 => {
-                if let Some(old) = walk.pick(&(0..server.delivered.len()).collect::<Vec<_>>()) {
-                    let bytes = server.delivered[old].clone();
-                    model.receive(&bytes, &RULES);
-                    node.replica.receive(&bytes).await.expect("redelivered");
+                let from = if walk.below(4) == 0 {
+                    &server.past
+                } else {
+                    &server.delivered
+                };
+                if let Some(old) = walk.pick(&(0..from.len()).collect::<Vec<_>>()) {
+                    let bytes = from[old].clone();
+                    let (expected, received) = deliver(&node, &mut model, &bytes).await;
+                    assert!(
+                        same(&model, &expected, &received),
+                        "{at}: again, {expected:?} of {:?}, and the replica {received:?}",
+                        model.taken
+                    );
                 }
             }
             // The power goes in the middle of a message: nothing of it
@@ -856,7 +987,15 @@ async fn walk(pool: SqlitePool, seed: u64) {
             17 | 20 | 21 => {
                 let lane = walk.below(2);
                 let went = node.replica.send_lane(lane, walk.below(5) == 0).await;
-                assert!(quiet || went.is_ok() || uplink.refusing.lock().unwrap().is_some());
+                assert!(
+                    // Refused for good with nothing else to try it beside,
+                    // a row is not blamed: the lane goes again later.
+                    quiet
+                        || went.is_ok()
+                        || uplink.refusing.lock().unwrap().is_some()
+                        || uplink.cannot_take.lock().unwrap().is_some(),
+                    "{at}: {went:?}"
+                );
                 for (_, up) in uplink.taken() {
                     forgets_what_it_told(&mut model, &up);
                     answers.extend(server.file(&up, me));
@@ -943,6 +1082,22 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 _ if server.began <= server.confirmed => server_copy = Some(server.clone()),
                 _ => {}
             },
+            // The next message comes in a later protocol: nothing is done,
+            // and the transport keeps it, for a replica updated since.
+            29 => {
+                if let Some(bytes) = server.queue.front() {
+                    let mut later = ToReplica::decode(bytes.as_slice()).unwrap();
+                    later.protocol += 1;
+                    let later = later.encode_to_vec();
+                    pins(&node.pool, &mut model).await;
+                    assert_eq!(model.receive(&later, &RULES), model::Received::Waits);
+                    let waits = node.replica.receive(&later).await;
+                    assert!(
+                        matches!(waits, Err(Error::Protocol { .. })),
+                        "{at}: {waits:?}"
+                    );
+                }
+            }
             // The transport loses the first message of a snapshot.
             27 => {
                 let begins = |bytes: &Vec<u8>| match ToReplica::decode(bytes.as_slice()) {
@@ -973,9 +1128,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     }
                 }
                 if let Some(bytes) = server.queue.pop_front() {
-                    pins(&node.pool, &mut model).await;
-                    let expected = model.receive(&bytes, &RULES);
-                    let received = node.replica.receive(&bytes).await.expect("applied");
+                    let (expected, received) = deliver(&node, &mut model, &bytes).await;
                     assert!(
                         same(&model, &expected, &received),
                         "{at}: {expected:?} of {:?}, and the replica {received:?}",
@@ -992,9 +1145,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
     // Quiet: everything goes, and is answered, until nothing is left.
     for round in 0..200 {
         while let Some(bytes) = server.queue.pop_front() {
-            pins(&node.pool, &mut model).await;
-            model.receive(&bytes, &RULES);
-            node.replica.receive(&bytes).await.expect("applied");
+            deliver(&node, &mut model, &bytes).await;
         }
         let mut said = false;
         for lane in 0..2 {
