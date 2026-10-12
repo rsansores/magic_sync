@@ -1792,8 +1792,9 @@ pub(crate) async fn collect<P: Sync + 'static>(
 }
 
 /// In a transaction of its own, lets go of the retired rows of `codecs`'
-/// tables nothing keeps — of `one` alone, when given — and commits:
-/// answers how many went.
+/// tables nothing keeps — of `one` alone, when given, as it stands now: a
+/// message applied since it was listed may have sent it again — and
+/// commits: answers how many went.
 #[cfg(feature = "sqlite")]
 async fn collected<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1807,10 +1808,10 @@ async fn collected<P: Sync + 'static>(
         .await?;
     let mut gone = 0;
     for codec in codecs {
-        let keys = match one {
-            Some(key) => vec![key.clone()],
-            None => collectable(&mut tx, codec).await?,
-        };
+        let mut keys = collectable(&mut tx, codec).await?;
+        if let Some(one) = one {
+            keys.retain(|key| key == one);
+        }
         gone += codec.collect(&mut tx, &keys).await?;
     }
     sqlx::query("DELETE FROM sync_applying")

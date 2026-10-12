@@ -2327,6 +2327,40 @@ async fn a_retired_row_goes_once_nothing_points_at_it(pool: SqlitePool) {
     assert!(w.rejected().await.is_empty());
 }
 
+/// A retired row listed to be collected, row by row, and sent again by a
+/// message applied meanwhile is live: the collection of that one row
+/// leaves it.
+#[sqlx::test(migrations = false)]
+async fn a_row_sent_again_while_listed_for_collection_stays(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [id] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(id, "sku")])]))
+        .await;
+    let x = id.simple();
+    w.exec(&format!("INSERT INTO receipts (item_id) VALUES (x'{x}')"))
+        .await
+        .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes("items", vec![key(&[&id.to_string()])])],
+    ))
+    .await;
+    w.exec("DELETE FROM receipts").await.unwrap();
+    let codecs = codecs();
+    let items = codec_of(&codecs, "items").unwrap();
+    let mut conn = w.pool.acquire().await.unwrap();
+    let listed = collectable(&mut conn, items).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    w.receive(&down(3, "", vec![upserts("items", vec![item(id, "sku")])]))
+        .await;
+    let gone = collected(&mut conn, &[items], Some(&listed[0]))
+        .await
+        .unwrap();
+    assert_eq!(gone, 0);
+    assert_eq!(w.items().await, ["sku"]);
+}
+
 /// A retired row a live row of the server's still points at stays — even
 /// through a key checked at commit — and costs the messages after it
 /// nothing: none is applied again for it.

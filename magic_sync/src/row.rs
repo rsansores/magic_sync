@@ -578,14 +578,15 @@ pub(crate) async fn retire_by_keys<R: Row>(
         .filter(|key| !pinned.contains(*key))
         .cloned()
         .collect();
-    delete_together::<R>(exec, going, &mut retired).await?;
+    delete_together::<R>(exec, going, "", &mut retired).await?;
     Ok(retired)
 }
 
 /// Lets go of the retired rows of `keys` that nothing which stays points
 /// at — no row of any table, live or retired, but those of `keys`
 /// themselves, which go with them — together, as [`retire_by_keys`]
-/// deletes; the rest stay as they are. Answers how many went.
+/// deletes; the rest stay as they are, and so does a row of `keys` that is
+/// live. Answers how many went.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn collect_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<u64, Error> {
     let (mut pinned, pointed) = pointed_at::<R>(exec, keys, |_| Some(String::new())).await?;
@@ -596,8 +597,11 @@ pub(crate) async fn collect_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Re
         .filter(|key| !pinned.contains(*key))
         .cloned()
         .collect();
+    let retired = R::RETIRED.map_or(" AND false".to_owned(), |column| {
+        format!(" AND {} IS NOT NULL", ident(column))
+    });
     let mut gone = Retired::default();
-    delete_together::<R>(exec, going, &mut gone).await?;
+    delete_together::<R>(exec, going, &retired, &mut gone).await?;
     Ok(gone.deleted)
 }
 
@@ -714,14 +718,15 @@ fn pin(pinned: &mut HashSet<Key>, pointed: &[Pointed], stays: impl Fn((&Key, boo
     }
 }
 
-/// Deletes the rows of `going` together, so rows that point only at one
-/// another go; one the database refuses is tried again once those it
-/// waited for have gone, and answered in `retired` when that changes
-/// nothing.
+/// Deletes the rows of `going` the SQL condition `only` admits (empty:
+/// every one) together, so rows that point only at one another go; one the
+/// database refuses is tried again once those it waited for have gone, and
+/// answered in `retired` when that changes nothing.
 #[cfg(feature = "sqlite")]
 async fn delete_together<R: Row>(
     exec: &mut Conn,
     mut going: Vec<Key>,
+    only: &str,
     retired: &mut Retired,
 ) -> Result<(), Error> {
     loop {
@@ -731,6 +736,7 @@ async fn delete_together<R: Row>(
             let delete = |keys: &[Key]| {
                 let mut qb = sqlx::QueryBuilder::new(format!("DELETE FROM {}", R::QUALIFIED));
                 key_filter::<R>(&mut qb, keys);
+                qb.push(only);
                 qb
             };
             refused.extend(one_by_one(exec, chunk, delete, &mut retired.deleted).await?);
