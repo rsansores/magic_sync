@@ -105,6 +105,10 @@ build is one side): run `cargo fmt` and `cargo clippy` with
   no token left behind by a checkout, no expression injected into a script.
 - **test-server** — the server's suite against PostgreSQL 14 and 18, and the
   book's snippets built on the server's side.
+- **moved-database** — the server's database moved between two clusters
+  mid-walk (`pg_dump` into `pg_restore`, the first one's transaction ids far
+  ahead of the second's) keeps sending what changes
+  (`scripts/moved-database.sh`; it needs PostgreSQL's server programs).
 - **diagnostics** — the derive's refusals, message by message, on the pinned
   rustc.
 - **test-replica** — a replica's suite, and the snippets' test of the README.

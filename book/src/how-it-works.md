@@ -323,7 +323,7 @@ Should its outbox outgrow `outbox_messages` or `outbox_bytes` behind any
 snapshot it begins with, it is dropped and the replica provisioned again
 instead — an alarm, in its `last_error`.
 
-### 4.6 Applying, on the replica, and saying so
+### 4.5 Applying, on the replica, and saying so
 
 The replica applies a message in one transaction ([`replica::apply`]):
 
@@ -334,10 +334,10 @@ The replica applies a message in one transaction ([`replica::apply`]):
 - A row it is told to let go of is deleted or, if a row of its own still points
   at it, retired (its `RETIRED` column set). A sale keeps its customer.
 
-Then it tells the server the number of the last message it applied. Until it
-does, what the server recorded in 4.4 is only *on its way*: every held row
-remembers the message that carried it, and counts as held once the replica
-has acknowledged that message. This is what keeps the progress figures
+Then it tells the server the last message it applied — its number, its nonce
+and the seal it came with. Until it does, what the server recorded in 4.4 is
+only *on its way*: every held row remembers the message that carried it, and
+counts as held once the replica has acknowledged that message. This is what keeps the progress figures
 (section 6) honest: they count what the replica confirmed, never what was
 merely sent.
 

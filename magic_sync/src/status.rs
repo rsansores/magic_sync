@@ -70,7 +70,7 @@ pub enum Scope<'a> {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Progress {
-    /// The contract this answer serializes as: [`CONTRACT`].
+    /// The contract this answer serializes as: `CONTRACT`.
     pub contract: u32,
     /// Each replica of the scope.
     pub replicas: Vec<ReplicaProgress>,
@@ -127,7 +127,7 @@ impl TableProgress {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct RowProgress {
-    /// The contract this answer serializes as: [`CONTRACT`].
+    /// The contract this answer serializes as: `CONTRACT`.
     pub contract: u32,
     /// Each replica of the scope the row is something to.
     pub places: Vec<RowPlace>,
@@ -165,8 +165,7 @@ pub enum RowState {
 }
 
 /// Where a replica stands, in one word: the first of these that applies.
-/// Ordered worst first. It reads back from its JSON too, for a host that
-/// takes the state to list from a request.
+/// Ordered worst first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -192,13 +191,13 @@ pub enum ReplicaState {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct ReplicaCounts {
-    /// Replicas [`ReplicaState::AwaitingFix`].
+    /// Replicas whose state is `awaiting_fix`.
     pub awaiting_fix: i64,
-    /// Replicas [`ReplicaState::Unreachable`].
+    /// Replicas whose state is `unreachable`.
     pub unreachable: i64,
-    /// Replicas [`ReplicaState::CatchingUp`].
+    /// Replicas whose state is `catching_up`.
     pub catching_up: i64,
-    /// Replicas [`ReplicaState::Synced`].
+    /// Replicas whose state is `synced`.
     pub synced: i64,
 }
 
@@ -305,7 +304,7 @@ pub struct TableOverview {
 pub struct Health {
     /// Nothing waits for a fix. A replica out of reach is not unhealthy — it
     /// is the network's to settle, and listed in `failing`; nor is a
-    /// backlog, unless it stops draining, which the host says when.
+    /// backlog, unless it stops draining, which `oldest` shows.
     pub healthy: bool,
     /// Changes noted and not yet planned.
     pub pending: i64,
@@ -317,7 +316,7 @@ pub struct Health {
     pub quarantine: Listed<Quarantined>,
     /// What replicas sent that waits in the inbox until a fix.
     pub inbox: Listed<Unfiled>,
-    /// Replicas sends keep failing to.
+    /// Replicas that sends keep failing to.
     pub failing: Listed<Failing>,
 }
 
@@ -437,7 +436,7 @@ pub struct Unfiled {
     pub attempts: i32,
 }
 
-/// A replica sends to keep failing to.
+/// A replica that sends keep failing to.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
@@ -525,7 +524,7 @@ mod stored {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Overview {
-    /// The contract this answer serializes as: [`CONTRACT`].
+    /// The contract this answer serializes as: `CONTRACT`.
     pub contract: u32,
     /// The server's time when the answer was read: every time in it is the
     /// server's, and how long ago one was is measured from this.
@@ -545,7 +544,7 @@ pub struct Overview {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct Listing {
-    /// The contract this answer serializes as: [`CONTRACT`].
+    /// The contract this answer serializes as: `CONTRACT`.
     pub contract: u32,
     /// The server's time when the answer was read.
     pub now: DateTime<Utc>,

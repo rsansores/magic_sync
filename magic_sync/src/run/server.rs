@@ -851,8 +851,6 @@ struct Refiling {
     filed: usize,
 }
 
-/// Proof that this process runs the relay: a connection holding the
-/// advisory lock. Drop it, or lose the connection, and the lock is free.
 /// Done notes pruned a transaction at a time.
 const PRUNED_AT_ONCE: i64 = 10_000;
 
@@ -863,6 +861,8 @@ const HELD_HERE: &str = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 
        AND pid = pg_backend_pid() AND granted AND objsubid = 1 \
        AND classid = ($1::bigint >> 32)::oid AND objid = ($1::bigint & 4294967295)::oid)";
 
+/// Proof that this process runs the relay: a connection holding the
+/// advisory lock. Drop it, or lose the connection, and the lock is free.
 struct Lock {
     conn: PgConnection,
 }
