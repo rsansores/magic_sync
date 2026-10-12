@@ -175,7 +175,6 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::KeyPart
 pub magic_sync::row::Mirror::Both
 pub magic_sync::row::Mirror::Catalog
 pub magic_sync::row::Mirror::Record
-pub magic_sync::row::Mirror::ServerOnly
 impl core::clone::Clone for magic_sync::row::Mirror
 pub fn magic_sync::row::Mirror::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::row::Mirror

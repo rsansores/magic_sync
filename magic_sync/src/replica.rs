@@ -253,7 +253,6 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
                     out.push(refuse("DELETE", QUIET, why));
                 }
             }
-            Mirror::ServerOnly => {}
         }
     }
     out

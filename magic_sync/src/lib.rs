@@ -110,7 +110,7 @@ pub use row::{Columns, Row};
 /// |---|---|
 /// | `table` | the table's name (required) |
 /// | `schema` | its PostgreSQL schema; `public` when left out |
-/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server), `both` (each side its own columns) or `server` (it never travels) — required |
+/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server) or `both` (each side its own columns) — required |
 /// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names: a uuid, or an `Option` of one), `follows(col)` (wherever the row `col` points at goes: one column, the whole of a foreign key into a mirrored table) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
 /// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]), and a field of the row itself — not of a part flattened in |
 /// | `active` | for `catalog` and `both`, the relation the rows the table's rule sends are read through on the server — `view` or `schema.view` (a name has no dot), a view that leaves out the rows no replica is sent for their own sake; one it leaves out still travels while a row a replica holds points at it |

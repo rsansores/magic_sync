@@ -169,8 +169,7 @@ impl<P: Sync + 'static> Codec<P> {
         )
     }
 
-    /// The codec of `R`, encoded and decoded so. A server-only row has none,
-    /// and does not build.
+    /// The codec of `R`, encoded and decoded so.
     fn typed<R>(
         encoding: &'static str,
         encode: Encode<R>,
@@ -180,12 +179,6 @@ impl<P: Sync + 'static> Codec<P> {
     where
         R: Row + Clone + Send + Sync,
     {
-        const {
-            assert!(
-                !matches!(R::MIRROR, Mirror::ServerOnly),
-                "a server-only row does not travel: it has no codec"
-            );
-        }
         // A replica files nothing: placing a row is the server's.
         #[cfg(feature = "sqlite")]
         let place = {

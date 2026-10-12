@@ -32,9 +32,6 @@ pub enum Mirror {
     /// Written on both, column by column (`mirror = "both"`): the columns the
     /// replicas own travel up, the others down.
     Both,
-    /// Only the server has it (`mirror = "server"`): a row the host writes
-    /// with this module's functions, and that never travels.
-    ServerOnly,
 }
 
 /// Which replicas hold which rows of a table the server sends down: the

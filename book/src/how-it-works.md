@@ -77,7 +77,6 @@ A table is declared once, as the Rust struct that is its row, implementing
 | `Catalog` | the server | down to the replicas that should hold its rows |
 | `Record` | a replica | up to the server |
 | `Both` | both, column by column | the columns the replicas own (`#[row(replica_owned)]`) go up; the rest go down |
-| `ServerOnly` | the server | nowhere |
 
 ### Which replicas hold which rows? (`sync`, for tables that go down)
 

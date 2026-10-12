@@ -536,7 +536,6 @@ enum Mirror {
     Catalog,
     Record,
     Both,
-    Server,
 }
 
 impl Mirror {
@@ -545,13 +544,10 @@ impl Mirror {
             "catalog" => Mirror::Catalog,
             "record" => Mirror::Record,
             "both" => Mirror::Both,
-            "server" => Mirror::Server,
             other => {
                 return Err(syn::Error::new_spanned(
                     lit,
-                    format!(
-                        "mirror = \"{other}\": expected \"catalog\", \"record\", \"both\" or \"server\""
-                    ),
+                    format!("mirror = \"{other}\": expected \"catalog\", \"record\" or \"both\""),
                 ))
             }
         })
@@ -562,7 +558,6 @@ impl Mirror {
             Mirror::Catalog => quote!(Catalog),
             Mirror::Record => quote!(Record),
             Mirror::Both => quote!(Both),
-            Mirror::Server => quote!(ServerOnly),
         }
     }
 

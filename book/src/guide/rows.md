@@ -16,7 +16,6 @@ and which says how it travels. The same struct serves both sides.
 | `catalog` | the server | down, to the replicas that should hold it |
 | `record` | a replica | up, to the server |
 | `both` | both, column by column | the columns replicas own go up, the rest come down |
-| `server` | the server | nowhere: a struct the engine's writes use, nothing more |
 
 ## Which replicas hold it: `sync`
 
