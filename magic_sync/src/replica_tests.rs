@@ -1202,6 +1202,59 @@ async fn what_a_server_says_is_kept_within_bounds(pool: SqlitePool) {
     );
 }
 
+/// The longest field any event logged on this thread wrote, while it is
+/// the default.
+struct Longest(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for Longest {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Widest(usize);
+        impl tracing::field::Visit for Widest {
+            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0 = self.0.max(format!("{value:?}").len());
+            }
+        }
+        let mut widest = Widest(0);
+        event.record(&mut widest);
+        self.0
+            .fetch_max(widest.0, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// What a server sends is logged within bounds, however long: a key that
+/// does not parse, a row that does not decode, a table a snapshot names
+/// that the replica does not hold.
+#[sqlx::test(migrations = false)]
+async fn what_a_server_says_is_logged_within_bounds(pool: SqlitePool) {
+    let w = world(pool).await;
+    let longest = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _logging = tracing::subscriber::set_default(Longest(longest.clone()));
+    let huge = "x".repeat(1 << 20);
+    let mut unkeyed = upserts("items", vec![item(Uuid::now_v7(), "a")]);
+    unkeyed.keys[0].parts[0] = huge.clone();
+    let mut gone = deletes("items", vec![key(&[&huge])]);
+    gone.table = "items".to_owned();
+    let wordy = format!("{{\"id\": \"{huge}\"}}").into_bytes();
+    let price = upserts("prices", vec![(key(&[&Uuid::now_v7().to_string()]), wordy)]);
+    w.receive(&down(1, "", vec![unkeyed, gone, price])).await;
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(2, &s, Vec::new())).await;
+    w.receive(&end(3, &s, &[&huge])).await;
+    let longest = longest.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(longest > 0, "logged");
+    assert!(longest < 1024, "a field of {longest} bytes");
+}
+
 /// Shapes no server sends cost nothing: rows with keys not one per row are
 /// a malformed message, applied not at all; a snapshot's end that names a
 /// table again and again sweeps it once.
