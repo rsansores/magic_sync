@@ -164,6 +164,29 @@ pub enum RowState {
     Quarantined,
 }
 
+/// Where a wish stands: what its replica answered to it, or that it has
+/// not yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WishState {
+    /// No answer to it yet: on its way, or carried out and the answer on its
+    /// way back.
+    Pending,
+    /// The replica cannot carry it out yet — the hardware away, a build that
+    /// cannot read it — and tries again; the reason says why.
+    Waiting,
+    /// Carried out: the setting holds what was wished.
+    Applied,
+    /// The replica will not carry it out; the reason says why. Wish again to
+    /// try again.
+    Refused,
+    /// Based on a version of the setting the replica no longer held: not
+    /// carried out, and the replica's value stands.
+    Superseded,
+}
+
 /// Where a replica stands, in one word: the first of these that applies.
 /// Ordered worst first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

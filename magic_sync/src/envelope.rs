@@ -27,7 +27,7 @@ pub(crate) use sync::to_replica::Body;
 #[cfg(any(feature = "sqlite", test))]
 pub(crate) use sync::TableBacklog;
 pub(crate) use sync::{
-    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, ToReplica, Up,
+    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, ToReplica, Up, Wish,
 };
 
 #[cfg(any(feature = "postgres", test))]

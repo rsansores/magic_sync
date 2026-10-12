@@ -247,6 +247,33 @@ impl<P: Sync + 'static> Codec<P> {
             .collect()
     }
 
+    /// `row`, encoded as this table's: refused when `R` is not the table's
+    /// row.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn encode_row<R: Row>(&self, row: R) -> Result<Vec<u8>, Error> {
+        self.ops.encode_any(Box::new(row))
+    }
+
+    /// `bytes`, decoded as this table's row: refused when `R` is not the
+    /// table's row, or the bytes do not decode ([`Error::Malformed`]).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn decode_row<R: Row>(&self, bytes: &[u8]) -> Result<R, Error> {
+        self.ops
+            .decode_any(bytes)?
+            .downcast::<R>()
+            .map(|row| *row)
+            .map_err(|_| self.not_its_row::<R>())
+    }
+
+    #[cfg(feature = "postgres")]
+    fn not_its_row<R: Row>(&self) -> Error {
+        Error::Misuse(format!(
+            "`{}` is not the row of the table `{}`",
+            std::any::type_name::<R>(),
+            self.table.name
+        ))
+    }
+
     /// The rows of `keys`, retired or not, encoded; a key with no row is
     /// left out, which is how its absence is seen. A row that does not encode
     /// is answered apart, so one row cannot keep its table from travelling.
@@ -463,6 +490,10 @@ pub(crate) struct Encoded {
 
 trait Ops<P>: Send + Sync {
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded>;
+    #[cfg(feature = "postgres")]
+    fn encode_any(&self, row: Box<dyn std::any::Any + Send>) -> Result<Vec<u8>, Error>;
+    #[cfg(feature = "postgres")]
+    fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error>;
     #[cfg(feature = "sqlite")]
     fn apply_down<'a>(
         &'a self,
@@ -791,6 +822,22 @@ where
             }
             Ok(encoded)
         })
+    }
+
+    #[cfg(feature = "postgres")]
+    fn encode_any(&self, row: Box<dyn std::any::Any + Send>) -> Result<Vec<u8>, Error> {
+        let row = row.downcast::<R>().map_err(|_| {
+            Error::Misuse(format!(
+                "a row that is not `{}`'s, to encode as one",
+                R::TABLE
+            ))
+        })?;
+        (self.encode)(*row)
+    }
+
+    #[cfg(feature = "postgres")]
+    fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
+        Ok(Box::new((self.decode)(bytes)?))
     }
 
     #[cfg(feature = "sqlite")]

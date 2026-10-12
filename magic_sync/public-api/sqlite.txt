@@ -376,6 +376,7 @@ impl core::marker::UnsafeUnpin for magic_sync::wire::MapError
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::wire::MapError
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::wire::MapError
 pub type magic_sync::wire::Place<R, P> = fn(&mut R, uuid::Uuid, &P)
+pub mod magic_sync::wish
 #[non_exhaustive] pub enum magic_sync::Error
 pub magic_sync::Error::Database(sqlx_core::error::Error)
 #[non_exhaustive] pub magic_sync::Error::Host

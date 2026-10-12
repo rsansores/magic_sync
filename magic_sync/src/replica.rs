@@ -61,8 +61,10 @@ pub(crate) fn parsed<P: Sync + 'static>(
 /// The engine's steps, in order, each as released and never edited: the
 /// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
 #[cfg(feature = "sqlite")]
-const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] =
-    [include_str!("../sql/sqlite/1.sql")];
+const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [
+    include_str!("../sql/sqlite/1.sql"),
+    include_str!("../sql/sqlite/2.sql"),
+];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
 /// script that also records the version it brings them to — `None` for a
@@ -108,7 +110,7 @@ struct Trigger {
 /// A write the engine makes while it applies what the server sent is noted
 /// by none and refused by none.
 #[cfg(feature = "sqlite")]
-fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
+fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
     use crate::row::Mirror;
     const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
     // A row noted again is one note, written once more: a hot row goes up
@@ -267,7 +269,8 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
 #[cfg(feature = "sqlite")]
 #[must_use]
 pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
-    generated(codecs)
+    let wishes = crate::wish::wishes_for(codecs);
+    generated(&codecs.iter().chain(&wishes).collect::<Vec<_>>())
         .into_iter()
         .map(|t| format!("DROP TRIGGER IF EXISTS {};\n{};\n", ident(&t.name), t.sql))
         .collect()
@@ -328,6 +331,9 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
+    crate::wish::unclaimed(codecs)?;
+    let wishes = crate::wish::wishes_for(codecs);
+    let codecs: &[&Codec<P>] = &codecs.iter().chain(&wishes).collect::<Vec<_>>();
     let (version, needed) = (schema_version(conn).await?, crate::REPLICA_SCHEMA_VERSION);
     if version > needed {
         return Err(Error::Misuse(format!(
@@ -477,7 +483,7 @@ fn engines(name: &str) -> bool {
 ///
 /// [`Replica::new`]: crate::run::replica::Replica::new
 #[cfg(feature = "sqlite")]
-fn unknown<P: Sync + 'static>(codecs: &[Codec<P>], name: &str, table: &str) -> bool {
+fn unknown<P: Sync + 'static>(codecs: &[&Codec<P>], name: &str, table: &str) -> bool {
     name.starts_with("sync_note_")
         && !codecs
             .iter()
@@ -540,6 +546,9 @@ pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
 /// are at a later version than this build's, or [`check`] refuses what results.
 #[cfg(feature = "sqlite")]
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
+    crate::wish::unclaimed(codecs)?;
+    let wishes = crate::wish::wishes_for(codecs);
+    let all: &[&Codec<P>] = &codecs.iter().chain(&wishes).collect::<Vec<_>>();
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
     let version = schema_version(&mut tx).await?;
     if version > crate::REPLICA_SCHEMA_VERSION {
@@ -558,13 +567,13 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
             .await?;
     let ours = live
         .into_iter()
-        .filter(|(name, table)| engines(name) && !unknown(codecs, name, table));
+        .filter(|(name, table)| engines(name) && !unknown(all, name, table));
     for (name, _) in ours {
         sqlx::query(&format!("DROP TRIGGER {}", ident(&name)))
             .execute(&mut *tx)
             .await?;
     }
-    for trigger in generated(codecs) {
+    for trigger in generated(all) {
         sqlx::query(&trigger.sql).execute(&mut *tx).await?;
     }
     check(&mut tx, codecs).await?;

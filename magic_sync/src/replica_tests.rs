@@ -4981,7 +4981,8 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0xe5dd_b8ea_c465_953a];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] =
+        [0xe5dd_b8ea_c465_953a, 0x0981_b07e_c108_212d];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

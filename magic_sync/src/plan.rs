@@ -246,8 +246,10 @@ const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 
 /// The engine's steps, in order, each as released and never edited: the
 /// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
-const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] =
-    [include_str!("../sql/postgres/1.sql")];
+const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [
+    include_str!("../sql/postgres/1.sql"),
+    include_str!("../sql/postgres/2.sql"),
+];
 
 /// The engine's step to `version` of its schema on the server, as one SQL
 /// script that also records the version it brings it to — `None` for a
@@ -1013,7 +1015,9 @@ impl Engine {
         codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        crate::wish::unclaimed(codecs)?;
+        let wishes = crate::wish::wishes_for(codecs);
+        let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
         let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine
             .triggers_needed()
@@ -1043,7 +1047,9 @@ impl Engine {
         codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        crate::wish::unclaimed(codecs)?;
+        let wishes = crate::wish::wishes_for(codecs);
+        let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
         let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine
             .indexes_missing(conn)
@@ -3578,9 +3584,11 @@ pub(crate) mod tests {
             .execute(&mut *conn)
             .await
             .expect("drop the schema");
-        sqlx::raw_sql(&migration(1).expect("the first step"))
-            .execute(&mut *conn)
-            .await
-            .expect("the schema");
+        for step in 1..=crate::SERVER_SCHEMA_VERSION {
+            sqlx::raw_sql(&migration(step).expect("a step of this build"))
+                .execute(&mut *conn)
+                .await
+                .expect("the schema");
+        }
     }
 }

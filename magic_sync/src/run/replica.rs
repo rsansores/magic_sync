@@ -205,6 +205,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         uplink: U,
         settings: Settings,
     ) -> Result<Self, Error> {
+        let codecs = crate::wish::with_wishes(codecs)?;
         replica::check_settings(&codecs, &settings.lanes)?;
         settings.backoff.check("backoff")?;
         let zero = [

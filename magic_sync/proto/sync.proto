@@ -167,3 +167,36 @@ message Digest {
   uint64 count = 2;
   uint64 fingerprint = 3;
 }
+
+// A row of the engine's table `sync_wishes`, which travels as any table
+// written on both sides does: down in a `Down`'s tables, up in an `Up`'s. It
+// is what the server wants one setting of the replica to hold: a row of a
+// table the replica owns, whose desired columns the server may wish other
+// values (PROTOCOL.md 4.5). The server owns the first fields; the replica the
+// answer, which the server never sends down.
+message Wish {
+  // A uuid: the row's key.
+  string id = 1;
+  // The replica the setting belongs to: this one.
+  string replica_id = 2;
+  // The setting's table, and its row's key.
+  string table = 3;
+  Key key = 4;
+  // The row as wished, encoded as the setting's table's own row: the replica
+  // takes its desired columns, and compares its version when `if_unchanged`.
+  bytes wanted = 5;
+  // Drawn at random for every wish, from 1 to 2^63 - 1: an answer is of the
+  // wish whose version it names.
+  uint64 version = 6;
+  // Carried out only while the replica holds the version `wanted` carries.
+  bool if_unchanged = 7;
+  // The server's words on it: who asked, why.
+  string note = 8;
+  // The replica's answer: the version it answers, 0 for none yet.
+  uint64 answered = 9;
+  // "applied", "refused", "superseded" or "waiting"; empty with no answer.
+  string outcome = 10;
+  string reason = 11;
+  // When it answered, RFC 3339, by the replica's clock.
+  string answered_at = 12;
+}

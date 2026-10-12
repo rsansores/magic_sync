@@ -163,9 +163,24 @@ async fn world(pool: crate::DbPool) -> World {
 
 /// The world, with a table written on both sides when `tallies`.
 async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
+    let (replicas, partition) = founded(&pool, "").await;
+    let codecs = [
+        Some(Codec::new::<Item, ItemRow>(to_wire, from_wire, None)),
+        tallies.then(|| Codec::json::<Tally>(None)),
+        tallies.then(|| Codec::json::<Pad>(None)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    provisioned(pool, codecs, replicas, partition).await
+}
+
+/// The engine's schema, the fixture's and `more`, and two live replicas of
+/// one partition.
+async fn founded(pool: &crate::DbPool, more: &str) -> ([Uuid; 2], Uuid) {
     let mut conn = pool.acquire().await.expect("a connection");
     crate::plan::tests::install(&mut conn).await;
-    sqlx::raw_sql(SCHEMA)
+    sqlx::raw_sql(&format!("{SCHEMA}{more}"))
         .execute(&mut *conn)
         .await
         .expect("schema");
@@ -179,17 +194,20 @@ async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
             .await
             .expect("a replica");
     }
-    let (items, tally, pad) = (
-        Table::of::<Item>(),
-        Table::of::<Tally>(),
-        Table::of::<Pad>(),
-    );
-    let tables: Vec<&Table> = if tallies {
-        vec![&items, &tally, &pad]
-    } else {
-        vec![&items]
-    };
-    let mut tx = conn.begin().await.expect("a transaction");
+    (replicas, partition)
+}
+
+/// The world of `codecs` — the engine's own tables added as a server adds
+/// them — over `replicas`, each provisioned, of nothing yet.
+async fn provisioned(
+    pool: crate::DbPool,
+    codecs: Vec<Codec<()>>,
+    replicas: [Uuid; 2],
+    partition: Uuid,
+) -> World {
+    let codecs = crate::wish::with_wishes(codecs).expect("the codecs");
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = pool.begin().await.expect("a transaction");
     let engine = Engine::install(&mut tx, &tables, REPLICAS)
         .await
         .expect("the engine");
@@ -197,14 +215,7 @@ async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
     let mut world = World {
         pool,
         engine,
-        codecs: [
-            Some(Codec::new::<Item, ItemRow>(to_wire, from_wire, None)),
-            tallies.then(|| Codec::json::<Tally>(None)),
-            tallies.then(|| Codec::json::<Pad>(None)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
+        codecs,
         replicas,
         partition,
         provisioned: BTreeMap::new(),
@@ -2307,6 +2318,9 @@ async fn an_upload_kept_whole_keeps_only_its_rows(pool: crate::DbPool) {
 
 #[path = "status_tests.rs"]
 mod status;
+
+#[path = "wish_tests.rs"]
+mod wishes;
 
 /// Replicas are sent to side by side, as many at once as the relay says and
 /// no more, each its messages one after the other, in order.
