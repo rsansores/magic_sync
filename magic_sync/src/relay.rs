@@ -172,6 +172,11 @@ struct Writer {
     /// How many it may hold, and the ready messages carry before they are
     /// written.
     room: usize,
+    /// What the last sweep of the messages being filled could not free —
+    /// open spans — less what has gone since: the next sweep waits for
+    /// `room` more than this, so spans that stay open cost one sweep per
+    /// `room` bytes, not one per row.
+    stuck: usize,
     /// Per replica, the last message written, its sequence and nonce: what
     /// the next one follows. A replica provisioned is absent until its
     /// snapshot's first message, which follows nothing.
@@ -414,6 +419,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 .collect(),
             snapshots: ids.clone(),
             room: self.buffered,
+            stuck: 0,
             ready: Vec::new(),
             rows: 0,
             ready_bytes: 0,
@@ -773,13 +779,15 @@ impl Writer {
         // Every replica's message being filled, ended early: what a pass
         // holds stays bounded however many replicas it fills at once, by a
         // message each — what a span holds goes on, as it fits one.
-        if self.buffered > self.room {
+        self.stuck = self.stuck.min(self.buffered);
+        if self.buffered > self.room + self.stuck {
             let replicas: Vec<Uuid> = self.packers.keys().copied().collect();
             for replica in replicas {
                 if let Some(done) = self.packers.get_mut(&replica).and_then(Packer::relieve) {
                     self.ready(replica, Body::Down(done));
                 }
             }
+            self.stuck = self.buffered;
         }
     }
 
