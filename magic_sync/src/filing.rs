@@ -759,6 +759,7 @@ async fn restored(conn: &mut Conn, replica: Uuid, epoch: Uuid, sequence: i64) ->
     );
     for sql in [
         "DELETE FROM sync.outbox",
+        "DELETE FROM sync.bodies",
         "DELETE FROM sync.gone",
         "UPDATE sync.chains SET last_sequence = NULL, last_nonce = NULL, snapshot_sequence = NULL, \
            snapshot_end = NULL",

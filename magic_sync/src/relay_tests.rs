@@ -57,6 +57,8 @@ const REPLICAS: Replicas = Replicas {
 #[derive(Default)]
 struct Fake {
     sent: Mutex<Vec<(Uuid, Body)>>,
+    /// The id of every message taken.
+    ids: Mutex<Vec<String>>,
     failing: Mutex<BTreeMap<Uuid, bool>>,
     fail_next: Mutex<BTreeMap<Uuid, usize>>,
 }
@@ -66,7 +68,7 @@ impl Transport for Fake {
         &self,
         replica: Uuid,
         message: Vec<u8>,
-        _id: &str,
+        id: &str,
     ) -> impl Future<Output = Result<(), Error>> + Send {
         let message = body(&message);
         let next = self
@@ -87,6 +89,7 @@ impl Transport for Fake {
             }),
             None => {
                 self.sent.lock().unwrap().push((replica, message));
+                self.ids.lock().unwrap().push(id.to_owned());
                 Ok(())
             }
         };
@@ -98,6 +101,7 @@ impl Transport for Fake {
 fn body(bytes: &[u8]) -> Body {
     let message = envelope::ToReplica::decode(bytes).expect("a message");
     assert_eq!(message.protocol, envelope::PROTOCOL);
+    assert_eq!(message.encode_to_vec(), bytes, "as the message encodes");
     message.body.expect("a body")
 }
 
@@ -2619,4 +2623,106 @@ async fn a_replica_cannot_have_itself_provisioned_on_every_round_trip(pool: crat
     earlier(60).await;
     world.file(a, &missed(world.last_sent(a).await)).await;
     assert_eq!(world.count(resyncs).await, 1, "two minutes on");
+}
+
+/// A database restored from an older copy numbers its next messages again:
+/// each is another message than the one that had its number, and has
+/// another id, so a transport that deduplicates by id delivers it.
+#[sqlx::test(migrations = false)]
+async fn a_message_numbered_again_after_a_restore_has_an_id_of_its_own(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let wire = Fake::default();
+    let one = world.item("one").await;
+    world.pass(&wire).await;
+    let mut conn = world.pool.acquire().await.unwrap();
+    crate::testkit::back_up(&mut conn, &["fixture", "sync"]).await;
+    world
+        .exec(
+            "UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2",
+            one,
+            "two",
+        )
+        .await;
+    world.pass(&wire).await;
+    let before = std::mem::take(&mut *wire.ids.lock().unwrap());
+    crate::testkit::restore(&mut conn, &["fixture", "sync"]).await;
+    world
+        .exec(
+            "UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2",
+            one,
+            "three",
+        )
+        .await;
+    world.pass(&wire).await;
+    let after = wire.ids.lock().unwrap().clone();
+    assert!(!after.is_empty());
+    for id in &after {
+        assert!(!before.contains(id), "{id} names two messages");
+    }
+}
+
+/// A message the transport took is recorded sent in the statement that lets
+/// it leave the outbox: a relay that dies right after leaves the replica
+/// with a last send, from which its silence is counted.
+#[sqlx::test(migrations = false)]
+async fn a_message_taken_is_recorded_sent_as_it_leaves_the_outbox(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    world.item("one").await;
+    let relay = world.relay();
+    world.record(&relay).await;
+    sqlx::query("UPDATE sync.replicas SET last_sent_at = NULL, applied_at = NULL")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let epoch = world.epoch().await;
+    let mut conn = world.pool.acquire().await.unwrap();
+    let shared = tokio::sync::Mutex::new(&mut *conn);
+    let (sent, failed) = relay
+        .send(&shared, &Fake::default(), a, epoch)
+        .await
+        .unwrap();
+    assert_eq!((sent, failed.is_none()), (1, true));
+    assert_eq!(world.outbox(a).await, 0);
+    let last_sent: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_sent_at FROM sync.replicas WHERE replica_id = $1")
+            .bind(a)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    assert!(last_sent.is_some());
+}
+
+/// What a change sends every replica is stored once, under each replica's
+/// own envelope, and leaves with the last message that carries it.
+#[sqlx::test(migrations = false)]
+async fn a_body_sent_to_every_replica_is_stored_once(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, b] = world.replicas;
+    world.item("one").await;
+    let wire = Fake::default();
+    wire.failing.lock().unwrap().insert(b, true);
+    let bodies = "SELECT count(*) FROM sync.bodies";
+    world.record(&world.relay()).await;
+    assert_eq!(world.count(bodies).await, 1);
+    assert_eq!(
+        world
+            .count("SELECT count(DISTINCT body) FROM sync.outbox WHERE body IS NOT NULL")
+            .await,
+        1
+    );
+    world.publish(&world.relay(), &wire).await;
+    assert_eq!(world.outbox(a).await, 0);
+    assert_eq!(world.count(bodies).await, 1, "b's message still carries it");
+    wire.failing.lock().unwrap().clear();
+    sqlx::query("UPDATE sync.replicas SET retry_after = NULL")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.publish(&world.relay(), &wire).await;
+    assert_eq!(world.count(bodies).await, 0);
+    assert_eq!(
+        wire.delivered(),
+        BTreeMap::from([(a, names(&["one"])), (b, names(&["one"]))])
+    );
 }

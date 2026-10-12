@@ -798,6 +798,9 @@ mod server {
             }
             for bytes in std::mem::take(&mut *kept.sent.lock().unwrap()) {
                 let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
+                // The bytes the transport took are the message's own, as
+                // this build encodes it, however the outbox kept them.
+                assert_eq!(message.encode_to_vec(), bytes, "{step}: as encoded");
                 let (snapshot, place) = match &mut message.body {
                     Some(Body::Down(m)) => (Some(&mut m.snapshot_id), Some((m.sequence, m.nonce))),
                     Some(Body::EndSnapshot(m)) => {

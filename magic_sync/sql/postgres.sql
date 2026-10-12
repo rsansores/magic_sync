@@ -166,6 +166,18 @@ CREATE TABLE sync.epoch (
 );
 INSERT INTO sync.epoch DEFAULT VALUES;
 
+-- What messages carry, each stored once however many replicas it goes to:
+-- the rows a broadcast sends every replica are one body, under each
+-- replica's own envelope.
+CREATE TABLE sync.bodies (
+    id    BIGSERIAL PRIMARY KEY,
+    bytes BYTEA     NOT NULL
+);
+
+COMMENT ON TABLE sync.bodies IS
+    'The tables a message carries, as protobuf, shared by every outbox message that carries '
+    'them: gone with the last of those.';
+
 -- The messages each replica is owed, written in the transaction that
 -- records what they carry, and sent after it commits, in order: a message
 -- leaves once the transport took it. A replica the transport cannot reach
@@ -173,16 +185,33 @@ INSERT INTO sync.epoch DEFAULT VALUES;
 CREATE TABLE sync.outbox (
     replica_id UUID        NOT NULL,
     sequence   BIGINT      NOT NULL,
-    message    BYTEA       NOT NULL,
+    nonce      BIGINT      NOT NULL,
+    head       BYTEA       NOT NULL,
+    body       BIGINT      REFERENCES sync.bodies (id),
+    tail       BYTEA       NOT NULL,
     snapshot   BOOLEAN     NOT NULL,
     written_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (replica_id, sequence)
 );
 
+-- What still carries a body, when a message that did leaves.
+CREATE INDEX outbox_body ON sync.outbox (body);
+
 COMMENT ON TABLE sync.outbox IS
-    'Messages written for a replica and not yet taken by the transport, as the bytes it '
-    'carries. Sent in sequence order once the pass that wrote them commits, by whichever '
-    'process runs the relay: a crash or a lost lock loses none of them.';
+    'Messages written for a replica and not yet taken by the transport. Sent in sequence order '
+    'once the pass that wrote them commits, by whichever process runs the relay: a crash or a '
+    'lost lock loses none of them.';
+COMMENT ON COLUMN sync.outbox.head IS
+    'The bytes the transport is given are head, then the body''s, then tail: a message is a '
+    'protobuf ToReplica, and the tables of its body are fields of it like the others, so the '
+    'replica''s own fields — the message''s place in its chain, the seal — go around a body '
+    'shared with others.';
+COMMENT ON COLUMN sync.outbox.body IS
+    'What it carries, in sync.bodies. NULL: nothing but its head and tail.';
+COMMENT ON COLUMN sync.outbox.nonce IS
+    'The message''s nonce: with the epoch and the sequence, the id the transport is given, '
+    'the same every time it goes, and another for a message numbered again by a database '
+    'restored from an older copy.';
 COMMENT ON COLUMN sync.outbox.snapshot IS
     'Part of a snapshot: what the replica should hold, whole. A snapshot written for a replica '
     'replaces its outbox, so these lead it; what follows them counts against its bound.';

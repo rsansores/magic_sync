@@ -300,7 +300,12 @@ decides what a replica will hold before anything goes, and nothing goes that
 is not recorded: a relay that dies after the commit loses nothing — whoever
 runs the relay next sends the outbox — and one that dies before it sent
 nothing. A message keeps its number, and its transport id, however often it
-goes.
+goes; a database restored from an older copy numbers its next messages again,
+and each of those has an id of its own (`{epoch}-{sequence}-{nonce}`). What a
+message carries is stored once, in `sync.bodies`, however many replicas'
+messages carry it — the rows of a change every replica gets are one body —
+under each replica's own head and tail: a protobuf message is its fields one
+after the other, so the bytes the transport is given are the message's own.
 
 The record transaction runs on the connection that holds the relay's lock. If
 that connection is lost, PostgreSQL releases the lock and rolls back the

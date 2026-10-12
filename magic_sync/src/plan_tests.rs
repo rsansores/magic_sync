@@ -744,11 +744,13 @@ impl World {
             .chain(live.iter())
             .map(|r| (*r, self.wire.ids(*r).len()))
             .collect();
-        let outbox: Vec<(Uuid, i64, Vec<u8>, bool)> =
-            sqlx::query_as("SELECT replica_id, sequence, message, snapshot FROM sync.outbox")
-                .fetch_all(&mut *self.conn)
-                .await
-                .expect("the outbox");
+        let outbox: Vec<Outboxed> = sqlx::query_as(
+            "SELECT o.replica_id, o.sequence, o.nonce, o.head, o.body, b.bytes, o.tail, o.snapshot \
+               FROM sync.outbox o LEFT JOIN sync.bodies b ON b.id = o.body",
+        )
+        .fetch_all(&mut *self.conn)
+        .await
+        .expect("the outbox");
         let sent = if chance(12) {
             self.history
                 .push("the relay died before it sent".to_owned());
@@ -765,15 +767,22 @@ impl World {
             // outbox: the next relay sends them again.
             self.history
                 .push("the relay died before it trimmed its outbox".to_owned());
-            for (replica, sequence, message, snapshot) in outbox {
+            for message in outbox {
                 sqlx::query(
-                    "INSERT INTO sync.outbox (replica_id, sequence, message, snapshot) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    "WITH body AS (INSERT INTO sync.bodies (id, bytes) \
+                                   SELECT $5, $6 WHERE $5 IS NOT NULL ON CONFLICT DO NOTHING) \
+                     INSERT INTO sync.outbox \
+                       (replica_id, sequence, nonce, head, body, tail, snapshot) \
+                     VALUES ($1, $2, $3, $4, $5, $7, $8) ON CONFLICT DO NOTHING",
                 )
-                .bind(replica)
-                .bind(sequence)
-                .bind(message)
-                .bind(snapshot)
+                .bind(message.replica_id)
+                .bind(message.sequence)
+                .bind(message.nonce)
+                .bind(message.head)
+                .bind(message.body)
+                .bind(message.bytes)
+                .bind(message.tail)
+                .bind(message.snapshot)
                 .execute(&mut *self.conn)
                 .await
                 .expect("sent again");
@@ -1237,6 +1246,19 @@ impl Oracle {
 /// A pass sends each replica only rows it should hold, or held already —
 /// a change not planned yet may still point at it there — and takes back
 /// only rows it should not hold: what `tx` — the pass, recorded and not
+/// A message in an outbox, as it is kept: its parts, and its body.
+#[derive(sqlx::FromRow)]
+struct Outboxed {
+    replica_id: Uuid,
+    sequence: i64,
+    nonce: i64,
+    head: Vec<u8>,
+    body: Option<i64>,
+    bytes: Option<Vec<u8>>,
+    tail: Vec<u8>,
+    snapshot: bool,
+}
+
 /// committed — wrote to the outboxes past the message `drawn`, against what
 /// should be held as the pass read the rows, and `held`, what the replicas
 /// held before it.
@@ -1247,12 +1269,14 @@ async fn assert_minimal(
     history: &[String],
 ) {
     use prost::Message as _;
-    let written: Vec<(Uuid, Vec<u8>)> =
-        sqlx::query_as("SELECT replica_id, message FROM sync.outbox WHERE sequence > $1")
-            .bind(drawn)
-            .fetch_all(&mut *tx)
-            .await
-            .expect("written");
+    let written: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT o.replica_id, o.head || coalesce(b.bytes, '') || o.tail FROM sync.outbox o \
+           LEFT JOIN sync.bodies b ON b.id = o.body WHERE o.sequence > $1",
+    )
+    .bind(drawn)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("written");
     if written.is_empty() {
         return;
     }

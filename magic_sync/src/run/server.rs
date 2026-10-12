@@ -698,6 +698,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
             }
         }
         .await;
+        let swept = async { crate::relay::sweep_bodies(&mut *self.begin().await?).await }.await;
+        if let Err(e) = swept {
+            tracing::warn!("sync: sweeping the outbox's bodies failed: {e}");
+        }
         match pruned {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "sync: done notes pruned"),
