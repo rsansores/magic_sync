@@ -49,9 +49,8 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::plan::Engine
 pub struct magic_sync::plan::Replicas
 impl magic_sync::plan::Replicas
 pub const fn magic_sync::plan::Replicas::live(self, &'static str) -> Self
+pub const fn magic_sync::plan::Replicas::new(&'static str, &'static str) -> Self
 pub const fn magic_sync::plan::Replicas::partitioned_by(self, &'static str) -> Self
-pub const fn magic_sync::plan::Replicas::relation(&'static str) -> Self
-pub const fn magic_sync::plan::Replicas::table(self, &'static str) -> Self
 impl core::clone::Clone for magic_sync::plan::Replicas
 pub fn magic_sync::plan::Replicas::clone(&self) -> Self
 impl core::fmt::Debug for magic_sync::plan::Replicas

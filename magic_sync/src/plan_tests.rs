@@ -2264,9 +2264,7 @@ async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: crate:
     let printed = Engine::triggers(
         &mut conn,
         &[Codec::<()>::json::<Product>(None)],
-        Replicas::relation("shop.registers")
-            .table("registers")
-            .live("active"),
+        Replicas::new("shop.registers", "registers").live("active"),
     )
     .await
     .expect("the triggers");
@@ -2762,19 +2760,15 @@ async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate
     };
     for (replicas, named) in [
         (
-            Replicas::relation("fixture.nowhere").table("t_replicas"),
+            Replicas::new("fixture.nowhere", "t_replicas"),
             "no table or view",
         ),
         (
-            Replicas::relation("fixture.t_replicas")
-                .table("t_replicas")
-                .live("alive"),
+            Replicas::new("fixture.t_replicas", "t_replicas").live("alive"),
             "does not read",
         ),
         (
-            Replicas::relation("fixture.t_replicas")
-                .table("t_replicas")
-                .partitioned_by("retired_at"),
+            Replicas::new("fixture.t_replicas", "t_replicas").partitioned_by("retired_at"),
             "no uuid column `retired_at`",
         ),
     ] {

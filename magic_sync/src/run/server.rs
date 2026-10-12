@@ -215,7 +215,7 @@ impl Settings {
 /// }
 ///
 /// # async fn start(pool: sqlx::PgPool, codecs: Vec<Codec<()>>, upload: (Uuid, Vec<u8>)) -> Result<(), Error> {
-/// const REGISTERS: Replicas = Replicas::relation("shop.registers").table("registers").live("active");
+/// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
 ///
 /// let server = Arc::new(
 ///     Server::new(pool.clone(), codecs, REGISTERS, Queues, Anyone::new(pool), Settings::default())

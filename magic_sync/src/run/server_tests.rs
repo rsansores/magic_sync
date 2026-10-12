@@ -1280,8 +1280,7 @@ async fn a_replica_named_twice_by_its_relation_is_one(pool: PgPool) {
     let server = Server::new(
         pool.clone(),
         codecs(),
-        Replicas::relation("fixture.twice")
-            .table("t_replicas")
+        Replicas::new("fixture.twice", "t_replicas")
             .live("live")
             .partitioned_by("partition_id"),
         wire.clone(),

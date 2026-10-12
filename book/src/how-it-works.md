@@ -167,7 +167,7 @@ write it.
 
 ### 4.2 Planning
 
-Before each pass the relay compares the replicas (`Replicas::relation` and
+Before each pass the relay compares the replicas (`Replicas::new` and
 `live`) with what it saw last (`sync.replicas.live`, `partition_id`): a
 replica that became live, or moved to another partition, is provisioned again
 from scratch; one that stopped being live, or is gone, is forgotten — nothing
