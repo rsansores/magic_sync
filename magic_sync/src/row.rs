@@ -1142,7 +1142,7 @@ pub(crate) async fn update_held<R: Row>(
             returned.join(", ")
         ));
         for row in &qb.build().fetch_all(&mut *exec).await? {
-            written.push(key_of_row(row, &kinds)?);
+            written.push(key_of_row(row, &kinds, 0)?);
         }
     }
     Ok(written)
