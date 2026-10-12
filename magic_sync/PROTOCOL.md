@@ -266,11 +266,14 @@ refuses — because the row it points at is not held, or because rows point
 at a value of it the message changed or let go of: a constraint that fails
 the commit is the replica finding such a row, never a failure of its
 storage. The replica applies the message again, row by row, finds the rows
-at fault, and applies it once more with them rejected before they are
-tried. Only a failure of the
-replica's own storage (the database is unavailable, the disk is full, the
-file is damaged) fails the message: then the replica **must not**
-acknowledge it, and it will be delivered again.
+at fault — by the database's own check of its keys — and applies it once
+more with them rejected before they are tried; and should the database
+still refuse it for what no row of it explains, it applies it with every
+row of it rejected, so that the rest of what it says stands. Anything else
+the database answers of a row — a trigger's own error included — refuses
+that row. Only a failure of the replica's own storage (the database is
+unavailable, the disk is full, the file is damaged) fails the message: then
+the replica **must not** acknowledge it, and it will be delivered again.
 
 ### 4.2 Snapshots
 

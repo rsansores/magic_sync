@@ -163,13 +163,14 @@ mod imp {
     /// delete — refuse it (`NO ACTION`, `RESTRICT`, deferred or not), or
     /// change the row that points (`CASCADE`, `SET NULL`, `SET DEFAULT`),
     /// which would change a row of the replica's own the server never sent —
-    /// as `(child, its columns, the parent's columns)`. A key naming no
-    /// parent columns names the parent's primary key, `key`.
+    /// as `(child, its columns, the parent's columns)` with the key's id in
+    /// the child's list of them. A key naming no parent columns names the
+    /// parent's primary key, `key`.
     pub(crate) async fn pointing(
         conn: &mut Conn,
         table: &str,
         key: &[&str],
-    ) -> Result<Vec<(String, Vec<String>, Vec<String>)>, Error> {
+    ) -> Result<Vec<Pointer>, Error> {
         let rows: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
             r#"SELECT m.name, f.id, f."from", f."to"
                  FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) f
@@ -179,23 +180,57 @@ mod imp {
         .bind(table)
         .fetch_all(&mut *conn)
         .await?;
-        let mut out: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
-        let mut last = None;
+        let mut out: Vec<Pointer> = Vec::new();
         for (child, id, from, to) in rows {
-            if last.as_ref() != Some(&(child.clone(), id)) {
-                out.push((child.clone(), Vec::new(), Vec::new()));
-                last = Some((child, id));
+            if out.last().is_none_or(|p| p.child != child || p.id != id) {
+                out.push(Pointer {
+                    child,
+                    id,
+                    from: Vec::new(),
+                    to: Vec::new(),
+                });
             }
-            let (_, from_columns, to_columns) = out.last_mut().expect("just pushed");
-            from_columns.push(from);
-            to_columns.extend(to);
+            let pointer = out.last_mut().expect("just pushed");
+            pointer.from.push(from);
+            pointer.to.extend(to);
         }
-        for (_, from, to) in &mut out {
-            if to.len() != from.len() {
-                *to = key.iter().map(|k| (*k).to_owned()).collect();
+        for pointer in &mut out {
+            if pointer.to.len() != pointer.from.len() {
+                pointer.to = key.iter().map(|k| (*k).to_owned()).collect();
             }
         }
         Ok(out)
+    }
+
+    /// A foreign key into a table: the table it is of, its id there, its
+    /// columns and the ones they point at.
+    pub(crate) struct Pointer {
+        pub(crate) child: String,
+        pub(crate) id: i64,
+        pub(crate) from: Vec<String>,
+        pub(crate) to: Vec<String>,
+    }
+
+    /// `table.columns = +from.columns`, column by column: the comparison a
+    /// foreign key makes — the parent column's collation, its affinity
+    /// applied to the value pointing at it, which the unary `+` leaves with
+    /// none of its own.
+    pub(crate) fn points(table: &str, to: &[String], from: &str, columns: &[String]) -> String {
+        to.iter()
+            .zip(columns)
+            .map(|(t, f)| format!("{table}.{} = +{from}.{}", ident(t), ident(f)))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    /// Whether `table` has rowids: one declared `WITHOUT ROWID` has none.
+    pub(crate) async fn has_rowid(conn: &mut Conn, table: &str) -> Result<bool, Error> {
+        let without: Option<i64> =
+            sqlx::query_scalar("SELECT wr FROM pragma_table_list WHERE name = ?1")
+                .bind(table)
+                .fetch_optional(&mut *conn)
+                .await?;
+        Ok(without != Some(1))
     }
 
     /// The unique indexes of `table` other than its primary key, each with

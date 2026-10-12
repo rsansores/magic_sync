@@ -232,7 +232,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     ///
     /// The message must come again: the replica's storage failed
     /// ([`Error::Database`]), or it speaks a later protocol than this build
-    /// ([`Error::Protocol`]). Nothing of it was applied.
+    /// ([`Error::Protocol`]). Nothing of it was applied. Nothing it carries
+    /// is an error: what the database refuses of it is rejected, row by row
+    /// — every row of it when the database refuses it for what no row
+    /// explains — and a message even that does not apply is
+    /// [`Received::Malformed`].
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
         let mut care = Care::default();
         let received = loop {
@@ -254,10 +258,17 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             // The database may have rolled the transaction back under it: a
             // connection that no longer knows whether it is in one goes.
             conn.close_on_drop();
-            match stop {
-                Stop::Culprits(culprits) => care.refuse(culprits)?,
-                Stop::Failed(e) if e.is_refusal() && care.heed() => {}
+            let again = match stop {
+                Stop::Culprits(culprits) => care.refuse(culprits) || care.heed(),
+                Stop::Failed(e) if e.is_refusal() => care.heed(),
                 Stop::Failed(e) => return Err(e),
+            };
+            if !again {
+                // Refused with every row of it refused: nothing a message
+                // changes is at fault, and this one never applies.
+                return Ok(replica::malformed(
+                    "the database refuses it even with every row of it refused".to_owned(),
+                ));
             }
         };
         if matches!(

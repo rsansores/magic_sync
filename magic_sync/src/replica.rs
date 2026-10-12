@@ -520,9 +520,9 @@ pub enum Received {
 /// the whole transaction back, or that a foreign key checked at commit
 /// refuses (its parent is not held, or rows point at what it changed), stops
 /// it with its [`Culprit`], for the caller to apply the message again,
-/// `care`fully, with that row refused. A commit a key refuses anyway is the
-/// caller's to answer by applying the message `care`fully, which finds the
-/// row.
+/// `care`fully, with that row refused. A commit the database refuses anyway
+/// is the caller's to answer by applying the message with more [`Care`]:
+/// carefully, which finds the row, and then whole, every row refused.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn receive<P: Sync + 'static>(
     conn: &mut Conn,
@@ -551,16 +551,10 @@ pub(crate) async fn receive<P: Sync + 'static>(
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
-    let received = if care.careful {
+    let received = if care.careful() {
         carefully(conn, codecs, body, care).await
     } else {
-        act(conn, codecs, body, care).await
-    };
-    let received = match received {
-        Ok(r @ (Received::Applied(_) | Received::SnapshotEnded | Received::Filed)) => {
-            collect(conn, codecs, care).await.map(|()| r)
-        }
-        other => other,
+        applied(conn, codecs, body, care).await
     };
     let quiet = sqlx::query("DELETE FROM sync_applying")
         .execute(&mut *conn)
@@ -616,36 +610,63 @@ enum Spot {
     Collect(String),
 }
 
-/// How a message is applied: all at once, or — once a refusal rolled a
-/// whole transaction back — `careful`ly, row by row, each in a savepoint of
-/// its own, and the rows that did so refused before they are tried.
+/// How a message is applied: all at once; or — once a refusal rolled a
+/// whole transaction back — `Careful`ly, row by row, each in a savepoint of
+/// its own, and the rows that did so refused before they are tried; or —
+/// once the database refuses it for what no row of it explains — `Whole`,
+/// every row of it refused, so that what the message says of where the
+/// replica stands is taken all the same.
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Default)]
 pub(crate) struct Care {
-    careful: bool,
+    level: Level,
     culprits: HashMap<(String, Spot), Culprit>,
 }
 
 #[cfg(feature = "sqlite")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Level {
+    #[default]
+    Bold,
+    Careful,
+    Whole,
+}
+
+/// Why every row of a message is refused, once nothing else took.
+#[cfg(feature = "sqlite")]
+const WHOLE: &str =
+    "the database refused the message it came in, for what no row of it alone explains";
+
+#[cfg(feature = "sqlite")]
 impl Care {
-    /// After a refusal took the whole transaction with it: row by row from
-    /// now on. Answers whether that is news — a careful run that fails so
-    /// fails for another reason.
-    pub(crate) fn heed(&mut self) -> bool {
-        !std::mem::replace(&mut self.careful, true)
+    fn careful(&self) -> bool {
+        self.level >= Level::Careful
     }
 
-    /// Refuses `culprits` before they are tried, next time, all at once —
-    /// one refused already is not what failed, and the message stops with an
-    /// error.
-    pub(crate) fn refuse(&mut self, culprits: Vec<Culprit>) -> Result<(), Error> {
-        self.careful = true;
+    /// The database refused the message as applied: the next way to apply
+    /// it, row by row, then whole. Answers whether there is one — once
+    /// every row of it is refused, the database refuses something no
+    /// message changes.
+    pub(crate) fn heed(&mut self) -> bool {
+        let next = match self.level {
+            Level::Bold => Level::Careful,
+            Level::Careful => Level::Whole,
+            Level::Whole => return false,
+        };
+        self.level = next;
+        true
+    }
+
+    /// Refuses `culprits` before they are tried, next time, all at once:
+    /// answers whether any is news — one refused already is not what
+    /// failed.
+    pub(crate) fn refuse(&mut self, culprits: Vec<Culprit>) -> bool {
+        self.level = self.level.max(Level::Careful);
+        let mut news = false;
         for culprit in culprits {
             let place = (culprit.table.clone(), culprit.row.clone());
             if self.culprits.contains_key(&place) {
-                return Err(Error::Misuse(format!(
-                    "a row refused before it was tried failed the message again: {culprit:?}"
-                )));
+                continue;
             }
             tracing::error!(
                 table = culprit.table,
@@ -653,12 +674,20 @@ impl Care {
                 culprit.why
             );
             self.culprits.insert(place, culprit);
+            news = true;
         }
-        Ok(())
+        news
     }
 
-    fn culprit(&self, table: &str, row: &Spot) -> Option<&Culprit> {
-        self.culprits.get(&(table.to_owned(), row.clone()))
+    /// Why the row at `row` of `table` is refused before it is tried, if
+    /// it is.
+    fn culprit(&self, table: &str, row: &Spot) -> Option<&str> {
+        if self.level == Level::Whole {
+            return Some(WHOLE);
+        }
+        self.culprits
+            .get(&(table.to_owned(), row.clone()))
+            .map(|c| c.why.as_str())
     }
 }
 
@@ -714,7 +743,7 @@ async fn row_begun(conn: &mut Conn) -> Result<(), Error> {
 }
 
 #[cfg(feature = "sqlite")]
-fn malformed(why: String) -> Received {
+pub(crate) fn malformed(why: String) -> Received {
     tracing::error!("sync: a message this build can do nothing with — dropped: {why}");
     Received::Malformed(why)
 }
@@ -722,10 +751,10 @@ fn malformed(why: String) -> Received {
 /// `body` acted on carefully, once a refusal took a whole transaction with
 /// it — the commit's own included: and then, since a foreign key checked at
 /// commit refuses what a row of the message changed, or let go of, under
-/// rows that point at it by a column other than its key, the rows that did
-/// so are found, to be refused. What the message's tables held that rows
-/// point at is read before, and what of it is gone, still pointed at,
-/// after.
+/// rows that point at it, or a row of it that points at one the replica
+/// does not hold, the rows that did so are found, to be refused — by the
+/// database's own check of its keys. What each row pointing at the server's
+/// tables points at is recorded before, and read again after.
 #[cfg(feature = "sqlite")]
 async fn carefully<P: Sync + 'static>(
     conn: &mut Conn,
@@ -734,46 +763,54 @@ async fn carefully<P: Sync + 'static>(
     care: &Care,
 ) -> Result<Received, Stop> {
     let mut upserts: HashMap<(&str, Key), Spot> = HashMap::new();
-    let names: Vec<&str> = match &body {
-        Body::Down(down) => {
-            for (entry, table) in down.tables.iter().enumerate() {
-                let Some(codec) = codec_of(codecs, &table.table) else {
-                    continue;
-                };
-                for (at, key) in parsed(codec, &table.keys).into_iter().enumerate() {
-                    if let Some(key) = key {
-                        upserts.insert((codec.table.name, key), Spot::Upsert { entry, at });
-                    }
+    if let Body::Down(down) = &body {
+        for (entry, table) in down.tables.iter().enumerate() {
+            let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
+                continue;
+            };
+            for (at, key) in parsed(codec, &table.keys).into_iter().enumerate() {
+                if let Some(key) = key {
+                    upserts.insert((codec.table.name, key), Spot::Upsert { entry, at });
                 }
             }
-            down.tables.iter().map(|t| t.table.as_str()).collect()
         }
-        Body::EndSnapshot(end) => end.tables.iter().map(String::as_str).collect(),
-        Body::Filed(_) => codecs.iter().map(|c| c.table.name).collect(),
-    };
-    let mut touched: Vec<&Codec<P>> = Vec::new();
+    }
+    // Any of the server's tables may change: a message's rows, the end of a
+    // snapshot, a let-go once filed, a retired row let go of.
+    let mut before = Vec::new();
+    let mut recorded = 0;
     for codec in codecs.iter().filter(|c| c.sent_down()) {
-        if names.contains(&codec.table.name) {
-            touched.push(codec);
-        }
+        let pointing = codec.pointing(conn, recorded).await?;
+        recorded += pointing.len();
+        before.push((codec, pointing));
     }
-    let mut before = Vec::with_capacity(touched.len());
-    for codec in touched {
-        before.push((codec, codec.pointed(conn).await?));
-    }
-    let received = act(conn, codecs, body, care).await?;
+    let received = applied(conn, codecs, body, care).await?;
     let mut culprits = Vec::new();
-    for (codec, pointed) in &before {
+    let why = "rows here point at what it changes, through a key checked at commit";
+    for (codec, pointing) in &before {
         let table = codec.table.name;
-        for key in codec.broken(conn, pointed).await? {
+        for key in codec.broken(conn, pointing).await? {
             let row = upserts
                 .remove(&(table, key.clone()))
                 .unwrap_or_else(|| Spot::LetGo(key_text(&key)));
             culprits.push(Culprit {
                 table: table.to_owned(),
                 row,
-                why: "rows here point at what it changes, through a key checked at commit"
-                    .to_owned(),
+                why: why.to_owned(),
+            });
+        }
+        crate::row::forget(conn, pointing).await?;
+        let mine: Vec<Key> = upserts
+            .keys()
+            .filter(|(t, _)| *t == table)
+            .map(|(_, key)| key.clone())
+            .collect();
+        for key in codec.orphaned(conn, &mine).await? {
+            let row = upserts.remove(&(table, key)).expect("one of the message's");
+            culprits.push(Culprit {
+                table: table.to_owned(),
+                row,
+                why: "a row it points at, through a foreign key, is not held here".to_owned(),
             });
         }
     }
@@ -782,6 +819,25 @@ async fn carefully<P: Sync + 'static>(
     } else {
         Err(Stop::Culprits(culprits))
     }
+}
+
+/// `body` acted on, and then the retired rows nothing keeps any more let go
+/// of, once it changed what the replica holds.
+#[cfg(feature = "sqlite")]
+async fn applied<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    body: Body,
+    care: &Care,
+) -> Result<Received, Stop> {
+    let received = act(conn, codecs, body, care).await?;
+    if matches!(
+        received,
+        Received::Applied(_) | Received::SnapshotEnded | Received::Filed
+    ) {
+        collect(conn, codecs, care).await?;
+    }
+    Ok(received)
 }
 
 #[cfg(feature = "sqlite")]
@@ -1114,9 +1170,9 @@ async fn apply<P: Sync + 'static>(
         for at in (0..beside.len()).filter(|at| beside[*at].as_ref().is_none_or(|k| last[k] == *at))
         {
             match care.culprit(&table.table, &Spot::Upsert { entry, at }) {
-                Some(culprit) => {
+                Some(why) => {
                     let key = beside[at].as_ref();
-                    refuse(conn, codec, key, &culprit.why, naming, by).await?;
+                    refuse(conn, codec, key, why, naming, by).await?;
                 }
                 None => pending.push(at),
             }
@@ -1212,7 +1268,7 @@ impl<P: Sync + 'static> Part<'_, P> {
         if positions.is_empty() {
             return Ok(());
         }
-        if !care.careful {
+        if !care.careful() {
             let (held, refused) = take(
                 conn,
                 self.codec,
@@ -1373,7 +1429,7 @@ async fn let_go<P: Sync + 'static>(
     by: &By,
     care: &Care,
 ) -> Result<(), Stop> {
-    if !care.careful {
+    if !care.careful() {
         let_go_together(conn, codecs, codec, keys, by).await?;
         return Ok(());
     }
@@ -1381,7 +1437,7 @@ async fn let_go<P: Sync + 'static>(
     let mut pending = Vec::new();
     for key in keys {
         match care.culprit(table, &Spot::LetGo(key_text(key))) {
-            Some(culprit) => reject(conn, table, &[key_text(key)], &culprit.why, by).await?,
+            Some(why) => reject(conn, table, &[key_text(key)], why, by).await?,
             None => pending.push(key.clone()),
         }
     }
@@ -1560,7 +1616,7 @@ async fn collect<P: Sync + 'static>(
             .into_iter()
             .filter(|key| !noted.contains(&key_text(key)))
             .collect();
-        if !care.careful {
+        if !care.careful() {
             codec.retire(conn, &retired, &[], &server).await?;
             continue;
         }

@@ -1811,6 +1811,226 @@ async fn a_key_checked_at_commit_finds_the_row_that_broke_it(pool: SqlitePool) {
     );
 }
 
+/// A key checked at commit compares as the database compares it — by the
+/// parent column's collation, and its affinity applied to what points at
+/// it — and the row that broke it is found so, however the values are
+/// spelled: one that points at a label in another case under `NOCASE`, or
+/// at a text label by a number.
+#[sqlx::test(migrations = false)]
+async fn a_key_checked_at_commit_is_found_by_the_databases_own_comparison(pool: SqlitePool) {
+    let tables = TABLES.replace(
+        "label TEXT NOT NULL,",
+        "label TEXT NOT NULL UNIQUE COLLATE NOCASE,",
+    ) + "CREATE TABLE tags (id INTEGER PRIMARY KEY, \
+           label TEXT REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TABLE counts (id INTEGER PRIMARY KEY, \
+           label INTEGER REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);";
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let aisle = Uuid::now_v7();
+    let shelf = |slot: i64, label: &str| {
+        let row = Shelf {
+            aisle,
+            slot,
+            label: label.to_owned(),
+            revision: 1,
+        };
+        (key(&[&aisle.to_string(), &slot.to_string()]), json(&row))
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "shelves",
+            vec![shelf(1, "tagged"), shelf(2, "7"), shelf(3, "free")],
+        )],
+    ))
+    .await;
+    w.exec("INSERT INTO tags (label) VALUES ('TAGGED'); INSERT INTO counts (label) VALUES (7)")
+        .await
+        .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![upserts(
+            "shelves",
+            vec![shelf(1, "renamed"), shelf(2, "eight"), shelf(3, "free too")],
+        )],
+    ))
+    .await;
+    assert_eq!(
+        w.texts("SELECT label FROM shelves ORDER BY slot").await,
+        ["tagged", "7", "free too"]
+    );
+    assert_eq!(
+        w.rejected().await,
+        [format!("shelves {aisle}|1"), format!("shelves {aisle}|2")]
+    );
+}
+
+/// A refusal at commit that no row explains — a key of a table without
+/// rowids, which the database's check cannot point to — refuses every row
+/// of the message: the replica takes none of it, reports each, and follows
+/// it, rather than failing it for ever.
+#[sqlx::test(migrations = false)]
+async fn a_refusal_no_row_explains_refuses_the_whole_message(pool: SqlitePool) {
+    let tables = TABLES.replace("label TEXT NOT NULL,", "label TEXT NOT NULL UNIQUE,")
+        + "CREATE TABLE marks (label TEXT PRIMARY KEY \
+             REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED) WITHOUT ROWID;";
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let (aisle, id) = (Uuid::now_v7(), Uuid::now_v7());
+    let shelf = |label: &str| {
+        let row = Shelf {
+            aisle,
+            slot: 1,
+            label: label.to_owned(),
+            revision: 1,
+        };
+        (key(&[&aisle.to_string(), "1"]), json(&row))
+    };
+    w.receive(&down(1, "", vec![upserts("shelves", vec![shelf("x")])]))
+        .await;
+    w.exec("INSERT INTO marks (label) VALUES ('x')")
+        .await
+        .unwrap();
+    let received = w
+        .receive(&down(
+            2,
+            "",
+            vec![
+                upserts("shelves", vec![shelf("y")]),
+                upserts("items", vec![item(id, "a")]),
+            ],
+        ))
+        .await;
+    assert!(matches!(received, Received::Applied(_)), "{received:?}");
+    assert_eq!(w.texts("SELECT label FROM shelves").await, ["x"]);
+    assert!(w.items().await.is_empty());
+    assert_eq!(
+        w.rejected().await,
+        [format!("items {id}"), format!("shelves {aisle}|1")]
+    );
+    w.receive(&down(3, "", vec![upserts("items", vec![item(id, "a")])]))
+        .await;
+    assert_eq!(w.items().await, ["a"], "followed");
+}
+
+/// Whatever a server sends a replica whose database refuses rows in every
+/// way it can — a trigger that aborts, one that rolls the whole transaction
+/// back, one that fails with an error of its own, unique values, keys
+/// checked at once and at commit, by collation and by affinity — and
+/// whatever the host writes between messages, receiving never errs: the
+/// replica's storage and a later protocol are the only errors there are.
+#[sqlx::test(migrations = false)]
+async fn nothing_a_message_carries_makes_receiving_an_error(pool: SqlitePool) {
+    let tables = tree_tables().replace(
+        "label TEXT NOT NULL,",
+        "label TEXT NOT NULL UNIQUE COLLATE NOCASE,",
+    ) + "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;
+         CREATE TABLE tags (id INTEGER PRIMARY KEY, \
+           label TEXT REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TABLE counts (id INTEGER PRIMARY KEY, \
+           label INTEGER REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TABLE marks (label TEXT PRIMARY KEY \
+           REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED) WITHOUT ROWID;
+         CREATE TRIGGER shelf_doomed BEFORE UPDATE ON shelves WHEN NEW.label LIKE 'doom%'
+         BEGIN SELECT RAISE(ROLLBACK, 'a doomed shelf'); END;
+         CREATE TRIGGER shelf_json BEFORE INSERT ON shelves WHEN NEW.label LIKE 'j%'
+         BEGIN SELECT json_extract(NEW.label, '$.x'); END;
+         CREATE TRIGGER item_gone BEFORE DELETE ON items WHEN OLD.name LIKE 'gone%'
+         BEGIN SELECT RAISE(ROLLBACK, 'an item doomed to stay'); END;
+         CREATE TRIGGER item_kept BEFORE DELETE ON items WHEN OLD.name LIKE 'keep%'
+         BEGIN SELECT RAISE(ABORT, 'an item kept'); END;";
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let mut walk = crate::testkit::Walk(0x5eed_0fe4);
+    let aisle = Uuid::from_u128(77);
+    let labels = [
+        "tagged", "TAGGED", "Tagged", "7", "07", "7.0", "doom", "jx", "free",
+    ];
+    let names = ["fine", "fine", "keep", "gone", "dup"];
+    let mut sequence = BASE;
+    for step in 0..400 {
+        let mut tables = Vec::new();
+        for _ in 0..1 + walk.below(4) {
+            let mut part = match walk.below(4) {
+                0 => {
+                    let rows = (0..walk.below(4))
+                        .map(|_| {
+                            let id = Uuid::from_u128(1 + walk.below(6) as u128);
+                            let parent = Uuid::from_u128(1 + walk.below(6) as u128);
+                            let name = format!("{}{}", names[walk.below(5)], walk.below(3));
+                            node(id, parent, &name)
+                        })
+                        .collect();
+                    upserts("items", rows)
+                }
+                1 => {
+                    let rows = (0..walk.below(4))
+                        .map(|_| {
+                            let row = Shelf {
+                                aisle,
+                                slot: i64::try_from(walk.below(5)).unwrap(),
+                                label: labels[walk.below(labels.len())].to_owned(),
+                                revision: 1,
+                            };
+                            let slot = row.slot.to_string();
+                            (key(&[&aisle.to_string(), &slot]), json(&row))
+                        })
+                        .collect();
+                    upserts("shelves", rows)
+                }
+                2 => upserts("ghosts", vec![(key(&["?"]), vec![7])]),
+                _ => {
+                    let id = Uuid::from_u128(1 + walk.below(6) as u128);
+                    deletes("items", vec![key(&[&id.to_string()])])
+                }
+            };
+            if walk.below(3) == 0 {
+                let slot = walk.below(5).to_string();
+                part.deletes.push(key(&[&aisle.to_string(), &slot]));
+                part.table = "shelves".to_owned();
+                part.upserts.clear();
+                part.keys.clear();
+            }
+            tables.push(part);
+        }
+        sequence += 2;
+        let snapshot = format!("s{step}");
+        let mut bytes = numbered(sequence - 1, 0, &snapshot, tables);
+        if walk.below(10) == 0 {
+            let at = walk.below(bytes.len());
+            bytes[at] ^= 1 << walk.below(8);
+        }
+        let ended = ending(sequence, sequence - 1, &snapshot, &["items", "shelves"]);
+        let messages = if walk.below(4) == 0 {
+            vec![bytes, ended]
+        } else {
+            vec![bytes]
+        };
+        for bytes in messages {
+            match w.replica.receive(&bytes).await {
+                Ok(_) | Err(Error::Protocol { .. }) => {}
+                Err(e) => panic!("step {step}: {e}"),
+            }
+        }
+        // The host's own rows, pointing at what the server sent.
+        let label = labels[walk.below(labels.len())];
+        let host = match walk.below(6) {
+            0 => format!("INSERT INTO tags (label) VALUES ('{label}')"),
+            5 => format!("INSERT INTO marks (label) VALUES ('{label}')"),
+            1 => format!("INSERT INTO counts (label) VALUES ({})", walk.below(10)),
+            2 => format!(
+                "INSERT INTO receipts (item_id) VALUES (x'{}')",
+                Uuid::from_u128(1 + walk.below(6) as u128).simple()
+            ),
+            3 => "DELETE FROM tags WHERE id = (SELECT min(id) FROM tags); \
+                  DELETE FROM counts WHERE id = (SELECT min(id) FROM counts)"
+                .to_owned(),
+            _ => "DELETE FROM receipts WHERE id = (SELECT min(id) FROM receipts)".to_owned(),
+        };
+        let _ = w.exec(&host).await;
+    }
+}
+
 /// Within a table's part, its deletes come first: a unique value one row
 /// gives up is another's in the same message, and so is one a row taken
 /// later in the part gives up. Two rows that swap one cannot be taken one
@@ -4533,11 +4753,12 @@ async fn an_unknown_tables_name_and_key_are_kept_to_the_byte(pool: SqlitePool) {
     );
 }
 
-/// What the database fails with that is not the rows' — a host's trigger
-/// that reads a table there is not — fails the message, rather than
-/// refusing every row it touched: the next build may fix it.
+/// What the database fails with that is not its storage — a host's trigger
+/// that reads a table there is not — refuses the rows it touched, not the
+/// message: they are reported, and taken when the server sends them again
+/// once a fix is deployed.
 #[sqlx::test(migrations = false)]
-async fn a_failure_that_is_not_the_rows_fails_the_message(pool: SqlitePool) {
+async fn a_failure_that_is_not_the_storages_refuses_the_rows(pool: SqlitePool) {
     let w = world(pool).await;
     w.exec(
         "CREATE TRIGGER broken BEFORE INSERT ON items \
@@ -4545,19 +4766,15 @@ async fn a_failure_that_is_not_the_rows_fails_the_message(pool: SqlitePool) {
     )
     .await
     .unwrap();
-    let message = down(
-        1,
-        "",
-        vec![upserts("items", vec![item(Uuid::now_v7(), "a")])],
-    );
-    match w.replica.receive(&message).await {
-        Err(Error::Database(e)) => assert!(e.to_string().contains("no such table"), "{e}"),
-        other => panic!("{other:?}"),
-    }
-    assert!(w.rejected().await.is_empty());
+    let id = Uuid::now_v7();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(id, "a")])]))
+        .await;
+    assert_eq!(w.rejected().await, [format!("items {id}")]);
     w.exec("DROP TRIGGER broken").await.unwrap();
-    w.receive(&message).await;
+    w.receive(&down(2, "", vec![upserts("items", vec![item(id, "a")])]))
+        .await;
     assert_eq!(w.items().await, ["a"]);
+    assert!(w.rejected().await.is_empty());
 }
 
 /// A table takes a replica's deletes only when keyed by it — alone or with

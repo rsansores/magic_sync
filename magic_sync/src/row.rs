@@ -582,7 +582,10 @@ pub(crate) async fn retire_by_keys<R: Row>(
     // The table's own keys into itself, whose rows let go of together keep
     // one another only while one of them stays.
     let mut inward = Vec::new();
-    for (child, from, to) in crate::dialect::pointing(exec, R::TABLE, R::KEY).await? {
+    for crate::dialect::Pointer {
+        child, from, to, ..
+    } in crate::dialect::pointing(exec, R::TABLE, R::KEY).await?
+    {
         let stays = match server.iter().find(|(t, _)| t.eq_ignore_ascii_case(&child)) {
             None => String::new(),
             Some((_, Some(column))) => format!(" AND c.{} IS NOT NULL", ident(column)),
@@ -592,10 +595,12 @@ pub(crate) async fn retire_by_keys<R: Row>(
             inward.push((from, to));
             continue;
         }
+        // The parent's column first: compared by its collation, as the key
+        // compares, and through the child's index.
         let on: Vec<String> = from
             .iter()
             .zip(&to)
-            .map(|(f, t)| format!("c.{} = {}.{}", ident(f), R::QUALIFIED, ident(t)))
+            .map(|(f, t)| format!("{}.{} = c.{}", R::QUALIFIED, ident(t), ident(f)))
             .collect();
         pointers.push(format!(
             "EXISTS (SELECT 1 FROM {} c WHERE {}{stays})",
@@ -630,7 +635,7 @@ pub(crate) async fn retire_by_keys<R: Row>(
             let on: Vec<String> = from
                 .iter()
                 .zip(to)
-                .map(|(f, t)| format!("c.{} = p.{}", ident(f), ident(t)))
+                .map(|(f, t)| format!("p.{} = c.{}", ident(t), ident(f)))
                 .collect();
             let mut qb = sqlx::QueryBuilder::new(format!(
                 "SELECT {}, {retired_column} IS NOT NULL, {} FROM {} c JOIN (SELECT * FROM {}",
@@ -748,112 +753,139 @@ async fn keep<R: Row>(
     Ok(retired.kept - before)
 }
 
-/// The rows of a table that rows point at through one foreign key — rows
-/// of the replica's own, or of the server's — each with the values they
-/// point at it by: what that key, checked at commit, refuses once the row
-/// changes them or goes ([`broken`]).
+/// Which row of a table each row pointing at it through one foreign key
+/// points at — by the key's own comparison — as of when it was recorded,
+/// kept in a temporary table for [`broken`] to read once a message changed
+/// the table. A table without rowids is not recorded: what its rows point at
+/// is not found.
 #[cfg(feature = "sqlite")]
-pub(crate) struct Pointed {
+pub(crate) struct Pointing {
+    temp: String,
     child: String,
+    id: i64,
     from: Vec<String>,
-    to: Vec<String>,
-    rows: Vec<(String, Key)>,
 }
 
-/// The values of `columns` of the row `alias` as one text, each as SQL
-/// quotes it: the same values, the same text.
+/// What every foreign key into the table points at ([`Pointing`]), in
+/// temporary tables named from `name` on — none when the connection
+/// enforces no foreign key. [`forget`] drops them.
 #[cfg(feature = "sqlite")]
-fn quoted(alias: &str, columns: &[String]) -> String {
-    columns
-        .iter()
-        .map(|c| format!("quote({alias}.{})", ident(c)))
-        .collect::<Vec<_>>()
-        .join(" || ',' || ")
-}
-
-/// Every row of the table something points at, per foreign key into it
-/// ([`Pointed`]) — none when the connection enforces no foreign key.
-#[cfg(feature = "sqlite")]
-pub(crate) async fn pointed<R: Row>(exec: &mut Conn) -> Result<Vec<Pointed>, Error> {
+pub(crate) async fn pointing<R: Row>(exec: &mut Conn, name: usize) -> Result<Vec<Pointing>, Error> {
     let enforced: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
         .fetch_one(&mut *exec)
         .await?;
     if enforced == 0 {
         return Ok(Vec::new());
     }
-    let kinds = key_kinds::<R>();
     let mut out = Vec::new();
-    for (child, from, to) in crate::dialect::pointing(exec, R::TABLE, R::KEY).await? {
-        let on: Vec<String> = from
-            .iter()
-            .zip(&to)
-            .map(|(f, t)| format!("c.{} = p.{}", ident(f), ident(t)))
-            .collect();
-        let keys: Vec<String> = R::KEY.iter().map(|k| format!("p.{}", ident(k))).collect();
-        let rows = sqlx::query(&format!(
-            "SELECT {}, {} FROM {} p WHERE EXISTS (SELECT 1 FROM {} c WHERE {})",
-            keys.join(", "),
-            quoted("p", &to),
-            R::QUALIFIED,
-            ident(&child),
-            on.join(" AND ")
-        ))
-        .fetch_all(&mut *exec)
-        .await?;
-        let mut pointed = Vec::with_capacity(rows.len());
-        for row in &rows {
-            use sqlx::Row as _;
-            let values: String = row.try_get(R::KEY.len())?;
-            pointed.push((values, key_of_row(row, &kinds, 0)?));
+    for pointer in crate::dialect::pointing(exec, R::TABLE, R::KEY).await? {
+        if !crate::dialect::has_rowid(exec, &pointer.child).await? {
+            continue;
         }
-        out.push(Pointed {
-            child,
-            from,
-            to,
-            rows: pointed,
+        let temp = format!("sync_pointing_{}", name + out.len());
+        let from: Vec<String> = pointer
+            .from
+            .iter()
+            .enumerate()
+            .map(|(n, f)| format!("c.{} AS sync_from_{n}", ident(f)))
+            .collect();
+        let keys: Vec<String> = R::KEY
+            .iter()
+            .enumerate()
+            .map(|(n, k)| format!("p.{} AS sync_key_{n}", ident(k)))
+            .collect();
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE {temp} AS SELECT c.rowid AS sync_child, {}, {} FROM {} c \
+               JOIN {} p ON {}",
+            from.join(", "),
+            keys.join(", "),
+            ident(&pointer.child),
+            R::QUALIFIED,
+            crate::dialect::points("p", &pointer.to, "c", &pointer.from)
+        ))
+        .execute(&mut *exec)
+        .await?;
+        out.push(Pointing {
+            temp,
+            child: pointer.child,
+            id: pointer.id,
+            from: pointer.from,
         });
     }
     Ok(out)
 }
 
-/// The keys of `pointed` whose values a row still points at, and no row of
-/// the table holds any more: what a foreign key checked at commit refuses.
+/// The keys of the rows `pointing` recorded that rows still point at — by
+/// the same values — through a key the database finds broken: what a key
+/// checked at commit refuses, the table having changed or let go of them.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn broken<R: Row>(
     exec: &mut Conn,
-    pointed: &[Pointed],
+    pointing: &[Pointing],
 ) -> Result<Vec<Key>, Error> {
-    let mut out = Vec::new();
-    for key in pointed.iter().filter(|p| !p.rows.is_empty()) {
-        let on: Vec<String> = key
-            .from
-            .iter()
-            .zip(&key.to)
-            .map(|(f, t)| format!("p.{} = c.{}", ident(t), ident(f)))
-            .collect();
-        let present: Vec<String> = key
-            .from
-            .iter()
-            .map(|f| format!("c.{} IS NOT NULL", ident(f)))
-            .collect();
-        let dangling: std::collections::HashSet<String> = sqlx::query_scalar(&format!(
-            "SELECT DISTINCT {} FROM {} c WHERE {} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {})",
-            quoted("c", &key.from),
-            ident(&key.child),
-            present.join(" AND "),
-            R::QUALIFIED,
-            on.join(" AND ")
-        ))
-        .fetch_all(&mut *exec)
-        .await?
-        .into_iter()
+    let kinds = key_kinds::<R>();
+    let keys: Vec<String> = (0..R::KEY.len())
+        .map(|n| format!("w.sync_key_{n}"))
         .collect();
-        out.extend(
-            key.rows
-                .iter()
-                .filter(|(values, _)| dangling.contains(values))
-                .map(|(_, key)| key.clone()),
-        );
+    let mut out = Vec::new();
+    for p in pointing {
+        let same: Vec<String> = p
+            .from
+            .iter()
+            .enumerate()
+            .map(|(n, f)| format!("w.sync_from_{n} IS c.{}", ident(f)))
+            .collect();
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT {} FROM {} w JOIN {} c ON c.rowid = w.sync_child \
+              WHERE {} AND w.sync_child IN \
+                (SELECT rowid FROM pragma_foreign_key_check($1) WHERE fkid = $2)",
+            keys.join(", "),
+            p.temp,
+            ident(&p.child),
+            same.join(" AND ")
+        ))
+        .bind(&p.child)
+        .bind(p.id)
+        .fetch_all(&mut *exec)
+        .await?;
+        for row in &rows {
+            out.push(key_of_row(row, &kinds, 0)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Drops the temporary tables of `pointing`.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn forget(exec: &mut Conn, pointing: &[Pointing]) -> Result<(), Error> {
+    for p in pointing {
+        sqlx::query(&format!("DROP TABLE temp.{}", p.temp))
+            .execute(&mut *exec)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The keys of `keys` whose row the database finds pointing, through a
+/// foreign key, at a row it does not hold — none of a table without rowids.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn orphaned<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<Key>, Error> {
+    if !crate::dialect::has_rowid(exec, R::TABLE).await? {
+        return Ok(Vec::new());
+    }
+    let kinds = key_kinds::<R>();
+    let mut out = Vec::new();
+    for chunk in keys.chunks(keys_per_statement::<R>()) {
+        let mut qb =
+            sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(R::KEY), R::QUALIFIED));
+        key_filter::<R>(&mut qb, chunk);
+        qb.push(format!(
+            " AND rowid IN (SELECT rowid FROM pragma_foreign_key_check({}))",
+            crate::dialect::literal(R::TABLE)
+        ));
+        for row in qb.build().fetch_all(&mut *exec).await? {
+            out.push(key_of_row(&row, &kinds, 0)?);
+        }
     }
     Ok(out)
 }
@@ -874,21 +906,15 @@ pub(crate) async fn unparented<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<
         .await?
         .into_iter()
         .map(|(parent, from, to)| {
-            let set = |c: &String| format!("{}.{}", R::QUALIFIED, ident(c));
-            let known: Vec<String> = from
-                .iter()
-                .zip(&to)
-                .map(|(f, t)| format!("p.{} = {}", ident(t), set(f)))
-                .collect();
             let present: Vec<String> = from
                 .iter()
-                .map(|f| format!("{} IS NOT NULL", set(f)))
+                .map(|f| format!("{}.{} IS NOT NULL", R::QUALIFIED, ident(f)))
                 .collect();
             format!(
                 "({} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {}))",
                 present.join(" AND "),
                 ident(&parent),
-                known.join(" AND ")
+                crate::dialect::points("p", &to, R::QUALIFIED, &from)
             )
         })
         .collect();

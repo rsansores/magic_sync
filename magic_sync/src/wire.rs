@@ -302,22 +302,33 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.present(conn, keys)
     }
 
-    /// The rows of this table rows point at, by what they point at them with
-    /// ([`row::pointed`]).
+    /// What every foreign key into this table points at, recorded in
+    /// temporary tables named from `name` on ([`row::pointing`]).
     #[cfg(feature = "sqlite")]
-    pub(crate) fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>> {
-        self.ops.pointed(conn)
+    pub(crate) fn pointing<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        name: usize,
+    ) -> Fut<'a, Vec<row::Pointing>> {
+        self.ops.pointing(conn, name)
     }
 
-    /// The keys of `pointed` whose values rows still point at, and this table
-    /// no longer holds ([`row::broken`]).
+    /// The keys of the rows `pointing` recorded that rows still point at
+    /// through a key the database finds broken ([`row::broken`]).
     #[cfg(feature = "sqlite")]
     pub(crate) fn broken<'a>(
         &'a self,
         conn: &'a mut Conn,
-        pointed: &'a [row::Pointed],
+        pointing: &'a [row::Pointing],
     ) -> Fut<'a, Vec<Key>> {
-        self.ops.broken(conn, pointed)
+        self.ops.broken(conn, pointing)
+    }
+
+    /// The keys of `keys` whose row the database finds pointing at a row it
+    /// does not hold ([`row::orphaned`]).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn orphaned<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        self.ops.orphaned(conn, keys)
     }
 
     /// The keys of `keys` whose row points at one this replica does not hold
@@ -465,9 +476,12 @@ trait Ops<P>: Send + Sync {
     #[cfg(feature = "sqlite")]
     fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
-    fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>>;
+    fn pointing<'a>(&'a self, conn: &'a mut Conn, name: usize) -> Fut<'a, Vec<row::Pointing>>;
     #[cfg(feature = "sqlite")]
-    fn broken<'a>(&'a self, conn: &'a mut Conn, pointed: &'a [row::Pointed]) -> Fut<'a, Vec<Key>>;
+    fn broken<'a>(&'a self, conn: &'a mut Conn, pointing: &'a [row::Pointing])
+        -> Fut<'a, Vec<Key>>;
+    #[cfg(feature = "sqlite")]
+    fn orphaned<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
     fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
@@ -884,12 +898,21 @@ where
     }
 
     #[cfg(feature = "sqlite")]
-    fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>> {
-        Box::pin(row::pointed::<R>(conn))
+    fn pointing<'a>(&'a self, conn: &'a mut Conn, name: usize) -> Fut<'a, Vec<row::Pointing>> {
+        Box::pin(row::pointing::<R>(conn, name))
     }
 
     #[cfg(feature = "sqlite")]
-    fn broken<'a>(&'a self, conn: &'a mut Conn, pointed: &'a [row::Pointed]) -> Fut<'a, Vec<Key>> {
-        Box::pin(row::broken::<R>(conn, pointed))
+    fn broken<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        pointing: &'a [row::Pointing],
+    ) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::broken::<R>(conn, pointing))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn orphaned<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::orphaned::<R>(conn, keys))
     }
 }
