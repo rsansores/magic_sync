@@ -378,6 +378,29 @@ fn holders(relation: &str, key: &str) -> String {
     )
 }
 
+/// What replicas hold of the rows of the relation `relation` (SQL text)
+/// whose keys `keys` answers, as `SELECT replica_id, row_key, noted,
+/// refused` (see [`holds`]), looked up key by key.
+fn held_by_key(relation: &str, keys: &str) -> String {
+    format!(
+        "SELECT h.replica_id, h.row_key, h.noted, coalesce(h.refused >= h.sequence, false) AS refused \
+           FROM ({keys}) AS k(row_key) \
+          CROSS JOIN LATERAL (SELECT * FROM sync.held h \
+                               WHERE h.relation = {relation} AND h.row_key = k.row_key OFFSET 0) h"
+    )
+}
+
+/// What the replicas `replicas` answers hold of the relation `relation`,
+/// as [`held_by_key`] does, looked up replica by replica.
+fn held_by_replica(relation: &str, replicas: &str) -> String {
+    format!(
+        "SELECT h.replica_id, h.row_key, h.noted, coalesce(h.refused >= h.sequence, false) AS refused \
+           FROM ({replicas}) AS r(replica_id) \
+          CROSS JOIN LATERAL (SELECT * FROM sync.held h \
+                               WHERE h.replica_id = r.replica_id AND h.relation = {relation} OFFSET 0) h"
+    )
+}
+
 /// The rows of `f` — `replica_id` and `row_key`, a row of `table`, worked
 /// out apart — that their replica holds, as a join.
 fn held_by(f: &str, table: &str) -> String {
@@ -414,15 +437,15 @@ fn not_null(alias: &str, columns: &[String]) -> String {
 /// marked; the batch's notes and what they changed; the rows that cannot
 /// go, those whose place is in question, and those a replica keeps beyond
 /// what its tables' rules send it — the parents and followers those need,
-/// the rows in question it keeps; the replicas the plan touches, and the
-/// rows set aside it owes no replica any more. Each
-/// is keyed, and a round adds to it what it lacks, so a row found again is
-/// found once.
+/// the rows in question it keeps; what the rules send of the rows the batch
+/// asks about; the replicas the plan touches, and the rows set aside it
+/// owes no replica any more. The sets a round adds to are keyed, so a row
+/// found again is found once.
 ///
-/// The rows the rules send — every row of a table changed for every
-/// replica of a partition, every row for a replica provisioned — are never
-/// kept here: what of them goes is read as it is sent, and only what they
-/// need besides is kept.
+/// What the rules hold a replica to is never kept whole — every row of a
+/// table changed for every replica of a partition: of the rows the batch
+/// asks about only what goes is kept, no more than what records it; and a
+/// replica provisioned is sent every row of its rules as they are read.
 const PLAN_TABLES: &str = "
 CREATE TEMP TABLE IF NOT EXISTS sync_live (replica_id UUID PRIMARY KEY, fresh BOOLEAN NOT NULL)
     ON COMMIT DELETE ROWS;
@@ -449,6 +472,8 @@ CREATE TEMP TABLE IF NOT EXISTS sync_kept (
     replica_id UUID, rel INTEGER, row_key TEXT, round INTEGER NOT NULL,
     sends BOOLEAN NOT NULL, up BOOLEAN NOT NULL, down BOOLEAN NOT NULL,
     PRIMARY KEY (replica_id, rel, row_key)) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE IF NOT EXISTS sync_sends (
+    rel INTEGER, row_key TEXT, replica_id UUID, lacks BOOLEAN) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_touched (replica_id UUID PRIMARY KEY) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_settled (replica_id UUID, relation TEXT, row_key TEXT)
     ON COMMIT DELETE ROWS;
@@ -463,7 +488,7 @@ SET LOCAL work_mem = '64MB';
 DELETE FROM sync_live; DELETE FROM sync_batch; DELETE FROM sync_changed;
 DELETE FROM sync_regrouped; DELETE FROM sync_reassigned; DELETE FROM sync_released;
 DELETE FROM sync_blocked; DELETE FROM sync_suspect; DELETE FROM sync_kept;
-DELETE FROM sync_touched; DELETE FROM sync_settled;
+DELETE FROM sync_sends; DELETE FROM sync_touched; DELETE FROM sync_settled;
 ";
 
 /// Parses a key back into its parts, as the table's key columns type them.
@@ -1515,6 +1540,7 @@ impl Engine {
         let mut blocked_from = 0;
         loop {
             blocked_from = self.spread_blocked(conn, blocked_from).await?;
+            self.keep_sends(conn, &asked).await?;
             self.question(conn, &asked).await?;
             self.keep_all(conn, &asked).await?;
             if !self.conflicts(conn, &asked, blocked_from).await? {
@@ -1526,7 +1552,7 @@ impl Engine {
             )
             .await?;
         }
-        self.touch(conn, &asked).await?;
+        self.touch(conn).await?;
         self.settled(conn, &asked).await?;
         let blocked: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
             "SELECT b.replica_id, b.rel, b.row_key, b.why FROM sync_blocked b \
@@ -1725,24 +1751,15 @@ impl Engine {
     /// pointed at before, for whoever holds it; the rows it holds that
     /// cannot go.
     async fn question(&self, conn: &mut Conn, asked: &Asked) -> Result<(), Error> {
-        for i in 0..self.plans.len() {
-            let Some(held) = self.held_asked(i, asked) else {
-                continue;
-            };
-            // What its rules still send it, asked of the rows it holds only.
-            let wanted = self
-                .wanted_sql(
-                    i,
-                    &self.key_among(i, "SELECT replica_id, row_key FROM h", true),
-                )
-                .map_or(String::new(), |w| {
-                    format!(" EXCEPT SELECT w.replica_id, w.key FROM ({w}) w")
-                });
-            let select = format!(
-                "WITH h AS MATERIALIZED (SELECT replica_id, row_key FROM ({held}) AS h) \
-                 SELECT q.replica_id, {i}, q.row_key, NULL FROM (TABLE h{wanted}) AS q(replica_id, row_key)"
-            );
-            self.add(conn, Set::Suspect, &select, 0).await?;
+        // The rows a table with a rule sends were put in question with
+        // what it sends (see `keep_sends`); those of a table with none, it
+        // holds only as long as something needs them.
+        for i in (0..self.plans.len()).filter(|&i| self.wanted_sql(i, "true").is_none()) {
+            if let Some(held) = self.held_asked(i, asked) {
+                let select =
+                    format!("SELECT h.replica_id, {i}, h.row_key, NULL FROM ({held}) AS h");
+                self.add(conn, Set::Suspect, &select, 0).await?;
+            }
         }
         if asked.released {
             // The parents a changed row pointed at, for whoever holds it.
@@ -1832,7 +1849,7 @@ impl Engine {
             }
         }
         for (c, reference) in self.references() {
-            if let Some(sends) = self.asked_sends(c, asked, true, "true") {
+            if let Some(sends) = self.asked_sends(c, asked, &not_null("t", &reference.columns)) {
                 let source = format!(
                     "SELECT a.replica_id, {} FROM ({sends}) a JOIN {} t ON {} WHERE {}",
                     key_sql("t", &reference.columns),
@@ -1844,7 +1861,7 @@ impl Engine {
             }
         }
         for (f, column, p) in self.followers() {
-            if let Some(sends) = self.asked_sends(p, asked, true, "true") {
+            if let Some(sends) = self.asked_sends(p, asked, "true") {
                 let source = format!(
                     "SELECT a.replica_id, {} FROM ({sends}) a JOIN {} t ON {} WHERE a.lacks",
                     self.key_of_row(f),
@@ -2089,7 +2106,7 @@ impl Engine {
                 "SELECT k.replica_id, k.row_key FROM sync_kept k WHERE k.rel = {c}"
             )];
             sources.extend(
-                self.asked_sends(c, asked, true, "true")
+                self.asked_sends(c, asked, "true")
                     .map(|sends| format!("SELECT a.replica_id, a.row_key FROM ({sends}) a")),
             );
             let select = format!(
@@ -2226,69 +2243,127 @@ impl Engine {
     }
 
     /// The rows of `i` its rule sends a live replica that the batch asks
+    /// about — every one, for a replica provisioned: read as they are sent,
+    /// never kept, a snapshot of every replica of a partition being as large
+    /// as it is; and of a key changed or moved between groups, of a group
+    /// given or taken, what `sync_sends` kept of them — that the replica
+    /// lacks, refused, or holds a version of from before a change of the
+    /// batch, but those that cannot go: `SELECT replica_id, row_key, lacks`;
+    /// those read as they are sent narrowed by `filter` on the table aliased
+    /// `t` and the replicas aliased `s`. `None` when the batch asks about
+    /// none.
+    fn asked_sends(&self, i: usize, asked: &Asked, filter: &str) -> Option<String> {
+        let mut parts: Vec<String> = self.fresh_sends(i, asked, filter).into_iter().collect();
+        if [&asked.changed, &asked.regrouped, &asked.reassigned]
+            .iter()
+            .any(|asks| asks.contains(&i))
+        {
+            parts.push(format!(
+                "SELECT replica_id, row_key, lacks FROM sync_sends WHERE rel = {i}"
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(" UNION ALL "))
+    }
+
+    /// Keeps in `sync_sends` the rows the rules send that the batch asks
     /// about — of a key changed or moved between groups, of a group given
-    /// or taken, every one for a replica provisioned when `fresh` — that
-    /// the replica lacks, refused, or holds a version of from before a
-    /// change of the batch, but those that cannot go, narrowed by `filter`
-    /// on the table aliased `t` and the replicas aliased `s`: `SELECT
-    /// replica_id, row_key, lacks`. Read as they are sent, never kept: a
-    /// rule's rows are every replica's of a partition. `None` when the
-    /// batch asks about none.
-    fn asked_sends(&self, i: usize, asked: &Asked, fresh: bool, filter: &str) -> Option<String> {
-        let table = literal(self.plans[i].table);
-        let held = "s.id IN (SELECT replica_id FROM sync_live WHERE NOT fresh)";
-        let reassigned =
-            format!("s.id IN (SELECT replica_id FROM sync_reassigned WHERE rel = {i})");
-        let mut parts = Vec::new();
-        if fresh && asked.fresh {
-            let wanted = self.wanted_sql(
-                i,
-                &format!("{filter} AND s.id IN (SELECT replica_id FROM sync_live WHERE fresh)"),
-            )?;
-            parts.push(format!(
-                "SELECT w.replica_id, w.key, true FROM ({wanted}) w"
-            ));
-        }
-        let keyed: Vec<String> = [
-            (&asked.changed, "sync_changed"),
-            (&asked.regrouped, "sync_regrouped"),
-        ]
-        .into_iter()
-        .filter(|(asks, _)| asks.contains(&i))
-        .map(|(_, of)| format!("SELECT row_key FROM {of} WHERE rel = {i}"))
-        .collect();
-        let mut wanted = Vec::new();
-        if !keyed.is_empty() {
-            let mut narrowed = format!(
-                "{filter} AND {held} AND {}",
-                self.key_among(i, &keyed.join(" UNION ALL "), false)
-            );
-            if asked.reassigned.contains(&i) {
-                narrowed = format!("{narrowed} AND NOT {reassigned}");
+    /// or taken; not those of a replica provisioned — that the replica
+    /// lacks, refused, or holds a version of from before a change of the
+    /// batch, but those that cannot go: no more than what records it holds
+    /// them. And of those rows, the ones a replica holds that its rules no
+    /// longer send it, in `sync_suspect`: their place is in question.
+    ///
+    /// What the rules send and what the replicas hold of the rows asked
+    /// about are read once each, and compared as sets, whatever the
+    /// statistics of the tables they are read from say.
+    async fn keep_sends(&self, conn: &mut Conn, asked: &Asked) -> Result<(), Error> {
+        sqlx::Executor::execute(&mut *conn, "DELETE FROM sync_sends").await?;
+        let held = "IN (SELECT replica_id FROM sync_live WHERE NOT fresh)";
+        for i in 0..self.plans.len() {
+            let table = literal(self.plans[i].table);
+            let reassigned = format!("IN (SELECT replica_id FROM sync_reassigned WHERE rel = {i})");
+            let keys: Vec<String> = [
+                (&asked.changed, "sync_changed"),
+                (&asked.regrouped, "sync_regrouped"),
+            ]
+            .into_iter()
+            .filter(|(asks, _)| asks.contains(&i))
+            .map(|(_, of)| format!("SELECT row_key FROM {of} WHERE rel = {i}"))
+            .collect();
+            let mut sets = Vec::new();
+            if !keys.is_empty() {
+                let keys = keys.join(" UNION ");
+                let mut those = format!("{held} AND {}", self.key_among(i, &keys, false));
+                let mut holders = format!("h.replica_id {held}");
+                if asked.reassigned.contains(&i) {
+                    those = format!("{those} AND s.id NOT {reassigned}");
+                    holders = format!("{holders} AND h.replica_id NOT {reassigned}");
+                }
+                sets.push((
+                    self.wanted_sql(i, &format!("s.id {those}")),
+                    format!(
+                        "SELECT * FROM ({}) h WHERE {holders}",
+                        held_by_key(&table, &keys)
+                    ),
+                ));
             }
-            wanted.push(self.wanted_sql(i, &narrowed)?);
+            if asked.reassigned.contains(&i) {
+                let replicas = format!(
+                    "SELECT x.replica_id FROM sync_reassigned x JOIN sync_live l USING (replica_id) \
+                      WHERE x.rel = {i} AND NOT l.fresh"
+                );
+                sets.push((
+                    self.wanted_sql(i, &format!("s.id {held} AND s.id {reassigned}")),
+                    held_by_replica(&table, &replicas),
+                ));
+            }
+            // A table with no rule of its own: its rows in question are
+            // read with the rest (see `question`).
+            for (wanted, holds) in sets {
+                let Some(wanted) = wanted else { continue };
+                sqlx::query(&format!(
+                    "WITH w AS MATERIALIZED (SELECT w.replica_id, w.key FROM ({wanted}) w), \
+                          h AS MATERIALIZED (SELECT h.replica_id, h.row_key, h.refused, {} AS stale \
+                                               FROM ({holds}) h \
+                                               LEFT JOIN sync_changed c ON c.rel = {i} AND c.row_key = h.row_key), \
+                          doubted AS (INSERT INTO sync_suspect (replica_id, rel, row_key, round) \
+                                      SELECT q.replica_id, {i}, q.row_key, 0 \
+                                        FROM (SELECT replica_id, row_key FROM h EXCEPT TABLE w) q \
+                                      ON CONFLICT DO NOTHING) \
+                     INSERT INTO sync_sends \
+                     SELECT {i}, q.row_key, q.replica_id, q.lacks \
+                       FROM (SELECT q.*, true AS lacks \
+                               FROM (TABLE w EXCEPT SELECT replica_id, row_key FROM h WHERE NOT refused) q \
+                             UNION ALL \
+                             SELECT q.*, false \
+                               FROM (SELECT replica_id, row_key FROM h WHERE NOT refused AND stale \
+                                     INTERSECT TABLE w) q) AS q(replica_id, row_key, lacks) \
+                      WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
+                                           AND b.rel = {i} AND b.row_key = q.row_key)",
+                    stale("c.noted")
+                ))
+                .execute(&mut *conn)
+                .await?;
+            }
         }
-        if asked.reassigned.contains(&i) {
-            wanted.push(self.wanted_sql(i, &format!("{filter} AND {held} AND {reassigned}"))?);
-        }
-        for wanted in wanted {
-            parts.push(format!(
-                "SELECT w.replica_id, w.key, h.replica_id IS NULL OR h.refused FROM ({wanted}) w \
-                   {} \
-                   LEFT JOIN sync_changed c ON c.rel = {i} AND c.row_key = w.key \
-                  WHERE h.replica_id IS NULL OR h.refused OR {}",
-                holds("LEFT JOIN", "h", "w.replica_id", &table, "w.key"),
-                stale("c.noted")
-            ));
-        }
-        if parts.is_empty() {
+        analyze(conn, "sync_sends").await
+    }
+
+    /// The rows of `i` its rule sends the replicas provisioned, every one,
+    /// but those that cannot go, narrowed by `filter` on the table aliased
+    /// `t` and the replicas aliased `s`: `SELECT replica_id, row_key, lacks`.
+    fn fresh_sends(&self, i: usize, asked: &Asked, filter: &str) -> Option<String> {
+        if !asked.fresh {
             return None;
         }
+        let wanted = self.wanted_sql(
+            i,
+            &format!("{filter} AND s.id IN (SELECT replica_id FROM sync_live WHERE fresh)"),
+        )?;
         Some(format!(
-            "SELECT a.* FROM ({}) AS a(replica_id, row_key, lacks) \
-              WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = a.replica_id \
-                                   AND b.rel = {i} AND b.row_key = a.row_key)",
-            parts.join(" UNION ALL ")
+            "SELECT w.replica_id, w.key AS row_key, true AS lacks FROM ({wanted}) w \
+              WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = w.replica_id \
+                                   AND b.rel = {i} AND b.row_key = w.key)"
         ))
     }
 
@@ -2304,23 +2379,21 @@ impl Engine {
             (&asked.regrouped, "sync_regrouped"),
         ] {
             if asks.contains(&i) {
-                parts.push(format!(
-                    "SELECT c.replica_id, x.row_key FROM {of} x {} WHERE x.rel = {i}",
-                    holders(&table, "x.row_key")
-                ));
+                let keys = format!("SELECT row_key FROM {of} WHERE rel = {i}");
+                parts.push(held_by_key(&table, &keys));
             }
         }
         if asked.reassigned.contains(&i) {
-            parts.push(format!(
-                "SELECT h.replica_id, h.row_key FROM sync_reassigned x \
-                   JOIN sync_live l ON l.replica_id = x.replica_id AND NOT l.fresh \
-                  CROSS JOIN LATERAL (SELECT h.replica_id, h.row_key FROM sync.held h \
-                                       WHERE h.replica_id = x.replica_id AND h.relation = {table} \
-                                      OFFSET 0) h \
-                  WHERE x.rel = {i}"
-            ));
+            let replicas = format!("SELECT replica_id FROM sync_reassigned WHERE rel = {i}");
+            parts.push(held_by_replica(&table, &replicas));
         }
-        (!parts.is_empty()).then(|| parts.join(" UNION "))
+        (!parts.is_empty()).then(|| {
+            format!(
+                "SELECT h.replica_id, h.row_key FROM ({}) AS h \
+                  WHERE h.replica_id IN (SELECT replica_id FROM sync_live WHERE NOT fresh)",
+                parts.join(" UNION ")
+            )
+        })
     }
 
     /// What the batch the plan in this transaction planned asks about, as
@@ -2354,16 +2427,13 @@ impl Engine {
 
     /// Records in `sync_touched` every replica the plan sends to, takes
     /// from or provisions.
-    async fn touch(&self, conn: &mut Conn, asked: &Asked) -> Result<(), Error> {
+    async fn touch(&self, conn: &mut Conn) -> Result<(), Error> {
         let mut sources = vec![
             "SELECT replica_id FROM sync_live WHERE fresh".to_owned(),
             "SELECT replica_id FROM sync_kept WHERE sends".to_owned(),
             format!("SELECT replica_id FROM ({}) AS d", Self::DROPPED),
         ];
-        sources.extend((0..self.plans.len()).filter_map(|i| {
-            self.asked_sends(i, asked, false, "true")
-                .map(|sends| format!("SELECT DISTINCT replica_id FROM ({sends}) AS a"))
-        }));
+        sources.push("SELECT DISTINCT replica_id FROM sync_sends".to_owned());
         for source in sources {
             sqlx::query(&format!(
                 "INSERT INTO sync_touched {source} ON CONFLICT DO NOTHING"
@@ -2390,40 +2460,70 @@ impl Engine {
             .collect())
     }
 
-    /// Every row the plan sends a live replica, `(rel, row_key,
-    /// replica_id)`: what the rules send that the batch asks about, and
-    /// what the replicas keep besides.
-    fn sent_sql(&self, asked: &Asked) -> String {
-        let mut parts: Vec<String> = (0..self.plans.len())
-            .filter_map(|i| {
-                self.asked_sends(i, asked, true, "true").map(|sends| {
-                    format!(
-                        "SELECT {i}, a.row_key, a.replica_id FROM ({sends}) a \
-                          WHERE NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = a.replica_id \
-                                               AND k.rel = {i} AND k.row_key = a.row_key)"
-                    )
-                })
-            })
-            .collect();
-        parts.push(
-            "SELECT k.rel, k.row_key, k.replica_id FROM sync_kept k WHERE k.sends".to_owned(),
-        );
-        parts.join(" UNION ALL ")
-    }
-
     /// Opens, as the cursor `sync_sent`, every row the plan sends a live
-    /// replica — `(table, key, replica)` — tables parents first, each by
-    /// key: read once, a page at a time, by [`Engine::next`].
+    /// replica — `(table, key, replica)` — tables parents first, and of a
+    /// table what its rules send a replica provisioned, the rest they send,
+    /// and what the replicas keep besides, each by key: read once, a page at
+    /// a time, by [`Engine::next`]. A snapshot is read in the order of the
+    /// table's key, which its index gives, rather than sorted whole.
     pub(crate) async fn open_sent(&self, conn: &mut Conn) -> Result<(), Error> {
         let asked = self.asked(conn).await?;
+        let mut parts = Vec::new();
+        for &i in &self.order {
+            let plan = &self.plans[i];
+            let key = self.key_of_row(i);
+            let unkept = |replica: &str, key: &str| {
+                format!(
+                    "NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = {replica} \
+                                    AND k.rel = {i} AND k.row_key = {key})"
+                )
+            };
+            let fresh = format!(
+                "s.id IN (SELECT replica_id FROM sync_live WHERE fresh) \
+                 AND NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = s.id \
+                                    AND b.rel = {i} AND b.row_key = {key}) AND {}",
+                unkept("s.id", &key)
+            );
+            if asked.fresh && matches!(plan.route, Route::Broadcast) {
+                // Every row for every replica of its partition: the rows
+                // are put in order, each then joined to its replicas, so
+                // what goes is never sorted whole.
+                parts.push(format!(
+                    "(SELECT {i}, t.key, s.id FROM (SELECT {key} AS key, t.* FROM {} t ORDER BY 1 OFFSET 0) t \
+                       CROSS JOIN LATERAL (SELECT s.id FROM {} WHERE {} AND {fresh} OFFSET 0) s)",
+                    plan.active,
+                    self.replicas_sql(),
+                    self.same_partition(),
+                ));
+            } else if let Some(wanted) = self.wanted_sql(i, &fresh).filter(|_| asked.fresh) {
+                let by = match plan.route {
+                    Route::Grouped { .. } => "2".to_owned(),
+                    _ => plan
+                        .key
+                        .iter()
+                        .map(|c| format!("t.{}", ident(c.name)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+                parts.push(format!(
+                    "(SELECT {i}, x.key, x.replica_id FROM ({wanted} ORDER BY {by}) AS x)"
+                ));
+            }
+            parts.push(format!(
+                "(SELECT {i}, s.row_key, s.replica_id FROM sync_sends s \
+                   WHERE s.rel = {i} AND {} ORDER BY s.row_key)",
+                unkept("s.replica_id", "s.row_key")
+            ));
+            parts.push(format!(
+                "(SELECT k.rel, k.row_key, k.replica_id FROM sync_kept k \
+                   WHERE k.rel = {i} AND k.sends ORDER BY k.row_key)"
+            ));
+        }
         sqlx::Executor::execute(
             &mut *conn,
             format!(
-                "DECLARE sync_sent NO SCROLL CURSOR FOR \
-                 SELECT * FROM ({}) AS x(rel, row_key, replica_id) \
-                  ORDER BY array_position({}, x.rel), x.row_key",
-                self.sent_sql(&asked),
-                self.order_array(false)
+                "DECLARE sync_sent NO SCROLL CURSOR FOR {}",
+                parts.join(" UNION ALL ")
             )
             .as_str(),
         )
@@ -2443,9 +2543,12 @@ impl Engine {
                 "SELECT replica_id, row_key FROM sync_kept WHERE rel = {i} AND sends"
             )];
             sent.extend(
-                self.asked_sends(i, asked, true, &self.key_among(i, &quarantined, true))
+                self.fresh_sends(i, asked, &self.key_among(i, &quarantined, true))
                     .map(|sends| format!("SELECT replica_id, row_key FROM ({sends}) AS a")),
             );
+            sent.push(format!(
+                "SELECT replica_id, row_key FROM sync_sends WHERE rel = {i}"
+            ));
             sqlx::query(&format!(
                 "INSERT INTO sync_settled \
                  SELECT q.replica_id, q.relation, q.row_key FROM sync.quarantine q \
