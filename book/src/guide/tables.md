@@ -61,6 +61,18 @@ declaration changes.
 > it needs. Leave a trigger on a table no row declares, and it refuses too: its
 > changes would be noted and never sent.
 
+The planner looks rows up by more than their keys: by the columns that point
+at another mirrored table, by a row's replica or partition column, by the
+column a table follows, and a group's members by their row and their group,
+its assignments by their group and their replica. On a large table, a lookup
+no index serves reads the whole table on every pass, so the server needs an
+index for each: one of yours serves when it leads with those columns, in any
+order. [`Engine::indexes`] prints, one `CREATE INDEX` per line, those your
+database does not have — write them in the migration beside the triggers.
+
+> **What happens:** forget one, and the server refuses to start, printing the
+> indexes it needs.
+
 > **Mind:** a trigger as printed does not fire in a session whose
 > `session_replication_role` is `replica` — a logical replication
 > subscription applying changes, a restore told to disable triggers — so
@@ -74,8 +86,8 @@ declaration changes.
 > the server with `Server::install` instead of `Server::new`
 > ([The server](server.md)). Every time it starts, in one transaction and one
 > process at a time, it brings the `sync` schema to the version this build
-> needs and writes every trigger that is missing or not as the engine needs
-> it. Run it before anything writes a mirrored table: a write before its
+> needs, writes every trigger that is missing or not as the engine needs
+> it, and creates every index it needs that no index serves. Run it before anything writes a mirrored table: a write before its
 > trigger exists is never noted.
 
 ## On a register
@@ -132,6 +144,7 @@ over the database your migrations build.
 
 [`magic_sync::plan::migration`]: ../api/server/magic_sync/plan/fn.migration.html
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers
+[`Engine::indexes`]: ../api/server/magic_sync/plan/struct.Engine.html#method.indexes
 [`magic_sync::replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
 [`magic_sync::replica::install`]: ../api/replica/magic_sync/replica/fn.install.html
 [`magic_sync::replica::check`]: ../api/replica/magic_sync/replica/fn.check.html

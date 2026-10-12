@@ -636,7 +636,9 @@ async fn world(pool: crate::DbPool) -> World {
         .expect("schema");
     // A write that waits on the long writer gives up, rather than wait on
     // a transaction this same thread is to commit.
-    sqlx::raw_sql("SET lock_timeout = '100ms'")
+    // Each statement planned as it runs, rather than as a plan cached
+    // before a pass refused sequential scans.
+    sqlx::raw_sql("SET lock_timeout = '100ms'; SET plan_cache_mode = force_custom_plan")
         .execute(&mut *conn)
         .await
         .expect("a lock timeout");
@@ -750,7 +752,36 @@ impl World {
                 .expect("held")
                 .into_iter()
                 .collect();
+        // Every lookup the planner makes on a host table is served by an
+        // index: refused a sequential scan, it makes one only where none
+        // serves it. (What the connection counted before is not reported
+        // until the transaction ends: what this one adds is the difference.)
+        sqlx::raw_sql("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .expect("no sequential scans");
+        let scans = "SELECT relname::text, seq_scan FROM pg_stat_xact_user_tables \
+                      WHERE schemaname = 'fixture'";
+        let before: BTreeMap<String, i64> = sqlx::query_as(scans)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("scans")
+            .into_iter()
+            .collect();
         let outcome = relay.record(&mut tx).await.expect("recorded");
+        let scanned: Vec<String> = sqlx::query_as::<_, (String, i64)>(scans)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("scans")
+            .into_iter()
+            .filter(|(table, count)| before.get(table) != Some(count))
+            .map(|(table, _)| table)
+            .collect();
+        assert!(
+            scanned.is_empty(),
+            "the planner scanned host tables whole: {scanned:?}; last steps: {:#?}",
+            &self.history[self.history.len().saturating_sub(8)..]
+        );
         // Nothing here is a note no build can plan: a note parked is the
         // planner failing.
         assert!(
@@ -2165,9 +2196,43 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .execute(&mut *conn)
         .await
         .expect("a host's migration");
+    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let indexes = Engine::indexes(&mut conn, &codecs, REPLICAS)
+        .await
+        .expect("the indexes");
+    assert!(
+        why.contains(&indexes) && indexes.contains("t_list_members\" (\"customer_id\")"),
+        "refused naming the indexes it prints: {why}"
+    );
+    // One of the host's own serves, whatever its name, leading with the
+    // columns in another order.
+    sqlx::raw_sql(
+        "CREATE INDEX by_number ON fixture.t_account_members (number, region, partition_id)",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("an index of the host's");
+    let indexes = Engine::indexes(&mut conn, &codecs, REPLICAS)
+        .await
+        .expect("the indexes");
+    assert!(
+        !indexes.contains("t_account_members\" (\"region"),
+        "{indexes}"
+    );
+    sqlx::raw_sql(&indexes)
+        .execute(&mut *conn)
+        .await
+        .expect("a host's migration");
     Engine::new(&mut conn, &tables, REPLICAS)
         .await
-        .expect("the triggers it printed are the ones it needs");
+        .expect("the triggers and indexes it printed are the ones it needs");
+    assert_eq!(
+        Engine::indexes(&mut conn, &codecs, REPLICAS)
+            .await
+            .expect("the indexes"),
+        "",
+        "none missing"
+    );
 
     // Keyed as the primary key orders it, not as the row declares it: every
     // key it noted would be read the other way round.
@@ -3311,7 +3376,9 @@ async fn a_database_moved_to_another_cluster_keeps_sending_what_changes(pool: cr
         .await
         .expect("the moved database");
     world.conn = world.pool.acquire().await.expect("a connection");
-    sqlx::raw_sql("SET lock_timeout = '100ms'")
+    // Each statement planned as it runs, rather than as a plan cached
+    // before a pass refused sequential scans.
+    sqlx::raw_sql("SET lock_timeout = '100ms'; SET plan_cache_mode = force_custom_plan")
         .execute(&mut *world.conn)
         .await
         .expect("a lock timeout");

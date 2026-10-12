@@ -36,6 +36,7 @@ pub async fn magic_sync::plan::Engine::overview(&self, &mut magic_sync::Conn, ma
 pub async fn magic_sync::plan::Engine::progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>) -> core::result::Result<magic_sync::status::Progress, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::row_progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, &str, &str) -> core::result::Result<magic_sync::status::RowProgress, magic_sync::Error>
 impl magic_sync::plan::Engine
+pub async fn magic_sync::plan::Engine::indexes<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>], magic_sync::plan::Replicas) -> core::result::Result<alloc::string::String, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::triggers<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>], magic_sync::plan::Replicas) -> core::result::Result<alloc::string::String, magic_sync::Error>
 impl core::fmt::Debug for magic_sync::plan::Engine
 pub fn magic_sync::plan::Engine::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

@@ -259,7 +259,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// [`Error::Misuse`] when the database is not what the engine needs —
     /// its schema at another version, a table that is not its row column for
     /// column, a trigger missing or different from what [`Engine::triggers`]
-    /// prints — or for a declaration the schema cannot honour, or settings
+    /// prints, an index [`Engine::indexes`] prints — or for a declaration the schema cannot honour, or settings
     /// the server cannot run with; [`Error::Database`] when the database
     /// fails.
     pub async fn new(
@@ -284,7 +284,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// for a host with no migrations of its own: in one transaction, and one
     /// process at a time, the engine's schema installed or upgraded and every
     /// trigger missing or different written (any of the engine's on a table
-    /// no longer declared dropped). A table mirrored for the first time that
+    /// no longer declared dropped), and every index the planner needs that
+    /// none serves created. A table mirrored for the first time that
     /// already has rows is sent whole. Run it before anything writes a
     /// mirrored table — a write before its trigger is never noted — on a
     /// pool whose connections may create triggers.
