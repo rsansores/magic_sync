@@ -454,8 +454,9 @@ For a table the replica writes and the server mirrors:
    noted: it is the server's already. A row of a table written on both sides
    begins on the server; the replica edits only its own columns of it, and
    only those edits go up: it **must** refuse an insert of one, an update
-   of a column it does not own, and a delete unless the table is keyed by
-   the replica. A record without a version is history, written once.
+   of a column it does not own, and a delete of one but a row keyed by
+   itself, in a table keyed by the replica. A record without a version is
+   history, written once.
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only
@@ -534,7 +535,11 @@ backlog, and the last applied message.
 
 From time to time (hourly is reasonable), a replica **should** report what it
 holds of every table the server sends it, in `Up.digests`, together with the
-`(epoch, sequence, nonce, mac)` of the last message it applied (5.2):
+`(epoch, sequence, nonce, mac)` of the last message it applied (5.2). It
+**must** leave out a table it wrote rows of that the server has not filed
+(`Filed`, 4.4): the server records a row the replica deleted as held until
+it files the delete — in the transaction that files it, it records the row
+held no more.
 
 - `table`: the table;
 - `count`: how many rows it holds, **leaving out** rows it retired (4.3) and

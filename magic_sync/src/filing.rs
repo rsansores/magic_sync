@@ -506,7 +506,8 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
 /// The server letting go of `keys`, rows `sender` deleted — of its own rows
 /// only — each it refuses for its data (a row of the server's that still
 /// points at it) answered apart with why, so one refused delete holds back
-/// nothing else.
+/// nothing else. What `sender` let go of it no longer holds, nor has on its
+/// way back: what it says it holds next leaves them out.
 async fn delete<P: Sync + 'static>(
     conn: &mut Conn,
     codec: &Codec<P>,
@@ -516,16 +517,31 @@ async fn delete<P: Sync + 'static>(
     if keys.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    if let Ok(gone) = delete_guarded(conn, codec, keys, sender).await? {
-        return Ok((gone, Vec::new()));
-    }
-    let mut gone = Vec::new();
-    let mut refused = Vec::new();
-    for key in keys {
-        match delete_guarded(conn, codec, std::slice::from_ref(key), sender).await? {
-            Ok(one) => gone.extend(one),
-            Err(e) => refused.push((key.clone(), e.to_string())),
+    let (gone, refused) = match delete_guarded(conn, codec, keys, sender).await? {
+        Ok(gone) => (gone, Vec::new()),
+        Err(_) => {
+            let mut gone = Vec::new();
+            let mut refused = Vec::new();
+            for key in keys {
+                match delete_guarded(conn, codec, std::slice::from_ref(key), sender).await? {
+                    Ok(one) => gone.extend(one),
+                    Err(e) => refused.push((key.clone(), e.to_string())),
+                }
+            }
+            (gone, refused)
         }
+    };
+    let texts: Vec<String> = gone.iter().map(key_text).collect();
+    for sql in [
+        "DELETE FROM sync.held WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+        "DELETE FROM sync.gone WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+    ] {
+        sqlx::query(sql)
+            .bind(sender)
+            .bind(codec.table.name)
+            .bind(&texts)
+            .execute(&mut *conn)
+            .await?;
     }
     Ok((gone, refused))
 }

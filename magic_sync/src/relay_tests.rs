@@ -22,6 +22,9 @@ CREATE TABLE fixture.items (
 CREATE VIEW items AS SELECT * FROM fixture.items WHERE retired_at IS NULL;
 CREATE TABLE fixture.tallies (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, title TEXT NOT NULL, seen INTEGER NOT NULL);
+CREATE TABLE fixture.pads (
+    replica_id UUID NOT NULL, id UUID NOT NULL, partition_id UUID NOT NULL, title TEXT NOT NULL,
+    seen INTEGER NOT NULL, PRIMARY KEY (replica_id, id));
 ";
 
 /// Written on both sides: the server's title, the replicas' count.
@@ -33,6 +36,26 @@ CREATE TABLE fixture.tallies (
     sync = "broadcast"
 )]
 struct Tally {
+    id: Uuid,
+    partition_id: Uuid,
+    title: String,
+    #[row(replica_owned)]
+    seen: i32,
+}
+
+/// Written on both sides and keyed by a replica: each replica's own, which
+/// it may delete, and every replica of the partition holds.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "pads",
+    schema = "fixture",
+    mirror = "both",
+    sync = "broadcast",
+    key = "replica_id, id",
+    origin = "replica_id"
+)]
+struct Pad {
+    replica_id: Uuid,
     id: Uuid,
     partition_id: Uuid,
     title: String,
@@ -156,9 +179,13 @@ async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
             .await
             .expect("a replica");
     }
-    let (items, tally) = (Table::of::<Item>(), Table::of::<Tally>());
+    let (items, tally, pad) = (
+        Table::of::<Item>(),
+        Table::of::<Tally>(),
+        Table::of::<Pad>(),
+    );
     let tables: Vec<&Table> = if tallies {
-        vec![&items, &tally]
+        vec![&items, &tally, &pad]
     } else {
         vec![&items]
     };
@@ -173,6 +200,7 @@ async fn world_of(pool: crate::DbPool, tallies: bool) -> World {
         codecs: [
             Some(Codec::new::<Item, ItemRow>(to_wire, from_wire, None)),
             tallies.then(|| Codec::json::<Tally>(None)),
+            tallies.then(|| Codec::json::<Pad>(None)),
         ]
         .into_iter()
         .flatten()
@@ -2737,4 +2765,79 @@ async fn a_body_sent_to_every_replica_is_stored_once(pool: crate::DbPool) {
         wire.delivered(),
         BTreeMap::from([(a, names(&["one"])), (b, names(&["one"]))])
     );
+}
+
+/// A replica deletes a two-way row of its own: the server lets it go, and
+/// no longer records the replica holding it — so the digests it sends with
+/// the delete, which leave the row out, agree with what is recorded — and
+/// takes it back from every other replica holding it.
+#[sqlx::test(migrations = false)]
+async fn a_replica_that_deletes_its_own_two_way_row_holds_what_is_recorded(pool: crate::DbPool) {
+    use crate::envelope::{fingerprint, Digest};
+    let world = world_of(pool, true).await;
+    let [a, b] = world.replicas;
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO fixture.pads (replica_id, id, partition_id, title, seen) \
+         VALUES ($1, $2, $3, 'mine', 0)",
+    )
+    .bind(a)
+    .bind(id)
+    .bind(world.partition)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let wire = Wire::new(0);
+    world.pass(&wire).await;
+    for replica in world.replicas {
+        world
+            .acknowledge(replica, world.last_sent(replica).await)
+            .await;
+    }
+    let key = format!("{a}|{id}");
+    let held = |replica: Uuid| {
+        let world = &world;
+        let key = key.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM sync.held WHERE replica_id = $1 AND relation = 'pads' \
+                   AND row_key = $2",
+            )
+            .bind(replica)
+            .bind(key)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!((held(a).await, held(b).await), (1, 1));
+
+    let mut up = crate::testkit::confirmation(&world.pool, a, world.last_sent(a).await).await;
+    up.tables = vec![envelope::Table {
+        table: "pads".to_owned(),
+        deletes: vec![envelope::Key {
+            parts: vec![a.to_string(), id.to_string()],
+        }],
+        ..envelope::Table::default()
+    }];
+    up.digests = ["items", "tallies", "pads"]
+        .into_iter()
+        .map(|table| Digest {
+            table: table.to_owned(),
+            count: 0,
+            fingerprint: fingerprint(Vec::new()),
+        })
+        .collect();
+    world.file(a, &up).await;
+    assert_eq!(world.count("SELECT count(*) FROM fixture.pads").await, 0);
+    assert_eq!(held(a).await, 0, "not recorded held by the replica that deleted it");
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE kind = 'resync'")
+            .await,
+        2,
+        "its digests agree: provisioned no more than when it began"
+    );
+    world.pass(&wire).await;
+    assert_eq!(held(b).await, 0, "taken back from the others");
 }
