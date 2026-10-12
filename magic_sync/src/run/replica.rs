@@ -235,15 +235,19 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
             replica::settled(&mut tx).await?;
             let stop = match replica::receive(&mut tx, &self.codecs, bytes, &care).await {
-                Ok(received) => {
-                    tx.commit().await?;
-                    break received;
+                // A key checked at commit may refuse it: a row of the
+                // message is at fault, and found once applied carefully.
+                Ok(received) => match tx.commit().await {
+                    Ok(()) => break received,
+                    Err(e) => Stop::Failed(e.into()),
+                },
+                Err(stop) => {
+                    drop(tx);
+                    stop
                 }
-                Err(stop) => stop,
             };
             // The database may have rolled the transaction back under it: a
             // connection that no longer knows whether it is in one goes.
-            drop(tx);
             conn.close_on_drop();
             match stop {
                 Stop::Culprits(culprits) => care.refuse(culprits)?,

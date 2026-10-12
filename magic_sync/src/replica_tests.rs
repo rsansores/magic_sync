@@ -1663,6 +1663,58 @@ async fn rows_let_go_of_together_that_point_at_one_another_go_together(pool: Sql
     assert_eq!(w.texts("SELECT name FROM items").await, ["other"]);
 }
 
+/// A key the database checks only at commit, on a column other than the
+/// key: a row of the replica's own, or of the server's, points at a shelf's
+/// label, and a message changes or lets go of that shelf. The commit would
+/// refuse the message on every delivery; instead the row that changed is
+/// found, and rejected — it keeps what it held — and the rest is taken.
+#[sqlx::test(migrations = false)]
+async fn a_key_checked_at_commit_finds_the_row_that_broke_it(pool: SqlitePool) {
+    let tables = TABLES.replace("label TEXT NOT NULL,", "label TEXT NOT NULL UNIQUE,")
+        + "CREATE TABLE tags (id INTEGER PRIMARY KEY, \
+             label TEXT REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);";
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let aisle = Uuid::now_v7();
+    let shelf = |slot: i64, label: &str| {
+        let row = Shelf {
+            aisle,
+            slot,
+            label: label.to_owned(),
+            revision: 1,
+        };
+        (key(&[&aisle.to_string(), &slot.to_string()]), json(&row))
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "shelves",
+            vec![shelf(1, "tagged"), shelf(2, "free"), shelf(3, "kept")],
+        )],
+    ))
+    .await;
+    w.exec("INSERT INTO tags (label) VALUES ('tagged'), ('kept')")
+        .await
+        .unwrap();
+    let mut part = upserts("shelves", vec![shelf(1, "renamed"), shelf(2, "free too")]);
+    part.deletes = vec![key(&[&aisle.to_string(), "3"])];
+    w.receive(&down(
+        2,
+        "",
+        vec![part, upserts("items", vec![item(Uuid::now_v7(), "taken")])],
+    ))
+    .await;
+    assert_eq!(
+        w.texts("SELECT label FROM shelves ORDER BY slot").await,
+        ["tagged", "free too", "kept"]
+    );
+    assert_eq!(w.items().await, ["taken"]);
+    assert_eq!(
+        w.rejected().await,
+        [format!("shelves {aisle}|1"), format!("shelves {aisle}|3")]
+    );
+}
+
 /// Within a table's part, its deletes come first: a unique value one row
 /// gives up is another's in the same message, and so is one a row taken
 /// later in the part gives up. Two rows that swap one cannot be taken one

@@ -494,9 +494,12 @@ pub enum Received {
 /// ([`Error::Protocol`]) and waits for it to be updated. Nothing a message
 /// carries is an error: a row it cannot take is rejected, a message it
 /// cannot read is [`Received::Malformed`] — and a row whose refusal rolled
-/// the whole transaction back, or that a deferred foreign key would refuse at
-/// commit (its parent is not held), stops it with its [`Culprit`], for the
-/// caller to apply the message again, `care`fully, with that row refused.
+/// the whole transaction back, or that a foreign key checked at commit
+/// refuses (its parent is not held, or rows point at what it changed), stops
+/// it with its [`Culprit`], for the caller to apply the message again,
+/// `care`fully, with that row refused. A commit a key refuses anyway is the
+/// caller's to answer by applying the message `care`fully, which finds the
+/// row.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn receive<P: Sync + 'static>(
     conn: &mut Conn,
@@ -525,7 +528,11 @@ pub(crate) async fn receive<P: Sync + 'static>(
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
-    let received = act(conn, codecs, body, care).await;
+    let received = if care.careful {
+        carefully(conn, codecs, body, care).await
+    } else {
+        act(conn, codecs, body, care).await
+    };
     let quiet = sqlx::query("DELETE FROM sync_applying")
         .execute(&mut *conn)
         .await;
@@ -536,7 +543,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
 
 /// Why applying a message stopped short: the replica failed, or rows'
 /// refusal would take the whole transaction with it — one that did, or rows
-/// a deferred key would refuse at commit.
+/// a key checked at commit would refuse.
 #[cfg(feature = "sqlite")]
 #[derive(Debug)]
 pub(crate) enum Stop {
@@ -679,6 +686,71 @@ async fn row_begun(conn: &mut Conn) -> Result<(), Error> {
 fn malformed(why: String) -> Received {
     tracing::error!("sync: a message this build can do nothing with — dropped: {why}");
     Received::Malformed(why)
+}
+
+/// `body` acted on carefully, once a refusal took a whole transaction with
+/// it — the commit's own included: and then, since a foreign key checked at
+/// commit refuses what a row of the message changed, or let go of, under
+/// rows that point at it by a column other than its key, the rows that did
+/// so are found, to be refused. What the message's tables held that rows
+/// point at is read before, and what of it is gone, still pointed at,
+/// after.
+#[cfg(feature = "sqlite")]
+async fn carefully<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    body: Body,
+    care: &Care,
+) -> Result<Received, Stop> {
+    let mut upserts: HashMap<(&str, Key), Spot> = HashMap::new();
+    let names: Vec<&str> = match &body {
+        Body::Down(down) => {
+            for (entry, table) in down.tables.iter().enumerate() {
+                let Some(codec) = codec_of(codecs, &table.table) else {
+                    continue;
+                };
+                for (at, key) in parsed(codec, &table.keys).into_iter().enumerate() {
+                    if let Some(key) = key {
+                        upserts.insert((codec.table.name, key), Spot::Upsert { entry, at });
+                    }
+                }
+            }
+            down.tables.iter().map(|t| t.table.as_str()).collect()
+        }
+        Body::EndSnapshot(end) => end.tables.iter().map(String::as_str).collect(),
+        Body::Filed(_) => codecs.iter().map(|c| c.table.name).collect(),
+    };
+    let mut touched: Vec<&Codec<P>> = Vec::new();
+    for codec in codecs.iter().filter(|c| c.sent_down()) {
+        if names.contains(&codec.table.name) {
+            touched.push(codec);
+        }
+    }
+    let mut before = Vec::with_capacity(touched.len());
+    for codec in touched {
+        before.push((codec, codec.pointed(conn).await?));
+    }
+    let received = act(conn, codecs, body, care).await?;
+    let mut culprits = Vec::new();
+    for (codec, pointed) in &before {
+        let table = codec.table.name;
+        for key in codec.broken(conn, pointed).await? {
+            let row = upserts
+                .remove(&(table, key.clone()))
+                .unwrap_or_else(|| Spot::LetGo(key_text(&key)));
+            culprits.push(Culprit {
+                table: table.to_owned(),
+                row,
+                why: "rows here point at what it changes, through a key checked at commit"
+                    .to_owned(),
+            });
+        }
+    }
+    if culprits.is_empty() {
+        Ok(received)
+    } else {
+        Err(Stop::Culprits(culprits))
+    }
 }
 
 #[cfg(feature = "sqlite")]

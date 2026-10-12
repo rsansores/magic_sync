@@ -295,6 +295,24 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.retire(conn, keys, held, server)
     }
 
+    /// The rows of this table rows point at, by what they point at them with
+    /// ([`row::pointed`]).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>> {
+        self.ops.pointed(conn)
+    }
+
+    /// The keys of `pointed` whose values rows still point at, and this table
+    /// no longer holds ([`row::broken`]).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn broken<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        pointed: &'a [row::Pointed],
+    ) -> Fut<'a, Vec<Key>> {
+        self.ops.broken(conn, pointed)
+    }
+
     /// The keys of `keys` whose row points at one this replica does not hold
     /// ([`row::unparented`]).
     #[cfg(feature = "sqlite")]
@@ -431,6 +449,10 @@ trait Ops<P>: Send + Sync {
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
     fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>>;
+    #[cfg(feature = "sqlite")]
+    fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>>;
+    #[cfg(feature = "sqlite")]
+    fn broken<'a>(&'a self, conn: &'a mut Conn, pointed: &'a [row::Pointed]) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
     fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
@@ -772,5 +794,15 @@ where
     #[cfg(feature = "sqlite")]
     fn unparented<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
         Box::pin(row::unparented::<R>(conn, keys))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn pointed<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<row::Pointed>> {
+        Box::pin(row::pointed::<R>(conn))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn broken<'a>(&'a self, conn: &'a mut Conn, pointed: &'a [row::Pointed]) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::broken::<R>(conn, pointed))
     }
 }

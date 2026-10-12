@@ -750,6 +750,116 @@ async fn keep<R: Row>(
     Ok(retired.kept - before)
 }
 
+/// The rows of a table that rows point at through one foreign key — rows
+/// of the replica's own, or of the server's — each with the values they
+/// point at it by: what that key, checked at commit, refuses once the row
+/// changes them or goes ([`broken`]).
+#[cfg(feature = "sqlite")]
+pub(crate) struct Pointed {
+    child: String,
+    from: Vec<String>,
+    to: Vec<String>,
+    rows: Vec<(String, Key)>,
+}
+
+/// The values of `columns` of the row `alias` as one text, each as SQL
+/// quotes it: the same values, the same text.
+#[cfg(feature = "sqlite")]
+fn quoted(alias: &str, columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("quote({alias}.{})", ident(c)))
+        .collect::<Vec<_>>()
+        .join(" || ',' || ")
+}
+
+/// Every row of the table something points at, per foreign key into it
+/// ([`Pointed`]) — none when the connection enforces no foreign key.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn pointed<R: Row>(exec: &mut Conn) -> Result<Vec<Pointed>, Error> {
+    let enforced: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *exec)
+        .await?;
+    if enforced == 0 {
+        return Ok(Vec::new());
+    }
+    let kinds = key_kinds::<R>();
+    let mut out = Vec::new();
+    for (child, from, to) in crate::dialect::pointing(exec, R::TABLE, R::KEY).await? {
+        let on: Vec<String> = from
+            .iter()
+            .zip(&to)
+            .map(|(f, t)| format!("c.{} = p.{}", ident(f), ident(t)))
+            .collect();
+        let keys: Vec<String> = R::KEY.iter().map(|k| format!("p.{}", ident(k))).collect();
+        let rows = sqlx::query(&format!(
+            "SELECT {}, {} FROM {} p WHERE EXISTS (SELECT 1 FROM {} c WHERE {})",
+            keys.join(", "),
+            quoted("p", &to),
+            R::QUALIFIED,
+            ident(&child),
+            on.join(" AND ")
+        ))
+        .fetch_all(&mut *exec)
+        .await?;
+        let mut pointed = Vec::with_capacity(rows.len());
+        for row in &rows {
+            use sqlx::Row as _;
+            let values: String = row.try_get(R::KEY.len())?;
+            pointed.push((values, key_of_row(row, &kinds, 0)?));
+        }
+        out.push(Pointed {
+            child,
+            from,
+            to,
+            rows: pointed,
+        });
+    }
+    Ok(out)
+}
+
+/// The keys of `pointed` whose values a row still points at, and no row of
+/// the table holds any more: what a foreign key checked at commit refuses.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn broken<R: Row>(
+    exec: &mut Conn,
+    pointed: &[Pointed],
+) -> Result<Vec<Key>, Error> {
+    let mut out = Vec::new();
+    for key in pointed.iter().filter(|p| !p.rows.is_empty()) {
+        let on: Vec<String> = key
+            .from
+            .iter()
+            .zip(&key.to)
+            .map(|(f, t)| format!("p.{} = c.{}", ident(t), ident(f)))
+            .collect();
+        let present: Vec<String> = key
+            .from
+            .iter()
+            .map(|f| format!("c.{} IS NOT NULL", ident(f)))
+            .collect();
+        let dangling: std::collections::HashSet<String> = sqlx::query_scalar(&format!(
+            "SELECT DISTINCT {} FROM {} c WHERE {} AND NOT EXISTS (SELECT 1 FROM {} p WHERE {})",
+            quoted("c", &key.from),
+            ident(&key.child),
+            present.join(" AND "),
+            R::QUALIFIED,
+            on.join(" AND ")
+        ))
+        .fetch_all(&mut *exec)
+        .await?
+        .into_iter()
+        .collect();
+        out.extend(
+            key.rows
+                .iter()
+                .filter(|(values, _)| dangling.contains(values))
+                .map(|(_, key)| key.clone()),
+        );
+    }
+    Ok(out)
+}
+
 /// The keys of `keys` whose row points, through a foreign key, at a row the
 /// database does not hold: what a deferred key refuses at commit, found
 /// before it does — none when the connection enforces no foreign key. A key
