@@ -416,14 +416,8 @@ fn confirmation(sender: Uuid, standing: &Standing, upload: &Up) -> Confirmed {
         tracing::error!(%sender, sequence = upload.sequence, "upload: a sequence or nonce no message has — malformed, left out");
         return Confirmed::Nothing;
     };
-    let seal = envelope::seal(
-        &standing.secret,
-        sender,
-        epoch,
-        upload.sequence,
-        upload.nonce,
-    );
-    if upload.mac != seal {
+    let place = (upload.sequence, upload.nonce);
+    if !envelope::sealed(&standing.secret, sender, epoch, place, &upload.mac) {
         tracing::error!(%sender, sequence, "upload: it says it applied a message this server did not seal — left out");
         return Confirmed::Nothing;
     }
@@ -795,28 +789,72 @@ async fn provision_again(
         tracing::debug!(%replica, why, "sync: a replica that holds less has its snapshot on the way");
         return Ok(());
     }
-    if resync(conn, replica).await? {
-        tracing::warn!(%replica, why, "sync: a replica holds less than recorded — it is provisioned again");
-    }
-    Ok(())
+    asked(conn, replica, why).await
 }
 
 /// `replica` says it missed a message — `gap`, the newest it could not
 /// follow, 0 for none: it applies nothing more until a snapshot begins, so
 /// it is provisioned again, unless one that began after that message is on
-/// its way.
+/// its way. A message past every one sent it is none it could have missed.
 async fn gap(conn: &mut Conn, replica: Uuid, standing: &Standing, gap: u64) -> Result<(), Error> {
     if gap == 0 {
         return Ok(());
     }
     let missed = i64::try_from(gap).unwrap_or(i64::MAX);
+    if standing
+        .last
+        .map_or(missed > standing.drawn, |(last, _)| missed > last)
+    {
+        tracing::error!(%replica, gap, "upload: a gap past every message sent it — malformed, left out");
+        return Ok(());
+    }
     if standing.snapshot.is_some_and(|began| began > missed) {
         tracing::debug!(%replica, "sync: a replica that missed a message has its snapshot on the way");
         return Ok(());
     }
-    if resync(conn, replica).await? {
-        tracing::warn!(%replica, missed, "sync: a replica missed a message — it is provisioned again");
+    asked(conn, replica, &format!("it missed message {missed}")).await
+}
+
+/// How long a replica waits between the provisionings it asks for itself:
+/// the first, doubling with every one it asks for while it keeps asking, up
+/// to 32 times the first.
+const ASKED: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Provisions `replica` again, `why` as it says it — it missed a message,
+/// or holds less than recorded — unless it asked for one too soon: what it
+/// says of itself is not sealed, and a replica that says it on every upload
+/// must not have the server send it everything on every round trip. Its
+/// next upload says it again.
+async fn asked(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error> {
+    let due: bool = sqlx::query_scalar(
+        "SELECT asked_at IS NULL \
+             OR asked_at <= now() - make_interval(secs => $2 * power(2, least(asks - 1, 5))) \
+           FROM sync.replicas WHERE replica_id = $1",
+    )
+    .bind(replica)
+    .bind(ASKED.as_secs_f64())
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(true);
+    if !due {
+        tracing::warn!(%replica, why, "sync: a replica asks to be provisioned again too soon after the last time — not yet");
+        return Ok(());
     }
+    if !resync(conn, replica).await? {
+        return Ok(());
+    }
+    tracing::warn!(%replica, why, "sync: a replica holds less than recorded — it is provisioned again");
+    // Quiet long enough, it starts over.
+    sqlx::query(
+        "UPDATE sync.replicas SET asked_at = now(), \
+           asks = CASE WHEN asked_at < now() - make_interval(secs => $2 * 64) THEN 1 \
+                       ELSE asks + 1 END \
+         WHERE replica_id = $1",
+    )
+    .bind(replica)
+    .bind(ASKED.as_secs_f64())
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

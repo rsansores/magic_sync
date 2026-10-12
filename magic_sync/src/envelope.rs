@@ -42,7 +42,7 @@ impl Body {
 }
 
 /// The server's seal on its message `sequence` of `epoch`, nonce `nonce`, to
-/// `replica`: HMAC-SHA256 under the epoch's secret, cut to 16 bytes. A
+/// `replica`: HMAC-SHA256 under the epoch's secret, cut to [`SEAL`] bytes. A
 /// replica gives it back as it came when it says it applied the message, so
 /// the server knows it sent that message — this installation, before or
 /// after a restore of its database — and no one made it up.
@@ -55,13 +55,49 @@ pub(crate) fn seal(
     nonce: u64,
 ) -> Vec<u8> {
     use hmac::Mac as _;
+    sealer(secret, replica, epoch, sequence, nonce)
+        .finalize()
+        .into_bytes()[..SEAL]
+        .to_vec()
+}
+
+/// Whether `mac` is the server's seal on that message ([`seal`]), compared
+/// in a time that says nothing of where it differs.
+#[cfg(feature = "postgres")]
+pub(crate) fn sealed(
+    secret: &[u8],
+    replica: uuid::Uuid,
+    epoch: uuid::Uuid,
+    (sequence, nonce): (u64, u64),
+    mac: &[u8],
+) -> bool {
+    use hmac::Mac as _;
+    mac.len() == SEAL
+        && sealer(secret, replica, epoch, sequence, nonce)
+            .verify_truncated_left(mac)
+            .is_ok()
+}
+
+/// The bytes of a seal.
+#[cfg(feature = "postgres")]
+const SEAL: usize = 16;
+
+#[cfg(feature = "postgres")]
+fn sealer(
+    secret: &[u8],
+    replica: uuid::Uuid,
+    epoch: uuid::Uuid,
+    sequence: u64,
+    nonce: u64,
+) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac as _;
     let mut mac =
         hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
     mac.update(replica.as_bytes());
     mac.update(epoch.as_bytes());
     mac.update(&sequence.to_be_bytes());
     mac.update(&nonce.to_be_bytes());
-    mac.finalize().into_bytes()[..16].to_vec()
+    mac
 }
 
 #[cfg(all(test, feature = "postgres"))]

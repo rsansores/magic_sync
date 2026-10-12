@@ -379,6 +379,14 @@ whenever that sequence grows. The server provisions it again, unless a
 snapshot that began after that message is on its way: a snapshot that began
 before it is one the replica lost the beginning of, or applied before it
 was restored from an older copy.
+A gap past every message the server sent the replica is none it could have
+missed: malformed, and left out.
+
+Neither a gap nor a message older than the last applied carries a seal the
+server can check, so what a replica says of itself provisions it again at
+most once a minute, and twice as long between each time while it keeps
+saying so, up to 32 minutes; one quiet for 64 minutes starts over. Until then
+the server leaves it as it is, and the replica's next `Up` says it again.
 
 ---
 

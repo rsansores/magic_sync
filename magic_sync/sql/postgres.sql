@@ -233,7 +233,9 @@ CREATE TABLE sync.replicas (
     heals            INTEGER     NOT NULL DEFAULT 0,
     backlog          JSONB,
     backlog_at       TIMESTAMPTZ,
-    drifted_at       TIMESTAMPTZ
+    drifted_at       TIMESTAMPTZ,
+    asked_at         TIMESTAMPTZ,
+    asks             INTEGER     NOT NULL DEFAULT 0
 );
 
 COMMENT ON TABLE sync.replicas IS
@@ -255,6 +257,10 @@ COMMENT ON COLUMN sync.replicas.last_error IS
 COMMENT ON COLUMN sync.replicas.refusals IS
     'Times in a row the transport refused its next message for good: past a few it is '
     'provisioned again, and that is an alarm.';
+COMMENT ON COLUMN sync.replicas.asked_at IS
+    'When it was last provisioned again for what it says of itself — it missed a message, or '
+    'holds less than recorded — which no seal proves: asks counts those since it was last quiet '
+    'a while, and each waits twice as long as the one before, up to 32 times the first.';
 COMMENT ON COLUMN sync.replicas.drifted_at IS
     'When its digests last differed from what the server records and it was provisioned '
     'again for it. Digests that differ again within a day are a bug no provisioning cures: '

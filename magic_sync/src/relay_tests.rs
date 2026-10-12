@@ -1031,6 +1031,20 @@ async fn an_acknowledgement_the_server_did_not_seal_changes_nothing(pool: crate:
         assert_eq!(applied().await, before, "{sequence}");
     }
     assert_eq!(world.epoch().await, epoch, "no new epoch");
+    let real = crate::testkit::confirmation(&world.pool, a, last).await;
+    for mac in [
+        Vec::new(),
+        real.mac[..1].to_vec(),
+        real.mac[..8].to_vec(),
+        [real.mac.as_slice(), &[0]].concat(),
+    ] {
+        let up = envelope::Up {
+            mac,
+            ..real.clone()
+        };
+        crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+        assert_eq!(applied().await, before, "a seal cut short, or made longer");
+    }
     world.acknowledge(a, last).await;
     assert_eq!(applied().await, Some(last as i64));
 }
@@ -2500,9 +2514,7 @@ async fn an_edit_of_a_two_way_row_the_server_forgot_is_held_waits_until_it_is(po
 /// whatever order the inbox is filed again, the row ends as the replica's
 /// newest edit: an edit filed supersedes every older one kept.
 #[sqlx::test(migrations = false)]
-async fn a_two_way_row_ends_as_its_newest_edit_whatever_waited_in_the_inbox(
-    pool: crate::DbPool,
-) {
+async fn a_two_way_row_ends_as_its_newest_edit_whatever_waited_in_the_inbox(pool: crate::DbPool) {
     let world = world_of(pool, true).await;
     let [a, _] = world.replicas;
     let id = world.tally("count").await;
@@ -2539,7 +2551,9 @@ async fn a_two_way_row_ends_as_its_newest_edit_whatever_waited_in_the_inbox(
         let mut newest = 0;
         for seen in 1..=12 {
             hold(walk.below(3) > 0).await;
-            world.file(a, &edit(world.partition, id, "count", seen)).await;
+            world
+                .file(a, &edit(world.partition, id, "count", seen))
+                .await;
             newest = seen;
             if walk.below(3) == 0 {
                 world.refile_all().await;
@@ -2554,4 +2568,55 @@ async fn a_two_way_row_ends_as_its_newest_edit_whatever_waited_in_the_inbox(
         );
         assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
     }
+}
+
+/// What a replica says of itself is not sealed: a gap past every message
+/// sent it is none it could have missed, and a replica that says it missed
+/// one on every upload is provisioned again once in a while, not on every
+/// round trip.
+#[sqlx::test(migrations = false)]
+async fn a_replica_cannot_have_itself_provisioned_on_every_round_trip(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    world.item("one").await;
+    world.pass(&Fake::default()).await;
+    let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
+    let missed = |gap: u64| envelope::Up {
+        gap,
+        protocol: envelope::PROTOCOL,
+        ..envelope::Up::default()
+    };
+    let earlier = |seconds: i32| {
+        let pool = world.pool.clone();
+        async move {
+            sqlx::query("UPDATE sync.replicas SET asked_at = asked_at - make_interval(secs => $1)")
+                .bind(f64::from(seconds))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    for past in [u64::MAX, world.last_sent(a).await + 1] {
+        world.file(a, &missed(past)).await;
+        assert_eq!(world.count(resyncs).await, 0, "past every message sent it");
+    }
+    world.file(a, &missed(world.last_sent(a).await)).await;
+    assert_eq!(world.count(resyncs).await, 1);
+    world.pass(&Fake::default()).await;
+    world.file(a, &missed(world.last_sent(a).await)).await;
+    assert_eq!(world.count(resyncs).await, 0, "too soon");
+    earlier(61).await;
+    world.file(a, &missed(world.last_sent(a).await)).await;
+    assert_eq!(world.count(resyncs).await, 1, "a minute on");
+    world.pass(&Fake::default()).await;
+    earlier(61).await;
+    world.file(a, &missed(world.last_sent(a).await)).await;
+    assert_eq!(
+        world.count(resyncs).await,
+        0,
+        "asking again, it waits longer"
+    );
+    earlier(60).await;
+    world.file(a, &missed(world.last_sent(a).await)).await;
+    assert_eq!(world.count(resyncs).await, 1, "two minutes on");
 }
