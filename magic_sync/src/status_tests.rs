@@ -935,6 +935,25 @@ async fn a_change_set_aside_for_everyone_is_not_each_replicas_fix(pool: crate::D
     }
 }
 
+/// A retry of a row set aside that the planner set aside in its turn is
+/// listed as the row's change it is: the status still reads.
+#[sqlx::test(migrations = false)]
+async fn a_retry_set_aside_is_listed_as_a_change_of_its_row(pool: crate::DbPool) {
+    let world = world(pool).await;
+    sqlx::query(
+        "INSERT INTO sync.notes (kind, relation, row_key, partition_id, parked_at, attempts) \
+         VALUES ('retry', 'items', 'not-a-key', $1, now(), 1)",
+    )
+    .bind(world.partition)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+
+    let parked = world.overview(Scope::All).await.health.parked;
+    assert_eq!(parked.total, 1);
+    assert_eq!(parked.first[0].kind, crate::status::NoteKind::Row);
+}
+
 /// A row sent and not yet confirmed that a replica should no longer hold is
 /// leaving it, as a confirmed one is.
 #[sqlx::test(migrations = false)]

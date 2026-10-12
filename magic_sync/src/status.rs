@@ -458,19 +458,17 @@ mod stored {
     use sqlx::postgres::PgRow;
     use sqlx::Row as _;
 
-    pub(super) fn parked(row: PgRow) -> sqlx::Result<Parked> {
+    /// A note of a kind this build does not know, a later build's, is
+    /// `None`: counted, and left out of the listing.
+    pub(super) fn parked(row: PgRow) -> sqlx::Result<Option<Parked>> {
         let kind = match row.try_get::<String, _>("kind")?.as_str() {
-            "row" => NoteKind::Row,
+            "row" | "retry" => NoteKind::Row,
             "members" => NoteKind::Members,
             "assigned" => NoteKind::Assigned,
             "resync" => NoteKind::Resync,
-            other => {
-                return Err(sqlx::Error::Decode(
-                    format!("`{other}` is no kind of note").into(),
-                ))
-            }
+            _ => return Ok(None),
         };
-        Ok(Parked {
+        Ok(Some(Parked {
             id: row.try_get("id")?,
             kind,
             table: row.try_get("table")?,
@@ -479,7 +477,7 @@ mod stored {
             attempts: row.try_get("attempts")?,
             last_error: row.try_get("last_error")?,
             parked_at: row.try_get("parked_at")?,
-        })
+        }))
     }
 
     pub(super) fn quarantined(row: PgRow) -> sqlx::Result<Quarantined> {
@@ -1097,7 +1095,10 @@ impl Engine {
             .bind(limit)
             .try_map(stored::parked)
             .fetch_all(&mut *conn)
-            .await?,
+            .await?
+            .into_iter()
+            .flatten()
+            .collect(),
         };
         let ids = scoped.ids();
         // Live replicas only, as every read: one that is no longer sent to

@@ -637,11 +637,13 @@ impl<S: Senders, T: Transport> Server<S, T> {
         }
     }
 
-    /// Plans the parked notes again and sends the quarantine again; answers
-    /// the walk that files the inbox again, a page at a time beside the
-    /// passes, up to what it holds now.
+    /// Plans the parked notes again and sends the quarantine again — once
+    /// what the engine declares is observed, so nothing of a table it no
+    /// longer mirrors is; answers the walk that files the inbox again, a
+    /// page at a time beside the passes, up to what it holds now.
     async fn retry(&self, lock: &mut Lock) -> Result<Refiling, Error> {
         let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
+        self.engine.observe(&mut tx).await?;
         let unparked = relay::unpark(&mut tx).await?;
         let retried = relay::retry_quarantine(&mut tx).await?;
         tx.commit().await?;

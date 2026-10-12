@@ -1399,7 +1399,7 @@ impl Engine {
             "DELETE FROM sync.gone WHERE relation <> ALL($1)",
             "DELETE FROM sync.quarantine WHERE relation <> ALL($1)",
             "UPDATE sync.notes SET done_at = now() \
-              WHERE done_at IS NULL AND kind = 'row' AND relation <> ALL($1)",
+              WHERE done_at IS NULL AND kind IN ('row', 'retry') AND relation <> ALL($1)",
         ] {
             sqlx::query(sql).bind(&tables).execute(&mut *conn).await?;
         }
