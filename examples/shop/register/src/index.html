@@ -13,6 +13,8 @@
   ul { list-style: none; padding: 0; margin: 0; }
   li { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); }
   .note { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .footer { display: flex; gap: 6px; align-items: center; margin-top: 10px; font-size: 13px; }
+  .footer input { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; width: 150px; }
 </style>
 </head>
 <body>
@@ -22,6 +24,11 @@
 </div>
 <ul id="products"></ul>
 <p class="note" id="note"></p>
+<form class="footer" id="footer-form">
+  <label>Footer <input id="footer" maxlength="80"></label>
+  <button>Change here</button>
+  <button type="button" class="plug" id="printer"></button>
+</form>
 <script>
 const money = c => (c / 100).toFixed(2);
 async function sell(id) {
@@ -29,6 +36,14 @@ async function sell(id) {
   refresh();
 }
 async function plug() { await fetch('/api/plug', { method: 'POST' }); refresh(); }
+async function printer() { await fetch('/api/printer', { method: 'POST' }); refresh(); }
+async function changeFooter(event) {
+  event.preventDefault();
+  const text = document.getElementById('footer').value;
+  await fetch('/api/footer', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) });
+  document.getElementById('footer').blur();
+  refresh();
+}
 function item(className, text) {
   const li = document.createElement('li');
   li.className = className;
@@ -50,6 +65,10 @@ async function refresh() {
   document.getElementById('name').textContent = s.name;
   document.getElementById('dot').style.background = s.online ? 'var(--ok)' : 'var(--off)';
   document.getElementById('plug').textContent = s.online ? 'Unplug' : 'Plug in';
+  document.getElementById('printer').textContent = s.printer ? 'Printer off' : 'Printer on';
+  const footer = document.getElementById('footer');
+  // Left alone while it is being edited.
+  if (document.activeElement !== footer) footer.value = s.footer;
   // Built as elements, never as HTML: a product's name is the head office's
   // text, and stays text.
   document.getElementById('products').replaceChildren(...(s.products.length
@@ -60,6 +79,8 @@ async function refresh() {
     (waiting ? ` · ${waiting} receipt${waiting > 1 ? 's' : ''} not at the head office yet` : ' · all at the head office');
 }
 document.getElementById('plug').addEventListener('click', plug);
+document.getElementById('printer').addEventListener('click', printer);
+document.getElementById('footer-form').addEventListener('submit', changeFooter);
 refresh(); setInterval(refresh, 700);
 </script>
 </body>

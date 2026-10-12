@@ -55,7 +55,8 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 - **The replica protocol** (`PROTOCOL.md`, `proto/sync.proto`) is written for
   a replica in any language, with test vectors (`tests/golden`) that the
   engine's own replica is held to.
-- **The shop** example, a head office and its registers with a page each, and
+- **The shop** example, a head office and its registers with a page each — a
+  footer of each register's the head office may wish another among them — and
   **the book**, which builds it step by step, explains the engine and carries
   the protocol; both sides' API reference is published with it.
 

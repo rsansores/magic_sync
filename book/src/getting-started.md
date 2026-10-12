@@ -112,5 +112,17 @@ Ctrl-C stops either one, and loses nothing it was doing.
 - **Delete a product a register has sold.** That register keeps the product
   for its receipts — it *retires* it: out of the list, still there for what
   points at it — and the other deletes it.
+- **Wish a register another footer.** Each register prints a footer of its
+  own under its receipts, and the head office may wish it another (*wish
+  another*, under the register): it changes on the register within a second,
+  and *Footers wished* says *applied*. Turn the register's printer off first
+  and the wish *waits* — *the printer is off* — until it is back on. Wish one
+  longer than the printer's 40 characters and the register *refuses* it.
+  Change the footer on the register itself while the head office's form is
+  open, then wish: the wish was based on the footer the page showed, so it is
+  *changed there first* — superseded — and the register's own stands. Unplug
+  a register and wish: it is *on its way* until the register is back. Every
+  time, both pages end showing the same footer
+  ([Settings and wishes](guide/settings.md)).
 
 The rest of the book builds this from scratch.

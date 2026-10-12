@@ -29,6 +29,14 @@ CREATE TABLE IF NOT EXISTS shop.receipts (
     total_cents BIGINT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL
 );
+
+-- Each register's footer, as it last said: a setting the head office may
+-- wish another.
+CREATE TABLE IF NOT EXISTS shop.footers (
+    register_id UUID PRIMARY KEY,
+    text        TEXT NOT NULL,
+    changed_at  TIMESTAMPTZ NOT NULL
+);
 -- ANCHOR_END: tables
 
 -- ANCHOR: deliveries

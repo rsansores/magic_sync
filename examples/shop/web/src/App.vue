@@ -6,13 +6,15 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import {
   RowPlaces,
   SyncDashboard,
+  WishList,
   type Listing,
   type Overview,
   type Progress,
   type ReplicaState,
   type RowProgress,
+  type WishListing,
 } from 'magic_sync_dashboard'
-import { api, type Product, type ShopState } from './api'
+import { api, type Footer, type Product, type ShopState } from './api'
 
 const state = ref<ShopState | null>(null)
 const overview = ref<Overview | null>(null)
@@ -25,6 +27,9 @@ const listing = ref<Listing | null>(null)
 // The product whose registers are shown, and where it is on each.
 const holding = ref<string | null>(null)
 const places = ref<RowProgress | null>(null)
+// What the head office wished of the registers' footers, and how each
+// register answered.
+const wishes = ref<WishListing | null>(null)
 const error = ref('')
 
 // The dashboard's names for what the engine knows by id.
@@ -33,10 +38,11 @@ const labels = { products: 'Products', receipts: 'Receipts' }
 
 async function refresh() {
   try {
-    ;[state.value, overview.value, listing.value] = await Promise.all([
+    ;[state.value, overview.value, listing.value, wishes.value] = await Promise.all([
       api.state(),
       api.overview(),
       api.listing(filter.value, offset.value),
+      api.wishes(),
     ])
     progress.value = selected.value ? await api.progress(selected.value) : null
     places.value = holding.value ? await api.row('products', holding.value) : null
@@ -91,6 +97,22 @@ function save() {
 function remove(p: Product) {
   return act(() => api.deleteProduct(p.id))
 }
+
+// ANCHOR: footer
+const footerOf = (register: string) => state.value?.footers.find((f) => f.register_id === register)
+// The footer each register's form was opened on: the wish is based on it.
+const asking = ref<{ seen: Footer; text: string } | null>(null)
+function ask(seen: Footer) {
+  asking.value = { seen, text: seen.text }
+}
+function wish() {
+  const a = asking.value!
+  return act(async () => {
+    await api.wishFooter(a.seen, a.text)
+    asking.value = null
+  })
+}
+// ANCHOR_END: footer
 
 // A register's page, on the host this page was opened with.
 function pageOf(url: string) {
@@ -183,6 +205,12 @@ function pageOf(url: string) {
         <!-- ANCHOR_END: dashboard -->
       </section>
       <section>
+        <h2>Footers wished</h2>
+        <!-- ANCHOR: wishes -->
+        <WishList :wishes="wishes" :names="names" :setting="() => 'footer'" />
+        <!-- ANCHOR_END: wishes -->
+      </section>
+      <section>
         <h2>Registers</h2>
         <p v-if="state && state.registers.length === 0" class="note">
           No register yet. Start one: <code>cargo run -- --name "Register 1" --port 8081</code> in
@@ -197,6 +225,18 @@ function pageOf(url: string) {
                 {{ r.cut ? 'mend the line' : 'cut the line' }}
               </button>
             </figcaption>
+            <p v-if="footerOf(r.id)" class="note">
+              <template v-if="asking?.seen.register_id === r.id">
+                <form class="wish" @submit.prevent="wish">
+                  <input v-model="asking.text" />
+                  <button>Wish</button>
+                </form>
+              </template>
+              <template v-else>
+                Footer: “{{ footerOf(r.id)!.text }}”
+                <button class="link" @click="ask(footerOf(r.id)!)">wish another</button>
+              </template>
+            </p>
             <iframe :src="pageOf(r.url)" :title="r.name" />
           </figure>
         </div>
@@ -316,5 +356,10 @@ iframe {
 .note {
   color: #6b7385;
   font-size: 13px;
+}
+.wish {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
 }
 </style>

@@ -22,7 +22,9 @@ And the same tables, minus `registers`, on every register's SQLite.
 head office sends, whatever its version, because the order of the messages —
 not a column — says which is the latest. A column that orders versions
 (`#[row(version)]`) belongs to a table a register edits and the head office
-files, such as a record a register corrects.
+files, such as a record a register corrects, or a setting of its own — the
+footer each register prints, which the head office may wish another
+([Settings and wishes](settings.md)).
 
 ### The engine's part: installed for you, or in your migrations
 

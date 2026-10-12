@@ -9,10 +9,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use magic_sync::replica::{self, Received};
 use magic_sync::run::replica::{Replica, Settings, Uplink};
+use magic_sync::wish::{CarryOut, Outcome, Wish, Wishes};
 use magic_sync::Error;
 use serde::{Deserialize, Serialize};
-use shop_rows::{codecs, Product};
+use shop_rows::{codecs, Footer, Product};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -67,6 +69,32 @@ fn unreachable(e: impl std::fmt::Display) -> Error {
 }
 // ANCHOR_END: uplink
 
+// ANCHOR: printer
+/// The receipt printer, which takes a new footer — when it is on, and when
+/// the footer fits its 40 characters.
+#[derive(Clone)]
+struct Printer {
+    on: Arc<AtomicBool>,
+}
+
+impl CarryOut<Footer> for Printer {
+    async fn carry_out(&self, wish: Wish<Footer>) -> Outcome {
+        let text = &wish.wanted.text;
+        if text.chars().count() > 40 {
+            return Outcome::Refused(format!(
+                "\"{text}\" is longer than the printer's 40 characters"
+            ));
+        }
+        if !self.on.load(Ordering::Relaxed) {
+            return Outcome::Later("the printer is off".to_owned());
+        }
+        // A real printer is sent the footer here. `Applied`: the engine
+        // writes it into `footers`, and tells the head office.
+        Outcome::Applied
+    }
+}
+// ANCHOR_END: printer
+
 type ShopReplica = Replica<(), Uuid, Http>;
 
 #[derive(Clone)]
@@ -76,6 +104,7 @@ struct App {
     me: Uuid,
     name: String,
     online: Arc<watch::Sender<bool>>,
+    printer: Printer,
 }
 
 #[tokio::main]
@@ -148,8 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (online, plugged) = watch::channel(true);
     let client = reqwest::Client::new();
+    let printer = Printer {
+        on: Arc::new(AtomicBool::new(true)),
+    };
     let mut settings = Settings::default();
     settings.idle = Duration::from_millis(300);
+    // What carries out the head office's wishes of its footer.
+    settings.wishes = Wishes::new().on::<Footer>(printer.clone());
     let replica = Arc::new(
         Replica::new(
             pool.clone(),
@@ -180,6 +214,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // ANCHOR_END: build
 
+    // Its footer, the first time it starts: its own, noted, and so sent up.
+    sqlx::query(
+        "INSERT INTO footers (register_id, text, changed_at) VALUES ($1, 'Thank you!', $2) \
+         ON CONFLICT (register_id) DO NOTHING",
+    )
+    .bind(me)
+    .bind(chrono::Utc::now())
+    .execute(&pool)
+    .await?;
+
     // Introduce itself to the head office, which provisions it the first time.
     let url = format!("http://127.0.0.1:{port}");
     let hello = serde_json::json!({ "id": me, "name": name, "url": url });
@@ -201,12 +245,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         me,
         name,
         online: Arc::new(online),
+        printer,
     };
     let router = Router::new()
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/api/state", get(state))
         .route("/api/sell", post(sell))
         .route("/api/plug", post(plug))
+        .route("/api/footer", post(write_footer))
+        .route("/api/printer", post(switch_printer))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(format!("{bind}:{port}")).await?;
     tracing::info!("this register is at {url}");
@@ -336,6 +383,8 @@ async fn take(
 struct RegisterState {
     name: String,
     online: bool,
+    footer: String,
+    printer: bool,
     products: Vec<Product>,
     sold: i64,
     unsent: i64,
@@ -354,6 +403,10 @@ async fn state(State(app): State<App>) -> Result<Json<RegisterState>, (StatusCod
         .fetch_one(&app.pool)
         .await
         .map_err(fail)?;
+    let footer: String = sqlx::query_scalar("SELECT text FROM footers")
+        .fetch_one(&app.pool)
+        .await
+        .map_err(fail)?;
     // ANCHOR: progress
     let mut conn = app.pool.acquire().await.map_err(fail)?;
     let up = replica::progress(&mut conn)
@@ -365,6 +418,8 @@ async fn state(State(app): State<App>) -> Result<Json<RegisterState>, (StatusCod
     Ok(Json(RegisterState {
         name: app.name.clone(),
         online: *app.online.borrow(),
+        footer,
+        printer: app.printer.on.load(Ordering::Relaxed),
         products,
         sold,
         unsent,
@@ -406,5 +461,37 @@ async fn sell(
 async fn plug(State(app): State<App>) -> StatusCode {
     app.online.send_modify(|online| *online = !*online);
     app.replica.nudge();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct FooterForm {
+    text: String,
+}
+
+/// The register's own change of its footer: a write of its setting, which
+/// goes up — and supersedes a wish of the head office based on the footer
+/// it had.
+async fn write_footer(
+    State(app): State<App>,
+    Json(form): Json<FooterForm>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    sqlx::query("UPDATE footers SET text = $1, changed_at = $2")
+        .bind(form.text)
+        .bind(chrono::Utc::now())
+        .execute(&app.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    app.replica.nudge();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Turns the printer off, or back on — when a wish that waited for it is
+/// offered again.
+async fn switch_printer(State(app): State<App>) -> StatusCode {
+    let on = !app.printer.on.fetch_xor(true, Ordering::Relaxed);
+    if on {
+        app.replica.offer_wishes();
+    }
     StatusCode::NO_CONTENT
 }

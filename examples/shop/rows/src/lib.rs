@@ -37,6 +37,28 @@ pub struct Receipt {
 }
 // ANCHOR_END: rows
 
+// ANCHOR: footer
+/// What a register prints under every receipt: the register's own setting,
+/// which the head office may wish another — carried out only while the
+/// register has not changed it since the head office looked.
+#[derive(sqlx::FromRow, Clone, Debug, Serialize, Deserialize, magic_sync::Row)]
+#[row(
+    table = "footers",
+    schema = "shop",
+    mirror = "setting",
+    key = "register_id",
+    origin = "register_id",
+    apply = "if_unchanged"
+)]
+pub struct Footer {
+    pub register_id: Uuid,
+    #[row(desired)]
+    pub text: String,
+    #[row(version)]
+    pub changed_at: DateTime<Utc>,
+}
+// ANCHOR_END: footer
+
 // ANCHOR: registers
 /// The registers, as the engine finds them on the server.
 #[cfg(feature = "server")]
@@ -55,6 +77,7 @@ pub fn codecs() -> Vec<Codec<()>> {
     vec![
         Codec::json::<Product>(None),
         Codec::json::<Receipt>(Some(place_receipt)),
+        Codec::json::<Footer>(None),
     ]
 }
 // ANCHOR_END: codecs

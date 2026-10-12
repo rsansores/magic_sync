@@ -73,6 +73,13 @@ hardware. It answers:
   `Replica::offer_wishes` (the hardware came back), after the next message
   that changes a wish, at start, and every `wishes_every`.
 
+The shop's registers carry out the head office's wishes of their receipt
+footer through their printer (`examples/shop/register/src/main.rs`):
+
+```rust,ignore
+{{#include ../../../examples/shop/register/src/main.rs:printer}}
+```
+
 A setting that lives only in the database needs no code: `Direct` answers
 `Applied`, and the engine writes it. `Replica::new` refuses a setting with no
 handler.
