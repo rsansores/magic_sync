@@ -5,6 +5,7 @@
 //! own, and hands every message the server sends to [`Replica::receive`],
 //! acknowledging it to the transport only once that returned `Ok`.
 
+use crate::envelope::Limits;
 use crate::replica::{self, Care, Lane, Outbox, Received, Stop};
 use crate::run::Backoff;
 use crate::wire::Codec;
@@ -73,6 +74,10 @@ pub trait Uplink: Send + Sync + 'static {
 pub struct Settings {
     /// How much one message up carries.
     pub outbox: Outbox,
+    /// How much one message from the server carries, at most: rows — its
+    /// upserts and deletes together — and tables, or uploads it answers.
+    /// One that carries more is malformed. The server's limits, or more.
+    pub inbound: Limits,
     /// The streams up, the main one first: it carries what the engine says
     /// besides the replica's rows.
     pub lanes: Vec<Lane>,
@@ -96,6 +101,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             outbox: Outbox::default(),
+            inbound: Limits::default(),
             lanes: vec![Lane::new("main", &[])],
             idle: Duration::from_secs(1),
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
@@ -243,7 +249,8 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             let mut conn = self.pool.acquire().await?;
             let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
             replica::settled(&mut tx).await?;
-            let stop = match replica::receive(&mut tx, &self.codecs, bytes, &care).await {
+            let limits = &self.settings.inbound;
+            let stop = match replica::receive(&mut tx, &self.codecs, bytes, limits, &care).await {
                 // A key checked at commit may refuse it: a row of the
                 // message is at fault, and found once applied carefully.
                 Ok(received) => match tx.commit().await {

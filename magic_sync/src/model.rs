@@ -173,6 +173,22 @@ impl Model {
         let Some(body) = message.body else {
             return Received::Malformed;
         };
+        // More than a message carries, as a replica takes them by default.
+        let most = crate::envelope::Limits::default().rows();
+        let (rows, entries) = match &body {
+            Body::Down(d) => (
+                d.tables
+                    .iter()
+                    .map(|t| t.upserts.len() + t.deletes.len())
+                    .sum(),
+                d.tables.len(),
+            ),
+            Body::EndSnapshot(e) => (0, e.tables.len()),
+            Body::Filed(f) => (0, f.uploads.len()),
+        };
+        if rows > most || entries > most {
+            return Received::Malformed;
+        }
         let (place, ends) = match &body {
             Body::Filed(_) => {
                 self.collect(rules);

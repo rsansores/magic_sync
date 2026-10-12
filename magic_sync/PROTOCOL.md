@@ -140,6 +140,7 @@ has a case of each:
 | `snapshot_id` | a UUID; empty on a message of no snapshot | `snapshot_no_uuid`, `ends_a_snapshot_of_no_id` |
 | `mac` | 16 bytes | `no_mac`, `mac_too_short`, `mac_too_long` |
 | `keys` | one per upsert | `keys_not_one_per_row` |
+| `tables`, `deletes`, `upserts`, `uploads` | no more rows — upserts and deletes together — and no more tables, or uploads, than the replica takes in a message: the server's limits, or more (500 each by default) | `more_rows_than_a_message_carries`, `more_tables_than_a_message_carries`, `ends_more_tables_than_a_message_carries`, `files_more_uploads_than_a_message_carries` |
 
 A row's own fields are the row's to answer for, not the message's: a key
 that does not parse, a row that does not decode, a table the replica does

@@ -530,8 +530,9 @@ pub enum Received {
     Malformed(String),
 }
 
-/// A message from the server, as the transport delivered it, acted on in the
-/// caller's transaction — one begun with `BEGIN IMMEDIATE`, so that what it
+/// A message from the server, as the transport delivered it — one that
+/// carries more rows, or more tables or uploads, than `limits` is malformed
+/// — acted on in the caller's transaction — one begun with `BEGIN IMMEDIATE`, so that what it
 /// reads cannot change before it writes. The caller commits, then
 /// acknowledges the message to the transport — never before: a message
 /// acknowledged and not committed would never come again.
@@ -552,6 +553,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
     bytes: &[u8],
+    limits: &envelope::Limits,
     care: &Care,
 ) -> Result<Received, Stop> {
     let message = match ToReplica::decode(bytes) {
@@ -572,6 +574,9 @@ pub(crate) async fn receive<P: Sync + 'static>(
             "a message with nothing this build knows in it".to_owned(),
         ));
     };
+    if let Some(why) = envelope::oversized(&body, limits) {
+        return Ok(malformed(why));
+    }
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
@@ -1142,14 +1147,16 @@ async fn apply<P: Sync + 'static>(
 ) -> Result<Vec<Applied>, Stop> {
     let naming = !message.snapshot_id.is_empty();
     let mut parts = Vec::new();
+    // Rows of tables the replica does not take, rejected — and logged —
+    // once per table, however many parts name it.
+    let mut foreign: Vec<(&str, Vec<String>)> = Vec::new();
     for (entry, table) in message.tables.iter().enumerate() {
         let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
-            let why = if codec_of(codecs, &table.table).is_some() {
-                "a table the server does not send"
-            } else {
-                "a table this replica does not mirror"
-            };
-            reject(conn, &table.table, &foreign_keys(table), why, by).await?;
+            let keys = foreign_keys(table);
+            match foreign.iter_mut().find(|(name, _)| *name == table.table) {
+                Some((_, all)) => all.extend(keys),
+                None => foreign.push((&table.table, keys)),
+            }
             continue;
         };
         let deletes = keys_of(codec, &table.deletes);
@@ -1226,6 +1233,14 @@ async fn apply<P: Sync + 'static>(
         if !took {
             break;
         }
+    }
+    for (table, keys) in &foreign {
+        let why = if codec_of(codecs, table).is_some() {
+            "a table the server does not send"
+        } else {
+            "a table this replica does not mirror"
+        };
+        reject(conn, table, keys, why, by).await?;
     }
     let mut taken = Vec::new();
     let mut culprits = Vec::new();

@@ -431,6 +431,51 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
             "malformed",
             one(end(101, 100, "")),
         ),
+        // More than a message carries, as a replica takes them by default.
+        (
+            "more_rows_than_a_message_carries",
+            "malformed",
+            with(|d| {
+                d.tables.push(Table {
+                    table: "items".to_owned(),
+                    deletes: vec![crate::envelope::Key::default(); 501],
+                    ..Table::default()
+                });
+            }),
+        ),
+        (
+            "more_tables_than_a_message_carries",
+            "malformed",
+            with(|d| {
+                d.tables = vec![
+                    Table {
+                        table: "items".to_owned(),
+                        ..Table::default()
+                    };
+                    501
+                ];
+            }),
+        ),
+        (
+            "ends_more_tables_than_a_message_carries",
+            "malformed",
+            one(Body::EndSnapshot(EndSnapshot {
+                snapshot_id: snapshot.to_owned(),
+                tables: vec!["items".to_owned(); 501],
+                sequence: 101,
+                epoch: EPOCH.to_owned(),
+                nonce: nonce_of(101),
+                mac: SEAL.to_vec(),
+                ..EndSnapshot::default()
+            })),
+        ),
+        (
+            "files_more_uploads_than_a_message_carries",
+            "malformed",
+            one(Body::Filed(crate::envelope::Filed {
+                uploads: (1..=501).collect(),
+            })),
+        ),
         // A key that does not parse is left out, and the rest applied.
         (
             "a_delete_of_a_key_that_does_not_parse",
@@ -493,7 +538,8 @@ fn the_malformed_corpus_is_the_one_checked_in() {
                   # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, nonce\n\
                   # 0x5eed000000000064, sealed with sixteen bytes 0x5e, of nothing, makes of each\n\
                   # what `outcome` says: `malformed`\n\
-                  # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2).\n";
+                  # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2). It\n\
+                  # takes 500 rows a message, and 500 tables or uploads, at most.\n";
     let text: String = malformed()
         .iter()
         .map(|(case, outcome, bytes)| format!("{case} {outcome} {}\n", hex(bytes)))

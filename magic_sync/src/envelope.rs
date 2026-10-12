@@ -264,6 +264,30 @@ impl Limits {
     }
 }
 
+/// Why `body` is more than a message within `limits` carries — more rows
+/// (upserts and deletes together), or more tables or uploads, than its
+/// rows — when it is: no server sends one, and a replica takes none.
+#[cfg(feature = "sqlite")]
+pub(crate) fn oversized(body: &Body, limits: &Limits) -> Option<String> {
+    let (rows, entries) = match body {
+        Body::Down(down) => (
+            down.tables
+                .iter()
+                .map(|t| t.upserts.len() + t.deletes.len())
+                .sum(),
+            down.tables.len(),
+        ),
+        Body::EndSnapshot(end) => (0, end.tables.len()),
+        Body::Filed(filed) => (0, filed.uploads.len()),
+    };
+    (rows > limits.rows || entries > limits.rows).then(|| {
+        format!(
+            "{rows} rows in {entries} entries, and a message carries {} at most",
+            limits.rows
+        )
+    })
+}
+
 /// One replica's rows made into messages within `limits`, a row at a time,
 /// in the order given — upserts parents first, then deletes children first:
 /// a new message begins when the current one is full, and a row larger than

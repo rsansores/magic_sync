@@ -223,6 +223,15 @@ fn ending(sequence: u64, previous: u64, snapshot: &str, tables: &[&str]) -> Vec<
     .encoded()
 }
 
+/// Settings that take messages larger than a server of the default limits
+/// sends.
+fn roomy() -> Settings {
+    Settings {
+        inbound: Limits::new(1 << 20, 1 << 30).unwrap(),
+        ..Settings::default()
+    }
+}
+
 fn ids<const N: usize>() -> [Uuid; N] {
     std::array::from_fn(|_| Uuid::now_v7())
 }
@@ -1115,7 +1124,7 @@ async fn a_row_the_replica_cannot_take_is_reported_until_it_takes_it(pool: Sqlit
 /// sends the replica cannot take, however much, is not kept to be named.
 #[sqlx::test(migrations = false)]
 async fn a_snapshot_names_only_refused_rows_the_replica_holds(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = world_with(pool, roomy()).await;
     let [held] = ids();
     w.receive(&down(
         1,
@@ -1255,12 +1264,65 @@ async fn what_a_server_says_is_logged_within_bounds(pool: SqlitePool) {
     assert!(longest < 1024, "a field of {longest} bytes");
 }
 
+/// A message carries what the replica takes at most — rows, tables, the
+/// uploads it answers — or is malformed; and rows of tables it does not
+/// take, however many parts name them, are rejected — and logged — once
+/// per table.
+#[sqlx::test(migrations = false)]
+async fn a_message_carries_what_the_replica_takes_at_most(pool: SqlitePool) {
+    let settings = Settings {
+        inbound: Limits::new(3, 1 << 20).unwrap(),
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    let ghost = |n: u8| upserts("ghosts", vec![(key(&[&n.to_string()]), vec![n])]);
+    let logged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _logging = tracing::subscriber::set_default(Counted(logged.clone()));
+    let received = w
+        .receive(&down(1, "", vec![ghost(1), ghost(2), ghost(3)]))
+        .await;
+    assert!(matches!(received, Received::Applied(_)), "{received:?}");
+    assert_eq!(logged.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(w.rejected().await, ["ghosts 1", "ghosts 2", "ghosts 3"]);
+    let four = down(2, "", vec![ghost(1), ghost(2), ghost(3), ghost(4)]);
+    assert!(matches!(w.receive(&four).await, Received::Malformed(_)));
+    let rows = (0..4).map(|n| item(Uuid::from_u128(n), "x")).collect();
+    let four = down(2, "", vec![upserts("items", rows)]);
+    assert!(matches!(w.receive(&four).await, Received::Malformed(_)));
+    let filed = Body::Filed(Filed {
+        uploads: vec![1, 2, 3, 4],
+    });
+    assert!(matches!(
+        w.receive(&filed.encoded()).await,
+        Received::Malformed(_)
+    ));
+}
+
+/// Counts the error events logged.
+struct Counted(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for Counted {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_event() && *metadata.level() == tracing::Level::ERROR
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 /// Shapes no server sends cost nothing: rows with keys not one per row are
 /// a malformed message, applied not at all; a snapshot's end that names a
 /// table again and again sweeps it once.
 #[sqlx::test(migrations = false)]
 async fn shapes_no_server_sends_cost_nothing(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = world_with(pool, roomy()).await;
     let [a, b] = ids();
     let mut unkeyed = upserts("items", vec![item(a, "a"), item(b, "b")]);
     unkeyed.keys.pop();
@@ -1416,13 +1478,13 @@ async fn a_row_that_rolls_back_the_whole_message_is_rejected_and_the_rest_taken(
 /// rejected, and it is taken when it comes again.
 #[sqlx::test(migrations = false)]
 async fn a_disk_full_while_applying_leaves_the_message_to_come_again(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = world_with(pool, roomy()).await;
     let pages: i64 = w.count("PRAGMA page_count").await;
     let options = (*w.pool.connect_options())
         .clone()
         .pragma("max_page_count", (pages + 2).to_string());
     let full = SqlitePool::connect_with(options).await.unwrap();
-    let cramped = Replica::new(full, codecs(), w.me, w.uplink.clone(), Settings::default())
+    let cramped = Replica::new(full, codecs(), w.me, w.uplink.clone(), roomy())
         .await
         .unwrap();
     let rows: Vec<(WireKey, Vec<u8>)> = (0..2000)
@@ -1448,7 +1510,7 @@ async fn a_disk_full_while_applying_leaves_the_message_to_come_again(pool: Sqlit
 /// SQLite's limit of variables.
 #[sqlx::test(migrations = false)]
 async fn a_message_past_a_statements_variables_is_taken_whole(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = world_with(pool, roomy()).await;
     let ids: Vec<Uuid> = (0..crate::dialect::MAX_BINDS + 10)
         .map(|_| Uuid::now_v7())
         .collect();
@@ -1562,7 +1624,7 @@ async fn a_row_whose_deferred_parent_is_missing_is_refused_not_the_message(pool:
         "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL \
          REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED,",
     );
-    let w = world_over(pool, &tables, Settings::default()).await;
+    let w = world_over(pool, &tables, roomy()).await;
     let parent = Uuid::from_u128(1);
     let price = |id: Uuid| {
         let row = Price {
@@ -4586,7 +4648,13 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
         Settings::default(),
     ));
     let mut conn = w.pool.acquire().await.unwrap();
-    spawnable(receive(&mut conn, &codecs(), &[], &Care::default()));
+    spawnable(receive(
+        &mut conn,
+        &codecs(),
+        &[],
+        &Limits::default(),
+        &Care::default(),
+    ));
     let settings = Outbox::default();
     spawnable(outbox(
         &mut conn,
@@ -4746,7 +4814,7 @@ async fn a_two_way_row_that_cannot_be_held_for_its_edit_is_rejected_alone(pool: 
 /// hundred and five are all refused, and the message applied, in seconds.
 #[sqlx::test(migrations = false)]
 async fn five_hundred_rows_that_each_roll_the_message_back_are_all_refused(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = world_with(pool, roomy()).await;
     w.exec(
         "CREATE TRIGGER doomed BEFORE INSERT ON items WHEN NEW.name = 'doom' \
          BEGIN SELECT RAISE(ROLLBACK, 'doomed'); END",
@@ -4826,7 +4894,7 @@ async fn a_row_the_database_will_not_let_go_of_once_filed_is_rejected(pool: Sqli
 /// the row it happened on.
 #[sqlx::test(migrations = false)]
 async fn a_disk_full_while_applying_row_by_row_fails_the_message(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = world_with(pool, roomy()).await;
     w.exec(
         "CREATE TRIGGER doomed BEFORE INSERT ON items WHEN NEW.name = 'doom' \
          BEGIN SELECT RAISE(ROLLBACK, 'doomed'); END",
@@ -4838,7 +4906,7 @@ async fn a_disk_full_while_applying_row_by_row_fails_the_message(pool: SqlitePoo
         .clone()
         .pragma("max_page_count", (pages + 2).to_string());
     let full = SqlitePool::connect_with(options).await.unwrap();
-    let cramped = Replica::new(full, codecs(), w.me, w.uplink.clone(), Settings::default())
+    let cramped = Replica::new(full, codecs(), w.me, w.uplink.clone(), roomy())
         .await
         .unwrap();
     let mut rows: Vec<(WireKey, Vec<u8>)> = (0..2000)

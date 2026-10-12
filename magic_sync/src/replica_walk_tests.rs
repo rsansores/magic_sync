@@ -876,7 +876,8 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
                         .await
                         .unwrap();
-                    let _ = receive(&mut tx, &codecs(), bytes, &Care::default()).await;
+                    let limits = Limits::default();
+                    let _ = receive(&mut tx, &codecs(), bytes, &limits, &Care::default()).await;
                     drop(tx);
                     conn.close_on_drop();
                 }
