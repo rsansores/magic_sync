@@ -2464,6 +2464,14 @@ async fn a_unique_index_over_retired_rows_is_refused(pool: SqlitePool) {
             false,
         ),
         (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL AND name <> '' OR name = 'x'",
+            true,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE (retired_at IS NULL AND name <> '' OR name = 'x')",
+            true,
+        ),
+        (
             "CREATE UNIQUE INDEX shelves_label ON shelves (label)",
             false,
         ),

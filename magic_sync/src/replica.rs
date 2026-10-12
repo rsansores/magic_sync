@@ -402,8 +402,8 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
 
 /// Whether the unique index `sql` creates leaves out every row `retired`
 /// is set on: its filter says `<retired> IS NULL`, alone or as one of the
-/// conditions it joins with `AND` — in whatever case, quoting, spacing or
-/// parentheses.
+/// conditions it joins with `AND` — with no `OR` beside them — in whatever
+/// case, quoting, spacing or parentheses.
 #[cfg(feature = "sqlite")]
 fn leaves_out(sql: &str, retired: &str) -> bool {
     let normal = |text: &str| {
@@ -426,11 +426,14 @@ fn leaves_out(sql: &str, retired: &str) -> bool {
             return true;
         }
         // Split at each `and` outside parentheses; a term that is one pair
-        // of them, opened.
+        // of them, opened. An `or` outside them binds looser than any
+        // `and`: such a term admits rows its conditions do not, and says
+        // nothing.
         let words: Vec<&str> = term.split(' ').collect();
         let mut depth = 0i32;
         let mut parts = vec![Vec::new()];
         let mut closed_at_end = true;
+        let mut either = false;
         for (at, word) in words.iter().enumerate() {
             match *word {
                 "(" => depth += 1,
@@ -442,9 +445,13 @@ fn leaves_out(sql: &str, retired: &str) -> bool {
                     parts.push(Vec::new());
                     continue;
                 }
+                "or" if depth == 0 => either = true,
                 _ => {}
             }
             parts.last_mut().expect("one at least").push(*word);
+        }
+        if either {
+            continue;
         }
         if parts.len() > 1 {
             terms.extend(parts.into_iter().map(|p| p.join(" ")));
