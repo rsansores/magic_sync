@@ -589,7 +589,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
     let received = if care.careful() {
         carefully(conn, codecs, body, care).await
     } else {
-        applied(conn, codecs, body, care).await
+        act(conn, codecs, body, care).await
     };
     let quiet = sqlx::query("DELETE FROM sync_applying")
         .execute(&mut *conn)
@@ -635,8 +635,7 @@ pub(crate) struct Culprit {
 }
 
 /// Where a row is in a message: the upsert at `at` of its `entry`th table,
-/// or a key it lets go of (a delete, a sweep, a let-go once filed, a retired
-/// row nothing keeps).
+/// or a key it lets go of (a delete, a sweep, a let-go once filed).
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Spot {
@@ -810,7 +809,7 @@ async fn carefully<P: Sync + 'static>(
         }
     }
     // Any of the server's tables may change: a message's rows, the end of a
-    // snapshot, a let-go once filed, a retired row let go of.
+    // snapshot, a let-go once filed.
     let mut before = Vec::new();
     let mut recorded = 0;
     for codec in codecs.iter().filter(|c| c.sent_down()) {
@@ -818,7 +817,7 @@ async fn carefully<P: Sync + 'static>(
         recorded += pointing.len();
         before.push((codec, pointing));
     }
-    let received = applied(conn, codecs, body, care).await?;
+    let received = act(conn, codecs, body, care).await?;
     let mut culprits = Vec::new();
     let why = "rows here point at what it changes, through a key checked at commit";
     for (codec, pointing) in &before {
@@ -863,25 +862,6 @@ async fn carefully<P: Sync + 'static>(
     } else {
         Err(Stop::Culprits(culprits))
     }
-}
-
-/// `body` acted on, and then the retired rows nothing keeps any more let go
-/// of, once it changed what the replica holds.
-#[cfg(feature = "sqlite")]
-async fn applied<P: Sync + 'static>(
-    conn: &mut Conn,
-    codecs: &[Codec<P>],
-    body: Body,
-    care: &Care,
-) -> Result<Received, Stop> {
-    let received = act(conn, codecs, body, care).await?;
-    if matches!(
-        received,
-        Received::Applied(_) | Received::SnapshotEnded | Received::Filed
-    ) {
-        collect(conn, codecs, care).await?;
-    }
-    Ok(received)
 }
 
 #[cfg(feature = "sqlite")]
@@ -1692,71 +1672,101 @@ async fn cleared(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Er
 }
 
 /// Lets go of the rows of the server's tables the replica retired that
-/// nothing keeps any more — no row that stays points at them, no edit of
-/// them is on its way — as a delete would, in the transaction of every
-/// message applied: a retired row stays only for what needs it. One the
-/// database refuses to let go stays retired, and nobody is told: the server
-/// let go of it already.
+/// nothing keeps any more — no row that stays points at them, live or
+/// retired, of any table; no edit of them is on its way — as a delete
+/// would, once a message is applied: a retired row stays only for what
+/// needs it. It runs after the message commits, in a transaction of its
+/// own, children first — the server's tables in reverse — so it never
+/// makes a message be applied again; and should the database refuse it,
+/// row by row, each in a transaction of its own, while that lets one more
+/// go. One the database refuses to let go stays retired, and nobody is
+/// told: the server let go of it already. A failure is the replica's
+/// storage, and the next message collects again.
 #[cfg(feature = "sqlite")]
-async fn collect<P: Sync + 'static>(
-    conn: &mut Conn,
+pub(crate) async fn collect<P: Sync + 'static>(
+    pool: &sqlx::SqlitePool,
     codecs: &[Codec<P>],
-    care: &Care,
-) -> Result<(), Stop> {
-    let server: Vec<(&str, Option<&str>)> = codecs
-        .iter()
-        .filter(|c| c.sent_down())
-        .map(|c| (c.table.name, c.table.retired))
-        .collect();
-    for codec in codecs.iter().filter(|c| c.sent_down()) {
-        let table = codec.table.name;
-        let noted: HashSet<String> =
-            sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = $1")
-                .bind(table)
-                .fetch_all(&mut *conn)
-                .await?
-                .into_iter()
-                .collect();
-        let retired: Vec<Key> = codec
-            .retired_keys(conn)
-            .await?
-            .into_iter()
-            .filter(|key| !noted.contains(&key_text(key)))
-            .collect();
-        if !care.careful() {
-            codec.retire(conn, &retired, &[], &server).await?;
-            continue;
-        }
-        // One by one, each in a savepoint, while that lets one more go:
-        // rows that keep only one another go one after the other.
-        let mut pending: Vec<Key> = retired
-            .into_iter()
-            .filter(|key| care.culprit(table, &Spot::LetGo(key_text(key))).is_none())
-            .collect();
-        loop {
-            let mut kept = Vec::new();
-            for key in pending.iter().cloned() {
-                row_begun(conn).await?;
-                let one = std::slice::from_ref(&key);
-                let gone = codec
-                    .retire(conn, one, &[], &server)
-                    .await
-                    .map_err(Stop::from);
-                let spot = Spot::LetGo(key_text(&key));
-                if !row_done(conn, gone, table, spot)
-                    .await?
-                    .is_ok_and(|r| r.deleted > 0)
-                {
-                    kept.push(key);
+) -> Result<(), Error> {
+    let server: Vec<&Codec<P>> = codecs.iter().filter(|c| c.sent_down()).rev().collect();
+    let mut conn = pool.acquire().await?;
+    let refusal = match collected(&mut conn, &server, None).await {
+        Ok(_) => return Ok(()),
+        Err(e) if e.is_refusal() => e,
+        Err(e) => return Err(e),
+    };
+    // The database may have rolled the transaction back under it: a
+    // connection that no longer knows whether it is in one goes.
+    conn.close_on_drop();
+    drop(conn);
+    tracing::warn!("sync: retired rows refused to go together, let go of one by one: {refusal}");
+    loop {
+        let mut went = 0;
+        for codec in &server {
+            let keys = collectable(&mut *pool.acquire().await?, codec).await?;
+            for key in &keys {
+                let mut conn = pool.acquire().await?;
+                match collected(&mut conn, &[codec], Some(key)).await {
+                    Ok(gone) => went += gone,
+                    Err(e) if e.is_refusal() => conn.close_on_drop(),
+                    Err(e) => return Err(e),
                 }
             }
-            if kept.is_empty() || kept.len() == pending.len() {
-                break;
-            }
-            pending = kept;
+        }
+        if went == 0 {
+            return Ok(());
         }
     }
-    Ok(())
+}
+
+/// In a transaction of its own, lets go of the retired rows of `codecs`'
+/// tables nothing keeps — of `one` alone, when given — and commits:
+/// answers how many went.
+#[cfg(feature = "sqlite")]
+async fn collected<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[&Codec<P>],
+    one: Option<&Key>,
+) -> Result<u64, Error> {
+    let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+    // The engine's writes, which no trigger notes or refuses.
+    sqlx::query("INSERT INTO sync_applying (id) VALUES (1)")
+        .execute(&mut *tx)
+        .await?;
+    let mut gone = 0;
+    for codec in codecs {
+        let keys = match one {
+            Some(key) => vec![key.clone()],
+            None => collectable(&mut tx, codec).await?,
+        };
+        gone += codec.collect(&mut tx, &keys).await?;
+    }
+    sqlx::query("DELETE FROM sync_applying")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(gone)
+}
+
+/// The rows of `codec`'s table the replica retired with no edit of them on
+/// its way: the ones [`collect`] may let go of.
+#[cfg(feature = "sqlite")]
+async fn collectable<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+) -> Result<Vec<Key>, Error> {
+    let noted: HashSet<String> =
+        sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = $1")
+            .bind(codec.table.name)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+    Ok(codec
+        .retired_keys(conn)
+        .await?
+        .into_iter()
+        .filter(|key| !noted.contains(&key_text(key)))
+        .collect())
 }
 
 /// The snapshot in progress is complete: every row of its tables it did not

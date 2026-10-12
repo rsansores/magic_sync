@@ -304,6 +304,13 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.retire(conn, keys, held, server)
     }
 
+    /// A replica letting go of the retired rows of `keys` nothing that
+    /// stays points at ([`row::collect_by_keys`]): answers how many went.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn collect<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
+        self.ops.collect(conn, keys)
+    }
+
     /// The keys of `keys` this replica holds, retired or not.
     #[cfg(feature = "sqlite")]
     pub(crate) fn present<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
@@ -477,6 +484,8 @@ trait Ops<P>: Send + Sync {
         held: &'a [Key],
         server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired>;
+    #[cfg(feature = "sqlite")]
+    fn collect<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
@@ -873,6 +882,11 @@ where
         server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired> {
         Box::pin(row::retire_by_keys::<R>(conn, keys, held, server))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn collect<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
+        Box::pin(row::collect_by_keys::<R>(conn, keys))
     }
 
     #[cfg(feature = "postgres")]

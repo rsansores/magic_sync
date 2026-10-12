@@ -2289,6 +2289,64 @@ async fn a_retired_row_goes_once_nothing_points_at_it(pool: SqlitePool) {
     assert!(w.rejected().await.is_empty());
 }
 
+/// A retired row a live row of the server's still points at stays — even
+/// through a key checked at commit — and costs the messages after it
+/// nothing: none is applied again for it.
+#[sqlx::test(migrations = false)]
+async fn a_retired_row_a_live_one_points_at_stays_and_costs_nothing(pool: SqlitePool) {
+    let tables = TABLES.replace(
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL,",
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL \
+         REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED,",
+    );
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let [id] = ids();
+    let price = Price {
+        id,
+        cents: 1,
+        updated_at: at(1),
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts("items", vec![item(id, "a")]),
+            upserts("prices", vec![(key(&[&id.to_string()]), json(&price))]),
+        ],
+    ))
+    .await;
+    let x = id.simple();
+    w.exec(&format!(
+        "INSERT INTO receipts (item_id) VALUES (x'{x}'); INSERT INTO quotes (price_id) VALUES (x'{x}')"
+    ))
+    .await
+    .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            deletes("prices", vec![key(&[&id.to_string()])]),
+            deletes("items", vec![key(&[&id.to_string()])]),
+        ],
+    ))
+    .await;
+    assert_eq!(w.rejected().await, [format!("prices {id}")]);
+    w.exec("DELETE FROM receipts").await.unwrap();
+    let again = w.replica.again.load(std::sync::atomic::Ordering::Relaxed);
+    for n in 3..6 {
+        w.receive(&down(n, "", vec![upserts("shelves", Vec::new())]))
+            .await;
+    }
+    assert_eq!(
+        w.replica.again.load(std::sync::atomic::Ordering::Relaxed),
+        again,
+        "applied again"
+    );
+    let retired = "SELECT count(*) FROM items WHERE retired_at IS NOT NULL";
+    assert_eq!(w.count(retired).await, 1, "its price points at it");
+    assert_eq!(w.rejected().await, [format!("prices {id}")]);
+}
+
 /// A unique index over a table with a retired column must leave the
 /// retired rows out: one that does not would keep a retired row's value
 /// from every row the server sends after it.

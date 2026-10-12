@@ -104,9 +104,10 @@ refuses one that does not:
 CREATE UNIQUE INDEX products_code ON products (code) WHERE retired_at IS NULL;
 ```
 
-Every message applied looks for the retired rows that nothing keeps any
-more: on a table of many rows, an index on its retired column keeps that
-cheap.
+After every message it applies, in a transaction of its own, the replica
+looks for the retired rows that nothing keeps any more — no row of any
+table, live or retired, points at them — and lets them go, children first:
+on a table of many rows, an index on its retired column keeps that cheap.
 
 Same two ways for the engine's part: your migrations run the engine's
 first step, [`magic_sync::replica::migration`]`(1)`, and the script

@@ -333,9 +333,11 @@ A replica that must let go of a row that one of its own rows still points at
 (a receipt that names an order) keeps the row and marks it retired: a column
 the replica owns, set to when it was retired. Retired rows are out of
 everything the replica offers its users, but stay for what points at them,
-and only that long: once nothing does, the replica lets go of them as of a
-delete — it looks after every message it applies — and says nothing of one
-it cannot. A retired row holds none of its unique values against a live one.
+and only that long: once nothing that stays points at them — a live row or
+a retired one, of any table — the replica lets go of them, children first.
+It looks after every message it applies, once that message is applied and
+apart from it, so a row it cannot let go of never holds a message back; and
+it says nothing of one it cannot. A retired row holds none of its unique values against a live one.
 A retired row the server sends again becomes live.
 
 A row of a table written on both sides that the replica edited, and whose

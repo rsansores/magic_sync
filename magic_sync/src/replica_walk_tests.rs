@@ -796,8 +796,20 @@ async fn deliver(
         edits.filed(&filed.uploads);
     }
     pins(&node.pool, edits, model).await;
+    let before = model.rejections.clone();
     let expected = model.receive(bytes, &RULES);
+    let again = &node.replica.again;
+    let tries = again.load(std::sync::atomic::Ordering::Relaxed);
     let received = node.replica.receive(bytes).await.expect("applied");
+    // Applied again only for a row at fault, which it then rejects.
+    let culprit = model
+        .rejections
+        .iter()
+        .any(|(row, r)| before.get(row) != Some(r));
+    assert!(
+        culprit || again.load(std::sync::atomic::Ordering::Relaxed) == tries,
+        "applied again with no row at fault: {expected:?}"
+    );
     (expected, received)
 }
 
