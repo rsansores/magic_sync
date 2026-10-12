@@ -110,10 +110,14 @@ show what it decided.
 The server files a setting as it does a record, the newer version winning.
 A register that is provisioned again sends its settings and its answers again,
 and those the server takes whatever their version — they are what the register
-holds now. A register's digests fingerprint its settings and its answers too,
-so one the server finds apart from what it records — the server restored from
-an older copy, say — is provisioned again: either side restored from an older
-copy, both still end showing the same value.
+holds now. A register's digests — hourly by default
+(`Settings::digests_every`) — fingerprint its settings and its answers too, so
+one the server finds apart from what it records — the server restored from an
+older copy, say — is provisioned again. The snapshot names the settings the
+server records it holding, and the register deletes, as its own write, any it
+no longer holds: so the server lets go of a setting row only as the register's
+delete of it is filed. Either side restored from an older copy, both still end
+showing the same value, once a digest finds them apart.
 
 ## Where a wish stands
 

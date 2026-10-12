@@ -2567,6 +2567,7 @@ fn edit(partition: Uuid, id: Uuid, title: &str, seen: i32) -> envelope::Up {
             }],
             deletes: Vec::new(),
             restated: false,
+            recorded: Vec::new(),
         }],
         protocol: envelope::PROTOCOL,
         ..envelope::Up::default()

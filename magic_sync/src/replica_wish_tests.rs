@@ -129,7 +129,7 @@ impl World {
     }
 
     /// Offers the wishes it holds: whether that wrote anything.
-    async fn offer(&self) -> bool {
+    pub(super) async fn offer(&self) -> bool {
         self.replica
             .carry_out_wishes()
             .await
@@ -566,22 +566,46 @@ async fn a_snapshot_beginning_has_the_replica_say_its_settings_and_answers_again
         "all filed"
     );
 
+    // The snapshot names the screens the server records it holding: one
+    // it holds, one it does not, which it deletes.
     let (key, row) = wished(&w.screen(70, 1), 5, false);
-    w.receive(&begin(2, "again", vec![wishes(vec![(key, row)])]))
+    let screen_key = |id: u128| WireKey {
+        parts: vec![w.me.to_string(), Uuid::from_u128(id).to_string()],
+    };
+    let recorded = Table {
+        table: "screens".to_owned(),
+        recorded: vec![screen_key(1), screen_key(2)],
+        ..Table::default()
+    };
+    w.receive(&begin(2, "again", vec![wishes(vec![(key, row)]), recorded]))
         .await;
     let noted = w
         .texts("SELECT relation FROM sync_notes ORDER BY relation")
         .await;
-    assert_eq!(noted, ["screens", "sync_wishes"]);
+    assert_eq!(noted, ["screens", "screens", "sync_wishes"]);
     w.receive(&end(3, "again", &["sync_wishes"])).await;
     assert!(!w.offer().await, "the wish it held, answered");
     let up = w.up(0, false).await.expect("said again");
-    let said: BTreeMap<&str, usize> = up
+    let said: Vec<(&str, usize, usize, bool)> = up
         .tables
         .iter()
-        .map(|t| (t.table.as_str(), t.upserts.len()))
+        .map(|t| {
+            (
+                t.table.as_str(),
+                t.upserts.len(),
+                t.deletes.len(),
+                t.restated,
+            )
+        })
         .collect();
-    assert_eq!(said, BTreeMap::from([("screens", 1), ("sync_wishes", 1)]));
+    assert_eq!(
+        said,
+        [
+            ("screens", 1, 0, true),
+            ("sync_wishes", 1, 0, true),
+            ("screens", 0, 1, false)
+        ]
+    );
     let wish = WireWish::decode(
         up.tables
             .iter()
@@ -735,11 +759,26 @@ async fn walk_wishes(pool: SqlitePool, seed: u64) {
                     .values()
                     .map(|(version, wanted, unchanged)| wished(wanted, *version, *unchanged))
                     .collect();
+                // And the screens it records the replica holding: one it
+                // does not, the replica deletes.
+                let recorded = Table {
+                    table: "screens".to_owned(),
+                    recorded: (1..=3_u128)
+                        .filter(|_| walk.below(2) == 0)
+                        .map(|id| WireKey {
+                            parts: row_of(id).1.split('|').map(str::to_owned).collect(),
+                        })
+                        .collect(),
+                    ..Table::default()
+                };
                 n += 1;
-                let begun = numbered(BASE + n, 0, &name, vec![wishes(rows)]);
+                let begun = numbered(BASE + n, 0, &name, vec![wishes(rows), recorded]);
                 w.receive(&begun).await;
                 model.receive(&begun, &crate::model::Rules::ANY);
                 holder.began(&model);
+                if let Some(Body::Down(down)) = ToReplica::decode(begun.as_slice()).unwrap().body {
+                    holder.recorded(&down);
+                }
                 n += 1;
                 let ended = end(n, &name, &["sync_wishes"]);
                 w.receive(&ended).await;
@@ -1176,8 +1215,8 @@ async fn a_handler_of_another_row_type_is_refused_at_start(pool: SqlitePool) {
 }
 
 /// A wish whose key came in another spelling of the same key is the same
-/// row's; one whose version cannot move is refused rather than written
-/// with the version it had.
+/// row's; one whose version cannot move is refused before its handler acts,
+/// rather than written with the version it had.
 #[sqlx::test(migrations = false)]
 async fn a_wish_reads_its_key_as_the_tables_and_a_version_that_cannot_move_is_refused(
     pool: SqlitePool,
@@ -1200,9 +1239,169 @@ async fn a_wish_reads_its_key_as_the_tables_and_a_version_that_cannot_move_is_re
     ))
     .await;
     assert!(w.offer().await);
-    assert_eq!(hand.seen().len(), 1, "the same row, whatever its spelling");
+    assert!(hand.seen().is_empty(), "refused before its handler acts");
     let (_, outcome, reason) = w.answered().await.unwrap();
     assert_eq!(outcome.as_deref(), Some("refused"));
-    assert!(reason.unwrap().contains("cannot move"));
+    assert!(
+        reason.as_deref().is_some_and(|r| r.contains("cannot move")),
+        "the same row, whatever its spelling: {reason:?}"
+    );
     assert_eq!(w.setting().await, Some((40, i64::MAX)));
+}
+
+/// A setting whose codec carries its version, an instant, to the
+/// millisecond.
+#[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+#[row(
+    table = "dials",
+    mirror = "setting",
+    key = "replica_id, id",
+    origin = "replica_id",
+    apply = "if_unchanged"
+)]
+struct Dial {
+    replica_id: Uuid,
+    id: Uuid,
+    #[row(desired)]
+    level: i64,
+    #[row(version)]
+    at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct DialRow {
+    #[prost(string, tag = "1")]
+    replica_id: String,
+    #[prost(string, tag = "2")]
+    id: String,
+    #[prost(int64, tag = "3")]
+    level: i64,
+    #[prost(int64, tag = "4")]
+    at_ms: i64,
+}
+
+fn dial_to_wire(dial: Dial) -> Result<DialRow, crate::wire::MapError> {
+    Ok(DialRow {
+        replica_id: dial.replica_id.to_string(),
+        id: dial.id.to_string(),
+        level: dial.level,
+        at_ms: dial.at.timestamp_millis(),
+    })
+}
+
+fn dial_from_wire(row: DialRow) -> Result<Dial, crate::wire::MapError> {
+    Ok(Dial {
+        replica_id: row.replica_id.parse()?,
+        id: row.id.parse()?,
+        level: row.level,
+        at: chrono::DateTime::from_timestamp_millis(row.at_ms)
+            .ok_or_else(|| crate::wire::MapError::new("an instant out of range"))?,
+    })
+}
+
+/// A wish based on the version the server holds — the replica's, as its
+/// codec carried it up — finds the replica unchanged, however much finer
+/// the replica keeps it.
+#[sqlx::test(migrations = false)]
+async fn a_wish_compares_versions_as_the_codec_carries_them(pool: SqlitePool) {
+    let settings = Settings {
+        wishes: Wishes::new().on::<Dial>(Direct),
+        ..Settings::default()
+    };
+    let w = world_of(
+        pool,
+        "CREATE TABLE dials (replica_id BLOB NOT NULL, id BLOB NOT NULL, level INTEGER NOT NULL,
+             at TEXT NOT NULL, PRIMARY KEY (replica_id, id));",
+        settings,
+        vec![Codec::new::<Dial, DialRow>(
+            dial_to_wire,
+            dial_from_wire,
+            None,
+        )],
+    )
+    .await;
+    let at = Utc.with_ymd_and_hms(2027, 1, 15, 8, 0, 0).unwrap()
+        + chrono::TimeDelta::nanoseconds(123_456_789);
+    let held = Dial {
+        replica_id: w.me,
+        id: Uuid::from_u128(1),
+        level: 1,
+        at,
+    };
+    sqlx::query("INSERT INTO dials (replica_id, id, level, at) VALUES ($1, $2, $3, $4)")
+        .bind(held.replica_id)
+        .bind(held.id)
+        .bind(held.level)
+        .bind(held.at)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let wanted = dial_to_wire(Dial {
+        level: 9,
+        ..held.clone()
+    })
+    .unwrap();
+    let id = Uuid::from_u128(0xd1).to_string();
+    let wish = WireWish {
+        id: id.clone(),
+        table: "dials".to_owned(),
+        key: Some(key(&[&w.me.to_string(), &held.id.to_string()])),
+        wanted: wanted.encode_to_vec(),
+        version: 3,
+        if_unchanged: true,
+        ..WireWish::default()
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "sync_wishes",
+            vec![(key(&[&id]), wish.encode_to_vec())],
+        )],
+    ))
+    .await;
+    w.offer().await;
+    assert_eq!(
+        w.answered().await,
+        Some((Some(3), Some("applied".to_owned()), None))
+    );
+    let level: i64 = sqlx::query_scalar("SELECT level FROM dials")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(level, 9);
+}
+
+/// A setting re-stated stays so until the upload that carries it is filed
+/// — then a write since goes up as any write does; and one re-stated after
+/// it was sent is not done by the earlier upload's answer.
+#[sqlx::test(migrations = false)]
+async fn a_setting_is_re_stated_until_the_upload_that_carries_it_is_filed(pool: SqlitePool) {
+    let hand = Hand::default();
+    let w = wish_world(pool, &hand).await;
+    w.set(40, 1).await;
+    let filed = |up: &Up| {
+        Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded()
+    };
+    let restated = |up: &Up| {
+        up.tables
+            .iter()
+            .filter(|t| t.table == "screens")
+            .map(|t| t.restated)
+            .collect::<Vec<_>>()
+    };
+    let first = w.up(0, false).await.expect("its write");
+    w.receive(&begin(1, "again", Vec::new())).await;
+    w.receive(&end(2, "again", &[])).await;
+    w.receive(&filed(&first)).await;
+    let again = w.up(0, false).await.expect("re-stated");
+    assert_eq!(restated(&again), [true], "the earlier upload's answer");
+
+    w.set(50, 2).await;
+    w.receive(&filed(&again)).await;
+    let later = w.up(0, false).await.expect("its write since");
+    assert_eq!(restated(&later), [false], "filed: a write as any");
 }

@@ -38,6 +38,10 @@ message Table {
   // wishes, as it holds them now (PROTOCOL.md section 7) — the server takes
   // them whatever their version.
   bool restated = 5;
+  // Down only, in a snapshot: the rows of a setting the server records this
+  // replica holding (PROTOCOL.md section 4.2) — the replica deletes, as its
+  // own write, each it does not hold.
+  repeated Key recorded = 6;
 }
 
 // Server to replica: rows to hold and rows to let go, in the order given —

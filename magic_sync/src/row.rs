@@ -1365,7 +1365,7 @@ pub(crate) async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<
 
 /// `row` as PostgreSQL writes it as JSON (`to_jsonb`): its written columns
 /// by name, each value as its column's type writes it — the row in the
-/// table's own shape, which [`laid_over`] reads back.
+/// table's own shape, which [`wanted`] reads back.
 ///
 /// # Errors
 ///
@@ -1380,22 +1380,42 @@ pub(crate) async fn as_json<R: Row>(exec: &mut Conn, row: R) -> Result<serde_jso
     Ok(qb.build_query_scalar().fetch_one(&mut *exec).await?)
 }
 
-/// The row of `key` as the table holds it now — or, when it holds none, as
-/// `whole` (from [`as_json`]) is — with the columns of `laid` laid over it:
-/// whatever columns the table has gained since `whole` was written come from
-/// its own row. `None` when neither gives a row of `R`.
+/// The row a wish of `key` (as its text) wants: the row as the table holds
+/// it now — or, when it holds none, as `whole` (from [`as_json`]) is — with
+/// `whole`'s desired, key and version columns laid over it. Whatever
+/// columns the table has gained since `whole` was written come from its own
+/// row.
 ///
 /// # Errors
 ///
+/// [`Error::Malformed`] for a key that is not the table's;
 /// [`Error::Database`] when the database fails, or the row does not decode
-/// as `R`.
+/// as `R` — one the table does not hold, and a column it gained since
+/// `whole` was written is NULL in.
 #[cfg(feature = "postgres")]
-pub(crate) async fn laid_over<R: Row>(
+pub(crate) async fn wanted<R: Row>(
     exec: &mut Conn,
-    key: &Key,
+    key: &str,
     whole: &serde_json::Value,
-    laid: &serde_json::Value,
-) -> Result<Option<R>, Error> {
+) -> Result<R, Error> {
+    let table = Table::of::<R>();
+    let key_columns: Vec<Column> = table
+        .key
+        .iter()
+        .filter_map(|k| table.columns.iter().find(|c| c.name == *k).copied())
+        .collect();
+    let key = crate::plan::parse_key(&key_columns, key)?;
+    let laid: serde_json::Map<String, serde_json::Value> = whole
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| {
+            table.columns.iter().any(|c| {
+                c.name == name.as_str() && (c.desired || c.key.is_some() || c.version.is_some())
+            })
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
     let mut qb = sqlx::QueryBuilder::new(format!(
         "SELECT {} FROM (SELECT (jsonb_populate_record(coalesce(\
@@ -1403,13 +1423,13 @@ pub(crate) async fn laid_over<R: Row>(
         listed(&names),
         R::QUALIFIED
     ));
-    key_filter::<R>(&mut qb, std::slice::from_ref(key));
+    key_filter::<R>(&mut qb, std::slice::from_ref(&key));
     qb.push(format!("), jsonb_populate_record(NULL::{}, ", R::QUALIFIED));
     qb.push_bind(whole.clone());
     qb.push(")), ");
-    qb.push_bind(laid.clone());
+    qb.push_bind(serde_json::Value::Object(laid));
     qb.push(")).*) w");
-    Ok(qb.build_query_as::<R>().fetch_optional(&mut *exec).await?)
+    Ok(qb.build_query_as::<R>().fetch_one(&mut *exec).await?)
 }
 
 /// Every row of the table — of the replica `of`, by the table's origin,
@@ -1443,49 +1463,6 @@ pub(crate) async fn versions<R: Row>(
             )
         })
         .collect())
-}
-
-/// Lets go of every row of the replica `replica`, by the table's origin.
-///
-/// # Errors
-///
-/// [`Error::Database`] when the database fails or refuses.
-#[cfg(feature = "postgres")]
-pub(crate) async fn delete_of<R: Row>(exec: &mut Conn, replica: Uuid) -> Result<u64, Error> {
-    let Some(origin) = R::ORIGIN else {
-        return Ok(0);
-    };
-    Ok(sqlx::query(&format!(
-        "DELETE FROM {} WHERE {} = $1",
-        R::QUALIFIED,
-        ident(origin)
-    ))
-    .bind(replica)
-    .execute(&mut *exec)
-    .await?
-    .rows_affected())
-}
-
-/// `row` (from [`as_json`]) read back as a row of `R`.
-///
-/// # Errors
-///
-/// [`Error::Database`] when the database fails, or the row does not decode
-/// as `R` — one a column the table gained since it was written is NULL in.
-#[cfg(feature = "postgres")]
-pub(crate) async fn from_json<R: Row>(
-    exec: &mut Conn,
-    row: &serde_json::Value,
-) -> Result<R, Error> {
-    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
-    Ok(sqlx::query_as::<_, R>(&format!(
-        "SELECT {} FROM jsonb_populate_record(NULL::{}, $1)",
-        listed(&names),
-        R::QUALIFIED
-    ))
-    .bind(row.clone())
-    .fetch_one(&mut *exec)
-    .await?)
 }
 
 /// Inserts every row, or overwrites the one the table holds, whatever its

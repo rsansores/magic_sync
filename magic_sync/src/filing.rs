@@ -83,6 +83,7 @@ impl Unfiled {
             keys: vec![key.clone()],
             deletes: Vec::new(),
             restated: table.restated,
+            recorded: Vec::new(),
         };
         Some(Self::of(table, Self::key(codec, key)?, part, reason))
     }
@@ -1092,12 +1093,25 @@ async fn compare<P: Sync + 'static>(
         .execute(&mut *conn)
         .await?;
     let mut held = held.0;
+    // What the server keeps of the replica's uploads, unfiled until a fix:
+    // a setting or the answers it has not filed all of are not compared,
+    // as the replica leaves out a table of which it wrote what is not filed.
+    let kept: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT relation FROM sync.inbox WHERE replica_id = $1")
+            .bind(replica)
+            .fetch_all(&mut *conn)
+            .await?;
     let mut differ = Vec::new();
     for digest in digests {
         let mut keys = held.remove(&digest.table).unwrap_or_default();
         // A setting is compared as the server holds the replica's rows of
         // it, and the wishes as their answers too: either may differ after
         // a restore no message down revealed.
+        let own = codec_of(codecs, &digest.table)
+            .is_some_and(|c| setting(c) || c.table.name == crate::wish::TABLE);
+        if own && kept.contains(&digest.table) {
+            continue;
+        }
         match codec_of(codecs, &digest.table) {
             Some(codec) if setting(codec) => keys = codec.versions(conn, Some(replica)).await?,
             Some(codec) if codec.table.name == crate::wish::TABLE => {
@@ -1126,14 +1140,6 @@ async fn compare<P: Sync + 'static>(
     {
         tracing::error!(%replica, "sync ALARM: a replica differs again after being provisioned again — a bug no provisioning cures; deploy a fix");
         return Ok(differ);
-    }
-    // What the server holds of a setting that differs, it lets go of: the
-    // replica states again, as it provisions it, every row it holds.
-    for codec in codecs
-        .iter()
-        .filter(|c| setting(c) && differ.contains(&c.table.name.to_owned()))
-    {
-        codec.delete_of(conn, replica).await?;
     }
     resync(conn, replica).await?;
     sqlx::query("UPDATE sync.replicas SET drifted_at = now() WHERE replica_id = $1")

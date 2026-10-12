@@ -979,6 +979,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         deletes: (0..walk.below(3)).map(|_| key(&mut walk)).collect(),
                         keys: (0..walk.below(3)).map(|_| key(&mut walk)).collect(),
                         restated: walk.below(2) == 0,
+                        recorded: Vec::new(),
                     })
                     .collect(),
                 rejected: (0..walk.below(3))

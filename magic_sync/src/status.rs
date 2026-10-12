@@ -271,6 +271,19 @@ impl WishState {
         .into_iter()
         .find(|state| state.as_str() == word)
     }
+
+    /// The state `word` writes, as a listing shows it: a word of no state
+    /// this build knows — an answer of a later replica's — shows as
+    /// pending, and is logged.
+    pub(crate) fn shown(word: &str) -> Self {
+        Self::of(word).unwrap_or_else(|| {
+            tracing::warn!(
+                state = word,
+                "sync: a wish in a state this build does not know — shown as pending"
+            );
+            WishState::Pending
+        })
+    }
 }
 
 /// Where a replica stands, in one word: the first of these that applies.
@@ -290,7 +303,7 @@ pub enum ReplicaState {
     /// Changes are on their way to it, or from it — or held back: by a
     /// change the planner set aside that may concern it, or by the replica,
     /// a row of its own it deleted that waits to be sent again — or a wish
-    /// of its settings it has not carried out yet.
+    /// of its settings it has not answered yet.
     CatchingUp,
     /// It holds what it should, and the server has filed everything it last
     /// said it wrote.
@@ -641,7 +654,7 @@ mod stored {
                 replica: self.replica,
                 table: self.table,
                 key: self.key,
-                state: super::WishState::of(&self.state).unwrap_or(super::WishState::Pending),
+                state: super::WishState::shown(&self.state),
                 reason: self.reason,
                 note: self.note,
                 wished_at: self.wished_at,

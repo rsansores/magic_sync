@@ -214,7 +214,7 @@ pub(crate) async fn answers(
 ) -> Result<Vec<String>, crate::Error> {
     let answered: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(&format!(
         "SELECT k, w.answered, w.outcome FROM unnest($1::text[]) AS k \
-           LEFT JOIN sync.{TABLE} w ON w.id::text = k"
+           LEFT JOIN sync.{TABLE} w ON w.id = k::uuid"
     ))
     .bind(&keys)
     .fetch_all(&mut *conn)
@@ -226,7 +226,7 @@ pub(crate) async fn answers(
 }
 
 /// One wish's line in a digest of `sync_wishes`.
-fn answer_line(key: &str, answered: Option<i64>, outcome: Option<&str>) -> String {
+pub(crate) fn answer_line(key: &str, answered: Option<i64>, outcome: Option<&str>) -> String {
     format!(
         "{key}\t{}\t{}",
         answered.map(|a| a.to_string()).unwrap_or_default(),
@@ -407,10 +407,16 @@ mod server {
             Ok(encoded)
         }
 
-        /// The places of `rows` that, unless re-stated, would take a final
-        /// answer of a version back to another answer of it: an older
-        /// upload, filed late.
-        async fn stale(&self, conn: &mut Conn, rows: &[Vec<u8>]) -> Result<Vec<usize>, Error> {
+        /// The places of `rows` that, unless re-stated, are an older upload
+        /// filed late: one that would take a final answer of a version back
+        /// to another answer of it, or an answer of the wish as it stands
+        /// back to one of an earlier version — the replica answers no earlier
+        /// version once it holds a later one.
+        async fn stale(
+            &self,
+            conn: &mut Conn,
+            rows: &[Vec<u8>],
+        ) -> Result<std::collections::HashSet<usize>, Error> {
             use prost::Message as _;
             let said: Vec<(usize, Uuid, i64, String)> = rows
                 .iter()
@@ -422,9 +428,9 @@ mod server {
                     Some((at, id, answered, wish.outcome))
                 })
                 .collect();
-            let finals: Vec<(Uuid, i64, String)> = sqlx::query_as(&format!(
-                "SELECT id, answered, outcome FROM sync.{TABLE} \
-                  WHERE id = ANY($1) AND outcome IN ('applied', 'refused', 'superseded')"
+            let answers: Vec<(Uuid, i64, i64, String)> = sqlx::query_as(&format!(
+                "SELECT id, version, answered, outcome FROM sync.{TABLE} \
+                  WHERE id = ANY($1) AND answered IS NOT NULL"
             ))
             .bind(said.iter().map(|(_, id, _, _)| *id).collect::<Vec<_>>())
             .fetch_all(&mut *conn)
@@ -432,8 +438,13 @@ mod server {
             Ok(said
                 .into_iter()
                 .filter(|(_, id, answered, outcome)| {
-                    finals.iter().any(|(fid, fanswered, foutcome)| {
-                        fid == id && fanswered == answered && foutcome != outcome
+                    answers.iter().any(|(aid, version, aanswered, aoutcome)| {
+                        aid == id
+                            && ((aanswered == answered
+                                && aoutcome != outcome
+                                && ["applied", "refused", "superseded"]
+                                    .contains(&aoutcome.as_str()))
+                                || (aanswered == version && answered != version))
                     })
                 })
                 .map(|(at, _, _, _)| at)
@@ -456,7 +467,7 @@ mod server {
         ) -> Fut<'a, Taken> {
             Box::pin(async move {
                 let stale = if restated {
-                    Vec::new()
+                    std::collections::HashSet::new()
                 } else {
                     self.stale(conn, &rows).await?
                 };
@@ -488,10 +499,6 @@ mod server {
 
         fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>> {
             self.inner.versions(conn, of)
-        }
-
-        fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64> {
-            self.inner.delete_of(conn, replica)
         }
     }
 
@@ -583,6 +590,7 @@ mod server {
 
     /// One stored wish, before its row is read.
     type Stored = (
+        String,
         serde_json::Value,
         i64,
         String,
@@ -600,7 +608,7 @@ mod server {
         codec_of::<R, P>(codecs)?;
         let texts: Vec<String> = keys.iter().map(key_text).collect();
         let stored: Vec<Stored> = sqlx::query_as(&format!(
-            "SELECT w.wanted, w.version, {STATE}, \
+            "SELECT w.row_key, w.wanted, w.version, {STATE}, \
                     CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN w.reason END, \
                     w.note, w.wished_at, \
                     CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN w.answered_at END \
@@ -613,13 +621,13 @@ mod server {
         .fetch_all(&mut *conn)
         .await?;
         let mut out = Vec::with_capacity(stored.len());
-        for (whole, version, state, reason, note, wished_at, answered_at) in stored {
-            let wanted: R = crate::row::from_json(conn, &whole).await?;
+        for (row_key, whole, version, state, reason, note, wished_at, answered_at) in stored {
+            let wanted: R = crate::row::wanted(conn, &row_key, &whole).await?;
             out.push(WishOf {
                 key: wanted.key(),
                 wanted,
                 version,
-                state: WishState::of(&state).unwrap_or(WishState::Pending),
+                state: WishState::shown(&state),
                 reason,
                 note,
                 wished_at,
@@ -721,7 +729,11 @@ mod replica {
     /// only while the row is at the version the wish is based on. That is
     /// compared before the handler runs: a write of the row's own while it
     /// runs is overwritten with the wished columns when it answers
-    /// [`Outcome::Applied`], whatever the row's other columns became.
+    /// [`Outcome::Applied`], whatever the row's other columns became. A row
+    /// the replica's database then refuses — a check of the host's — is
+    /// answered `refused` and left as it was, though the handler acted: a
+    /// handler that reaches hardware checks what the table would refuse
+    /// first.
     pub trait CarryOut<R: Setting>: Send + Sync + 'static {
         /// Carries `wish` out, or says why not.
         fn carry_out(&self, wish: Wish<R>) -> impl Future<Output = Outcome> + Send;
@@ -754,12 +766,13 @@ mod replica {
     trait Carrier: Send + Sync {
         /// The row type it carries wishes of out.
         fn row(&self) -> TypeId;
-        /// Carries `wish` out — `wanted`, its row decoded — and records the
-        /// answer.
+        /// Carries `wish` out — `wanted`, its row decoded, and `travelled`,
+        /// the row held as the codec carries it — and records the answer.
         fn carry(
             self: Arc<Self>,
             run: Run,
             wanted: Box<dyn Any + Send>,
+            travelled: Option<Box<dyn Any + Send>>,
             wish: WishRow,
         ) -> Fut<Result<Offered, Error>>;
     }
@@ -976,8 +989,24 @@ mod replica {
                 row_key: crate::row::key_text(&key),
                 ..wish
             };
+            // The row it holds as the codec carries it: the version a wish is
+            // based on came the same way, and is compared with that.
+            let travelled = {
+                let mut conn = run.pool.acquire().await?;
+                codec
+                    .load(&mut conn, std::slice::from_ref(&key))
+                    .await?
+                    .rows
+                    .pop()
+                    .and_then(|(_, bytes)| codec.decode_any(&bytes).ok())
+            };
             match codec.decode_any(&wish.wanted) {
-                Ok(wanted) => carrier.clone().carry(run.clone(), wanted, wish).await,
+                Ok(wanted) => {
+                    carrier
+                        .clone()
+                        .carry(run.clone(), wanted, travelled, wish)
+                        .await
+                }
                 Err(e) => {
                     let why = format!("this build cannot read the row wished: {e}");
                     answer_alone(&run.pool, &wish, "waiting", Some(&why)).await
@@ -1052,7 +1081,17 @@ mod replica {
             ));
             match tokio::time::timeout(run.timeout, &mut task.0).await {
                 Ok(Ok(outcome)) => outcome,
-                Ok(Err(e)) if e.is_panic() => Outcome::Later("its handler panicked".to_owned()),
+                Ok(Err(e)) if e.is_panic() => {
+                    let panic = e.into_panic();
+                    let said = panic
+                        .downcast_ref::<&str>()
+                        .map(|said| (*said).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned());
+                    Outcome::Later(said.map_or_else(
+                        || "its handler panicked".to_owned(),
+                        |said| format!("its handler panicked: {said}"),
+                    ))
+                }
                 Ok(Err(_)) => Outcome::Later("its handler was cancelled".to_owned()),
                 Err(_) => Outcome::Later(format!(
                     "its handler did not answer within {:?}",
@@ -1090,12 +1129,7 @@ mod replica {
                         drop(tx);
                         return answer_alone(&run.pool, wish, "waiting", Some(NO_ROW)).await;
                     };
-                    let was = row.version_text();
-                    row.take_desired(wanted);
-                    row.raise_version();
-                    if row.version_text() == was {
-                        let why =
-                            format!("its version cannot move past {}", was.unwrap_or_default());
+                    if let Some(why) = stuck(&row) {
                         let wrote = answer(&mut tx, wish, "refused", Some(&why)).await?;
                         tx.commit().await?;
                         return Ok(Offered {
@@ -1103,6 +1137,8 @@ mod replica {
                             waiting: false,
                         });
                     }
+                    row.take_desired(wanted);
+                    row.raise_version();
                     crate::row::savepoint(&mut tx).await?;
                     let written = crate::row::overwrite_except(&mut tx, vec![row], &[]).await;
                     if let Err(e) = crate::row::released(&mut tx, written).await? {
@@ -1128,6 +1164,17 @@ mod replica {
         }
     }
 
+    /// Why no wish of `row` can be applied, when its version cannot move —
+    /// an integer at its largest: the replica would hold the same version
+    /// of another value.
+    fn stuck<R: Setting>(row: &R) -> Option<String> {
+        let was = row.version_text();
+        let mut raised = row.clone();
+        raised.raise_version();
+        (raised.version_text() == was)
+            .then(|| format!("its version cannot move past {}", was.unwrap_or_default()))
+    }
+
     /// Why a wish waits that is of a row the replica does not hold.
     const NO_ROW: &str = "this replica holds no such row yet";
 
@@ -1140,9 +1187,11 @@ mod replica {
             self: Arc<Self>,
             run: Run,
             wanted: Box<dyn Any + Send>,
+            travelled: Option<Box<dyn Any + Send>>,
             wish: WishRow,
         ) -> Fut<Result<Offered, Error>> {
-            Box::pin(async move { self.settle(&run, wanted, wish).await })
+            let travelled = travelled.and_then(|t| t.downcast::<R>().ok()).map(|t| *t);
+            Box::pin(async move { self.settle(&run, wanted, travelled, wish).await })
         }
     }
 
@@ -1151,6 +1200,7 @@ mod replica {
             self: Arc<Self>,
             run: &Run,
             wanted: Box<dyn Any + Send>,
+            travelled: Option<R>,
             wish: WishRow,
         ) -> Result<Offered, Error> {
             let wanted: R = *wanted
@@ -1174,13 +1224,17 @@ mod replica {
                 return answer_alone(&run.pool, &wish, "waiting", Some(NO_ROW)).await;
             };
             let based = wanted.version_text();
-            if wish.if_unchanged && held.version_text() != based {
+            let holds = travelled.as_ref().unwrap_or(&held).version_text();
+            if wish.if_unchanged && holds != based {
                 let why = format!(
                     "this replica holds version {} of it, and the wish is based on {}",
-                    held.version_text().unwrap_or_default(),
+                    holds.unwrap_or_default(),
                     based.unwrap_or_default()
                 );
                 return answer_alone(&run.pool, &wish, "superseded", Some(&why)).await;
+            }
+            if let Some(why) = stuck(&held) {
+                return answer_alone(&run.pool, &wish, "refused", Some(&why)).await;
             }
             let handed = Wish {
                 wanted: wanted.clone(),
@@ -1191,13 +1245,11 @@ mod replica {
             let outcome = self.outcome(run, wish.id, handed).await;
             let recorded = self.record(run, &wish, &key, wanted, &outcome).await;
             let mut given = self.given();
-            match recorded {
-                Ok(_) => {
-                    given.remove(&(wish.id, wish.version));
-                }
-                Err(_) => {
-                    given.insert((wish.id, wish.version), outcome);
-                }
+            // One outcome at most per wish, of the version offered last: a
+            // wish's id is its row's, so what is kept stays as few as the rows.
+            given.retain(|(id, _), _| *id != wish.id);
+            if recorded.is_err() {
+                given.insert((wish.id, wish.version), outcome);
             }
             recorded
         }

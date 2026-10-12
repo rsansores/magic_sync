@@ -1244,6 +1244,7 @@ impl World {
                 keys: vec![crate::envelope::Key { parts: vec![key] }],
                 deletes: Vec::new(),
                 restated: false,
+                recorded: Vec::new(),
             }],
             protocol: crate::envelope::PROTOCOL,
             ..crate::envelope::Up::default()
@@ -3518,6 +3519,7 @@ async fn a_replicas_inbox_is_bounded_by_its_bytes(pool: crate::DbPool) {
             }],
             deletes: Vec::new(),
             restated: false,
+            recorded: Vec::new(),
         }],
         ..crate::envelope::Up::default()
     };

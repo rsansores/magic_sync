@@ -279,7 +279,8 @@ async fn a_wish_stands_as_its_replica_answered_it(pool: crate::DbPool) {
 
 /// A final answer — applied, refused, superseded — stands against a later
 /// upload of another answer to the same wish, which the transport may have
-/// held back; one the replica re-states, as a snapshot begins, is what it
+/// held back, and an answer of the wish as it stands against one of the
+/// wish before; one the replica re-states, as a snapshot begins, is what it
 /// holds now, and is taken.
 #[sqlx::test(migrations = false)]
 async fn a_final_answer_stands_against_a_late_one_unless_restated(pool: crate::DbPool) {
@@ -305,14 +306,28 @@ async fn a_final_answer_stands_against_a_late_one_unless_restated(pool: crate::D
     restated.tables[0].restated = true;
     file(restated).await;
     assert_eq!(state().await, [WishState::Waiting], "what it holds now");
+
+    // Wished again: an answer of the wish before, filed after one of this
+    // one, is older than it.
+    world.desire(screen(a, 80), None).await;
+    world.catch_up(a, &mut model).await;
+    let again = held_wishes(&model).remove(0);
+    file(answer(&again, "applied", "")).await;
+    file(answer(&wish, "waiting", "away")).await;
+    assert_eq!(
+        state().await,
+        [WishState::Applied],
+        "an answer of the wish before"
+    );
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
 
 /// A replica's settings and answers are compared as the server holds them:
 /// one that differs — a server restored from a copy older than what the
-/// replica uploaded since — is provisioned again, and the server lets go of
-/// what it holds of the setting that differs, for the replica to state
-/// again as its snapshot begins.
+/// replica uploaded since — is provisioned again. The replica states again
+/// what it holds as its snapshot begins, and the snapshot names what the
+/// server records of its settings: a row the replica no longer holds it
+/// deletes, as its own write, and the server lets go of it as it files that.
 #[sqlx::test(migrations = false)]
 async fn a_replica_whose_settings_or_answers_differ_is_provisioned_again(pool: crate::DbPool) {
     let world = world(pool).await;
@@ -366,14 +381,30 @@ async fn a_replica_whose_settings_or_answers_differ_is_provisioned_again(pool: c
     let mut older = holder.clone();
     older.settings.insert(row.clone(), (40, 1));
     assert_eq!(compare(&older).await, 1, "a setting of another version");
-    assert!(
-        held().await.is_empty(),
-        "the server lets go of the setting that differs"
-    );
+
+    let mut gone = holder.clone();
+    gone.settings.remove(&row);
+    assert_eq!(compare(&gone).await, 1, "a setting it no longer holds");
+    assert_eq!(held().await, [(70, 2)], "nothing let go of before");
+    let wire = Wire::new(0);
+    world.pass(&wire).await;
+    while let Some(bytes) = wire.next(a) {
+        model.receive(&bytes, &Rules::ANY);
+        if let Some(Body::Down(down)) = envelope::ToReplica::decode(bytes.as_slice()).unwrap().body
+        {
+            gone.recorded(&down);
+        }
+        wire.acknowledge(a);
+    }
+    let up = gone.up(write_setting).expect("its delete");
+    assert_eq!(up.tables[0].deletes.len(), 1, "{up:?}");
+    crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+    assert!(held().await.is_empty(), "the server lets go of it");
 }
 
 /// A wish that does not decode as the row it says — another build's
-/// encoding, say — is no answer the server files, nor a wish it reads.
+/// encoding, say — is no answer the server files, nor a wish it reads, nor
+/// one it compares the replica's digests with.
 #[sqlx::test(migrations = false)]
 async fn an_answer_that_does_not_read_is_kept_for_a_fix(pool: crate::DbPool) {
     let world = world(pool).await;
@@ -396,6 +427,90 @@ async fn an_answer_that_does_not_read_is_kept_for_a_fix(pool: crate::DbPool) {
         .await
         .unwrap();
     assert_eq!(stored[0].outcome, None);
+
+    // The replica holds its answer, and fingerprints it: the server, which
+    // keeps it unfiled, does not compare the answers until it files it.
+    let mut up = model.digests(&[]);
+    let line = format!("{}\t{}\tforgotten", wish.id, wish.version);
+    up.digests = vec![envelope::Digest {
+        table: TABLE.to_owned(),
+        count: 1,
+        fingerprint: envelope::fingerprint(vec![line]),
+    }];
+    crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL")
+            .await,
+        0,
+        "not provisioned again"
+    );
+    assert!(
+        world
+            .count("SELECT count(*) FROM sync.replicas WHERE compared_at IS NOT NULL")
+            .await
+            > 0,
+        "compared"
+    );
+}
+
+/// A wish written before the setting gained a column is read, and sent, as
+/// the row the server holds now with what was wished laid over it.
+#[sqlx::test(migrations = false)]
+async fn a_wish_reads_as_its_row_has_become(pool: crate::DbPool) {
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "screens",
+        schema = "fixture",
+        mirror = "setting",
+        key = "replica_id, id",
+        origin = "replica_id"
+    )]
+    struct Grown {
+        replica_id: Uuid,
+        id: Uuid,
+        #[row(desired)]
+        level: i64,
+        #[row(version)]
+        revision: i64,
+        contrast: i64,
+    }
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    sqlx::query("INSERT INTO fixture.screens VALUES ($1, $2, 40, 1)")
+        .bind(a)
+        .bind(Uuid::from_u128(1))
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.desire(screen(a, 70), None).await;
+    sqlx::raw_sql("ALTER TABLE fixture.screens ADD COLUMN contrast BIGINT NOT NULL DEFAULT 5")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let codecs = vec![Codec::<()>::json::<Grown>(None)];
+    let mut conn = world.pool.acquire().await.unwrap();
+    let read = crate::wish::wishes::<Grown, ()>(&mut conn, &codecs, &[screen(a, 0).key()])
+        .await
+        .unwrap();
+    let wanted = &read[0].wanted;
+    assert_eq!((wanted.level, wanted.revision, wanted.contrast), (70, 1, 5));
+}
+
+/// The lines of an answers digest, and the fingerprints PROTOCOL.md section
+/// 8 gives of them and of a setting's.
+#[test]
+fn a_digest_of_settings_and_answers_is_as_the_protocol_pins_it() {
+    let one = |line: String| envelope::fingerprint([line]);
+    assert_eq!(one("a\t1".to_owned()), 0x6f37_5e81_eb6a_6700);
+    assert_eq!(
+        one(crate::wish::answer_line("w", None, None)),
+        0xba0c_6af6_f14e_26d2
+    );
+    assert_eq!(
+        one(crate::wish::answer_line("w", Some(7), Some("applied"))),
+        0x2e00_e679_fcb6_ffe0
+    );
 }
 
 /// A host table cannot take a name the engine keeps for its own.
@@ -619,10 +734,10 @@ impl World {
     ) {
         // Time enough passes for every wait to be over: a replica that
         // asks to be provisioned again too soon is, then, and digests are
-        // compared, and acted on, again.
+        // compared again — but not a day: one provisioning cures a
+        // difference, or the alarm says a bug.
         sqlx::raw_sql(
-            "UPDATE sync.replicas SET retry_after = NULL, asked_at = NULL, compared_at = NULL, \
-                    drifted_at = NULL; \
+            "UPDATE sync.replicas SET retry_after = NULL, asked_at = NULL, compared_at = NULL; \
              UPDATE sync.notes SET noted_at = now() WHERE noted_at > now()",
         )
         .execute(&self.pool)
@@ -633,22 +748,25 @@ impl World {
             let mut moved = passed.done + passed.sent > 0;
             for (replica, walked) in replicas.iter_mut() {
                 while let Some(bytes) = wire.next(*replica) {
-                    let begins = match envelope::ToReplica::decode(bytes.as_slice())
+                    let body = envelope::ToReplica::decode(bytes.as_slice())
                         .ok()
-                        .and_then(|m| m.body)
-                    {
+                        .and_then(|m| m.body);
+                    let begins = match &body {
                         Some(Body::Down(d)) => d.previous == 0,
                         Some(Body::EndSnapshot(e)) => e.previous == 0,
                         _ => false,
                     };
                     let received = walked.model.receive(&bytes, &Rules::ANY);
-                    if begins
-                        && matches!(
-                            received,
-                            crate::model::Received::Applied | crate::model::Received::Ended
-                        )
-                    {
-                        walked.holder.began(&walked.model);
+                    if matches!(
+                        received,
+                        crate::model::Received::Applied | crate::model::Received::Ended
+                    ) {
+                        if begins {
+                            walked.holder.began(&walked.model);
+                        }
+                        if let Some(Body::Down(down)) = &body {
+                            walked.holder.recorded(down);
+                        }
                     }
                     walked.holder.forget(&walked.model);
                     wire.acknowledge(*replica);

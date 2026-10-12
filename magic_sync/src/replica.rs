@@ -276,8 +276,9 @@ fn key_sql(table: &crate::row::Table, row: &str) -> String {
 /// Notes again every row of the replica's settings, and every answer it gave
 /// to a wish: what the server records of them may be behind — a server or a
 /// replica restored from an older copy — and a snapshot beginning is the
-/// moment the server sets out to find what this replica holds. A setting is
-/// filed as last sent, and an answer kept until the provisioning confirms.
+/// moment the server sets out to find what this replica holds. What it notes
+/// so goes up re-stated, which the server takes whatever its version, until
+/// the upload that carries it is filed (7).
 #[cfg(feature = "sqlite")]
 async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     for codec in codecs {
@@ -293,11 +294,35 @@ async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Res
         };
         sqlx::query(&format!(
             "INSERT INTO sync_notes (relation, row_key, restated) SELECT {}, {}, 1 FROM {} t{only} \
-             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, restated = 1",
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, restated = 1, \
+                    upload = NULL, sent = NULL, sent_at = NULL",
             literal(table.name),
             key_sql(table, "t"),
             ident(table.name)
         ))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Of `recorded`, the rows of a setting the server records this replica
+/// holding, notes those it does not hold as its own deletes: the server
+/// lets go of them as it files the deletes (4.2).
+#[cfg(feature = "sqlite")]
+async fn gone_here<P: Sync + 'static>(
+    conn: &mut Conn,
+    codec: &Codec<P>,
+    recorded: &[Key],
+) -> Result<(), Error> {
+    let held = codec.present(conn, recorded).await?;
+    for key in recorded.iter().filter(|k| !held.contains(k)) {
+        sqlx::query(
+            "INSERT INTO sync_notes (relation, row_key) VALUES ($1, $2) \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1",
+        )
+        .bind(codec.table.name)
+        .bind(key_text(key))
         .execute(&mut *conn)
         .await?;
     }
@@ -1301,6 +1326,11 @@ async fn apply<P: Sync + 'static>(
     let mut parts = Vec::new();
     let foreign = foreign_rows(codecs, &message.tables);
     for (entry, table) in message.tables.iter().enumerate() {
+        if let Some(codec) = codec_of(codecs, &table.table)
+            .filter(|c| naming && c.table.mirror == crate::row::Mirror::Setting)
+        {
+            gone_here(conn, codec, &keys_of(codec, &table.recorded)).await?;
+        }
         let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
             continue;
         };
@@ -2053,12 +2083,18 @@ async fn filed<P: Sync + 'static>(
         .iter()
         .filter_map(|u| i64::try_from(*u).ok())
         .collect();
-    sqlx::query(
-        "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) AND writes = sent",
-    )
-    .bind(json(&uploads))
-    .execute(&mut *conn)
-    .await?;
+    // A row written again since goes again, re-stated no more: the server
+    // took it as it was re-stated, and its later writes are newer (7).
+    for sql in [
+        "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) \
+            AND writes = sent",
+        "UPDATE sync_notes SET restated = 0 WHERE upload IN (SELECT value FROM json_each($1))",
+    ] {
+        sqlx::query(sql)
+            .bind(json(&uploads))
+            .execute(&mut *conn)
+            .await?;
+    }
     let both: Vec<&str> = codecs
         .iter()
         .filter(|c| matches!(c.table.mirror, crate::row::Mirror::Both))
@@ -2720,7 +2756,7 @@ async fn gather<P: Sync + 'static>(
             };
             let wire = wire_of(&key);
             let added = framed(bytes.len()) + framed(wire.encoded_len());
-            if framed(framed(part.table.len()) + added) > largest {
+            if framed(framed(part.table.len()) + usize::from(restated) * 2 + added) > largest {
                 let why = format!(
                     "a row of {} bytes, more than a message carries",
                     bytes.len()

@@ -648,7 +648,12 @@ mod server {
                      'screens',
                      '0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002',
                      '{\"replica_id\":\"0192f6a0-0000-7000-8000-0000000000aa\",\"id\":\"0192f6a0-0000-7000-8000-00000000f002\",\"level\":70,\"revision\":3}',
-                     7, false, 'ops');",
+                     7, false, 'ops'),
+                    ('0192f6a0-0000-7000-8000-00000000f005', '0192f6a0-0000-7000-8000-0000000000aa',
+                     'screens',
+                     '0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004',
+                     '{\"replica_id\":\"0192f6a0-0000-7000-8000-0000000000aa\",\"id\":\"0192f6a0-0000-7000-8000-00000000f004\",\"level\":30,\"revision\":1}',
+                     9, false, NULL);",
             None,
         ),
         // A row the replica refuses (its own check): it keeps what it had.
@@ -665,15 +670,27 @@ mod server {
         ),
         // A snapshot cut short by the transport, superseded by the next.
         ("cut", RESYNC, Some(1)),
-        ("snapshot", RESYNC, None),
+        // A snapshot, which names a setting the server records the replica
+        // holding, and the replica does not: it notes it deleted.
+        (
+            "snapshot",
+            "INSERT INTO fixture.screens VALUES ('0192f6a0-0000-7000-8000-0000000000aa',
+               '0192f6a0-0000-7000-8000-00000000f004', 1, 1);
+             INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');",
+            None,
+        ),
         // A message the transport loses: the next follows one the replica
         // never got. Then, in the gap, a message of another epoch, and one
         // that follows the last applied: neither applies until a snapshot.
         ("lost", "UPDATE fixture.items SET name = 'a3' WHERE name = 'a2';", None),
         ("gap", "UPDATE fixture.items SET name = 'a4' WHERE name = 'a3';", None),
         ("healed", RESYNC, None),
-        // The wish withdrawn: the replica lets go of it.
-        ("withdrawn", "DELETE FROM sync.sync_wishes;", None),
+        // One wish withdrawn: the replica lets go of it.
+        (
+            "withdrawn",
+            "DELETE FROM sync.sync_wishes WHERE id = '0192f6a0-0000-7000-8000-00000000f001';",
+            None,
+        ),
         // The replica's upload, filed, answered.
         ("filed", "", None),
         // A row whose version is older than the one the replica holds — a
@@ -702,7 +719,7 @@ mod server {
         (
             "emptied",
             "DELETE FROM fixture.items; DELETE FROM fixture.shelves; DELETE FROM fixture.prices;
-             DELETE FROM fixture.tasks;",
+             DELETE FROM fixture.tasks; DELETE FROM sync.sync_wishes;",
             None,
         ),
         ("empty_snapshot", RESYNC, None),
@@ -715,71 +732,71 @@ mod server {
     const HOLDS: &[(&str, &str)] = &[
         (
             "rows",
-            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"],"wishes":[]}"#,
+            r#"{"answers":[],"items":["a","b"],"noted":[],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"],"wishes":[]}"#,
         ),
         (
             "again",
-            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"],"wishes":[]}"#,
+            r#"{"answers":[],"items":["a","b"],"noted":[],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"],"wishes":[]}"#,
         ),
         (
             "update",
-            r#"{"items":["a2","b"],"prices":["250"],"rejected":[],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b"],"noted":[],"prices":["250"],"rejected":[],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "refused",
-            r#"{"items":["a2","b"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b"],"noted":[],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "delete",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b retired"],"noted":[],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "cut",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b retired"],"noted":[],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "snapshot",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "lost",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "gap",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a2","b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "healed",
-            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+            r#"{"answers":[],"items":["a4","b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7","screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "withdrawn",
-            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
+            r#"{"answers":[],"items":["a4","b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "filed",
-            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
+            r#"{"answers":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9 waiting"],"items":["a4","b retired"],"noted":[],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "older",
-            r#"{"items":["a4","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
+            r#"{"answers":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9 waiting"],"items":["a4","b retired"],"noted":[],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "unknown_field",
-            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
+            r#"{"answers":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9 waiting"],"items":["a5","b retired"],"noted":[],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "epoch",
-            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
+            r#"{"answers":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9 waiting"],"items":["a5","b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 restated","sync_wishes 0192f6a0-0000-7000-8000-00000000f005 restated"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f004 9"]}"#,
         ),
         (
             "emptied",
-            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[],"wishes":[]}"#,
+            r#"{"answers":[],"items":["b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 restated","sync_wishes 0192f6a0-0000-7000-8000-00000000f005 restated"],"prices":[],"rejected":[],"shelves":[],"tasks":[],"wishes":[]}"#,
         ),
         (
             "empty_snapshot",
-            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[],"wishes":[]}"#,
+            r#"{"answers":[],"items":["b retired"],"noted":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 restated","sync_wishes 0192f6a0-0000-7000-8000-00000000f005 restated"],"prices":[],"rejected":[],"shelves":[],"tasks":[],"wishes":[]}"#,
         ),
     ];
 
@@ -1067,13 +1084,17 @@ mod server {
                       # `holds step json`: what the replica then holds, per table its rows as\n\
                       # text (items: name, and ` retired`; shelves: label and revision; prices:\n\
                       # cents; tasks: title and done; wishes: the setting's table, its row's\n\
-                      # key and the wish's version), and its rejections as `table key`.\n\
-                      # The replica: it holds a setting, `screens`, which the server wishes at\n\
-                      # `update` and withdraws at `withdrawn`; its own check refuses a shelf\n\
-                      # labelled `refused`; after\n\
+                      # key and the wish's version; answers: the wish, the version answered and\n\
+                      # the outcome), its rejections as `table key`, and what it noted of its\n\
+                      # setting and its answers for the server, as `table key`, and ` restated`.\n\
+                      # The replica: it holds a setting, `screens`, which the server wishes two\n\
+                      # of at `update` and withdraws one of at `withdrawn` — the other of a row\n\
+                      # the replica does not hold, which the server records it holding at\n\
+                      # `snapshot`; its own check refuses a shelf labelled `refused`; after\n\
                       # `rows` it marks its task done (its own column), has that filed, and\n\
-                      # writes a receipt pointing at item b; at `filed`, the golden upload's\n\
-                      # rows are its own, sent under its number.\n\
+                      # writes a receipt pointing at item b; at `filed`, it writes a screen of\n\
+                      # its own, answers the wish it holds, and the golden upload's rows are\n\
+                      # its own, sent under its number.\n\
                       # Generated by conformance::server; applied by the replica conformance\n\
                       # suite, which reads each step by its name.\n";
         matches_golden(GOLDEN, &format!("{header}{}", sent(pool).await));
@@ -1196,6 +1217,7 @@ mod server {
                 keys: vec![key(&["0192f6a0-0000-7000-8000-000000000d01"])],
                 deletes: Vec::new(),
                 restated: false,
+                recorded: Vec::new(),
             }],
             ..up(0x0192_f6a0_0000_7002)
         };
@@ -1260,6 +1282,7 @@ mod server {
                 keys: vec![key(&[id])],
                 deletes: Vec::new(),
                 restated: false,
+                recorded: Vec::new(),
             }],
             ..up(number)
         };
@@ -1282,6 +1305,7 @@ mod server {
                 keys: vec![key(&[REPLICA, SCREEN])],
                 deletes: Vec::new(),
                 restated,
+                recorded: Vec::new(),
             }],
             ..up(number)
         };

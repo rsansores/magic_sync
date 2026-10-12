@@ -73,12 +73,22 @@ async fn world_of(
     settings: Settings,
     codecs: Vec<Codec<()>>,
 ) -> World {
+    world_as(Uuid::now_v7(), pool, tables, settings, codecs).await
+}
+
+/// [`world_of`], the replica `me`.
+async fn world_as(
+    me: Uuid,
+    pool: SqlitePool,
+    tables: &str,
+    settings: Settings,
+    codecs: Vec<Codec<()>>,
+) -> World {
     let pool = settled(pool).await;
     sqlx::raw_sql(tables).execute(&pool).await.expect("tables");
     install(&mut pool.acquire().await.unwrap(), &codecs)
         .await
         .expect("installed");
-    let me = Uuid::now_v7();
     let uplink = Uplinked::default();
     let replica = Replica::new(pool.clone(), codecs, me, uplink.clone(), settings)
         .await
@@ -204,6 +214,7 @@ fn upserts(table: &str, rows: Vec<(WireKey, Vec<u8>)>) -> Table {
         deletes: Vec::new(),
         keys,
         restated: false,
+        recorded: Vec::new(),
     }
 }
 
@@ -303,7 +314,8 @@ async fn golden_replica(pool: SqlitePool) -> World {
         wishes: crate::wish::Wishes::new().on::<Screen>(crate::wish::Direct),
         ..Settings::default()
     };
-    let w = world_of(
+    let w = world_as(
+        crate::conformance::REPLICA.parse().unwrap(),
         settled(pool).await,
         &format!("{TABLES}{SCREENS}"),
         settings,
@@ -337,6 +349,16 @@ async fn golden_holds(w: &World) -> serde_json::Value {
              WHERE retired_at IS NULL ORDER BY 1",
         )
         .await,
+        "answers": all(
+            "SELECT relation || ' ' || row_key || ' ' || answered || ' ' || outcome FROM sync_wishes \
+             WHERE retired_at IS NULL AND answered IS NOT NULL ORDER BY 1",
+        )
+        .await,
+        "noted": all(
+            "SELECT relation || ' ' || row_key || CASE WHEN restated = 1 THEN ' restated' ELSE '' END \
+             FROM sync_notes WHERE relation IN ('screens', 'sync_wishes') ORDER BY 1",
+        )
+        .await,
     })
 }
 
@@ -345,19 +367,17 @@ async fn golden_holds(w: &World) -> serde_json::Value {
 /// delivered again, changing nothing; then what the replica does of its own
 /// after the step, as the file's header says.
 async fn follow_golden(w: &World, messages: &[(String, String, Vec<u8>)], step: &str) {
-    use crate::conformance::{REPLICA, UPLOAD};
+    use crate::conformance::UPLOAD;
     for (_, expected, bytes) in messages.iter().filter(|(s, _, _)| s == step) {
         if expected == "lost" {
             continue;
         }
         if step == "filed" {
             // The replica's own upload, sent under the golden number.
+            golden_writes(w).await;
             w.exec(&format!(
-                "INSERT INTO readings (replica_id, id, value, at) \
-                 VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
-                 UPDATE sync_notes SET upload = {}, sent = writes, \
+                "UPDATE sync_notes SET upload = {}, sent = writes, \
                    sent_at = '2000-01-01T00:00:00.000Z';",
-                REPLICA.replace('-', ""),
                 i64::try_from(UPLOAD).unwrap()
             ))
             .await
@@ -393,6 +413,28 @@ async fn follow_golden(w: &World, messages: &[(String, String, Vec<u8>)], step: 
         .await
         .unwrap();
     }
+}
+
+/// What the replica of the golden messages writes of its own before its
+/// upload: a reading, an event, a screen; and it answers the wish it holds,
+/// at an instant of the corpus's.
+async fn golden_writes(w: &World) {
+    use crate::conformance::REPLICA;
+    w.exec(&format!(
+        "INSERT INTO readings (replica_id, id, value, at) \
+         VALUES (x'{replica}', x'0192f6a0000070008000000000000e01', 7, 1); \
+         INSERT INTO events (id, what) VALUES (x'0192f6a0000070008000000000000e02', 'opened'); \
+         INSERT INTO screens (replica_id, id, level, revision) \
+         VALUES (x'{replica}', x'0192f6a000007000800000000000f002', 40, 9);",
+        replica = REPLICA.replace('-', "")
+    ))
+    .await
+    .unwrap();
+    w.offer().await;
+    // Answered at an instant of the corpus's own, not now.
+    w.exec("UPDATE sync_wishes SET answered_at = '2027-01-15T08:00:02.000Z'")
+        .await
+        .unwrap();
 }
 
 /// The steps of the golden messages, in order.
@@ -451,7 +493,7 @@ async fn the_servers_own_messages_leave_the_replica_holding_what_the_file_says(p
 /// `MAGIC_SYNC_BLESS=1` writes them anew.
 #[sqlx::test(migrations = false)]
 async fn the_golden_uploads_are_what_the_replica_sends(pool: SqlitePool) {
-    use crate::conformance::{golden, hex, matches_golden, GOLDEN, GOLDEN_UP, REPLICA, UPLOAD};
+    use crate::conformance::{golden, hex, matches_golden, GOLDEN, GOLDEN_UP, UPLOAD};
     let w = golden_replica(pool).await;
     let text = std::fs::read_to_string(GOLDEN).expect("the golden messages");
     let messages = golden(&text);
@@ -461,20 +503,33 @@ async fn the_golden_uploads_are_what_the_replica_sends(pool: SqlitePool) {
     {
         follow_golden(&w, &messages, step).await;
     }
-    w.exec(&format!(
-        "INSERT INTO readings (replica_id, id, value, at) \
-         VALUES (x'{}', x'0192f6a0000070008000000000000e01', 7, 1); \
-         INSERT INTO events (id, what) VALUES (x'0192f6a0000070008000000000000e02', 'opened');",
-        REPLICA.replace('-', "")
-    ))
-    .await
-    .unwrap();
+    golden_writes(&w).await;
     let mut upload = w.up(0, false).await.expect("the upload");
     assert_eq!(upload.uploads.len(), 1);
-    assert!(!upload.rejected.is_empty() && upload.sequence > 0);
+    assert!(
+        !upload.rejected.is_empty() && upload.sequence > 0,
+        "{upload:?}"
+    );
+    // Filed, so its digests say its setting and its answer too.
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: upload.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
     upload.uploads = vec![UPLOAD];
     let digests = w.up(0, true).await.expect("the digests");
-    assert!(!digests.digests.is_empty());
+    for table in ["screens", "sync_wishes"] {
+        assert!(
+            digests
+                .digests
+                .iter()
+                .any(|d| d.table == table && d.count == 1),
+            "{table}: {:?}",
+            digests.digests
+        );
+    }
     let mut forged = digests.clone();
     forged.mac = vec![0; forged.mac.len()];
     let header = "# What a replica sends up: `name outcomes hex` per message, `outcomes` what\n\

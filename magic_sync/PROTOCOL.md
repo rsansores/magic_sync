@@ -319,6 +319,11 @@ is malformed (4.1).
   it recorded for those tables before the snapshot began are forgotten — the
   snapshot sent again what it should hold — and the ones it recorded since
   stand. Then the snapshot is no longer in progress.
+- A part of a snapshot's `Down` may carry `recorded`: keys of a setting the
+  server records the replica holding, which no other field of the part
+  concerns. Of those, the replica **must** note each row it does not hold as
+  its own delete (section 7), so the server lets go of it as it files the
+  delete; one it holds it has noted already, as the snapshot began.
 - The messages of a snapshot follow one another, and nothing else comes
   between them: a message that follows the last applied and names a
   snapshot other than the one in progress — one that ended, or was
@@ -612,6 +617,10 @@ lines are fingerprinted the same way, and say more than the key:
   the version it answered, a tab, and the outcome — each empty for a wish it
   has not answered.
 
+Test vectors: the setting line `a\t1` alone → `0x6f375e81eb6a6700`; the
+unanswered wish `w` (`w\t\t`) → `0xba0c6af6f14e26d2`; `w` applied at version 7
+(`w\t7\tapplied`) → `0x2e00e679fcb6ffe0`.
+
 A replica **must** leave out of its digests every table of which it wrote
 rows the server has not filed yet (section 7): what the server records of
 it is about to change, and a comparison now would find them apart for
@@ -733,7 +742,8 @@ A replica implementation is complete when:
       brought it is committed — superseded, unread or applied as 4.5 says —
       and records the answer, with the row it wrote, in one transaction;
       notes every setting and every answer again when a snapshot begins,
-      and sends them re-stated until filed (section 7); its digests, if it
+      and sends them re-stated until filed (section 7); deletes each row a
+      snapshot records it holding that it does not (4.2); its digests, if it
       reports them, include its settings and its answers (section 8).
 
 ---
@@ -843,8 +853,9 @@ back. A record with a version is filed only over an older version of it, and so 
 a **setting** — a value the replica holds and acts on — but one in a part
 `restated` (section 7), which is filed whatever its version: it is what the
 replica holds now, even when a replica restored from an older copy says an older
-version. So it keeps a row only with its key in `keys`: one without is
-malformed, and left out. What the upload says of the replica — rejections, the last applied
+version; a delete is filed whether its part is `restated` or not. The server
+keeps a row only with its key in `keys`: one without is malformed, and left
+out. What the upload says of the replica — rejections, the last applied
 message, a gap, digests, the backlog — is filed apart from its rows, so neither
 holds back the other. Deletes of a table not keyed by the replica, and keys that
 are not the table's, are malformed and left out. An upload beyond the server's
@@ -884,10 +895,12 @@ recorded for it (the same epoch and last sequence, sealed by the server), and
 against what it recorded as of that message: when it has sent the replica
 more meanwhile, it waits for the next digests. It compares a setting's
 against the rows of it it holds of that replica, and those of `sync_wishes`
-against the answers it keeps. If they differ, it provisions the replica again
-from scratch (4.2), having let go first of every row it holds of the replica's
-settings that differ: the replica re-states them as the snapshot begins
-(section 7). Digests that differ again
+against the answers it keeps — neither while it keeps rows of that table the
+replica uploaded and it could not file yet, as the replica leaves out a table
+it wrote rows of that are not filed. If they differ, it provisions the replica
+again from scratch (4.2): the replica re-states its settings and its answers
+as the snapshot begins (section 7), and deletes those the snapshot records it
+holding that it does not. Digests that differ again
 within a day of the provisioning they caused are a bug no provisioning cures:
 the server logs them and does not act on them. A digest of a table the server
 neither sends the replica nor holds as a setting — the replica's records, a

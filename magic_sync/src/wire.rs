@@ -203,12 +203,6 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.versions(conn, of)
     }
 
-    /// Lets go of every row of `replica`, by the table's origin.
-    #[cfg(feature = "postgres")]
-    pub(crate) fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64> {
-        self.ops.delete_of(conn, replica)
-    }
-
     /// Its table, and what it does with rows.
     #[cfg(feature = "postgres")]
     pub(crate) fn into_parts(self) -> (Table, Box<dyn Ops<P>>) {
@@ -508,31 +502,7 @@ impl<R: Row + Clone + Send + Sync> Build for Builder<R> {
         key: &'a str,
         whole: &'a serde_json::Value,
     ) -> Fut<'a, Vec<u8>> {
-        Box::pin(async move {
-            let table = Table::of::<R>();
-            let key_columns: Vec<row::Column> = table
-                .key
-                .iter()
-                .filter_map(|k| table.columns.iter().find(|c| c.name == *k).copied())
-                .collect();
-            let key = crate::plan::parse_key(&key_columns, key)?;
-            let laid: serde_json::Map<String, serde_json::Value> = whole
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter(|(name, _)| {
-                    table.columns.iter().any(|c| {
-                        c.name == name.as_str()
-                            && (c.desired || c.key.is_some() || c.version.is_some())
-                    })
-                })
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            let row = row::laid_over::<R>(conn, &key, whole, &serde_json::Value::Object(laid))
-                .await?
-                .ok_or_else(|| Error::Misuse(format!("`{}`: no row to send", R::TABLE)))?;
-            (self.encode)(row)
-        })
+        Box::pin(async move { (self.encode)(row::wanted::<R>(conn, key, whole).await?) })
     }
 }
 
@@ -592,9 +562,6 @@ pub(crate) trait Ops<P>: Send + Sync {
     /// Every row — of the replica `of`, when given — as `key \t version`
     /// lines.
     fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>>;
-    /// Lets go of every row of `replica`.
-    #[cfg(feature = "postgres")]
-    fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
     fn retire<'a>(
         &'a self,
@@ -1034,11 +1001,6 @@ where
 
     fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>> {
         Box::pin(row::versions::<R>(conn, of))
-    }
-
-    #[cfg(feature = "postgres")]
-    fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64> {
-        Box::pin(row::delete_of::<R>(conn, replica))
     }
 
     #[cfg(feature = "postgres")]

@@ -48,6 +48,11 @@ pub struct Table {
     /// them whatever their version.
     #[prost(bool, tag = "5")]
     pub restated: bool,
+    /// Down only, in a snapshot: the rows of a setting the server records this
+    /// replica holding (PROTOCOL.md section 4.2) — the replica deletes, as its
+    /// own write, each it does not hold.
+    #[prost(message, repeated, tag = "6")]
+    pub recorded: ::prost::alloc::vec::Vec<Key>,
 }
 /// Server to replica: rows to hold and rows to let go, in the order given —
 /// parents' upserts first, children's deletes first — applied in one

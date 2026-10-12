@@ -36,9 +36,12 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   every guarantee below holds for them. The server files a setting as a
   record, the newer version winning; a replica says its settings and answers
   again whenever a snapshot begins, which the server takes whatever their
-  version, and its digests fingerprint them — so once the system settles,
-  both sides show the same value, after a restore of either too. Table
-  names beginning `sync_` are the engine's.
+  version, and its digests fingerprint them; a snapshot names the settings
+  the server records it holding, and the replica deletes those it no longer
+  holds — so once the system settles, both sides show the same value, after
+  a restore of either too. A handler has `Settings::wishes_timeout` to
+  answer; `Wish::new` lets a host test its own. Table names beginning
+  `sync_` are the engine's.
 - **Codecs.** `Codec::json` (an object of the row's columns, 64-bit integers
   as text) and `Codec::new` (a protobuf message of your own).
 - **Runners.** `Server` and `Replica` run what a host builds; the host

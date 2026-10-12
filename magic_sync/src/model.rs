@@ -767,8 +767,27 @@ impl Holder {
             }
         }
         for row in rows {
+            // Noted afresh: an upload that carried it before files it no more.
+            self.sent.remove(&row);
             self.restated.insert(row.clone());
             self.note(row);
+        }
+    }
+
+    /// `down`, applied: in a snapshot, the rows of a setting the server
+    /// records it holding — each it does not hold it notes, as its delete
+    /// (4.2).
+    pub(crate) fn recorded(&mut self, down: &crate::envelope::Down) {
+        if down.snapshot_id.is_empty() {
+            return;
+        }
+        for part in &down.tables {
+            for key in &part.recorded {
+                let row = (part.table.clone(), key.parts.join("|"));
+                if !self.settings.contains_key(&row) {
+                    self.note(row);
+                }
+            }
         }
     }
 
@@ -924,18 +943,19 @@ impl Holder {
     /// The server filed `uploads`: their notes are done, but for a row
     /// written again since (4.4).
     pub(crate) fn filed(&mut self, uploads: &[u64]) {
-        let done: Vec<Row> = self
+        let carried: Vec<Row> = self
             .sent
             .iter()
-            .filter(|(row, (number, writes))| {
-                uploads.contains(number) && self.noted.get(*row) == Some(writes)
-            })
+            .filter(|(_, (number, _))| uploads.contains(number))
             .map(|(row, _)| row.clone())
             .collect();
-        for row in done {
-            self.noted.remove(&row);
-            self.sent.remove(&row);
+        for row in carried {
+            // Written again since, it goes again, re-stated no more.
             self.restated.remove(&row);
+            if self.noted.get(&row) == self.sent.get(&row).map(|(_, writes)| writes) {
+                self.noted.remove(&row);
+                self.sent.remove(&row);
+            }
         }
     }
 
