@@ -48,6 +48,7 @@ async fn drain(pool: &crate::DbPool, engine: &Engine) -> Drained {
             bytes: i64::MAX,
         },
         concurrency: 4,
+        buffered: crate::relay::BUFFERED,
     };
     let mut out = Drained {
         notes: 0,

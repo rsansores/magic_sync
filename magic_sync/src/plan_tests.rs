@@ -602,6 +602,7 @@ fn relay<'a>(
             bytes: 1 << 30,
         },
         concurrency: 4,
+        buffered: 1,
     }
 }
 

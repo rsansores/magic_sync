@@ -407,11 +407,23 @@ impl Packer {
             && (self.count >= self.limits.rows || self.bytes + added > self.limits.largest_row())
     }
 
+    /// The message being filled, ended early to free what it holds: whole
+    /// while no span is open in it, else up to the earliest span that does
+    /// not open it. Never inside a span: `None` when every open span opens
+    /// it.
+    pub(crate) fn relieve(&mut self) -> Option<Down> {
+        if self.spans.is_empty() {
+            self.finish()
+        } else {
+            self.before_spans()
+        }
+    }
+
     /// The message being filled up to the earliest span that does not open
     /// it, which stays to go on in the next; the spans before it, split
     /// already, are spans no more. `None` when every span opens it, or there
     /// is none.
-    pub(crate) fn before_spans(&mut self) -> Option<Down> {
+    fn before_spans(&mut self) -> Option<Down> {
         let first = self.spans.iter().position(|s| s.count > 0)?;
         let mark = self.spans.remove(first);
         self.spans.drain(..first);

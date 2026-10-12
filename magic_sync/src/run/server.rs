@@ -528,6 +528,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 bytes: i64::try_from(self.settings.outbox_bytes.get()).unwrap_or(i64::MAX),
             },
             concurrency: usize::try_from(self.settings.concurrency.get()).unwrap_or(usize::MAX),
+            buffered: relay::BUFFERED,
         }
     }
 

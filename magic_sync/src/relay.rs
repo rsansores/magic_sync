@@ -82,9 +82,8 @@ pub trait Transport: Send + Sync + 'static {
 /// Rows to send or take back a pass reads at a time.
 const PAGE: usize = 20_000;
 
-/// Bytes of rows a pass may hold in the messages it fills before it ends
-/// them all early.
-const BUFFERED: usize = 64 << 20;
+/// Bytes of rows a pass holds, as a server runs it: see [`Relay::buffered`].
+pub(crate) const BUFFERED: usize = 64 << 20;
 
 /// Bytes of messages one replica's sending reads from its outbox at a time.
 const SENT_AT_ONCE: usize = 8 << 20;
@@ -117,6 +116,9 @@ pub(crate) struct Relay<'a, P> {
     pub(crate) bound: Bound,
     /// Replicas sent to at once.
     pub(crate) concurrency: usize,
+    /// Bytes of rows a pass may hold in the messages it fills, or reads in
+    /// one chunk, before it ends them early, and writes the messages ready.
+    pub(crate) buffered: usize,
 }
 
 /// What recording a pass did.
@@ -167,6 +169,9 @@ struct Writer {
     ready_bytes: usize,
     /// Bytes of rows in the messages being filled.
     buffered: usize,
+    /// How many it may hold, and the ready messages carry before they are
+    /// written.
+    room: usize,
     /// Per replica, the last message written, its sequence and nonce: what
     /// the next one follows. A replica provisioned is absent until its
     /// snapshot's first message, which follows nothing.
@@ -398,6 +403,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 })
                 .collect(),
             snapshots: ids.clone(),
+            room: self.buffered,
             ready: Vec::new(),
             rows: 0,
             ready_bytes: 0,
@@ -449,7 +455,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
                     (keys, end)
                 };
                 let (mut keys, mut end) = chunk_of(RECORD_CHUNK);
-                let fit = self.engine.fitting(conn, *i, &keys, BUFFERED).await?;
+                let fit = self.engine.fitting(conn, *i, &keys, self.buffered).await?;
                 if fit < keys.len() {
                     (keys, end) = chunk_of(fit);
                 }
@@ -755,15 +761,12 @@ impl Writer {
             self.ready(replica, Body::Down(done));
         }
         // Every replica's message being filled, ended early: what a pass
-        // holds stays bounded however many replicas it fills at once — at
-        // its spans while that is enough, else whole.
-        for early in [Packer::before_spans, Packer::finish] {
-            if self.buffered <= BUFFERED {
-                break;
-            }
+        // holds stays bounded however many replicas it fills at once, by a
+        // message each — what a span holds goes on, as it fits one.
+        if self.buffered > self.room {
             let replicas: Vec<Uuid> = self.packers.keys().copied().collect();
             for replica in replicas {
-                if let Some(done) = self.packers.get_mut(&replica).and_then(early) {
+                if let Some(done) = self.packers.get_mut(&replica).and_then(Packer::relieve) {
                     self.ready(replica, Body::Down(done));
                 }
             }
@@ -817,7 +820,7 @@ impl Writer {
     /// of bytes, or `all`.
     async fn flush(&mut self, conn: &mut Conn, all: bool) -> Result<(), Error> {
         if self.ready.is_empty()
-            || (!all && self.rows < RECORD_CHUNK && self.ready_bytes < BUFFERED)
+            || (!all && self.rows < RECORD_CHUNK && self.ready_bytes < self.room)
         {
             return Ok(());
         }

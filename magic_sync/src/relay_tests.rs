@@ -253,6 +253,7 @@ impl World {
                 bytes: 1 << 30,
             },
             concurrency: 4,
+            buffered: BUFFERED,
         }
     }
 
@@ -3033,4 +3034,44 @@ async fn a_replica_delete_the_server_refuses_has_the_row_sent_again(pool: crate:
     world.settle(&wire, &mut models).await;
     assert!(models[&a].rows.contains_key(&pad), "sent again");
     assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+}
+
+/// A pass that holds more than its bytes ends its messages early, never
+/// between a table's deletes and its upserts: a name one item lets go of
+/// is there for the item that takes it, on a replica whose names are
+/// unique.
+#[sqlx::test(migrations = false)]
+async fn a_pass_short_of_memory_keeps_a_unique_value_moving_in_one_message(pool: crate::DbPool) {
+    const UNIQUE: Rules = Rules {
+        unique: |_, bytes| ItemRow::decode(bytes).ok().map(|row| row.name),
+        ..Rules::ANY
+    };
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let x = world.item("taken").await;
+    world.settle(&wire, &mut models).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM fixture.items WHERE id = $1")
+        .bind(x)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO fixture.items (id, partition_id, name) VALUES ($1, $2, 'taken')")
+        .bind(Uuid::now_v7())
+        .bind(world.partition)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let relay = Relay {
+        buffered: 1,
+        ..world.relay()
+    };
+    world.pass_relay(&relay, &wire).await;
+    let mut model = models.remove(&a).unwrap();
+    world.deliver(&wire, a, &mut model, &UNIQUE);
+    assert!(model.rejections.is_empty(), "{:?}", model.rejections);
+    assert_eq!(items_of(&model), names(&["taken"]));
 }

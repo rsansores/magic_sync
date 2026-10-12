@@ -242,7 +242,10 @@ for every serial column, before its relay runs.)
 Every row the delta sends is read once and encoded once by its codec, however
 many replicas get it, in the plan's snapshot, a chunk of rows at a time: what
 the relay holds in memory is a chunk, and one message being filled per
-replica, however much it sends. A row that cannot go — it does
+replica, however much it sends. Filling many replicas' messages at once, it
+ends them early past a bound — never between a table's deletes and its
+upserts, which a unique value moving from one row to another needs in one
+message. A row that cannot go — it does
 not encode, or no message could carry it — is planned around: the plan runs
 again with it blocked, so it is not sent, what points at it is not sent
 either, and a replica holding an older version of it has that version taken
