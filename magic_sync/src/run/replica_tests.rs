@@ -396,7 +396,7 @@ async fn notes_of_a_table_that_no_longer_goes_up_are_dropped(pool_: SqlitePool) 
     let pool = pool(pool_).await;
     sqlx::query(
         "INSERT INTO sync_notes (relation, row_key) VALUES ('retired_table', 'a'), ('events', 'b'); \
-         INSERT INTO sync_leaving (relation, row_key) VALUES ('retired_table', 'a')",
+         INSERT INTO sync_leaving (relation, row_key, epoch, sequence) VALUES ('retired_table', 'a', '', 1)",
     )
     .execute(&pool)
     .await

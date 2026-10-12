@@ -83,10 +83,13 @@ CREATE TABLE sync_rejections (
 
 -- Rows of tables written on both sides the server let go of while what this
 -- replica wrote of them had not reached it: kept retired, and let go of once
--- the server files it.
+-- the server files it. `epoch` and `sequence` are the message that let go
+-- of it, which a rejection names should the replica not manage to then.
 CREATE TABLE sync_leaving (
-    relation TEXT NOT NULL,
-    row_key  TEXT NOT NULL,
+    relation TEXT    NOT NULL,
+    row_key  TEXT    NOT NULL,
+    epoch    TEXT    NOT NULL,
+    sequence INTEGER NOT NULL,
     PRIMARY KEY (relation, row_key)
 );
 

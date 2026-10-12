@@ -408,7 +408,9 @@ A row the replica could not take, or could not let go of (4.1), is a
 the one the row came beside, `keys[i]`, or its delete's — why,
 and the `(epoch, sequence)` of the message that carried the row, or its
 delete — for a row the end of a snapshot could not let go of, the
-`EndSnapshot`'s. A row whose key cannot be told is logged and not reported.
+`EndSnapshot`'s; for a row held retired for the replica's edits (4.3) that
+it could not let go of once they were filed, the message that let go of
+it. A row whose key cannot be told is logged and not reported.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.

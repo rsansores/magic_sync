@@ -2159,6 +2159,65 @@ async fn a_two_way_row_keeps_the_replicas_columns_and_sends_only_its_edits(pool:
     );
 }
 
+/// A row held retired for its edit, that the database refuses to let go
+/// once they are filed, is rejected as refused by the message that let go
+/// of it — the one the server reads the rejection against — not by the last
+/// one applied since.
+#[sqlx::test(migrations = false)]
+async fn a_row_let_go_once_filed_is_refused_by_the_message_that_let_it_go(pool: SqlitePool) {
+    let w = world(pool).await;
+    let id = Uuid::now_v7();
+    let row = Task {
+        id,
+        title: "kept".into(),
+        done: false,
+        updated_at: at(0),
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "tasks",
+            vec![(key(&[&id.to_string()]), json(&row))],
+        )],
+    ))
+    .await;
+    w.exec(
+        "CREATE TRIGGER kept_task BEFORE DELETE ON tasks WHEN OLD.title = 'kept' \
+         BEGIN SELECT RAISE(ABORT, 'a task kept'); END;
+         UPDATE tasks SET done = 1",
+    )
+    .await
+    .unwrap();
+    let up = w.up(0, false).await.expect("the edit");
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes("tasks", vec![key(&[&id.to_string()])])],
+    ))
+    .await;
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("items", vec![item(Uuid::now_v7(), "later")])],
+    ))
+    .await;
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
+    let refused: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT row_key, epoch, sequence FROM sync_rejections")
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    let delete = i64::try_from(BASE + 2).unwrap();
+    assert_eq!(refused, [(id.to_string(), EPOCH.to_owned(), delete)]);
+}
+
 /// A record is the replica's: the server sends none of it and lets go of
 /// none of it. History is written once; state is edited, and a changed key
 /// goes up as the old one gone.
@@ -3931,7 +3990,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x0f0e_53bc_9433_e4d6];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x273b_5ae9_89db_0d77];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
