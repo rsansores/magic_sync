@@ -383,10 +383,11 @@ what the server knows about it**, never what the rows claim:
 - a record is kept from its first delivery, or the newest report wins when it
   has a `VERSION`;
 - a two-way table takes only the columns the replica owns, and only of a row
-  the server has and records the replica holding: an edit of a row it is
-  taking back, or of one it forgot the replica holds while it provisions it
-  again, waits; one of a row the replica was never sent is refused — a
-  replica never creates a two-way row;
+  the server has and records the replica holding: an edit of one it forgot
+  the replica holds while it provisions it again waits; one of a row it
+  deleted or is taking back is dropped, the server's change winning; one of
+  a row the replica was never sent is refused — a replica never creates a
+  two-way row;
 - a catalog is refused, because replicas do not write the server's tables;
 - a replica deletes only its own rows.
 

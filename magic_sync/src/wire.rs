@@ -661,12 +661,13 @@ where
 }
 
 /// What becomes of the edits of a two-way table's rows `sender` uploaded
-/// that the server did not write. One of a row `sender` was sent waits in
-/// the inbox, answered by its place in the upload: the server forgot what
-/// it holds until its provisioning is recorded, or deleted the row and is
-/// taking it back — the delete wins, and the edit leaves the inbox once
-/// `sender` let go of the row. One of a row never sent it breaks the
-/// protocol, and is left out.
+/// that the server did not write, of rows it does not record `sender`
+/// holding. While a provisioning of `sender` is pending, or written and not
+/// confirmed, the server records nothing of what it held: each waits in the
+/// inbox, answered by its place in the upload, until it does. Otherwise the
+/// row is one `sender` no longer holds — the server deleted it, or it left
+/// `sender`'s scope, and either wins — and the edit is left out; or one the
+/// server never sent it, which breaks the protocol, and is left out too.
 #[cfg(feature = "postgres")]
 async fn unheld<R: Row>(
     conn: &mut Conn,
@@ -676,41 +677,44 @@ async fn unheld<R: Row>(
     if unwritten.is_empty() {
         return Ok(Vec::new());
     }
-    let keys: Vec<Key> = unwritten.iter().map(|(_, key)| key.clone()).collect();
-    let there: std::collections::HashSet<Key> = row::get_by_keys::<R>(conn, &keys)
-        .await?
-        .iter()
-        .map(Row::key)
-        .collect();
-    let texts: Vec<String> = keys.iter().map(row::key_text).collect();
-    let sent: std::collections::HashSet<String> = sqlx::query_scalar(
-        "SELECT row_key FROM sync.held WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3) \
-         UNION SELECT row_key FROM sync.gone WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+    let (provisioning, sent): (bool, Vec<String>) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM sync.notes WHERE kind = 'resync' AND replica_id = $1 \
+                          AND done_at IS NULL) \
+             OR EXISTS (SELECT 1 FROM sync.chains c CROSS JOIN sync.epoch e \
+                          LEFT JOIN sync.replicas r USING (replica_id) \
+                         WHERE c.replica_id = $1 AND c.snapshot_end IS NOT NULL \
+                           AND (r.applied_epoch IS DISTINCT FROM e.epoch \
+                                OR coalesce(r.applied_sequence, 0) < c.snapshot_end)), \
+                ARRAY(SELECT row_key FROM sync.held \
+                       WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3) \
+                      UNION SELECT row_key FROM sync.gone \
+                       WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3))",
     )
     .bind(sender)
     .bind(R::TABLE)
-    .bind(&texts)
-    .fetch_all(&mut *conn)
-    .await?
-    .into_iter()
-    .collect();
-    let mut kept = Vec::new();
-    for (at, key) in unwritten {
-        let text = row::key_text(&key);
-        let reason = match (there.contains(&key), sent.contains(&text)) {
-            (true, _) => "an edit of a row the server does not record the replica holding",
-            (false, true) => "an edit of a row the server deleted, and is taking back",
-            (false, false) => {
-                tracing::error!(%sender, table = R::TABLE, key = text, "upload: an edit of a two-way row never sent it — malformed, left out");
-                continue;
-            }
-        };
-        kept.push(Refused {
-            at,
-            reason: reason.to_owned(),
-        });
+    .bind(unwritten.iter().map(|(_, key)| row::key_text(key)).collect::<Vec<_>>())
+    .fetch_one(&mut *conn)
+    .await?;
+    if provisioning {
+        return Ok(unwritten
+            .into_iter()
+            .map(|(at, _)| Refused {
+                at,
+                reason: "an edit of a row the server does not record the replica holding, \
+                         while it provisions it again"
+                    .to_owned(),
+            })
+            .collect());
     }
-    Ok(kept)
+    for (_, key) in unwritten {
+        let text = row::key_text(&key);
+        if sent.contains(&text) {
+            tracing::debug!(%sender, table = R::TABLE, key = text, "upload: an edit of a two-way row the replica no longer holds — left out");
+        } else {
+            tracing::error!(%sender, table = R::TABLE, key = text, "upload: an edit of a two-way row never sent it — malformed, left out");
+        }
+    }
+    Ok(Vec::new())
 }
 
 impl<R, P: Sync> Ops<P> for Typed<R, P>

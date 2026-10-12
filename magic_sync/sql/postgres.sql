@@ -354,7 +354,8 @@ CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, relation, row_key);
 COMMENT ON TABLE sync.inbox IS
     'What replicas uploaded that the server could not file for a reason a retry cannot '
     'change: a table it does not mirror, a row that does not decode, a row or a delete its '
-    'database refuses, an edit of a two-way row it does not record the replica holding — or '
+    'database refuses, an edit of a two-way row it does not record the replica holding while '
+    'it provisions it again — or '
     'every row of an upload whose filing failed as a whole. Never repaired by hand: a deploy '
     'that fixes the cause lets the next retry file it.';
 COMMENT ON COLUMN sync.inbox.relation IS

@@ -2495,8 +2495,8 @@ async fn an_edit_of_a_two_way_row_writes_only_the_replicas_columns(pool: crate::
 }
 
 /// The server deleted a row a replica edits meanwhile: the delete wins, and
-/// the edit brings back nothing — on the server, or on any replica. It
-/// waits until the replica let go of the row, then leaves.
+/// the edit brings back nothing — on the server, or on any replica — nor
+/// waits for anything.
 #[sqlx::test(migrations = false)]
 async fn an_edit_of_a_two_way_row_the_server_deleted_does_not_bring_it_back(pool: crate::DbPool) {
     let world = world_of(pool, true).await;
@@ -2512,13 +2512,34 @@ async fn an_edit_of_a_two_way_row_the_server_deleted_does_not_bring_it_back(pool
         .await;
     world.file(a, &edit(world.partition, id, "count", 3)).await;
     assert_eq!(world.tallied(id).await, None);
-    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 1);
-
-    world.pass(&Fake::default()).await;
-    world.acknowledge(a, world.last_sent(a).await).await;
-    world.refile_all().await;
-    assert_eq!(world.tallied(id).await, None);
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+}
+
+/// A row that left a replica's scope is taken back from it: an edit it made
+/// meanwhile is of a row it no longer holds, and is left out — it does not
+/// wait in the inbox for a row that will never be the replica's again.
+#[sqlx::test(migrations = false)]
+async fn an_edit_of_a_two_way_row_that_left_the_replicas_scope_is_left_out(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let id = world.tally("count").await;
+    world.pass(&Fake::default()).await;
+    world
+        .exec(
+            "UPDATE fixture.tallies SET partition_id = gen_random_uuid() \
+              WHERE id = $1 AND $2 = $2 AND $3 = $3",
+            id,
+            "",
+        )
+        .await;
+    world.pass(&Fake::default()).await;
+    world.file(a, &edit(world.partition, id, "count", 3)).await;
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+    assert_eq!(
+        world.count("SELECT seen::int8 FROM fixture.tallies").await,
+        0,
+        "not written"
+    );
 }
 
 /// A two-way row begins on the server: one a replica was never sent, it
@@ -2573,11 +2594,15 @@ async fn a_two_way_row_ends_as_its_newest_edit_whatever_waited_in_the_inbox(pool
     let hold = |holds: bool| {
         let pool = world.pool.clone();
         async move {
+            // Not held: forgotten, while it is provisioned again.
             let sql = if holds {
-                "INSERT INTO sync.held (replica_id, relation, row_key, noted, sequence) \
+                "WITH done AS (UPDATE sync.notes SET done_at = now() \
+                                WHERE kind = 'resync' AND replica_id = $1 AND done_at IS NULL) \
+                 INSERT INTO sync.held (replica_id, relation, row_key, noted, sequence) \
                  VALUES ($1, 'tallies', $2, $3, $4) ON CONFLICT DO NOTHING"
             } else {
-                "DELETE FROM sync.held WHERE replica_id = $1 AND relation = 'tallies' \
+                "WITH noted AS (INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', $1)) \
+                 DELETE FROM sync.held WHERE replica_id = $1 AND relation = 'tallies' \
                    AND row_key = $2 AND $3 >= 0 AND $4 >= 0"
             };
             sqlx::query(sql)
