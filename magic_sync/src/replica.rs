@@ -333,7 +333,16 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
     crate::wish::unclaimed(codecs)?;
     let wishes = crate::wish::wishes_for(codecs);
-    let codecs: &[&Codec<P>] = &codecs.iter().chain(&wishes).collect::<Vec<_>>();
+    checked(conn, &codecs.iter().chain(&wishes).collect::<Vec<_>>()).await
+}
+
+/// [`check`] of `codecs` as the engine holds them: the engine's own tables
+/// among them.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn checked<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[&Codec<P>],
+) -> Result<(), Error> {
     let (version, needed) = (schema_version(conn).await?, crate::REPLICA_SCHEMA_VERSION);
     if version > needed {
         return Err(Error::Misuse(format!(
@@ -576,7 +585,7 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
     for trigger in generated(all) {
         sqlx::query(&trigger.sql).execute(&mut *tx).await?;
     }
-    check(&mut tx, codecs).await?;
+    checked(&mut tx, all).await?;
     tx.commit().await?;
     Ok(())
 }

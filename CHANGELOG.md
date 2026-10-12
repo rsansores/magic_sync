@@ -5,7 +5,7 @@
 The first release. `magic_sync` keeps partial copies of PostgreSQL tables on
 SQLite replicas and brings back what the replicas write, offline-first: for
 every replica the server records what it holds, works out what it should hold,
-and sends the difference. Schemas: server 1, replica 1. Protocol 1. Dashboard
+and sends the difference. Schemas: server 2, replica 2. Protocol 1. Dashboard
 contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 
 ### What it is
@@ -22,6 +22,17 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   travels points at it, read from the foreign keys). A misuse is a compile
   error; a table that is not its row, a missing or different trigger, or a
   missing index is refused when the server or a replica starts.
+- **Settings and wishes.** A `setting` is a row a replica owns and acts on;
+  the server may wish its `#[row(desired)]` columns other values
+  (`Server::desire`, `withdraw`, `wishes`). The replica carries each wish out
+  once through the host's handler (`wish::CarryOut`, `Settings::wishes`) —
+  outside any transaction, so it may reach hardware — and answers `applied`
+  (the engine writes the row and the answer together), `refused`, `waiting`,
+  or `superseded` when `apply = "if_unchanged"` and the setting changed on
+  the replica since the wish was based on it. Wishes travel as rows of the
+  engine's own two-way table `sync_wishes` (schema step 2 on each side), so
+  every guarantee below holds for them; the server files a setting as its
+  replica last sent it, whatever its version.
 - **Codecs.** `Codec::json` (an object of the row's columns, 64-bit integers
   as text) and `Codec::new` (a protobuf message of your own).
 - **Runners.** `Server` and `Replica` run what a host builds; the host
@@ -58,7 +69,10 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 - What a replica writes is filed under the replica that sent it, whatever the
   rows claim; an upload is answered only once filed, and a replica forgets a
   write only on that answer.
-- Progress counts only what a replica confirmed it applied.
+- Progress counts only what a replica confirmed it applied. A row a replica
+  did not take because it deleted it and the delete is not filed yet is
+  reported held back (`Rejected.held_back`): no fault, no alarm, and sent
+  again should the server keep it.
 - An hourly fingerprint of what each replica holds catches what nothing
   foresaw.
 

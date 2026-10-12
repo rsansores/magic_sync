@@ -61,95 +61,10 @@ it holds.
 ## A setting both sides want to change
 
 The head office wants a register's screen brightness at 70; the register's
-user turned it to 40. Two writers, one setting. Do not make it one row both
-write: split it by who is right about what. The head office is right about
-what it *wants*; the register is right about what the setting *is*.
-
-The head office writes a **desired** table, which goes down to the register it
-is for:
-
-```rust,ignore
-{{#include ../../snippets/src/rows.rs:desired}}
-```
-
-The register writes a **reported** table, a record that goes up. Its
-`version` column orders the register's own reports, so the newest one wins at
-the head office, whatever order they arrive in:
-
-```rust,ignore
-{{#include ../../snippets/src/rows.rs:reported}}
-```
-
-On the server, with the triggers [`Engine::triggers`] prints beside them
-([Tables](tables.md)):
-
-```sql
-CREATE TABLE shop.desired_settings (
-    register_id UUID NOT NULL REFERENCES shop.registers (id),
-    id          UUID NOT NULL,
-    value       TEXT NOT NULL,
-    revision    BIGINT NOT NULL,
-    PRIMARY KEY (register_id, id)
-);
-
-CREATE TABLE shop.reported_settings (
-    register_id UUID NOT NULL REFERENCES shop.registers (id),
-    id          UUID NOT NULL,
-    value       TEXT NOT NULL,
-    reported_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (register_id, id)
-);
-```
-
-On the register, the same two tables as SQLite stores them:
-
-```sql
-CREATE TABLE desired_settings (
-    register_id BLOB NOT NULL, id BLOB NOT NULL,
-    value TEXT NOT NULL, revision INTEGER NOT NULL,
-    PRIMARY KEY (register_id, id)
-);
-CREATE TABLE reported_settings (
-    register_id BLOB NOT NULL, id BLOB NOT NULL,
-    value TEXT NOT NULL, reported_at TEXT NOT NULL,
-    PRIMARY KEY (register_id, id)
-);
-```
-
-Both are keyed by the register and the setting's id, so a wish and its report
-share their key. The wish carries a `revision` the head office raises on
-every change. Nothing in the engine compares it: a table the server sends
-down is taken as it comes, whatever its columns say, so the register does the
-comparing. It keeps, in a table of its own that never travels, the last
-revision it carried out of each setting, and carries out only the wishes
-newer than that — each once — reporting what the setting is afterwards in the
-same transaction that records it:
-
-```rust,ignore
-{{#include ../../snippets/src/replica.rs:apply_desired}}
-```
-
-Its bookkeeping table is the register's alone:
-
-```sql
-CREATE TABLE applied_settings (id BLOB PRIMARY KEY NOT NULL, revision INTEGER NOT NULL);
-```
-
-Run it after every message the register applied (`Received::Applied` names
-the tables, so you can run it only when `desired_settings` is among them, and
-a snapshot ends with `Received::SnapshotEnded`) and at start-up.
-The head office reads `reported_settings` to see what each register is
-actually set to, and compares it with what it wants. A user who turns the
-brightness down by hand writes the `reported` row again, with a newer
-`reported_at`; the wish stands until the head office changes it, and is not
-carried out a second time.
-
-> **Mind:** `apply` runs before the revision is recorded, so a register that
-> loses power between the two carries the wish out again. Make it
-> idempotent.
-
-> **Note:** the engine has no primitive for this pair: the register's half,
-> carrying a wish out once per revision, is the host's to write, as above.
+user turned it to 40. Two writers, one setting. The register is right about
+what the setting *is*, and the head office about what it *wants*: declare the
+register's row a `setting`, and let the head office wish it other values —
+[Settings and wishes](settings.md) is the whole of it.
 
 ## Archived rows replicas should not hold
 

@@ -285,6 +285,7 @@ pub struct magic_sync::run::replica::Replica<P: 'static, I: magic_sync::run::rep
 impl<P: core::marker::Sync + 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink> magic_sync::run::replica::Replica<P, I, U>
 pub async fn magic_sync::run::replica::Replica<P, I, U>::new(sqlx_sqlite::SqlitePool, alloc::vec::Vec<magic_sync::wire::Codec<P>>, I, U, magic_sync::run::replica::Settings) -> core::result::Result<Self, magic_sync::Error>
 pub fn magic_sync::run::replica::Replica<P, I, U>::nudge(&self)
+pub fn magic_sync::run::replica::Replica<P, I, U>::offer_wishes(&self)
 pub async fn magic_sync::run::replica::Replica<P, I, U>::receive(&self, &[u8]) -> core::result::Result<magic_sync::replica::Received, magic_sync::Error>
 pub async fn magic_sync::run::replica::Replica<P, I, U>::run(&self, impl core::future::future::Future<Output = ()>)
 impl<P: 'static, I: magic_sync::run::replica::Identity, U: magic_sync::run::replica::Uplink> core::fmt::Debug for magic_sync::run::replica::Replica<P, I, U>
@@ -305,6 +306,8 @@ pub magic_sync::run::replica::Settings::inbound: magic_sync::envelope::Limits
 pub magic_sync::run::replica::Settings::lanes: alloc::vec::Vec<magic_sync::replica::Lane>
 pub magic_sync::run::replica::Settings::outbox: magic_sync::replica::Outbox
 pub magic_sync::run::replica::Settings::send_timeout: core::time::Duration
+pub magic_sync::run::replica::Settings::wishes: magic_sync::wish::Wishes
+pub magic_sync::run::replica::Settings::wishes_every: core::time::Duration
 impl core::clone::Clone for magic_sync::run::replica::Settings
 pub fn magic_sync::run::replica::Settings::clone(&self) -> Self
 impl core::default::Default for magic_sync::run::replica::Settings
@@ -316,8 +319,8 @@ impl core::marker::Send for magic_sync::run::replica::Settings
 impl core::marker::Sync for magic_sync::run::replica::Settings
 impl core::marker::Unpin for magic_sync::run::replica::Settings
 impl core::marker::UnsafeUnpin for magic_sync::run::replica::Settings
-impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Settings
-impl core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Settings
+impl !core::panic::unwind_safe::RefUnwindSafe for magic_sync::run::replica::Settings
+impl !core::panic::unwind_safe::UnwindSafe for magic_sync::run::replica::Settings
 pub trait magic_sync::run::replica::Identity: core::marker::Send + core::marker::Sync + 'static
 pub fn magic_sync::run::replica::Identity::id(&self, &mut magic_sync::Conn) -> impl core::future::future::Future<Output = core::result::Result<core::option::Option<uuid::Uuid>, magic_sync::Error>> + core::marker::Send
 impl magic_sync::run::replica::Identity for uuid::Uuid
@@ -377,6 +380,79 @@ impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::wire::MapError
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::wire::MapError
 pub type magic_sync::wire::Place<R, P> = fn(&mut R, uuid::Uuid, &P)
 pub mod magic_sync::wish
+#[non_exhaustive] pub enum magic_sync::wish::Outcome
+pub magic_sync::wish::Outcome::Applied
+pub magic_sync::wish::Outcome::Later(alloc::string::String)
+pub magic_sync::wish::Outcome::Refused(alloc::string::String)
+impl core::clone::Clone for magic_sync::wish::Outcome
+pub fn magic_sync::wish::Outcome::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::wish::Outcome
+impl core::cmp::PartialEq for magic_sync::wish::Outcome
+pub fn magic_sync::wish::Outcome::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::wish::Outcome
+pub fn magic_sync::wish::Outcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::wish::Outcome
+impl core::marker::Freeze for magic_sync::wish::Outcome
+impl core::marker::Send for magic_sync::wish::Outcome
+impl core::marker::Sync for magic_sync::wish::Outcome
+impl core::marker::Unpin for magic_sync::wish::Outcome
+impl core::marker::UnsafeUnpin for magic_sync::wish::Outcome
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::wish::Outcome
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::wish::Outcome
+pub struct magic_sync::wish::Direct
+impl core::clone::Clone for magic_sync::wish::Direct
+pub fn magic_sync::wish::Direct::clone(&self) -> Self
+impl core::default::Default for magic_sync::wish::Direct
+pub fn magic_sync::wish::Direct::default() -> Self
+impl core::fmt::Debug for magic_sync::wish::Direct
+pub fn magic_sync::wish::Direct::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::wish::Direct
+impl<R: magic_sync::row::Setting> magic_sync::wish::CarryOut<R> for magic_sync::wish::Direct
+pub async fn magic_sync::wish::Direct::carry_out(&self, magic_sync::wish::Wish<R>) -> magic_sync::wish::Outcome
+impl core::marker::Freeze for magic_sync::wish::Direct
+impl core::marker::Send for magic_sync::wish::Direct
+impl core::marker::Sync for magic_sync::wish::Direct
+impl core::marker::Unpin for magic_sync::wish::Direct
+impl core::marker::UnsafeUnpin for magic_sync::wish::Direct
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::wish::Direct
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::wish::Direct
+#[non_exhaustive] pub struct magic_sync::wish::Wish<R>
+pub magic_sync::wish::Wish::held: core::option::Option<R>
+pub magic_sync::wish::Wish::note: core::option::Option<alloc::string::String>
+pub magic_sync::wish::Wish::version: i64
+pub magic_sync::wish::Wish::wanted: R
+impl<R: core::clone::Clone> core::clone::Clone for magic_sync::wish::Wish<R>
+pub fn magic_sync::wish::Wish<R>::clone(&self) -> Self
+impl<R: core::fmt::Debug> core::fmt::Debug for magic_sync::wish::Wish<R>
+pub fn magic_sync::wish::Wish<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<R> core::marker::Freeze for magic_sync::wish::Wish<R> where R: core::marker::Freeze, core::option::Option<R>: core::marker::Freeze
+impl<R> core::marker::Send for magic_sync::wish::Wish<R> where R: core::marker::Send, core::option::Option<R>: core::marker::Send
+impl<R> core::marker::Sync for magic_sync::wish::Wish<R> where R: core::marker::Sync, core::option::Option<R>: core::marker::Sync
+impl<R> core::marker::Unpin for magic_sync::wish::Wish<R> where R: core::marker::Unpin, core::option::Option<R>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for magic_sync::wish::Wish<R> where R: core::marker::UnsafeUnpin, core::option::Option<R>: core::marker::UnsafeUnpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for magic_sync::wish::Wish<R> where R: core::panic::unwind_safe::RefUnwindSafe, core::option::Option<R>: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for magic_sync::wish::Wish<R> where R: core::panic::unwind_safe::UnwindSafe, core::option::Option<R>: core::panic::unwind_safe::UnwindSafe
+pub struct magic_sync::wish::Wishes
+impl magic_sync::wish::Wishes
+pub fn magic_sync::wish::Wishes::new() -> Self
+pub fn magic_sync::wish::Wishes::on<R: magic_sync::row::Setting>(self, impl magic_sync::wish::CarryOut<R>) -> Self
+impl core::clone::Clone for magic_sync::wish::Wishes
+pub fn magic_sync::wish::Wishes::clone(&self) -> Self
+impl core::default::Default for magic_sync::wish::Wishes
+pub fn magic_sync::wish::Wishes::default() -> Self
+impl core::fmt::Debug for magic_sync::wish::Wishes
+pub fn magic_sync::wish::Wishes::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for magic_sync::wish::Wishes
+impl core::marker::Send for magic_sync::wish::Wishes
+impl core::marker::Sync for magic_sync::wish::Wishes
+impl core::marker::Unpin for magic_sync::wish::Wishes
+impl core::marker::UnsafeUnpin for magic_sync::wish::Wishes
+impl !core::panic::unwind_safe::RefUnwindSafe for magic_sync::wish::Wishes
+impl !core::panic::unwind_safe::UnwindSafe for magic_sync::wish::Wishes
+pub trait magic_sync::wish::CarryOut<R: magic_sync::row::Setting>: core::marker::Send + core::marker::Sync + 'static
+pub fn magic_sync::wish::CarryOut::carry_out(&self, magic_sync::wish::Wish<R>) -> impl core::future::future::Future<Output = magic_sync::wish::Outcome> + core::marker::Send
+impl<R: magic_sync::row::Setting> magic_sync::wish::CarryOut<R> for magic_sync::wish::Direct
+pub async fn magic_sync::wish::Direct::carry_out(&self, magic_sync::wish::Wish<R>) -> magic_sync::wish::Outcome
 #[non_exhaustive] pub enum magic_sync::Error
 pub magic_sync::Error::Database(sqlx_core::error::Error)
 #[non_exhaustive] pub magic_sync::Error::Host

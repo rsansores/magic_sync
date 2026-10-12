@@ -258,8 +258,7 @@ impl<P: Sync + 'static> Codec<P> {
     /// table's row, or the bytes do not decode ([`Error::Malformed`]).
     #[cfg(feature = "postgres")]
     pub(crate) fn decode_row<R: Row>(&self, bytes: &[u8]) -> Result<R, Error> {
-        self.ops
-            .decode_any(bytes)?
+        self.decode_any(bytes)?
             .downcast::<R>()
             .map(|row| *row)
             .map_err(|_| self.not_its_row::<R>())
@@ -272,6 +271,11 @@ impl<P: Sync + 'static> Codec<P> {
             std::any::type_name::<R>(),
             self.table.name
         ))
+    }
+
+    /// `bytes`, decoded as this table's row, its type erased.
+    pub(crate) fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
+        self.ops.decode_any(bytes)
     }
 
     /// The rows of `keys`, retired or not, encoded; a key with no row is
@@ -492,7 +496,6 @@ trait Ops<P>: Send + Sync {
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded>;
     #[cfg(feature = "postgres")]
     fn encode_any(&self, row: Box<dyn std::any::Any + Send>) -> Result<Vec<u8>, Error>;
-    #[cfg(feature = "postgres")]
     fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error>;
     #[cfg(feature = "sqlite")]
     fn apply_down<'a>(
@@ -835,7 +838,6 @@ where
         (self.encode)(*row)
     }
 
-    #[cfg(feature = "postgres")]
     fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
         Ok(Box::new((self.decode)(bytes)?))
     }

@@ -360,6 +360,62 @@ replica, or for this one before it was restored — names nothing. The answer
 may arrive before the replica recorded that the transport took the upload:
 it counts all the same.
 
+### 4.5 Wishes
+
+A **setting** is a table of the replica's own whose rows go up as a record's
+with a version do (section 7) — a value the replica holds and acts on: a
+module's configuration, a screen's brightness — some columns of which the
+server may **wish** other values. A replica that holds settings holds the
+server's wishes in a table of the engine's, `sync_wishes`: a table written on
+both sides (4.1), its rows encoded as the `Wish` message, its key the wish's
+`id`. A replica that holds none needs none of this section: it rejects the
+rows of `sync_wishes` as those of any table it does not know.
+
+A wish is one row of a setting — `table`, `key` — and what the server wants
+it to hold: `wanted`, the row encoded as `table`'s own, of which the replica
+takes the columns its declaration of the table says a wish sets, and nothing
+else. One row has one wish at most; a new one replaces it, under a new
+`version`, a number the server draws at random: only whether an answer is of
+the wish the replica holds matters, never which version is the later. The
+server owns `id` to `note`; the replica owns the answer — `answered`, the
+version it answers, `outcome`, `reason` and `answered_at` — which it **must
+not** take from a message: a wish it takes that it did not hold is one it has
+not answered.
+
+Once the message that brought a wish is committed — **never** inside the
+transaction that applies a message, since carrying one out may take time and
+reach outside the database — the replica carries out every wish it holds, not
+retired (4.3), that it has not answered, or answered `waiting`:
+
+1. It reads `wanted` as `table`'s row. One it cannot read — a table, or an
+   encoding, this build does not know — it answers `waiting`, and carries
+   out with a build that can. One whose key is not `key` it answers
+   `refused`.
+2. With `if_unchanged`, the wish is based on the version `wanted` carries:
+   if the replica holds no row of `key`, or holds it at another version, it
+   answers `superseded`, and does not carry it out — the replica's value
+   stands. Versions are compared as text: an integer decimal, an instant in
+   UTC, RFC 3339, to the microsecond (`2026-10-12T10:00:00.000001Z`).
+3. Otherwise it carries it out, however the setting takes it, and answers
+   `applied` — then, in **one** transaction, it writes the wished columns
+   onto the row it holds, if it holds one, with its version moved past what
+   it was (an integer one more; an instant now, or a microsecond past the
+   old one when the clock is behind), and records the answer; `refused`,
+   with why — the row as it was — final for that wish; or `waiting`, with
+   why, and carries it out again later.
+
+An answer is recorded only while the wish the replica holds is still the one
+it answers (the same `version`, not retired); a wish replaced meanwhile is
+carried out next, and the row keeps what carrying out the last one wrote. A
+`waiting` answer is recorded when it is new — another reason — not every time
+it waits again. The answer and the row it wrote are noted like any write of
+the replica's (section 7): the answer as an edit of the columns the replica
+owns of a two-way row.
+
+A replica that stops after carrying a wish out and before it records the
+answer carries it out again: carrying out the same wish twice **must** leave
+the setting as once does.
+
 ---
 
 ## 5. Acknowledging
@@ -635,7 +691,11 @@ A replica implementation is complete when:
       number, and forgets on `Filed` only the notes that send carried, as it
       carried them;
 - [ ] it reports digests with the fingerprint above (optional, recommended);
-- [ ] it says its backlog when it changes (optional, recommended).
+- [ ] it says its backlog when it changes (optional, recommended);
+- [ ] if it holds settings: it holds their wishes as a two-way table, takes
+      no answer from the server, carries each out after the message that
+      brought it is committed — superseded, unread or applied as 4.5 says —
+      and records the answer, with the row it wrote, in one transaction.
 
 ---
 
@@ -792,3 +852,15 @@ skipped. Two digests of one table are malformed: none of that `Up`'s digests
 is compared. The server compares a replica's digests at most once every ten
 minutes: those that come sooner are not compared. A replica that skips
 digests loses only this safety net.
+
+### A.6 How the server keeps wishes (section 4.5)
+
+The server writes a wish of a setting row when its host asks, in the host's
+transaction, under a version it draws at random — so a server restored from
+an older copy wishes under other numbers than it did — and sends it to the
+replica the row belongs to (the setting's `origin`), as it sends any row: one
+withdrawn is deleted, and taken back as a row is. It never sends an answer
+down. It files an answer as the edit of a two-way row it is (A.3): only while
+it records the replica holding the wish — so an answer to a wish withdrawn is
+left out — and keeps it beside the wish; a wish stands as its answer says
+only while that answer is of its version: `pending` until then.

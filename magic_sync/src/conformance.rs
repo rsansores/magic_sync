@@ -88,6 +88,24 @@ pub struct Event {
     pub what: String,
 }
 
+/// A setting: a replica's screen, whose level the server may wish.
+#[derive(sqlx::FromRow, Clone, Debug, PartialEq, Serialize, Deserialize, crate::Row)]
+#[row(
+    table = "screens",
+    schema = "fixture",
+    mirror = "setting",
+    key = "replica_id, id",
+    origin = "replica_id"
+)]
+pub struct Screen {
+    pub replica_id: Uuid,
+    pub id: Uuid,
+    #[row(desired)]
+    pub level: i64,
+    #[row(version)]
+    pub revision: i64,
+}
+
 /// Every table of the suite, parents first.
 pub fn codecs() -> Vec<Codec<()>> {
     vec![

@@ -88,41 +88,25 @@ pub struct LiveProduct {
 }
 // ANCHOR_END: active
 
-// ANCHOR: desired
-/// What the head office wants one of a register's settings to be.
+// ANCHOR: setting
+/// One of a register's settings, as the register holds it: its value is
+/// the register's, and the head office may wish it another.
 #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
 #[row(
-    table = "desired_settings",
+    table = "settings",
     schema = "shop",
-    mirror = "catalog",
+    mirror = "setting",
     key = "register_id, id",
-    sync = "assigned(register_id)"
+    origin = "register_id",
+    apply = "if_unchanged"
 )]
-pub struct DesiredSetting {
+pub struct RegisterSetting {
     pub register_id: Uuid,
     pub id: Uuid,
-    pub value: String,
-    /// Raised by every change, so the register can tell a new wish from one
-    /// it has carried out.
-    pub revision: i64,
-}
-// ANCHOR_END: desired
-
-// ANCHOR: reported
-/// What one of a register's settings is, as the register reports it.
-#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
-#[row(
-    table = "reported_settings",
-    schema = "shop",
-    mirror = "record",
-    key = "register_id, id",
-    origin = "register_id"
-)]
-pub struct ReportedSetting {
-    pub register_id: Uuid,
-    pub id: Uuid,
+    pub name: String,
+    #[row(desired)]
     pub value: String,
     #[row(version)]
-    pub reported_at: DateTime<Utc>,
+    pub changed_at: DateTime<Utc>,
 }
-// ANCHOR_END: reported
+// ANCHOR_END: setting

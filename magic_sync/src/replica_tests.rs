@@ -5435,3 +5435,6 @@ mod walk;
 fn a_replicas_default_limits_are_the_servers() {
     assert_eq!(Outbox::default().limits, Limits::default());
 }
+
+#[path = "replica_wish_tests.rs"]
+mod wishes;

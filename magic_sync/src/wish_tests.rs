@@ -2,30 +2,11 @@
 //! belongs to like any row, answered by it, and filed only while they stand.
 
 use super::*;
+pub(super) use crate::conformance::Screen;
 use crate::envelope::{Key as WireKey, Table as WireTable, Up, Wish};
 use crate::row::Row as _;
 use crate::status::WishState;
 use crate::wish::{WishRow, TABLE};
-
-/// A setting: a replica's screen, whose level the server may wish.
-#[derive(
-    sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
-)]
-#[row(
-    table = "screens",
-    schema = "fixture",
-    mirror = "setting",
-    key = "replica_id, id",
-    origin = "replica_id"
-)]
-pub(super) struct Screen {
-    pub(super) replica_id: Uuid,
-    pub(super) id: Uuid,
-    #[row(desired)]
-    pub(super) level: i64,
-    #[row(version)]
-    pub(super) revision: i64,
-}
 
 const SCREENS: &str = "
 CREATE TABLE fixture.screens (

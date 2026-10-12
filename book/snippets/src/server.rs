@@ -2,10 +2,11 @@
 
 pub mod partitioned;
 
+use crate::rows::RegisterSetting;
 use magic_sync::envelope::Limits;
 use magic_sync::plan::Engine;
-use magic_sync::run::server::{Senders, Settings};
-use magic_sync::status::{ReplicaState, RowState, Scope};
+use magic_sync::run::server::{Senders, Server, Settings, Transport, Wished};
+use magic_sync::status::{ReplicaState, RowState, Scope, WishState};
 use magic_sync::Error;
 use magic_sync::Row;
 use shop_rows::{codecs, Product, REGISTERS};
@@ -166,3 +167,49 @@ pub async fn who_holds(engine: &Engine, pool: &PgPool, product: &Product) -> Res
     Ok(())
 }
 // ANCHOR_END: row
+
+// ANCHOR: desire
+/// An operator sets a register's setting from the page that showed it: the
+/// row as the page read it, with the value they typed. The register carries
+/// the wish out only while the setting is still what the operator saw.
+pub async fn set_from_the_page<S: Senders, T: Transport>(
+    server: &Server<S, T>,
+    seen: RegisterSetting,
+    value: String,
+    operator: &str,
+) -> Result<Wished, Error> {
+    let mut tx = server.begin().await?;
+    let wished = server
+        .desire(&mut tx, RegisterSetting { value, ..seen }, Some(operator))
+        .await?;
+    // … the host's own audit row, in the same transaction …
+    tx.commit().await?;
+    Ok(wished)
+}
+// ANCHOR_END: desire
+
+// ANCHOR: wishes
+pub async fn where_the_wishes_stand<S: Senders, T: Transport>(
+    server: &Server<S, T>,
+    pool: &PgPool,
+    settings: &[RegisterSetting],
+) -> Result<(), Error> {
+    let mut conn = pool.acquire().await?;
+    let keys: Vec<_> = settings.iter().map(Row::key).collect();
+    for wish in server.wishes::<RegisterSetting>(&mut conn, &keys).await? {
+        let state = match wish.state {
+            WishState::Pending => "on its way",
+            WishState::Waiting => "waiting for the register",
+            WishState::Applied => "applied",
+            WishState::Refused => "refused",
+            WishState::Superseded => "superseded: the register changed it first",
+            _ => "in a state of a later version",
+        };
+        println!(
+            "{} → {}: {state} {:?}",
+            wish.wanted.name, wish.wanted.value, wish.reason
+        );
+    }
+    Ok(())
+}
+// ANCHOR_END: wishes

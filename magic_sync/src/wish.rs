@@ -55,6 +55,7 @@ pub(crate) struct WishRow {
 }
 
 /// The answers a replica gives, as they are written.
+#[cfg(feature = "postgres")]
 pub(crate) const OUTCOMES: [&str; 4] = ["applied", "refused", "superseded", "waiting"];
 
 fn to_wire(row: WishRow) -> Result<envelope::Wish, MapError> {
@@ -99,14 +100,18 @@ fn positive(number: u64, what: &str) -> Result<Option<i64>, MapError> {
     }
 }
 
-fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
-    let parts = wish.key.map(|k| k.parts).unwrap_or_default();
-    if parts.is_empty() {
-        return Err(MapError::new("a wish of no row"));
-    }
-    let version =
-        positive(wish.version, "a version")?.ok_or_else(|| MapError::new("a wish of version 0"))?;
-    let outcome = (!wish.outcome.is_empty()).then_some(wish.outcome);
+/// A replica's answer, as the server reads it off a wish it sent up.
+#[cfg(feature = "postgres")]
+type Answer = (
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+);
+
+#[cfg(feature = "postgres")]
+fn answer_of(wish: &envelope::Wish) -> Result<Answer, MapError> {
+    let outcome = (!wish.outcome.is_empty()).then(|| wish.outcome.clone());
     if let Some(outcome) = outcome.as_deref() {
         if !OUTCOMES.contains(&outcome) {
             return Err(MapError::new(format!(
@@ -118,6 +123,31 @@ fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
         "" => None,
         at => Some(DateTime::parse_from_rfc3339(at)?.with_timezone(&Utc)),
     };
+    Ok((
+        positive(wish.answered, "an answer to version")?,
+        outcome,
+        (!wish.reason.is_empty()).then(|| wish.reason.clone()),
+        answered_at,
+    ))
+}
+
+fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
+    let parts = wish
+        .key
+        .as_ref()
+        .map(|k| k.parts.clone())
+        .unwrap_or_default();
+    if parts.is_empty() {
+        return Err(MapError::new("a wish of no row"));
+    }
+    let version =
+        positive(wish.version, "a version")?.ok_or_else(|| MapError::new("a wish of version 0"))?;
+    // A replica takes no answer from the server: its own are the only ones,
+    // and a wish it did not hold is one it has not answered.
+    #[cfg(feature = "postgres")]
+    let (answered, outcome, reason, answered_at) = answer_of(&wish)?;
+    #[cfg(feature = "sqlite")]
+    let (answered, outcome, reason, answered_at) = (None, None, None, None);
     Ok(WishRow {
         id: wish.id.parse()?,
         replica_id: wish.replica_id.parse()?,
@@ -127,9 +157,9 @@ fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
         version,
         if_unchanged: wish.if_unchanged,
         note: (!wish.note.is_empty()).then_some(wish.note),
-        answered: positive(wish.answered, "an answer to version")?,
+        answered,
         outcome,
-        reason: (!wish.reason.is_empty()).then_some(wish.reason),
+        reason,
         answered_at,
     })
 }
@@ -364,5 +394,375 @@ mod server {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+pub use replica::*;
+
+#[cfg(feature = "sqlite")]
+mod replica {
+    use super::{WishRow, TABLE};
+    use crate::row::Setting;
+    use crate::wire::Codec;
+    use crate::{Conn, Error};
+    use sqlx::SqlitePool;
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    /// What the server wishes one setting row to hold, handed to the
+    /// replica's handler for the table.
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    pub struct Wish<R> {
+        /// The row as wished: its `#[row(desired)]` columns are the wish.
+        pub wanted: R,
+        /// The row as the replica holds it now; `None` when it holds none.
+        pub held: Option<R>,
+        /// What the server's host said of the wish: who asked, why.
+        pub note: Option<String>,
+        /// This wish of the row, drawn at random by the server: a wish
+        /// carried out again — after a crash before its answer was recorded,
+        /// or by a replica restored from an older copy — has the same one.
+        pub version: i64,
+    }
+
+    /// What a replica's handler did with a wish.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum Outcome {
+        /// The setting holds what was wished: the engine writes the desired
+        /// columns onto the row, with its version moved on, in the
+        /// transaction that records the answer — and both go up.
+        Applied,
+        /// It will not hold it, for this reason: final for this wish.
+        Refused(String),
+        /// It cannot carry it out now, for this reason: the wish waits, and
+        /// is offered again — at [`Replica::offer_wishes`], after the next
+        /// message that changes a wish, at start, and every
+        /// `Settings::wishes_every`.
+        ///
+        /// [`Replica::offer_wishes`]: crate::run::replica::Replica::offer_wishes
+        Later(String),
+    }
+
+    /// Carries a setting's wishes out: the host's, one per setting table,
+    /// handed to the replica in [`Wishes`]. Called with no transaction open —
+    /// it may take its time, and talk to hardware — once per wish, and again
+    /// only if the replica stopped before it recorded the answer, or was
+    /// restored from an older copy: carrying the same wish out twice must
+    /// leave the setting as once does.
+    pub trait CarryOut<R: Setting>: Send + Sync + 'static {
+        /// Carries `wish` out, or says why not.
+        fn carry_out(&self, wish: Wish<R>) -> impl Future<Output = Outcome> + Send;
+    }
+
+    /// The handler of a setting that lives only in the database: what is
+    /// wished is applied as it comes, and the engine writes it.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Direct;
+
+    impl<R: Setting> CarryOut<R> for Direct {
+        async fn carry_out(&self, _wish: Wish<R>) -> Outcome {
+            Outcome::Applied
+        }
+    }
+
+    type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+    /// Decodes a row of the table it was asked for.
+    pub(crate) trait Decode: Sync {
+        fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error>;
+    }
+
+    impl<P: Sync + 'static> Decode for Codec<P> {
+        fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
+            Codec::decode_any(self, bytes)
+        }
+    }
+
+    /// A table's handler, its row type erased.
+    trait Carrier: Send + Sync {
+        fn carry<'a>(
+            &'a self,
+            pool: &'a SqlitePool,
+            decode: &'a dyn Decode,
+            wish: WishRow,
+        ) -> Fut<'a, Result<(), Error>>;
+    }
+
+    struct Typed<R, H> {
+        handler: H,
+        row: std::marker::PhantomData<fn() -> R>,
+    }
+
+    /// The handlers of a replica's settings, one per setting table: every
+    /// setting the replica holds needs one, which
+    /// [`Replica::new`](crate::run::replica::Replica::new) checks.
+    ///
+    /// ```
+    /// use magic_sync::wish::{CarryOut, Direct, Outcome, Wish, Wishes};
+    /// # #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+    /// # #[row(table = "screens", mirror = "setting", key = "replica_id, id", origin = "replica_id")]
+    /// # pub struct Screen {
+    /// #     pub replica_id: uuid::Uuid,
+    /// #     pub id: uuid::Uuid,
+    /// #     #[row(desired)]
+    /// #     pub level: i64,
+    /// #     #[row(version)]
+    /// #     pub revision: i64,
+    /// # }
+    /// # #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+    /// # #[row(table = "footers", mirror = "setting", key = "replica_id, id", origin = "replica_id")]
+    /// # pub struct Footer {
+    /// #     pub replica_id: uuid::Uuid,
+    /// #     pub id: uuid::Uuid,
+    /// #     #[row(desired)]
+    /// #     pub text: String,
+    /// #     #[row(version)]
+    /// #     pub revision: i64,
+    /// # }
+    ///
+    /// /// The screen's backlight, which the hardware has to take.
+    /// struct Backlight;
+    ///
+    /// impl CarryOut<Screen> for Backlight {
+    ///     async fn carry_out(&self, wish: Wish<Screen>) -> Outcome {
+    ///         match set_backlight(wish.wanted.level) {
+    ///             Ok(()) => Outcome::Applied,
+    ///             Err(why) => Outcome::Later(why),
+    ///         }
+    ///     }
+    /// }
+    /// # fn set_backlight(_: i64) -> Result<(), String> { Ok(()) }
+    ///
+    /// // A receipt's footer lives only in the database: the engine writes it.
+    /// let wishes = Wishes::new().on::<Screen>(Backlight).on::<Footer>(Direct);
+    /// ```
+    #[derive(Clone, Default)]
+    pub struct Wishes {
+        carriers: HashMap<&'static str, Arc<dyn Carrier>>,
+    }
+
+    impl std::fmt::Debug for Wishes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let mut tables: Vec<_> = self.carriers.keys().collect();
+            tables.sort_unstable();
+            f.debug_struct("Wishes").field("tables", &tables).finish()
+        }
+    }
+
+    impl Wishes {
+        /// No handler yet.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// `handler` carries out the wishes of the setting `R`, in place of
+        /// one given before.
+        #[must_use]
+        pub fn on<R: Setting>(mut self, handler: impl CarryOut<R>) -> Self {
+            self.carriers.insert(
+                R::TABLE,
+                Arc::new(Typed {
+                    handler,
+                    row: std::marker::PhantomData::<fn() -> R>,
+                }),
+            );
+            self
+        }
+
+        /// Refuses handlers that do not meet `codecs`' settings one for one.
+        pub(crate) fn check<P>(&self, codecs: &[Codec<P>]) -> Result<(), Error> {
+            for codec in codecs {
+                let setting = codec.table.mirror == crate::row::Mirror::Setting;
+                if setting && !self.carriers.contains_key(codec.table.name) {
+                    return Err(Error::Misuse(format!(
+                        "`{}` is a setting, and nothing carries its wishes out: give it a \
+                         handler in `Settings::wishes` (`Direct` for one that lives only in the \
+                         database)",
+                        codec.table.name
+                    )));
+                }
+            }
+            for table in self.carriers.keys() {
+                let setting = codecs.iter().any(|c| {
+                    c.table.name == *table && c.table.mirror == crate::row::Mirror::Setting
+                });
+                if !setting {
+                    return Err(Error::Misuse(format!(
+                        "a handler of wishes for `{table}`, which is no setting this replica holds"
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        /// Offers every wish not carried out yet, or waiting, to its table's
+        /// handler, one after another. Answers how many it answered anew.
+        pub(crate) async fn offer<P: Sync + 'static>(
+            &self,
+            pool: &SqlitePool,
+            codecs: &[Codec<P>],
+        ) -> Result<usize, Error> {
+            let pending: Vec<WishRow> = sqlx::query_as(&format!(
+                "SELECT id, replica_id, relation, row_key, wanted, version, if_unchanged, note, \
+                        answered, outcome, reason, answered_at \
+                   FROM {TABLE} \
+                  WHERE retired_at IS NULL \
+                    AND (answered IS NOT version OR outcome = 'waiting') \
+                  ORDER BY relation, row_key"
+            ))
+            .fetch_all(pool)
+            .await?;
+            let mut answered = 0;
+            for wish in pending {
+                let before = (wish.answered, wish.outcome.clone(), wish.reason.clone());
+                let id = wish.id;
+                let codec = codecs.iter().find(|c| c.table.name == wish.relation);
+                match (self.carriers.get(wish.relation.as_str()), codec) {
+                    (Some(carrier), Some(codec)) => carrier.carry(pool, codec, wish).await?,
+                    _ => {
+                        let why = format!(
+                            "this build carries out no wish of `{}`: a build that holds it as a \
+                             setting does",
+                            wish.relation
+                        );
+                        answer(pool, &wish, None::<&mut Conn>, "waiting", Some(&why)).await?;
+                    }
+                }
+                let after: Option<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+                    &format!("SELECT answered, outcome, reason FROM {TABLE} WHERE id = $1"),
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+                answered += usize::from(after.is_some_and(|after| after != before));
+            }
+            Ok(answered)
+        }
+    }
+
+    /// Records `outcome` as the answer to `wish`, in `tx` when given, else in
+    /// a transaction of its own — while it is still the wish the replica
+    /// holds, and only when the answer is new: a wish waiting again for the
+    /// same reason sends nothing up.
+    async fn answer(
+        pool: &SqlitePool,
+        wish: &WishRow,
+        tx: Option<&mut Conn>,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<(), Error> {
+        let sql = format!(
+            "UPDATE {TABLE} SET answered = $2, outcome = $3, reason = $4, \
+                    answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+              WHERE id = $1 AND version = $2 AND retired_at IS NULL \
+                AND (answered IS NOT $2 OR outcome IS NOT $3 OR reason IS NOT $4)"
+        );
+        let query = sqlx::query(&sql)
+            .bind(wish.id)
+            .bind(wish.version)
+            .bind(outcome)
+            .bind(reason);
+        match tx {
+            Some(conn) => {
+                query.execute(conn).await?;
+            }
+            None => {
+                let mut conn = pool.acquire().await?;
+                let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+                query.execute(&mut *tx).await?;
+                tx.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
+    impl<R: Setting, H: CarryOut<R>> Carrier for Typed<R, H> {
+        fn carry<'a>(
+            &'a self,
+            pool: &'a SqlitePool,
+            decode: &'a dyn Decode,
+            wish: WishRow,
+        ) -> Fut<'a, Result<(), Error>> {
+            Box::pin(async move {
+                let wanted = match decode.decode_any(&wish.wanted).map(|r| r.downcast::<R>()) {
+                    Ok(Ok(row)) => *row,
+                    Ok(Err(_)) => {
+                        return Err(Error::Misuse(format!(
+                            "the handler of `{}`'s wishes is for `{}`, which is not the row its \
+                             codec decodes",
+                            R::TABLE,
+                            std::any::type_name::<R>()
+                        )))
+                    }
+                    Err(e) => {
+                        let why = format!("this build cannot read the row wished: {e}");
+                        return answer(pool, &wish, None, "waiting", Some(&why)).await;
+                    }
+                };
+                if wanted.key_text() != wish.row_key {
+                    let why = "the row wished is not the row the wish names";
+                    return answer(pool, &wish, None, "refused", Some(why)).await;
+                }
+                let key = wanted.key();
+                let held = {
+                    let mut conn = pool.acquire().await?;
+                    crate::row::get_by_keys::<R>(&mut conn, std::slice::from_ref(&key))
+                        .await?
+                        .pop()
+                };
+                if wish.if_unchanged {
+                    let based = wanted.version_text();
+                    let why = match &held {
+                        None => Some("this replica holds no such row".to_owned()),
+                        Some(held) if held.version_text() != based => Some(format!(
+                            "this replica holds version {} of it, and the wish is based on {based}",
+                            held.version_text()
+                        )),
+                        Some(_) => None,
+                    };
+                    if let Some(why) = why {
+                        return answer(pool, &wish, None, "superseded", Some(&why)).await;
+                    }
+                }
+                let outcome = self
+                    .handler
+                    .carry_out(Wish {
+                        wanted: wanted.clone(),
+                        held,
+                        note: wish.note.clone(),
+                        version: wish.version,
+                    })
+                    .await;
+                let mut conn = pool.acquire().await?;
+                let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+                match outcome {
+                    Outcome::Applied => {
+                        // What the setting is now, whatever became of the
+                        // wish meanwhile: the handler set it.
+                        let now = crate::row::get_by_keys::<R>(&mut tx, &[key]).await?.pop();
+                        if let Some(mut row) = now {
+                            row.take_desired(wanted);
+                            row.raise_version();
+                            crate::row::overwrite_except(&mut tx, vec![row], &[]).await?;
+                        }
+                        answer(pool, &wish, Some(&mut tx), "applied", None).await?;
+                    }
+                    Outcome::Refused(why) => {
+                        answer(pool, &wish, Some(&mut tx), "refused", Some(&why)).await?;
+                    }
+                    Outcome::Later(why) => {
+                        answer(pool, &wish, Some(&mut tx), "waiting", Some(&why)).await?;
+                    }
+                }
+                tx.commit().await?;
+                Ok(())
+            })
+        }
     }
 }

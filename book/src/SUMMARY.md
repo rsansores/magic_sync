@@ -11,6 +11,7 @@
 - [How a row travels: codecs](guide/codecs.md)
 - [The server](guide/server.md)
 - [A replica](guide/replica.md)
+- [Settings and wishes](guide/settings.md)
 - [Provisioning a replica](guide/provisioning.md)
 - [Progress and health](guide/progress.md)
 - [The dashboard](guide/dashboard.md)
