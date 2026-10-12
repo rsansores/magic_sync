@@ -626,7 +626,10 @@ async fn delete<P: Sync + 'static>(
     .await?;
     sqlx::query(
         "INSERT INTO sync.notes (kind, relation, row_key) \
-         SELECT 'retry', $1, k FROM unnest($2::text[]) AS k",
+         SELECT 'retry', $1, k FROM unnest($2::text[]) AS k \
+          WHERE NOT EXISTS (SELECT 1 FROM sync.notes n \
+                             WHERE n.done_at IS NULL AND n.kind = 'retry' \
+                               AND n.relation = $1 AND n.row_key = k)",
     )
     .bind(codec.table.name)
     .bind(&kept)

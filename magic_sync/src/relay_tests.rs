@@ -3104,6 +3104,29 @@ async fn a_replica_delete_the_server_refuses_has_the_row_sent_again(pool: crate:
     assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
 }
 
+/// A delete the server refuses, filed again and again from what it kept,
+/// notes the row to be sent again once while that note is pending.
+#[sqlx::test(migrations = false)]
+async fn a_refused_delete_filed_again_notes_one_retry(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    world.keep_pads().await;
+    let mut model = models.remove(&a).unwrap();
+    world.delete_pad(a, &mut model, &pad).await;
+    world.refile_all().await;
+    world.refile_all().await;
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE kind = 'retry' AND done_at IS NULL")
+            .await,
+        1
+    );
+}
+
 /// A delete the server refuses, of a row a version of which is on its way
 /// and comes before the answer: the replica holds that version back and
 /// says so, the server sets the row aside with no alarm — nothing is at
