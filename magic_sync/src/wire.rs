@@ -245,17 +245,19 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.load(conn, keys)
     }
 
-    /// A replica writing what the server sent: every column the replica does
-    /// not own, whatever the version — and a row it had retired is offered
-    /// again. A record is refused. Answers the keys the replica now
-    /// holds, and the rows it could not take — that do not decode, or that the
-    /// database refuses for their data — by their place in `rows`, with why.
+    /// A replica writing what the server sent, each row beside the key it
+    /// came with (`None` when that key does not parse): every column the
+    /// replica does not own, whatever the version — and a row it had retired
+    /// is offered again. A record is refused. Answers the rows it could not
+    /// take — that do not decode, that came beside a key not their own, or
+    /// that the database refuses for their data — by their place in `rows`,
+    /// with why: the rest it now holds, under the keys they came beside.
     #[cfg(feature = "sqlite")]
     pub(crate) fn apply_down<'a>(
         &'a self,
         conn: &'a mut Conn,
-        rows: Vec<Vec<u8>>,
-    ) -> Fut<'a, Taken> {
+        rows: Vec<(Vec<u8>, Option<Key>)>,
+    ) -> Fut<'a, Vec<Refused>> {
         self.ops.apply_down(conn, rows)
     }
 
@@ -371,8 +373,8 @@ impl<P: Sync + 'static> Codec<P> {
 /// Things by their place in a message's rows.
 type Placed<T> = Vec<(usize, T)>;
 
-/// What [`Codec::apply_down`] or [`Codec::apply_up`] did with a message's
-/// rows.
+/// What [`Codec::apply_up`] did with a message's rows.
+#[cfg(feature = "postgres")]
 #[derive(Debug, Default)]
 pub(crate) struct Taken {
     /// The keys of the rows this side now holds.
@@ -386,9 +388,6 @@ pub(crate) struct Taken {
 pub(crate) struct Refused {
     /// Its place in the message's rows.
     pub(crate) at: usize,
-    /// Its key, read off the row: `None` when the row does not decode.
-    #[cfg(feature = "sqlite")]
-    pub(crate) key: Option<Key>,
     /// Why.
     pub(crate) reason: String,
 }
@@ -404,7 +403,11 @@ pub(crate) struct Encoded {
 trait Ops<P>: Send + Sync {
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded>;
     #[cfg(feature = "sqlite")]
-    fn apply_down<'a>(&'a self, conn: &'a mut Conn, rows: Vec<Vec<u8>>) -> Fut<'a, Taken>;
+    fn apply_down<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        rows: Vec<(Vec<u8>, Option<Key>)>,
+    ) -> Fut<'a, Vec<Refused>>;
     #[cfg(feature = "postgres")]
     fn apply_up<'a>(
         &'a self,
@@ -549,8 +552,6 @@ where
                 Err(e) => {
                     failed.push(Refused {
                         at,
-                        #[cfg(feature = "sqlite")]
-                        key: None,
                         reason: e.to_string(),
                     });
                 }
@@ -598,14 +599,10 @@ where
         let mut written = Vec::new();
         let mut refused = Vec::new();
         for (at, one) in rows {
-            #[cfg(feature = "sqlite")]
-            let key = one.key();
             match self.attempt(conn, vec![one], how).await? {
                 Ok(keys) => written.extend(keys),
                 Err(e) => refused.push(Refused {
                     at,
-                    #[cfg(feature = "sqlite")]
-                    key: Some(key),
                     reason: e.to_string(),
                 }),
             }
@@ -646,7 +643,11 @@ where
     }
 
     #[cfg(feature = "sqlite")]
-    fn apply_down<'a>(&'a self, conn: &'a mut Conn, rows: Vec<Vec<u8>>) -> Fut<'a, Taken> {
+    fn apply_down<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        rows: Vec<(Vec<u8>, Option<Key>)>,
+    ) -> Fut<'a, Vec<Refused>> {
         Box::pin(async move {
             if !matches!(R::MIRROR, Mirror::Catalog | Mirror::Both) {
                 return Err(Error::Misuse(format!(
@@ -654,18 +655,37 @@ where
                     R::TABLE
                 )));
             }
-            let (rows, mut rejected) = self.decode(rows);
-            let offered: Vec<(usize, Key)> =
-                rows.iter().map(|(at, row)| (*at, row.key())).collect();
-            let (_, refused) = self.guarded(conn, rows, How::AllButOwned).await?;
-            let held: Vec<Key> = offered
-                .into_iter()
-                .filter(|(at, _)| !refused.iter().any(|r| r.at == *at))
-                .map(|(_, key)| key)
-                .collect();
+            let (bytes, beside): (Vec<Vec<u8>>, Vec<Option<Key>>) = rows.into_iter().unzip();
+            let (decoded, mut refused) = self.decode(bytes);
+            let mut pending = Vec::new();
+            for (at, row) in decoded {
+                if beside[at].as_ref() == Some(&row.key()) {
+                    pending.push((at, row));
+                } else {
+                    refused.push(Refused {
+                        at,
+                        reason: "a row beside a key that is not its own".to_owned(),
+                    });
+                }
+            }
+            // A row refused may be taken once the rest are: one that points
+            // at a row after it, or takes a value one of them gives up.
+            let mut held = Vec::new();
+            loop {
+                let tried: Placed<R> = pending.clone();
+                let (_, again) = self.guarded(conn, pending, How::AllButOwned).await?;
+                let failed: std::collections::HashSet<usize> = again.iter().map(|r| r.at).collect();
+                let (left, took): (Placed<R>, Placed<R>) =
+                    tried.into_iter().partition(|(at, _)| failed.contains(at));
+                held.extend(took.iter().map(|(_, row)| row.key()));
+                if took.is_empty() || left.is_empty() {
+                    refused.extend(again);
+                    break;
+                }
+                pending = left;
+            }
             row::unretire_by_keys::<R>(conn, &held).await?;
-            rejected.extend(refused);
-            Ok(Taken { held, rejected })
+            Ok(refused)
         })
     }
 

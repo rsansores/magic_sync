@@ -324,16 +324,16 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
             nonce: nonce_of(sequence),
             previous_nonce: if previous == 0 { 0 } else { nonce_of(previous) },
             mac: SEAL.to_vec(),
-            ..EndSnapshot::default()
         })
     };
     let message = |protocol: u32, body: Option<Body>| ToReplica { protocol, body }.encode_to_vec();
     let one = |body: Body| message(1, Some(body));
-    let with = |change: fn(&mut Down)| {
-        let mut d = chained(101, 100, "", EPOCH);
+    let after = |previous: u64, change: fn(&mut Down)| {
+        let mut d = chained(previous + 1, previous, "", EPOCH);
         change(&mut d);
         one(Body::Down(d))
     };
+    let with = |change: fn(&mut Down)| after(100, change);
     let mut truncated = one(down(101, 100, "", EPOCH));
     truncated.truncate(truncated.len() - 3);
     let snapshot = "0192f6a0-0000-7000-8000-000000005eee";
@@ -442,22 +442,42 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
                 });
             }),
         ),
+        // A row beside a key not its own is rejected, and the rest applied.
+        (
+            "a_row_beside_another_key",
+            "applied",
+            after(101, |d| {
+                let row = ItemRow {
+                    id: "0192f6a0-0000-7000-8000-0000000000b1".to_owned(),
+                    partition_id: Uuid::nil().to_string(),
+                    name: "beside".to_owned(),
+                };
+                d.tables.push(Table {
+                    table: "items".to_owned(),
+                    upserts: vec![row.encode_to_vec()],
+                    keys: vec![crate::envelope::Key {
+                        parts: vec!["0192f6a0-0000-7000-8000-0000000000b2".to_owned()],
+                    }],
+                    ..Table::default()
+                });
+            }),
+        ),
         (
             "begins_a_snapshot",
             "applied",
-            one(down(102, 0, snapshot, EPOCH)),
+            one(down(103, 0, snapshot, EPOCH)),
         ),
         (
             "follows_the_snapshot_and_is_not_of_it",
             "malformed",
-            one(down(103, 102, "", EPOCH)),
+            one(down(104, 103, "", EPOCH)),
         ),
         (
             "follows_the_snapshot_and_is_of_another",
             "malformed",
-            one(down(103, 102, other, EPOCH)),
+            one(down(104, 103, other, EPOCH)),
         ),
-        ("ends_the_snapshot", "ended", one(end(103, 102, snapshot))),
+        ("ends_the_snapshot", "ended", one(end(104, 103, snapshot))),
     ]
 }
 

@@ -1509,6 +1509,57 @@ async fn a_row_whose_deferred_parent_is_missing_is_refused_not_the_message(pool:
     assert_eq!(w.count("SELECT count(*) FROM sync_rejections").await, 499);
 }
 
+/// A row sent beside a key that is not its own is no row the server meant:
+/// it is rejected under the key it came beside, and nothing is held under
+/// either — even where its parent is missing and a deferred key would
+/// refuse the commit, which the row's own key, not the wire's, would have
+/// to be found by.
+#[sqlx::test(migrations = false)]
+async fn a_row_beside_another_key_is_rejected_under_that_key(pool: SqlitePool) {
+    let tables = TABLES.replace(
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL,",
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL \
+         REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED,",
+    );
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let [parent, beside, orphan, fine, lost] = ids();
+    let price = |id: Uuid| {
+        json(&Price {
+            id,
+            cents: 1,
+            updated_at: at(0),
+        })
+    };
+    let (_, item_row) = item(orphan, "orphan");
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts(
+                "items",
+                vec![
+                    item(parent, "parent"),
+                    item(fine, "fine"),
+                    (key(&[&beside.to_string()]), item_row),
+                ],
+            ),
+            upserts(
+                "prices",
+                vec![
+                    (key(&[&parent.to_string()]), price(parent)),
+                    (key(&[&beside.to_string()]), price(lost)),
+                ],
+            ),
+        ],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["fine", "parent"]);
+    assert_eq!(w.count("SELECT count(*) FROM prices").await, 1);
+    let mut expected = vec![format!("items {beside}"), format!("prices {beside}")];
+    expected.sort();
+    assert_eq!(w.rejected().await, expected);
+}
+
 /// A row the replica's own rows point at through a key that would cascade
 /// or set them null is kept, retired, like one a key would refuse to let
 /// go: letting it go would change rows of the replica's that the server

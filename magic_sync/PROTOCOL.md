@@ -144,7 +144,7 @@ has a case of each:
 A row's own fields are the row's to answer for, not the message's: a key
 that does not parse, a row that does not decode, a table the replica does
 not hold — the row is rejected, or its delete ignored (4.1), and the rest
-applied (`a_delete_of_a_key_that_does_not_parse`).
+applied (`a_delete_of_a_key_that_does_not_parse`, `a_row_beside_another_key`).
 
 What changes the protocol's number: a new kind of body, or a field whose
 meaning changes. What does not: a new field. A side **must** ignore fields it
@@ -211,7 +211,9 @@ their deletes ignored.
 
 1. **Upserts.** Each entry of `upserts` is one row, encoded as the table's
    message; `keys[i]` is the key of `upserts[i]`, and there **must** be one
-   key per upsert. For each row:
+   key per upsert. A row whose own key is not the one beside it is no row
+   the server meant: the replica rejects it under the key beside it. For
+   each row:
    - insert it, or overwrite the stored row with the same key, **whatever
      its version**: the messages of an epoch are ordered by their chain
      (4.1), so the one applied last is the server's latest, even when its

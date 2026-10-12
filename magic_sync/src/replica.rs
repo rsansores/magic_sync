@@ -30,16 +30,27 @@ pub(crate) fn keys_of<P: Sync + 'static>(
     codec: &Codec<P>,
     wire: &[envelope::Key],
 ) -> Vec<crate::row::Key> {
+    parsed(codec, wire).into_iter().flatten().collect()
+}
+
+/// Each key of `wire` as `codec`'s, in its place: `None`, logged, where one
+/// does not parse.
+pub(crate) fn parsed<P: Sync + 'static>(
+    codec: &Codec<P>,
+    wire: &[envelope::Key],
+) -> Vec<Option<crate::row::Key>> {
     wire.iter()
-        .filter_map(|key| match codec.key(&key.parts) {
-            Ok(key) => Some(key),
-            Err(e) => {
-                tracing::error!(
-                    table = codec.table.name,
-                    "sync: a key that does not parse — skipped: {e}"
-                );
-                None
-            }
+        .map(|key| {
+            codec
+                .key(&key.parts)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        table = codec.table.name,
+                        "sync: a key that does not parse — left out: {}",
+                        capped(&e.to_string())
+                    );
+                })
+                .ok()
         })
         .collect()
 }
@@ -917,25 +928,6 @@ fn json<T: serde::Serialize>(keys: &[T]) -> String {
     serde_json::to_string(keys).expect("strings and numbers serialize")
 }
 
-/// The text of a key that came on the wire: parsed by its table's codec and
-/// written back in the one form keys are compared in. `None`, logged, when it
-/// does not parse.
-#[cfg(feature = "sqlite")]
-fn wire_key<P: Sync + 'static>(codec: &Codec<P>, key: Option<&envelope::Key>) -> Option<String> {
-    let Some(key) = key else {
-        tracing::error!(
-            table = codec.table.name,
-            "sync: a row with no key beside it — not one to report"
-        );
-        return None;
-    };
-    codec
-        .key(&key.parts)
-        .inspect_err(|e| tracing::error!("sync: {e} — not one to report"))
-        .ok()
-        .map(|key| key_text(&key))
-}
-
 /// Rows to hold and rows to let go, in the order the server put them.
 ///
 /// A row the replica cannot take — of a table this build does not mirror or
@@ -967,52 +959,51 @@ async fn apply<P: Sync + 'static>(
             reject(conn, &table.table, &foreign_keys(table), why, sequence).await?;
             continue;
         };
+        let beside = parsed(codec, &table.keys);
         let mut held = Vec::new();
         if care.careful {
             for at in 0..table.upserts.len() {
                 let row = Spot::Upsert { entry, at };
                 if let Some(culprit) = care.culprit(&table.table, &row) {
                     let why = culprit.why.clone();
-                    refuse(conn, codec, table, at, &why, naming, sequence).await?;
+                    refuse(conn, table, beside[at].as_ref(), &why, naming, sequence).await?;
                     continue;
                 }
                 row_begun(conn).await?;
-                let took = take(conn, codec, table, &[at], naming, sequence).await;
+                let took = take(conn, codec, table, &beside, &[at], naming, sequence).await;
                 match row_done(conn, took, &table.table, row).await? {
                     Ok(keys) => held.extend(keys),
                     Err(e) => {
-                        refuse(conn, codec, table, at, &e.to_string(), naming, sequence).await?;
+                        let why = e.to_string();
+                        refuse(conn, table, beside[at].as_ref(), &why, naming, sequence).await?;
                     }
                 }
             }
         } else {
             let every: Vec<usize> = (0..table.upserts.len()).collect();
-            held = take(conn, codec, table, &every, naming, sequence).await?;
+            held = take(conn, codec, table, &beside, &every, naming, sequence).await?;
         }
         let deletes = keys_of(codec, &table.deletes);
         let_go(conn, codec, &deletes, Some(sequence), care).await?;
-        placed.push((entry, codec));
         taken.push(Applied {
             table: table.table.clone(),
-            keys: held,
+            keys: held.iter().map(|(_, key)| key.clone()).collect(),
         });
+        placed.push((entry, codec, held));
     }
     let mut culprits = Vec::new();
-    for ((entry, codec), applied) in placed.into_iter().zip(&taken) {
-        let orphans = codec.unparented(conn, &applied.keys).await?;
-        if orphans.is_empty() {
-            continue;
-        }
-        let table = &message.tables[entry];
-        let orphans: HashSet<String> = orphans.iter().map(key_text).collect();
-        culprits.extend(table.keys.iter().enumerate().filter_map(|(at, wire)| {
-            let key = key_text(&codec.key(&wire.parts).ok()?);
-            orphans.contains(&key).then(|| Culprit {
-                table: table.table.clone(),
-                row: Spot::Upsert { entry, at },
-                why: "a row it points at, through a foreign key, is not held here".to_owned(),
-            })
-        }));
+    for (entry, codec, held) in placed {
+        let keys: Vec<Key> = held.iter().map(|(_, key)| key.clone()).collect();
+        let orphans: HashSet<Key> = codec.unparented(conn, &keys).await?.into_iter().collect();
+        culprits.extend(
+            held.into_iter()
+                .filter(|(_, key)| orphans.contains(key))
+                .map(|(at, _)| Culprit {
+                    table: codec.table.name.to_owned(),
+                    row: Spot::Upsert { entry, at },
+                    why: "a row it points at, through a foreign key, is not held here".to_owned(),
+                }),
+        );
     }
     if !culprits.is_empty() {
         return Err(Stop::Culprits(culprits));
@@ -1022,8 +1013,8 @@ async fn apply<P: Sync + 'static>(
 
 /// Text the replica keeps of what a server said, at most: a reason, the
 /// name and a key of a table it does not know. A rejection always fits a
-/// message up, so one never holds back the replica's confirmation.
-#[cfg(feature = "sqlite")]
+/// message up, so one never holds back the replica's confirmation; and what
+/// either side logs of what the other sent.
 const TEXT_CAP: usize = 512;
 
 /// The keys of rows of a table this build does not take, as the server
@@ -1042,7 +1033,6 @@ fn foreign_keys(table: &Table) -> Vec<String> {
 }
 
 /// `text`, cut to [`TEXT_CAP`] bytes at a character.
-#[cfg(feature = "sqlite")]
 fn capped(text: &str) -> &str {
     let mut end = text.len().min(TEXT_CAP);
     while !text.is_char_boundary(end) {
@@ -1051,66 +1041,70 @@ fn capped(text: &str) -> &str {
     &text[..end]
 }
 
-/// The rows of `table` at `positions`, taken: the ones the replica cannot
-/// take are rejected, the rest are no longer ones to report, nor to let go
-/// once filed; while a snapshot is `naming` them, it names each, taken or
-/// refused. Answers the keys the replica now holds.
+/// The rows of `table` at `positions`, taken, each under the key it came
+/// `beside`: the ones the replica cannot take are rejected, the rest are no
+/// longer ones to report, nor to let go once filed; while a snapshot is
+/// `naming` them, it names each, taken or refused. Answers the rows the
+/// replica now holds, by their place in `table`, with their keys.
 #[cfg(feature = "sqlite")]
 async fn take<P: Sync + 'static>(
     conn: &mut Conn,
     codec: &Codec<P>,
     table: &Table,
+    beside: &[Option<Key>],
     positions: &[usize],
     naming: bool,
     sequence: i64,
-) -> Result<Vec<Key>, Stop> {
-    let rows = positions.iter().map(|at| table.upserts[*at].clone());
-    let applied = codec.apply_down(conn, rows.collect()).await?;
+) -> Result<Vec<(usize, Key)>, Stop> {
+    let rows = positions
+        .iter()
+        .map(|at| (table.upserts[*at].clone(), beside[*at].clone()))
+        .collect();
+    let failed: HashMap<usize, String> = codec
+        .apply_down(conn, rows)
+        .await?
+        .into_iter()
+        .map(|refused| (positions[refused.at], refused.reason))
+        .collect();
     let mut refused = Vec::new();
-    for row in &applied.rejected {
-        let key = match &row.key {
-            Some(key) => Some(key_text(key)),
-            None => wire_key(codec, table.keys.get(positions[row.at])),
-        };
-        reject(
-            conn,
-            &table.table,
-            &Vec::from_iter(key.clone()),
-            &row.reason,
-            sequence,
-        )
-        .await?;
+    for (at, why) in &failed {
+        let key = Vec::from_iter(beside[*at].as_ref().map(key_text));
+        reject(conn, &table.table, &key, why, sequence).await?;
         refused.extend(key);
     }
-    let held: Vec<String> = applied.held.iter().map(key_text).collect();
-    cleared(conn, &table.table, &held).await?;
+    let held: Vec<(usize, Key)> = positions
+        .iter()
+        .filter(|at| !failed.contains_key(at))
+        .filter_map(|at| Some((*at, beside[*at].clone()?)))
+        .collect();
+    let texts: Vec<String> = held.iter().map(|(_, key)| key_text(key)).collect();
+    cleared(conn, &table.table, &texts).await?;
     sqlx::query(
         "DELETE FROM sync_leaving WHERE relation = $1 \
            AND row_key IN (SELECT value FROM json_each($2))",
     )
     .bind(&table.table)
-    .bind(json(&held))
+    .bind(json(&texts))
     .execute(&mut *conn)
     .await?;
     if naming {
-        named(conn, &table.table, &[held, refused].concat()).await?;
+        named(conn, &table.table, &[texts, refused].concat()).await?;
     }
-    Ok(applied.held)
+    Ok(held)
 }
 
 /// The row of `table` at `at`, refused (`why`) before or as it was tried
 /// alone: rejected, and named by the snapshot in progress.
 #[cfg(feature = "sqlite")]
-async fn refuse<P: Sync + 'static>(
+async fn refuse(
     conn: &mut Conn,
-    codec: &Codec<P>,
     table: &Table,
-    at: usize,
+    key: Option<&Key>,
     why: &str,
     naming: bool,
     sequence: i64,
 ) -> Result<(), Error> {
-    let key = Vec::from_iter(wire_key(codec, table.keys.get(at)));
+    let key = Vec::from_iter(key.map(key_text));
     reject(conn, &table.table, &key, why, sequence).await?;
     if naming {
         named(conn, &table.table, &key).await?;
