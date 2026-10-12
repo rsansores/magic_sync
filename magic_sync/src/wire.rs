@@ -126,6 +126,7 @@ impl<P: Sync + 'static> Codec<P> {
         M: prost::Message + Default + 'static,
     {
         Self::typed(
+            std::any::type_name::<M>(),
             Box::new(move |row: R| {
                 to(row)
                     .map(|m| m.encode_to_vec())
@@ -153,6 +154,7 @@ impl<P: Sync + 'static> Codec<P> {
         let columns = Table::of::<R>().columns;
         let columns_back = columns.clone();
         Self::typed(
+            "json",
             Box::new(move |row: R| json_encode(R::TABLE, &columns, &row)),
             Box::new(move |bytes: &[u8]| json_decode(R::TABLE, &columns_back, bytes)),
             place,
@@ -161,7 +163,12 @@ impl<P: Sync + 'static> Codec<P> {
 
     /// The codec of `R`, encoded and decoded so. A server-only row has none,
     /// and does not build.
-    fn typed<R>(encode: Encode<R>, decode: Decode<R>, place: Option<Place<R, P>>) -> Self
+    fn typed<R>(
+        encoding: &'static str,
+        encode: Encode<R>,
+        decode: Decode<R>,
+        place: Option<Place<R, P>>,
+    ) -> Self
     where
         R: Row + Clone + Send + Sync,
     {
@@ -177,7 +184,14 @@ impl<P: Sync + 'static> Codec<P> {
             let _ = place;
             std::marker::PhantomData
         };
-        let table = Table::of::<R>();
+        // What a row carries is the server's to compare across deploys.
+        #[cfg(feature = "sqlite")]
+        let _ = encoding;
+        let table = Table {
+            #[cfg(feature = "postgres")]
+            encoding,
+            ..Table::of::<R>()
+        };
         Self {
             ops: Box::new(Typed {
                 owned: table.replica_owned(),

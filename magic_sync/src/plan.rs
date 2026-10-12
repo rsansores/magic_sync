@@ -151,6 +151,8 @@ pub(crate) struct Plan {
     owned: Vec<&'static str>,
     /// Every column a row of it carries.
     columns: Vec<&'static str>,
+    /// How its codec writes a row.
+    encoding: &'static str,
 }
 
 /// A plan: what a batch of changes asks of every replica. The rows it sends
@@ -786,7 +788,7 @@ impl Engine {
             );
             sqlx::Executor::execute(&mut *conn, drop.as_str()).await?;
         }
-        let mut first_noted = false;
+        let mut unnoted = false;
         for expected in engine.triggers_needed() {
             let existing = live
                 .iter()
@@ -794,9 +796,12 @@ impl Engine {
             if existing.is_some_and(|t| t.matches(&expected)) {
                 continue;
             }
-            if existing.is_some() {
+            if let Some(existing) = existing {
                 let drop = format!("DROP TRIGGER {} ON {}", expected.name, expected.on.sql());
                 sqlx::Executor::execute(&mut *conn, drop.as_str()).await?;
+                // Disabled, or firing for some writes only: what it let by
+                // was never noted.
+                unnoted |= !existing.plain;
             } else if expected.function == "note_row" {
                 let has_rows: bool = sqlx::query_scalar(&format!(
                     "SELECT EXISTS (SELECT 1 FROM {})",
@@ -804,13 +809,13 @@ impl Engine {
                 ))
                 .fetch_one(&mut *conn)
                 .await?;
-                first_noted |= has_rows;
+                unnoted |= has_rows;
             }
             sqlx::Executor::execute(&mut *conn, expected.ddl().as_str()).await?;
         }
-        if first_noted {
-            // Rows written before their table was noted reached no replica:
-            // every replica is provisioned again, and gets them.
+        if unnoted {
+            // Rows written while their table was not noted reached no
+            // replica: every replica is provisioned again, and gets them.
             sqlx::query(&resync_sql(&format!(
                 "SELECT s.id, s.partition FROM {}",
                 Self::replicas_of(engine.replicas)
@@ -1061,6 +1066,7 @@ impl Engine {
                     .map(|c| c.name)
                     .collect(),
                 columns: t.columns.iter().map(|c| c.name).collect(),
+                encoding: t.encoding,
             });
         }
 
@@ -1214,8 +1220,8 @@ impl Engine {
 
     /// What decides which rows each replica holds and what a row carries,
     /// as one text: the replicas, and per table, parents first, its key,
-    /// the rule that routes it, what it points at, its groups and its
-    /// columns. Two builds that write the same text place every row alike.
+    /// the rule that routes it, what it points at, its groups, its columns
+    /// and how its codec writes a row. Two builds that write the same text place every row alike.
     fn declared(&self) -> String {
         use std::fmt::Write as _;
         let r = &self.replicas;
@@ -1237,13 +1243,15 @@ impl Engine {
                 .collect();
             let _ = writeln!(
                 out,
-                "{} {} active {} key {key:?} {:?} references {references:?} group {:?} columns {:?}",
+                "{} {} active {} key {key:?} {:?} references {references:?} group {:?} columns {:?} \
+                 as {}",
                 p.table,
                 p.relation.sql(),
                 p.active,
                 p.route,
                 p.group,
                 p.columns,
+                p.encoding,
             );
         }
         out

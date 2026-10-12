@@ -27,6 +27,7 @@ note: the above error was encountered while instantiating `fn Codec::<()>::typed
  --> src/wire.rs
   |
   | /         Self::typed(
+  | |             "json",
   | |             Box::new(move |row: R| json_encode(R::TABLE, &columns, &row)),
   | |             Box::new(move |bytes: &[u8]| json_decode(R::TABLE, &columns_back, bytes)),
   | |             place,

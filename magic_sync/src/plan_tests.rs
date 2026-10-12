@@ -2549,6 +2549,39 @@ async fn a_table_mirrored_for_the_first_time_with_rows_provisions_every_replica(
     assert_eq!(resyncs, live, "every live replica, once");
 }
 
+/// A trigger disabled for a while let writes by unnoted: installing it again
+/// provisions every replica again, which gets them.
+#[sqlx::test(migrations = false)]
+async fn a_trigger_enabled_again_by_install_provisions_every_replica(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    world.settle().await;
+    sqlx::raw_sql(
+        "ALTER TABLE fixture.t_sizes DISABLE TRIGGER sync_note_row; \
+         INSERT INTO fixture.t_sizes (code, partition_id, name) VALUES (7, gen_random_uuid(), 's');",
+    )
+    .execute(&mut *world.conn)
+    .await
+    .expect("a size written while its table was not noted");
+    let codecs = codecs();
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = world.conn.begin().await.expect("a transaction");
+    Engine::install(&mut tx, &tables, REPLICAS)
+        .await
+        .expect("installed");
+    tx.commit().await.expect("committed");
+    let resyncs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL",
+    )
+    .fetch_one(&mut *world.conn)
+    .await
+    .expect("resyncs");
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM t_replicas WHERE live")
+        .fetch_one(&mut *world.conn)
+        .await
+        .expect("live");
+    assert_eq!(resyncs, live, "every live replica");
+}
+
 /// A replica asked to be provisioned again — by the host, by the relay —
 /// is noted once while one is pending, in its partition, and again once
 /// that one is done.
@@ -3006,4 +3039,32 @@ fn text_a_replica_says_is_kept_bounded() {
     let kept = crate::relay::stored(&said);
     assert_eq!(kept.len(), 4095, "cut before the character that crosses");
     assert_eq!(crate::relay::stored("a\0b"), "a\u{FFFD}b");
+}
+
+/// How a codec writes a row is part of what decides what a replica holds:
+/// a deploy that writes a table's rows otherwise declares otherwise, and
+/// every replica is provisioned again.
+#[sqlx::test(migrations = false)]
+async fn a_codec_that_writes_rows_otherwise_declares_otherwise(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    let codecs = codecs();
+    let mut tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let before = Engine::new(&mut world.conn, &tables, REPLICAS)
+        .await
+        .expect("an engine")
+        .declared();
+    let families = Table {
+        encoding: "fixture.Family",
+        ..Table::of::<Family>()
+    };
+    for table in &mut tables {
+        if table.name == families.name {
+            *table = &families;
+        }
+    }
+    let after = Engine::new(&mut world.conn, &tables, REPLICAS)
+        .await
+        .expect("an engine")
+        .declared();
+    assert_ne!(before, after);
 }

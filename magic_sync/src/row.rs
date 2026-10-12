@@ -968,6 +968,10 @@ pub(crate) struct Table {
     pub(crate) unmirrored: &'static [&'static str],
     /// [`Row::ORIGIN`].
     pub(crate) origin: Option<&'static str>,
+    /// How its codec writes a row: `json`, or the message's type. Empty
+    /// until a codec says.
+    #[cfg(feature = "postgres")]
+    pub(crate) encoding: &'static str,
 }
 
 impl Table {
@@ -986,6 +990,8 @@ impl Table {
             retired: R::RETIRED,
             unmirrored: R::UNMIRRORED,
             origin: R::ORIGIN,
+            #[cfg(feature = "postgres")]
+            encoding: "",
         }
     }
 
