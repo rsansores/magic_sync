@@ -3178,3 +3178,53 @@ async fn a_refused_delete_holds_the_row_again_as_it_was_noted(pool: crate::DbPoo
     world.settle(&wire, &mut models).await;
     assert_eq!(noted().await, (kept, true));
 }
+
+/// An engine that sends no table down — every table it declares a record
+/// the replicas send up — plans its notes to nothing, rather than failing
+/// on every pass: a replica provisioned is sent nothing, and the note is
+/// done.
+#[sqlx::test(migrations = false)]
+async fn an_engine_that_sends_nothing_down_plans_its_notes_to_nothing(pool: crate::DbPool) {
+    use crate::conformance::Reading;
+    let mut conn = pool.acquire().await.expect("a connection");
+    crate::plan::tests::install(&mut conn).await;
+    sqlx::raw_sql(&format!(
+        "{SCHEMA} CREATE TABLE fixture.readings (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         value BIGINT NOT NULL, at BIGINT NOT NULL, PRIMARY KEY (replica_id, id))"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("schema");
+    let (partition, replicas) = (Uuid::now_v7(), [Uuid::now_v7(), Uuid::now_v7()]);
+    for replica in replicas {
+        sqlx::raw_sql(&format!(
+            "INSERT INTO fixture.t_replicas VALUES ('{replica}', '{partition}', true); \
+             INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '{replica}')"
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("a replica");
+    }
+    let mut tx = conn.begin().await.expect("a transaction");
+    let engine = Engine::install(&mut tx, &[&Table::of::<Reading>()], REPLICAS)
+        .await
+        .expect("the engine");
+    tx.commit().await.expect("installed");
+    drop(conn);
+    let world = World {
+        pool,
+        engine,
+        codecs: vec![Codec::json::<Reading>(None)],
+        replicas,
+        partition,
+        provisioned: BTreeMap::new(),
+    };
+    world.pass(&Fake::default()).await;
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
+            .await,
+        0
+    );
+    assert_eq!(world.count("SELECT count(*) FROM sync.outbox").await, 0);
+}

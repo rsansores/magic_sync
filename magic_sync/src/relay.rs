@@ -200,6 +200,16 @@ impl<P: Sync + 'static> Relay<'_, P> {
         if notes.is_empty() {
             return Ok(Outcome::default());
         }
+        // An engine that sends no table down has nothing to plan: its notes
+        // — a replica to provision — are done with nothing written.
+        if self.engine.order.is_empty() {
+            let done: Vec<i64> = notes.iter().map(|n| n.id).collect();
+            crate::plan::mark_done(conn, &done).await?;
+            return Ok(Outcome {
+                done: done.len(),
+                ..Outcome::default()
+            });
+        }
         let (mut delta, notes, parked) = self.plan(conn, notes).await?;
         let mut outcome = Outcome {
             parked,
