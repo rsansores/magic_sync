@@ -23,8 +23,9 @@
 //! - after every delivery, a replica holds no row whose parent it lacks;
 //! - no message carries a row its replica holds already at that version
 //!   (every write gives a row a version of its own), but a snapshot;
-//! - a pass that planned every pending note sends a replica only rows it
-//!   should hold, and takes back only rows it should not;
+//! - a pass sends a replica only rows it should hold, and takes back only
+//!   rows it should not — wherever the notes it did not plan, beyond its
+//!   batch or parked, cannot reach the row;
 //! - whenever the system settles, each live replica holds exactly what it
 //!   should, every row as it is now, and the engine records exactly that.
 
@@ -730,18 +731,7 @@ impl World {
             outcome.parked,
             &self.history[self.history.len().saturating_sub(8)..]
         );
-        // What a change not planned — beyond the batch, or parked — would
-        // send or keep, the pass cannot know: it is minimal once it planned
-        // every change there is.
-        let planned_all: bool = sqlx::query_scalar(
-            "SELECT NOT EXISTS (SELECT 1 FROM sync.notes WHERE done_at IS NULL)",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .expect("pending");
-        if planned_all {
-            assert_minimal(&mut tx, drawn, &held, &self.history).await;
-        }
+        assert_minimal(&mut tx, drawn, &held, &self.history).await;
         if chance(6) {
             // Replicas heard while the pass is still recording: what they
             // say waits on what it locked, or goes in beside it.
@@ -1382,7 +1372,8 @@ impl Oracle {
 
 /// A pass sends each replica only rows it should hold, or held already —
 /// a change not planned yet may still point at it there — and takes back
-/// only rows it should not hold: what `tx` — the pass, recorded and not
+/// only rows it should not hold, wherever the changes it did not plan leave
+/// that to judge ([`Unplanned`]): what `tx` — the pass, recorded and not
 /// A message in an outbox, as it is kept: its parts, and its body.
 #[derive(sqlx::FromRow)]
 struct Outboxed {
@@ -1418,6 +1409,7 @@ async fn assert_minimal(
         return;
     }
     let oracle = Oracle::read(&mut *tx).await;
+    let unplanned = Unplanned::read(&mut *tx, &oracle).await;
     let mut should: BTreeMap<Uuid, BTreeSet<Row>> = BTreeMap::new();
     for (replica, message) in written {
         let Some(crate::envelope::Body::Down(down)) =
@@ -1434,7 +1426,9 @@ async fn assert_minimal(
             for key in &table.keys {
                 let row = (table.table.clone(), key.parts.join("|"));
                 assert!(
-                    should.contains(&row) || held.contains(&(replica, row.0.clone(), row.1.clone())),
+                    !unplanned.judges(replica, &row)
+                        || should.contains(&row)
+                        || held.contains(&(replica, row.0.clone(), row.1.clone())),
                     "{replica} was sent {row:?}, which it should not hold, nor held; last steps: {:#?}",
                     &history[history.len().saturating_sub(8)..]
                 );
@@ -1442,12 +1436,101 @@ async fn assert_minimal(
             for key in &table.deletes {
                 let row = (table.table.clone(), key.parts.join("|"));
                 assert!(
-                    !should.contains(&row),
+                    !unplanned.judges(replica, &row) || !should.contains(&row),
                     "{replica} was told to let go of {row:?}, which it should hold; last steps: {:#?}",
                     &history[history.len().saturating_sub(8)..]
                 );
             }
         }
+    }
+}
+
+/// What the changes a pass did not plan — beyond its batch, or parked —
+/// leave it unable to know: a row's place on a replica is judged against the
+/// rows as they are now only where no such change can reach it. A change
+/// reaches the rows connected to the one it changed — through what points at
+/// what now, or pointed before it — so what is judged is every row whose
+/// connected rows no unplanned change touched, on a replica no unplanned
+/// change names; and nothing while a group's members changed unplanned.
+struct Unplanned {
+    everything: bool,
+    replicas: BTreeSet<Uuid>,
+    /// The connected rows a change touched, by a row of them.
+    reached: BTreeSet<Row>,
+    /// Each row's connected rows, by the one that stands for them.
+    of: BTreeMap<Row, Row>,
+}
+
+impl Unplanned {
+    async fn read(conn: &mut Conn, oracle: &Oracle) -> Self {
+        let touched: Vec<Row> = sqlx::query_as(
+            "SELECT relation, row_key FROM sync.notes \
+              WHERE done_at IS NULL AND kind IN ('row', 'retry') \
+             UNION ALL SELECT p.relation, p.row_key FROM sync.pointed p \
+               JOIN sync.notes n ON n.id = p.note WHERE n.done_at IS NULL",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("changed, and pointed at before");
+        let replicas: BTreeSet<Uuid> = sqlx::query_scalar(
+            "SELECT replica_id FROM sync.notes \
+              WHERE done_at IS NULL AND kind IN ('resync', 'assigned')",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("replicas")
+        .into_iter()
+        .collect();
+        let everything: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM sync.notes \
+                             WHERE done_at IS NULL AND kind NOT IN ('row', 'retry', 'resync', 'assigned'))",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("members");
+        // Rows connected through what points at what, as a forest.
+        let mut of: BTreeMap<Row, Row> = BTreeMap::new();
+        fn root(of: &mut BTreeMap<Row, Row>, row: &Row) -> Row {
+            let mut at = row.clone();
+            while let Some(up) = of.get(&at).filter(|up| **up != at) {
+                at = up.clone();
+            }
+            of.insert(row.clone(), at.clone());
+            at
+        }
+        let join = |of: &mut BTreeMap<Row, Row>, a: &Row, b: &Row| {
+            let (a, b) = (root(of, a), root(of, b));
+            if a != b {
+                of.insert(a, b);
+            }
+        };
+        for (r, row) in &oracle.rows {
+            root(&mut of, r);
+            for (child, columns, parent) in REFERENCES {
+                if *child == r.0 {
+                    if let Some(k) = key_of(row, columns) {
+                        join(&mut of, r, &((*parent).to_owned(), k));
+                    }
+                }
+            }
+        }
+        let reached = touched.iter().map(|r| root(&mut of, r)).collect();
+        Unplanned {
+            everything,
+            replicas,
+            reached,
+            of,
+        }
+    }
+
+    /// Whether `row`'s place on `replica` can be judged against the rows as
+    /// they are now.
+    fn judges(&self, replica: Uuid, row: &Row) -> bool {
+        let mut at = row;
+        while let Some(up) = self.of.get(at).filter(|up| *up != at) {
+            at = up;
+        }
+        !self.everything && !self.replicas.contains(&replica) && !self.reached.contains(at)
     }
 }
 
