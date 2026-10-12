@@ -404,6 +404,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             None
         };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        replica::identified(&mut tx, id).await?;
         let outgoing = replica::outbox(
             &mut tx,
             &self.codecs,

@@ -101,8 +101,9 @@ struct Trigger {
 /// - a record without a version is history: an update of one is refused;
 /// - a row of a table written on both sides begins on the server: an insert
 ///   is refused, so is an update of a column the replica does not own, and a
-///   delete unless the table is keyed by the replica; only an update of the
-///   columns the replica owns goes up.
+///   delete unless the table is keyed by the replica and the row by this
+///   one ([`identified`]); only an update of the columns the replica owns,
+///   and such a delete, go up.
 ///
 /// A write the engine makes while it applies what the server sent is noted
 /// by none and refused by none.
@@ -233,7 +234,16 @@ fn generated<P: Sync + 'static>(codecs: &[Codec<P>]) -> Vec<Trigger> {
                 };
                 let body = format!("{guard}{}{gone}", note("NEW"));
                 out.push(noting("UPDATE", &of, QUIET, body));
-                if codec.takes_deletes() {
+                if let Some(origin) = codec.table.origin.filter(|_| codec.takes_deletes()) {
+                    let why = format!(
+                        "a row of `{table}` is let go of by the server: a replica deletes only \
+                         the ones keyed by it, once it knows which it is"
+                    );
+                    let others = format!(
+                        "{QUIET} AND NOT EXISTS (SELECT 1 FROM sync_replica WHERE replica = OLD.{})",
+                        ident(origin)
+                    );
+                    out.push(refuse("DELETE", &others, why));
                     out.push(noting("DELETE", "", QUIET, note("OLD")));
                 } else {
                     let why = format!(
@@ -262,6 +272,20 @@ pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
         .into_iter()
         .map(|t| format!("DROP TRIGGER IF EXISTS {};\n{};\n", ident(&t.name), t.sql))
         .collect()
+}
+
+/// Records which replica this is, for the triggers to know its rows by.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn identified(conn: &mut Conn, replica: Uuid) -> Result<(), Error> {
+    sqlx::query(
+        "INSERT INTO sync_replica (id, replica) VALUES (1, $1) \
+         ON CONFLICT (id) DO UPDATE SET replica = EXCLUDED.replica \
+           WHERE replica IS NOT EXCLUDED.replica",
+    )
+    .bind(replica)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// The version of the engine's tables a database holds: 0 when none.
@@ -2638,7 +2662,8 @@ pub(crate) async fn digested(conn: &mut Conn, every: std::time::Duration) -> Res
 
 /// What this replica holds of each table the server sends down, for the
 /// server to compare with what it records — rows it retired, or rejected,
-/// left out — and the last message it applied, which they are read against.
+/// left out, and tables with writes of its own the server has not filed —
+/// and the last message it applied, which they are read against.
 #[cfg(feature = "sqlite")]
 #[derive(Debug)]
 pub(crate) struct Held {
@@ -2659,6 +2684,17 @@ pub(crate) async fn held<P: Sync + 'static>(
         .await?;
     let mut digests = Vec::new();
     for codec in codecs.iter().filter(|c| c.sent_down()) {
+        // What the replica wrote of it and the server has not filed is
+        // about to change what the server records: compared now, the two
+        // would differ for nothing.
+        let unfiled: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sync_notes WHERE relation = $1)")
+                .bind(codec.table.name)
+                .fetch_one(&mut *conn)
+                .await?;
+        if unfiled {
+            continue;
+        }
         let rejected: HashSet<String> =
             sqlx::query_scalar("SELECT row_key FROM sync_rejections WHERE table_name = $1")
                 .bind(codec.table.name)

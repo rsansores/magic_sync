@@ -579,6 +579,11 @@ for each key, sorted:
 Test vectors: no keys → `0xcbf29ce484222325`; the single key `a` →
 `0x089bdc07b544e7b2`.
 
+A replica **must** leave out of its digests every table of which it wrote
+rows the server has not filed yet (section 7): what the server records of
+it is about to change, and a comparison now would find them apart for
+nothing.
+
 The server compares a digest only when the replica has applied every message
 recorded for it (the same epoch and last sequence, sealed by the server), and
 against what it recorded as of that message: when it has sent the replica

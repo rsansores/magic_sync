@@ -9,6 +9,14 @@ CREATE TABLE sync_version (
     version INTEGER NOT NULL
 );
 
+-- Which replica this is, once it knows: a row of a table written on both
+-- sides and keyed by its replica is this one's to delete only when keyed by
+-- it.
+CREATE TABLE sync_replica (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    replica BLOB    NOT NULL
+);
+
 -- Present only while the engine applies what the server sent, inside that
 -- transaction: the triggers note no write it makes, and refuse none.
 CREATE TABLE sync_applying (

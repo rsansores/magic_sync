@@ -2542,6 +2542,140 @@ async fn a_row_let_go_once_filed_is_refused_by_the_message_that_let_it_go(pool: 
     assert_eq!(refused, [(id.to_string(), EPOCH.to_owned(), delete)]);
 }
 
+/// A table of the server's that a replica writes too, keyed by the replica
+/// each row is of.
+#[derive(
+    sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
+)]
+#[row(
+    table = "carts",
+    schema = "fixture",
+    mirror = "both",
+    sync = "broadcast",
+    key = "replica_id, id",
+    origin = "replica_id"
+)]
+struct Cart {
+    replica_id: Uuid,
+    id: Uuid,
+    #[row(replica_owned)]
+    note: String,
+    #[row(version)]
+    at: i64,
+}
+
+/// A replica deletes, of a table written on both sides and keyed by its
+/// replica, only its own rows: the server lets go of no other replica's
+/// row for it, so the replica would hold less than the server records.
+#[sqlx::test(migrations = false)]
+async fn a_replica_deletes_only_its_own_rows_of_a_two_way_table(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    sqlx::raw_sql(&format!(
+        "{TABLES}CREATE TABLE carts (replica_id BLOB NOT NULL, id BLOB NOT NULL, \
+           note TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (replica_id, id));"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let codecs = || {
+        let mut codecs = codecs();
+        codecs.push(Codec::json::<Cart>(None));
+        codecs
+    };
+    install(&mut pool.acquire().await.unwrap(), &codecs())
+        .await
+        .unwrap();
+    let (me, other) = (Uuid::now_v7(), Uuid::now_v7());
+    let replica = Replica::new(
+        pool.clone(),
+        codecs(),
+        me,
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    let cart = |replica_id: Uuid| {
+        let row = Cart {
+            replica_id,
+            id: Uuid::now_v7(),
+            note: String::new(),
+            at: 1,
+        };
+        let key = key(&[&replica_id.to_string(), &row.id.to_string()]);
+        (row.id, (key, json(&row)))
+    };
+    let (mine, my_cart) = cart(me);
+    let (theirs, their_cart) = cart(other);
+    replica
+        .receive(&ending(BASE, 0, "provisioned", &[]))
+        .await
+        .unwrap();
+    replica
+        .receive(&down(
+            1,
+            "",
+            vec![upserts("carts", vec![my_cart, their_cart])],
+        ))
+        .await
+        .unwrap();
+    let delete = |id: Uuid| {
+        sqlx::query("DELETE FROM carts WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+    };
+    delete(mine)
+        .await
+        .expect_err("until it knows which replica it is");
+    replica.send_lane(0, false).await.unwrap();
+    let refused = delete(theirs).await.expect_err("another replica's row");
+    assert!(refused.to_string().contains("keyed by"), "{refused}");
+    delete(mine).await.expect("its own row");
+    let noted: Vec<String> = sqlx::query_scalar("SELECT row_key FROM sync_notes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(noted, [format!("{me}|{mine}")]);
+}
+
+/// A table with writes of the replica's the server has not filed is left
+/// out of its digests: what it holds of it is about to change on the
+/// server, which the comparison would take for a replica gone astray.
+#[sqlx::test(migrations = false)]
+async fn digests_leave_out_a_table_with_writes_not_filed(pool: SqlitePool) {
+    let w = world(pool).await;
+    let id = Uuid::now_v7();
+    let row = Task {
+        id,
+        title: "t".into(),
+        done: false,
+        updated_at: at(0),
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts(
+            "tasks",
+            vec![(key(&[&id.to_string()]), json(&row))],
+        )],
+    ))
+    .await;
+    w.exec("UPDATE tasks SET done = 1").await.unwrap();
+    let digested =
+        |up: &Up| -> Vec<String> { up.digests.iter().map(|d| d.table.clone()).collect() };
+    let up = w.up(0, true).await.unwrap();
+    assert_eq!(digested(&up), ["items", "shelves", "prices"]);
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads,
+        })
+        .encoded(),
+    )
+    .await;
+    let up = w.up(0, true).await.unwrap();
+    assert_eq!(digested(&up), ["items", "shelves", "prices", "tasks"]);
+}
+
 /// A record is the replica's: the server sends none of it and lets go of
 /// none of it. History is written once; state is edited, and a changed key
 /// goes up as the old one gone.
@@ -4314,7 +4448,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x273b_5ae9_89db_0d77];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x47bb_3d66_46ff_fe83];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
