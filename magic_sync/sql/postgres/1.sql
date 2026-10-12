@@ -321,7 +321,7 @@ CREATE TABLE sync.quarantine (
     replica_id UUID        NOT NULL,
     relation   TEXT        NOT NULL,
     row_key    TEXT        NOT NULL,
-    cause      TEXT        NOT NULL CHECK (cause IN ('server', 'replica')),
+    cause      TEXT        NOT NULL CHECK (cause IN ('server', 'replica', 'held_back')),
     reason     TEXT        NOT NULL,
     first_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -334,12 +334,14 @@ CREATE TABLE sync.quarantine (
 CREATE INDEX quarantine_row ON sync.quarantine (relation, row_key);
 
 COMMENT ON TABLE sync.quarantine IS
-    'Rows a replica should hold and does not, for a reason a retry cannot change. Never '
-    'repaired by hand: a deploy that fixes the cause lets the next retry through.';
+    'Rows a replica should hold and does not, for a reason a retry cannot change — or, held '
+    'back by the replica, one the next retry cures. Never repaired by hand: a deploy that '
+    'fixes the cause lets the next retry through.';
 COMMENT ON COLUMN sync.quarantine.cause IS
     'server: the server could not send the row — or a row it points at — and the replica '
     'does not hold it: an older version it had is taken back. replica: the replica refused it, and leaves it out of its digests, as the server '
-    'does when it compares them.';
+    'does when it compares them. held_back: a row of the replica''s own it deleted, not taken while the '
+    'delete was on its way — nothing to fix, no alarm: the retry sends it again should the server keep it.';
 COMMENT ON COLUMN sync.quarantine.carried IS
     'The message that carried the row again since it was set aside: once the replica says it '
     'applied it, the row leaves the quarantine. NULL: not carried since.';

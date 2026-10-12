@@ -2939,10 +2939,11 @@ fn cart_of(replica_id: Uuid, id: Uuid, at: i64) -> (WireKey, Vec<u8>) {
 }
 
 /// A row the replica deleted of its own, in a two-way table, is not taken
-/// again from a message the server sent before it filed the delete: the
+/// again from a message the server sent before it filed the delete — the
 /// server lets go of it once it files it, so the replica would hold a row
-/// nobody holds for it. Once the delete is filed, the row is the server's
-/// to send again.
+/// nobody holds for it — and the replica says it held it back, so the
+/// server does not count it held. Once the delete is filed, the row is the
+/// server's to send again.
 #[sqlx::test(migrations = false)]
 async fn a_row_the_replica_deleted_is_not_taken_again_until_the_delete_is_filed(pool: SqlitePool) {
     let w = world_of(
@@ -2975,9 +2976,14 @@ async fn a_row_the_replica_deleted_is_not_taken_again_until_the_delete_is_filed(
         "{late:?}"
     );
     assert_eq!(w.count("SELECT count(*) FROM carts").await, 0);
-    assert!(w.rejected().await.is_empty());
+    assert_eq!(w.rejected().await, [format!("carts {}|{id}", w.me)]);
     let up = w.up(0, false).await.expect("the delete");
     assert_eq!(up.tables[0].deletes.len(), 1);
+    assert!(
+        matches!(up.rejected.as_slice(), [r] if r.held_back),
+        "{:?}",
+        up.rejected
+    );
     w.receive(
         &Body::Filed(Filed {
             uploads: up.uploads,
@@ -2992,6 +2998,7 @@ async fn a_row_the_replica_deleted_is_not_taken_again_until_the_delete_is_filed(
     ))
     .await;
     assert_eq!(w.count("SELECT count(*) FROM carts").await, 1);
+    assert!(w.rejected().await.is_empty());
 }
 
 /// A table with writes of the replica's the server has not filed is left
@@ -4980,7 +4987,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x47bb_3d66_46ff_fe83];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0xe5dd_b8ea_c465_953a];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

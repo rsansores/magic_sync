@@ -199,6 +199,11 @@ pub struct Rejected {
     pub epoch: ::prost::alloc::string::String,
     #[prost(uint64, tag = "5")]
     pub sequence: u64,
+    /// The replica did not take the row because it deleted it, a row of its
+    /// own, and the server has not filed the delete: no fault of the row's,
+    /// nothing a fix cures. The server sends the row again, should it keep it.
+    #[prost(bool, tag = "6")]
+    pub held_back: bool,
 }
 /// What a replica holds of one table: how many rows, and a fingerprint of
 /// their keys. Rows it retired, or rejected, are left out.

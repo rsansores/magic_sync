@@ -256,8 +256,10 @@ their deletes ignored.
    - a row the replica had retired (4.3) becomes live again;
    - a row of its own it deleted, in a table keyed by the replica, whose
      delete the server has not filed yet (4.4), is **not** taken: the
-     server sent it before it heard of the delete, and lets go of it once
-     it files it.
+     server sent it before it heard of the delete. The replica records it
+     **held back** — a rejection marked `held_back` (section 6) — so the
+     server does not count it held, and sends it again should it keep the
+     row.
 
    A key both let go of and upserted in one part is held: its upsert comes
    after. A key upserted twice in one part is the last row beside it.
@@ -402,7 +404,9 @@ and the `(epoch, sequence)` of the message that carried the row, or its
 delete — for a row the end of a snapshot could not let go of, the
 `EndSnapshot`'s; for a row held retired for the replica's edits (4.3) that
 it could not let go of once they were filed, the message that let go of
-it. A row whose key cannot be told is logged and not reported.
+it. A row whose key cannot be told is logged and not reported. A row held
+back (4.1) is a rejection marked `held_back`: nothing is at fault, so the
+server raises no alarm over it; the rules below hold for it all the same.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.
@@ -592,7 +596,8 @@ says how to read it.
 - `tests/golden/to_server_verdicts.txt`: uploads a replica sends after a
   provisioning, a change and a take-back it applied — a refused delete
   with what it applied, an edit of a two-way row, a delete of a row of its
-  own, a refused sweep, a gap, what it applied said again lower, of another
+  own, a refused sweep, a row of its own held back, a gap, what it applied
+  said again lower, of another
   epoch, and past anything sent — each with what the server makes of it.
 
 A replica implementation is complete when:
@@ -619,7 +624,8 @@ A replica implementation is complete when:
       cannot take or let go of;
 - [ ] it reports rejections, each with the message that refused it, before
       it says it applied that message, and keeps them until it takes the
-      row or lets it go;
+      row or lets it go — a row of its own whose delete is not filed among
+      them, marked `held_back` (4.1);
 - [ ] it acknowledges the transport only after committing;
 - [ ] it reports the last applied `(epoch, sequence, nonce, mac)` to the
       server, as the message carried them;
@@ -724,11 +730,13 @@ delete of a row of its own is a fact whether the server's database lets the
 row go or refuses to: the server records the replica holding it no more, and
 sends it again a row it kept — but for a row that a message the replica had
 not applied when it sent the delete carries (the last it says it applied, or
-else the last the server heard it apply). The replica may take that
-message's version of it, so the server still records it held, and its own
-delete of the row follows. A delete filed later, from what the server kept,
-leaves the row held the same way: a delete of a row a replica does not hold
-changes nothing there. The server
+else the last the server heard it apply). That one the server still records
+held: the replica takes that message's version if it hears the delete filed
+first, and the server's own delete of the row, if it let it go, follows;
+otherwise the replica holds it back (4.1), and its rejection, which comes no
+later than it says it applied the message, records the row refused (A.4). A
+delete filed later, from what the server kept, leaves the row held the same
+way: a delete of a row a replica does not hold changes nothing there. The server
 keeps, of each row, the newest upload of it: a later upload of the row replaces
 what it kept, or drops it once filed, so what is filed later never rolls the row
 back. So it keeps a row only with its key in `keys`: one without is malformed,
@@ -754,7 +762,10 @@ again — and not held for progress, or for digests. The row is set aside for th
 replica, and sent again, or its delete, when the relay restarts or on a timer,
 which is after a deploy on either side has had the chance to fix the cause; it
 is taken once the replica applies a later message that carries it. A rejection
-of a delete re-records the row the server took back. A rejection of a message
+of a delete re-records the row the server took back. A row a replica held
+back (`held_back`) is recorded the same way and raises no alarm — nothing is at
+fault, and a fix is awaited for nothing: the retry sends it again, should the
+server keep the row. A rejection of a message
 other than the last one that carried the row, or of another epoch, names a
 version that no longer matters, or none it was sent, and is left out. The key is
 read as its table's key (section 3) whatever its spelling. A rejection of

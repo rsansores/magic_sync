@@ -504,6 +504,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
         refusing,
         Up {
             rejected: vec![Rejected {
+                held_back: false,
                 table: "items".into(),
                 key: Some(WireKey {
                     parts: vec![two.to_string()],
@@ -1136,6 +1137,7 @@ async fn a_refused_row_sent_again_is_on_its_way(pool: crate::DbPool) {
     let carried = world.last_sent(a).await;
     let mut said = crate::testkit::confirmation(&world.pool, a, carried).await;
     said.rejected = vec![Rejected {
+        held_back: false,
         table: "items".to_owned(),
         key: Some(WireKey {
             parts: vec![one.to_string()],

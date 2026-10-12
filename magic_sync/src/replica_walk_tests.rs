@@ -942,16 +942,6 @@ async fn pins(pool: &SqlitePool, edits: &Edits, model: &mut Model) {
             .map(|(me, id)| ("bins".to_owned(), format!("{me}|{id}")))
             .collect::<BTreeSet<model::Row>>()
     };
-    let noted: BTreeSet<model::Row> = sqlx::query_as::<_, (String, String)>(
-        "SELECT relation, row_key FROM sync_notes WHERE relation = 'bins'",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .collect();
-    let held = mine("SELECT replica_id, id FROM bins").await;
-    model.deleted = noted.difference(&held).cloned().collect();
     model.retiring = ids("SELECT item_id FROM receipts")
         .await
         .into_iter()
@@ -998,8 +988,6 @@ async fn deliver(
         "{at}: applied again with no row at fault: {expected:?}, {:?}",
         ToReplica::decode(bytes)
     );
-    // A delete of a bin's filed: the model is told.
-    pins(&node.pool, edits, model).await;
     (expected, received)
 }
 
@@ -1436,6 +1424,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 tx.commit().await.unwrap();
                 if let Some(outgoing) = &outgoing {
                     host.edits.carried(&outgoing.up);
+                    model.carried(&outgoing.up);
                 }
                 if let (Some(outgoing), 0) = (outgoing, walk.below(2)) {
                     answers.extend(server.file(&outgoing.up, me));
@@ -1469,6 +1458,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 let went = node.replica.send_lane(lane, walk.below(5) == 0).await;
                 for up in uplink.offered.lock().unwrap().drain(..) {
                     host.edits.carried(&up);
+                    model.carried(&up);
                     digests_are_the_models(&model, &host.edits, &up, &at);
                 }
                 assert!(
@@ -1628,7 +1618,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                         let row = ("bins".to_owned(), format!("{me}|{id}"));
                         model.rows.remove(&row);
                         model.retired.remove(&row);
-                        model.deleted.insert(row);
+                        model.deleted.insert(row, None);
                     }
                 }
             }
@@ -1749,6 +1739,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
             said |= node.replica.send_lane(lane, digests).await.unwrap().message;
             for up in uplink.offered.lock().unwrap().drain(..) {
                 host.edits.carried(&up);
+                model.carried(&up);
                 digests_are_the_models(&model, &host.edits, &up, "the end");
             }
         }

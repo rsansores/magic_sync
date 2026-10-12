@@ -77,13 +77,15 @@ CREATE TABLE sync_digests (
 -- them, and sends them again once a fix is deployed on either side. `epoch`
 -- and `sequence` are the message that refused it, which the server reads
 -- the rejection against: a snapshot that ends clears what was refused before
--- it began, which it sent again.
+-- it began, which it sent again. `held_back`: a row of its own it deleted,
+-- not taken while the delete is on its way — nothing to fix.
 CREATE TABLE sync_rejections (
     table_name  TEXT    NOT NULL,
     row_key     TEXT    NOT NULL,
     reason      TEXT    NOT NULL,
     epoch       TEXT    NOT NULL,
     sequence    INTEGER NOT NULL,
+    held_back   INTEGER NOT NULL DEFAULT 0,
     rejected_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     reported_at TEXT,
     PRIMARY KEY (table_name, row_key)

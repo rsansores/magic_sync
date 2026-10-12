@@ -1118,6 +1118,7 @@ mod server {
         };
         let rejection = |table: &str, parts: &[&str], sequence: u64| Up {
             rejected: vec![Rejected {
+                held_back: false,
                 table: table.to_owned(),
                 key: Some(key(parts)),
                 reason: "a check of its own".to_owned(),
@@ -1166,6 +1167,27 @@ mod server {
             rejected: rejection("prices", &["0192f6a0-0000-7000-8000-000000000c01"], took).rejected,
             ..confirming(last).await
         };
+        // A replica holds back a row of its own it deleted, the delete on
+        // its way: the task as the provisioning carried it.
+        let carried: i64 =
+            sqlx::query_scalar("SELECT sequence FROM sync.held WHERE relation = 'tasks'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        let held_back = Up {
+            rejected: vec![Rejected {
+                held_back: true,
+                reason: "deleted here, and the delete not filed yet".to_owned(),
+                ..rejection(
+                    "tasks",
+                    &["0192f6a0-0000-7000-8000-000000000d01"],
+                    u64::try_from(carried).unwrap(),
+                )
+                .rejected[0]
+                    .clone()
+            }],
+            ..up(0)
+        };
         let lines: Vec<(&str, &str, Up)> = vec![
             ("refused_delete", "confirmed,quarantined", refused_delete),
             ("edit", "filed,edited", edit),
@@ -1179,6 +1201,7 @@ mod server {
                     u64::try_from(ended).unwrap(),
                 ),
             ),
+            ("held_back", "held_back", held_back),
             ("gap", "provisioned", Up { gap: last, ..up(0) }),
             ("behind", "provisioned", confirming(first).await),
             ("elsewhere", "provisioned", elsewhere),
@@ -1188,7 +1211,8 @@ mod server {
             "# What the server makes of what a replica says, and does: `name outcomes hex`\n\
                       # per upload — confirmed: what it applied recorded; filed: answered;\n\
                       # edited: its column of a two-way row written; gone: its own row deleted;\n\
-                      # quarantined: the row it refused set aside; provisioned: provisioned\n\
+                      # quarantined: the row it refused set aside; held_back: the row of its\n\
+                      # own it held back set aside, with no alarm; provisioned: provisioned\n\
                       # again; restored: a new epoch, every replica provisioned again. Each\n\
                       # after a provisioning, a change and a take-back the replica applied.\n\
                       # Generated and filed by conformance::server.\n";
@@ -1212,6 +1236,8 @@ mod server {
                          AND done_at IS NULL";
         let quarantined = "SELECT count(*) FROM sync.quarantine \
                              WHERE replica_id = $1 AND cause = 'replica'";
+        let set_aside = "SELECT count(*) FROM sync.quarantine \
+                           WHERE replica_id = $1 AND cause = 'held_back'";
         for (name, outcomes, bytes) in golden(&std::fs::read_to_string(VERDICTS).unwrap()) {
             // Each judged on its own: no provisioning pending, none asked lately.
             sqlx::raw_sql(
@@ -1221,7 +1247,7 @@ mod server {
             .execute(&pool)
             .await
             .unwrap();
-            let before = scalar(quarantined).await;
+            let before = (scalar(quarantined).await, scalar(set_aside).await);
             let up = Up::decode(bytes.as_slice()).unwrap();
             server.receive(replica, &bytes).await.unwrap();
             let outcomes: Vec<&str> = outcomes.split(',').collect();
@@ -1245,7 +1271,8 @@ mod server {
                         scalar("SELECT count(*) FROM fixture.readings WHERE replica_id = $1").await
                             == 0
                     }
-                    "quarantined" => scalar(quarantined).await == before + 1,
+                    "quarantined" => scalar(quarantined).await == before.0 + 1,
+                    "held_back" => scalar(set_aside).await == before.1 + 1,
                     "provisioned" => scalar(resyncs).await == 1,
                     "restored" => {
                         sqlx::query_scalar::<_, bool>("SELECT epoch <> $1::uuid FROM sync.epoch")

@@ -154,6 +154,10 @@ message Rejected {
   // the row, or of another epoch.
   string epoch = 4;
   uint64 sequence = 5;
+  // The replica did not take the row because it deleted it, a row of its
+  // own, and the server has not filed the delete: no fault of the row's,
+  // nothing a fix cures. The server sends the row again, should it keep it.
+  bool held_back = 6;
 }
 
 // What a replica holds of one table: how many rows, and a fingerprint of

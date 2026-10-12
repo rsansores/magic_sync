@@ -985,6 +985,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                     .collect(),
                 rejected: (0..walk.below(3))
                     .map(|_| Rejected {
+                        held_back: false,
                         table: pick(&mut walk, &tables),
                         key: (walk.below(4) > 0).then(|| key(&mut walk)),
                         reason: "refused\0".into(),

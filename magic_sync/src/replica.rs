@@ -1206,7 +1206,7 @@ fn json<T: serde::Serialize>(keys: &[T]) -> String {
 /// more: what it points at, or the value it takes, may come later in the
 /// message. A row the replica takes or lets go of is no longer one to
 /// report. A row of its own it [`deleted`] is not taken until the server
-/// filed the delete.
+/// filed the delete: it is reported held back.
 #[cfg(feature = "sqlite")]
 async fn apply<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1275,6 +1275,10 @@ async fn apply<P: Sync + 'static>(
             }
         }
         let deleted = deleted(conn, codec, &beside).await?;
+        let held_back: Vec<String> = deleted.iter().map(key_text).collect();
+        if !held_back.is_empty() {
+            reject(conn, codec.table.name, &held_back, HELD_BACK, true, by).await?;
+        }
         let mut pending = Vec::new();
         for at in (0..beside.len()).filter(|at| {
             beside[*at]
@@ -1316,7 +1320,7 @@ async fn apply<P: Sync + 'static>(
         } else {
             "a table this replica does not mirror"
         };
-        reject(conn, table, keys, why, by).await?;
+        reject(conn, table, keys, why, false, by).await?;
     }
     let mut taken = Vec::new();
     let mut culprits = Vec::new();
@@ -1356,9 +1360,15 @@ async fn apply<P: Sync + 'static>(
     Ok(taken)
 }
 
+/// Why a row of its own the replica deleted is not taken while the server
+/// has not filed the delete.
+#[cfg(feature = "sqlite")]
+const HELD_BACK: &str = "deleted here, and the delete not filed yet";
+
 /// The rows of `keys` the replica deleted of its own, in a table keyed by
 /// it, whose deletes the server has not filed: one it sends meanwhile it
-/// sent before it heard of the delete, and lets go of once it files it.
+/// sent before it heard of the delete, and sends again once it has, should
+/// it keep the row.
 #[cfg(feature = "sqlite")]
 async fn deleted<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1550,7 +1560,15 @@ async fn refuse<P: Sync + 'static>(
     by: &By,
 ) -> Result<(), Error> {
     let table = codec.table.name;
-    reject(conn, table, &Vec::from_iter(key.map(key_text)), why, by).await?;
+    reject(
+        conn,
+        table,
+        &Vec::from_iter(key.map(key_text)),
+        why,
+        false,
+        by,
+    )
+    .await?;
     if naming {
         let held = codec.present(conn, &Vec::from_iter(key.cloned())).await?;
         named(conn, table, &held.iter().map(key_text).collect::<Vec<_>>()).await?;
@@ -1597,7 +1615,7 @@ async fn let_go<P: Sync + 'static>(
     let mut pending = Vec::new();
     for key in keys {
         match care.culprit(table, &Spot::LetGo(key_text(key))) {
-            Some(why) => reject(conn, table, &[key_text(key)], why, by).await?,
+            Some(why) => reject(conn, table, &[key_text(key)], why, false, by).await?,
             None => pending.push(key.clone()),
         }
     }
@@ -1609,7 +1627,7 @@ async fn let_go<P: Sync + 'static>(
             let gone = let_go_together(conn, codecs, codec, one, by).await;
             match row_done(conn, gone, table, Spot::LetGo(key_text(key))).await? {
                 Ok(refused) => again.extend(refused),
-                Err(e) => reject(conn, table, &[key_text(key)], &e.to_string(), by).await?,
+                Err(e) => reject(conn, table, &[key_text(key)], &e.to_string(), false, by).await?,
             }
         }
         if again.is_empty() || again.len() == pending.len() {
@@ -1677,7 +1695,7 @@ async fn let_go_together<P: Sync + 'static>(
     .execute(&mut *conn)
     .await?;
     for (key, why) in &retired.refused {
-        reject(conn, codec.table.name, &[key_text(key)], why, by).await?;
+        reject(conn, codec.table.name, &[key_text(key)], why, false, by).await?;
     }
     let gone: Vec<String> = keys
         .iter()
@@ -1696,28 +1714,33 @@ async fn let_go_together<P: Sync + 'static>(
 }
 
 /// Notes rows the replica could not take, or let go of, for the server to
-/// hear of: refused by the message `by`.
+/// hear of: refused by the message `by` — or `held_back`, rows of its own
+/// it deleted, not taken while the deletes are on their way, which is no
+/// fault to log.
 #[cfg(feature = "sqlite")]
 async fn reject(
     conn: &mut Conn,
     table: &str,
     keys: &[String],
     why: &str,
+    held_back: bool,
     by: &By,
 ) -> Result<(), Error> {
-    tracing::error!(
-        table = capped(table),
-        rows = keys.len(),
-        first = capped(keys.first().map_or("", String::as_str)),
-        sequence = by.sequence,
-        "sync: rows this replica cannot take or let go of — rejected, for the server to hear of: {}",
-        capped(why)
-    );
+    if !held_back {
+        tracing::error!(
+            table = capped(table),
+            rows = keys.len(),
+            first = capped(keys.first().map_or("", String::as_str)),
+            sequence = by.sequence,
+            "sync: rows this replica cannot take or let go of — rejected, for the server to hear of: {}",
+            capped(why)
+        );
+    }
     sqlx::query(
-        "INSERT INTO sync_rejections (table_name, row_key, reason, epoch, sequence) \
-         SELECT $1, value, $3, $5, $4 FROM json_each($2) WHERE true \
+        "INSERT INTO sync_rejections (table_name, row_key, reason, epoch, sequence, held_back) \
+         SELECT $1, value, $3, $5, $4, $6 FROM json_each($2) WHERE true \
          ON CONFLICT (table_name, row_key) DO UPDATE SET reason = EXCLUDED.reason, \
-           epoch = EXCLUDED.epoch, sequence = EXCLUDED.sequence, \
+           epoch = EXCLUDED.epoch, sequence = EXCLUDED.sequence, held_back = EXCLUDED.held_back, \
            rejected_at = EXCLUDED.rejected_at, reported_at = NULL",
     )
     .bind(table)
@@ -1725,6 +1748,7 @@ async fn reject(
     .bind(capped(why))
     .bind(by.sequence)
     .bind(&by.epoch)
+    .bind(held_back)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -2676,8 +2700,8 @@ async fn unreported(
     conn: &mut Conn,
     limit: usize,
 ) -> Result<Vec<(envelope::Rejected, i64)>, Error> {
-    let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
-        "SELECT table_name, row_key, reason, epoch, sequence FROM sync_rejections \
+    let rows: Vec<(String, String, String, String, i64, bool)> = sqlx::query_as(
+        "SELECT table_name, row_key, reason, epoch, sequence, held_back FROM sync_rejections \
           WHERE reported_at IS NULL AND epoch = (SELECT epoch FROM sync_applied WHERE id = 1) \
           ORDER BY rejected_at, table_name, row_key LIMIT $1",
     )
@@ -2686,7 +2710,7 @@ async fn unreported(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(table, key, reason, epoch, sequence)| {
+        .map(|(table, key, reason, epoch, sequence, held_back)| {
             let row = envelope::Rejected {
                 table,
                 key: Some(envelope::Key {
@@ -2695,6 +2719,7 @@ async fn unreported(
                 reason,
                 epoch,
                 sequence: u64::try_from(sequence).unwrap_or_default(),
+                held_back,
             };
             (row, sequence)
         })

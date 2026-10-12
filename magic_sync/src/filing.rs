@@ -663,7 +663,11 @@ async fn delete_guarded<P: Sync + 'static>(
 
 /// Rows `replica` reported it could not take, or let go of: each refused —
 /// still held, for what takes rows back, and not for what it holds — and
-/// quarantined, so a retry after a fix sends it, or its delete, again. Only
+/// quarantined, so a retry after a fix sends it, or its delete, again. A
+/// row it held back — one of its own it deleted, whose delete the server
+/// had not filed when the row reached it — is set aside the same way, as
+/// nothing a fix cures: the retry sends it again should the server keep
+/// it, and no alarm is raised. Only
 /// a refusal of the last message that carried the row: one of an older
 /// message (a newer version went since), or of another epoch, names
 /// nothing; one of a delete re-records the row it could not let go of. A
@@ -709,26 +713,36 @@ async fn rejected<P: Sync + 'static>(
             tracing::debug!(%replica, table = row.table, key, "upload: a rejection of a version that no longer matters — left out");
             continue;
         }
-        let reason = stored(&format!("rejected by the replica: {}", row.reason));
+        let (cause, said) = if row.held_back {
+            ("held_back", "held back")
+        } else {
+            ("replica", "rejected")
+        };
+        let reason = stored(&format!("{said} by the replica: {}", row.reason));
         sqlx::query(
             "INSERT INTO sync.quarantine AS q (replica_id, relation, row_key, cause, reason) \
-             VALUES ($1, $2, $3, 'replica', $4) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET cause = EXCLUDED.cause, \
                reason = EXCLUDED.reason, last_at = now(), attempts = q.attempts + 1, carried = NULL",
         )
         .bind(replica)
         .bind(codec.table.name)
         .bind(&key)
+        .bind(cause)
         .bind(&reason)
         .execute(&mut *conn)
         .await?;
-        tracing::error!(
-            %replica,
-            table = row.table,
-            key,
-            reason,
-            "sync: a replica could not take a row, or let it go — quarantined until a fix lets it through"
-        );
+        if row.held_back {
+            tracing::debug!(%replica, table = row.table, key, "upload: a row of the replica's own it deleted, held back until the delete is filed — sent again on the next retry");
+        } else {
+            tracing::error!(
+                %replica,
+                table = row.table,
+                key,
+                reason,
+                "sync: a replica could not take a row, or let it go — quarantined until a fix lets it through"
+            );
+        }
     }
     Ok(())
 }

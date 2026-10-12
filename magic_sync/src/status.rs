@@ -178,8 +178,9 @@ pub enum ReplicaState {
     AwaitingFix,
     /// Sends to it fail; it is tried again at `retry_at`.
     Unreachable,
-    /// Changes are on their way to it, or from it — or held back by a change
-    /// the planner set aside that may concern it.
+    /// Changes are on their way to it, or from it — or held back: by a
+    /// change the planner set aside that may concern it, or by the replica,
+    /// a row of its own it deleted that waits to be sent again.
     CatchingUp,
     /// It holds what it should, and the server has filed everything it last
     /// said it wrote.
@@ -554,6 +555,11 @@ pub struct Listing {
     pub replicas: Listed<ReplicaOverview>,
 }
 
+/// A row of `sync.quarantine` that waits for a fix: one a replica held back
+/// — a row of its own it deleted, the delete on its way — waits only for
+/// the next retry, and raises no alarm.
+const AWAITING_FIX: &str = "cause <> 'held_back'";
+
 /// Whether a row a replica holds is confirmed: the message that carried it
 /// is one the replica said it applied, in this epoch.
 const CONFIRMED: &str =
@@ -682,6 +688,8 @@ struct Recorded {
     backlog_at: Option<DateTime<Utc>>,
     waiting_since: Option<DateTime<Utc>>,
     quarantined: i64,
+    /// Of those, the ones that wait for a fix.
+    awaiting: i64,
     unfiled: i64,
     owed: i64,
 }
@@ -1106,7 +1114,7 @@ impl Engine {
         let mine = "replica_id = ANY($1)";
         let quarantine = Listed {
             total: sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM sync.quarantine WHERE {mine}"
+                "SELECT count(*) FROM sync.quarantine WHERE {mine} AND {AWAITING_FIX}"
             ))
             .bind(&ids)
             .fetch_one(&mut *conn)
@@ -1114,7 +1122,7 @@ impl Engine {
             first: sqlx::query(&format!(
                 "SELECT replica_id AS replica, relation AS table, row_key AS key, reason, \
                         first_at, last_at, attempts \
-                   FROM sync.quarantine WHERE {mine} \
+                   FROM sync.quarantine WHERE {mine} AND {AWAITING_FIX} \
                   ORDER BY first_at, relation, row_key, replica_id LIMIT $2"
             ))
             .bind(&ids)
@@ -1181,12 +1189,15 @@ impl Engine {
                     r.last_sent_at AS sent_at, r.applied_at, \
                     coalesce({}, false) AS unconfirmed, \
                     r.backlog, r.backlog_at, greatest(r.last_sent_at, r.applied_at) AS waiting_since, \
-                    coalesce(q.n, 0) AS quarantined, coalesce(i.n, 0) AS unfiled, \
+                    coalesce(q.n, 0) AS quarantined, coalesce(q.fix, 0) AS awaiting, \
+                    coalesce(i.n, 0) AS unfiled, \
                     coalesce(o.n, 0) AS owed \
                FROM unnest($1::uuid[]) AS s(id) \
                LEFT JOIN sync.replicas r ON r.replica_id = s.id \
                LEFT JOIN sync.chains c ON c.replica_id = s.id \
-               LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.quarantine \
+               LEFT JOIN (SELECT replica_id, count(*) AS n, \
+                                 count(*) FILTER (WHERE {AWAITING_FIX}) AS fix \
+                            FROM sync.quarantine \
                            WHERE replica_id = ANY($1) GROUP BY 1) q ON q.replica_id = s.id \
                LEFT JOIN (SELECT replica_id, count(*) AS n FROM sync.inbox \
                            WHERE replica_id = ANY($1) GROUP BY 1) i ON i.replica_id = s.id \
@@ -1210,11 +1221,16 @@ impl Engine {
                     at,
                 });
                 let behind = backlog.as_ref().is_some_and(|b| !b.tables.is_empty());
-                let state = if r.quarantined > 0 || r.unfiled > 0 || notes.own_parked > 0 {
+                let state = if r.awaiting > 0 || r.unfiled > 0 || notes.own_parked > 0 {
                     ReplicaState::AwaitingFix
                 } else if failures > 0 {
                     ReplicaState::Unreachable
-                } else if notes.pending > 0 || notes.parked > 0 || r.unconfirmed || behind {
+                } else if notes.pending > 0
+                    || notes.parked > 0
+                    || r.unconfirmed
+                    || behind
+                    || r.quarantined > 0
+                {
                     ReplicaState::CatchingUp
                 } else {
                     ReplicaState::Synced
