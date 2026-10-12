@@ -169,6 +169,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: "1.97.1"
+          # The expected messages quote core's source, which rustc shows only
+          # when it is installed.
+          components: rust-src
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --locked -p magic_sync --features postgres --test derive
       - run: cargo test --locked -p magic_sync --features sqlite --test derive

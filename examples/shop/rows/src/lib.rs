@@ -42,7 +42,9 @@ pub struct Receipt {
 /// The registers, as the engine finds them on the server.
 #[cfg(feature = "server")]
 pub const REGISTERS: magic_sync::plan::Replicas =
-    magic_sync::plan::Replicas::relation("shop.registers").table("registers").live("active");
+    magic_sync::plan::Replicas::relation("shop.registers")
+        .table("registers")
+        .live("active");
 // ANCHOR_END: registers
 
 // ANCHOR: codecs
