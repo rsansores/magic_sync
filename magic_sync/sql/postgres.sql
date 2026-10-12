@@ -95,7 +95,7 @@ CREATE INDEX pointed_row ON sync.pointed (relation, row_key);
 COMMENT ON TABLE sync.pointed IS
     'The mirrored rows a row pointed at before an update or a delete, by the note of its key '
     'as it was: a parent it no longer points at is let go of, and only once no replica holds '
-    'a version that points there. Gone once the note is done.';
+    'a version that points there. Gone with the note.';
 
 -- What each replica holds, as the engine sent it: the other half of every
 -- decision the planner takes.

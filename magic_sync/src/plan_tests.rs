@@ -704,6 +704,32 @@ impl World {
                 .collect();
         let outcome = relay.record(&mut tx).await.expect("recorded");
         assert_minimal(&mut tx, drawn, &held, &self.history).await;
+        if chance(6) {
+            // Replicas heard while the pass is still recording: what they
+            // say waits on what it locked, or goes in beside it.
+            self.history
+                .push("uploads filed while the relay recorded".to_owned());
+            let replicas: Vec<Uuid> = self.replicas.keys().copied().collect();
+            for replica in replicas {
+                let Some(up) = self.replicas[&replica].up() else {
+                    continue;
+                };
+                let mut beside = self.pool.begin().await.expect("a transaction");
+                sqlx::raw_sql("SET LOCAL lock_timeout = '50ms'")
+                    .execute(&mut *beside)
+                    .await
+                    .expect("a lock timeout");
+                let filed =
+                    crate::filing::file(&mut beside, &self.codecs, &up, replica, &(), i64::MAX)
+                        .await;
+                if filed.is_ok() && beside.commit().await.is_ok() {
+                    self.replicas
+                        .get_mut(&replica)
+                        .expect("modelled")
+                        .delivered(&up);
+                }
+            }
+        }
         if chance(12) {
             self.history
                 .push("the relay lost its lock while recording".to_owned());
@@ -717,6 +743,11 @@ impl World {
             .chain(live.iter())
             .map(|r| (*r, self.wire.ids(*r).len()))
             .collect();
+        let outbox: Vec<(Uuid, i64, Vec<u8>, bool)> =
+            sqlx::query_as("SELECT replica_id, sequence, message, snapshot FROM sync.outbox")
+                .fetch_all(&mut *self.conn)
+                .await
+                .expect("the outbox");
         let sent = if chance(12) {
             self.history
                 .push("the relay died before it sent".to_owned());
@@ -728,6 +759,25 @@ impl World {
                 .expect("published")
                 .sent
         };
+        if chance(10) {
+            // It died once the transport took them, before it trimmed its
+            // outbox: the next relay sends them again.
+            self.history
+                .push("the relay died before it trimmed its outbox".to_owned());
+            for (replica, sequence, message, snapshot) in outbox {
+                sqlx::query(
+                    "INSERT INTO sync.outbox (replica_id, sequence, message, snapshot) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                )
+                .bind(replica)
+                .bind(sequence)
+                .bind(message)
+                .bind(snapshot)
+                .execute(&mut *self.conn)
+                .await
+                .expect("sent again");
+            }
+        }
         for (replica, count) in before {
             assert!(
                 live.contains(&replica) || self.wire.ids(replica).len() == count,
@@ -1652,6 +1702,14 @@ async fn walk_from(world: &mut World, seed: u64, faults: Option<Faults>) {
             if *passes == 0 {
                 world.commit_writer().await;
             }
+        }
+        if n % 40 == 39 {
+            // Every done note gone, however recently: what replicas hold
+            // stays comparable with what is noted next.
+            prune(&mut world.conn, Duration::ZERO, i64::MAX)
+                .await
+                .expect("pruned");
+            world.history.push("done notes pruned".to_owned());
         }
         if faults.is_some() {
             world.round(Some(&mut storm)).await;
