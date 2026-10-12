@@ -1320,13 +1320,18 @@ async fn a_message_carries_what_the_replica_takes_at_most(pool: SqlitePool) {
     };
     let w = world_with(pool, settings).await;
     let ghost = |n: u8| upserts("ghosts", vec![(key(&[&n.to_string()]), vec![n])]);
-    let logged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _logging = tracing::subscriber::set_default(Counted(logged.clone()));
-    let received = w
-        .receive(&down(1, "", vec![ghost(1), ghost(2), ghost(3)]))
-        .await;
+    let parts = vec![ghost(1), ghost(2), ghost(3)];
+    let foreign = foreign_rows(&codecs(), &parts);
+    assert_eq!(
+        foreign,
+        [(
+            "ghosts",
+            vec!["1".to_owned(), "2".to_owned(), "3".to_owned()]
+        )],
+        "one table to reject and log, however many parts name it"
+    );
+    let received = w.receive(&down(1, "", parts)).await;
     assert!(matches!(received, Received::Applied(_)), "{received:?}");
-    assert_eq!(logged.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(w.rejected().await, ["ghosts 1", "ghosts 2", "ghosts 3"]);
     let four = down(2, "", vec![ghost(1), ghost(2), ghost(3), ghost(4)]);
     assert!(matches!(w.receive(&four).await, Received::Malformed(_)));
@@ -1340,25 +1345,6 @@ async fn a_message_carries_what_the_replica_takes_at_most(pool: SqlitePool) {
         w.receive(&filed.encoded()).await,
         Received::Malformed(_)
     ));
-}
-
-/// Counts the error events logged.
-struct Counted(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-impl tracing::Subscriber for Counted {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.is_event() && *metadata.level() == tracing::Level::ERROR
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 /// Shapes no server sends cost nothing: rows with keys not one per row are

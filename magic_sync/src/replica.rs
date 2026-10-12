@@ -1223,16 +1223,9 @@ async fn apply<P: Sync + 'static>(
 ) -> Result<Vec<Applied>, Stop> {
     let naming = !message.snapshot_id.is_empty();
     let mut parts = Vec::new();
-    // Rows of tables the replica does not take, rejected — and logged —
-    // once per table, however many parts name it.
-    let mut foreign: Vec<(&str, Vec<String>)> = Vec::new();
+    let foreign = foreign_rows(codecs, &message.tables);
     for (entry, table) in message.tables.iter().enumerate() {
         let Some(codec) = codec_of(codecs, &table.table).filter(|c| c.sent_down()) else {
-            let keys = foreign_keys(table);
-            match foreign.iter_mut().find(|(name, _)| *name == table.table) {
-                Some((_, all)) => all.extend(keys),
-                None => foreign.push((&table.table, keys)),
-            }
             continue;
         };
         let deletes = keys_of(codec, &table.deletes);
@@ -1483,6 +1476,27 @@ impl<P: Sync + 'static> Part<'_, P> {
 /// message up, so one never holds back the replica's confirmation; and what
 /// either side logs of what the other sent.
 const TEXT_CAP: usize = 512;
+
+/// The rows of tables the replica does not take, keys per table however many
+/// parts name it: rejected — and logged — once each.
+#[cfg(feature = "sqlite")]
+fn foreign_rows<'a, P: Sync + 'static>(
+    codecs: &[Codec<P>],
+    tables: &'a [Table],
+) -> Vec<(&'a str, Vec<String>)> {
+    let mut foreign: Vec<(&str, Vec<String>)> = Vec::new();
+    for table in tables {
+        if codec_of(codecs, &table.table).is_some_and(|c| c.sent_down()) {
+            continue;
+        }
+        let keys = foreign_keys(table);
+        match foreign.iter_mut().find(|(name, _)| *name == table.table) {
+            Some((_, all)) => all.extend(keys),
+            None => foreign.push((&table.table, keys)),
+        }
+    }
+    foreign
+}
 
 /// The keys of rows of a table this build does not take, as the server
 /// spelled them, to report: none when the name or a key is longer than any
