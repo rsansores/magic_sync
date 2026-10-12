@@ -18,17 +18,11 @@ And the same tables, minus `registers`, on every register's SQLite.
 {{#include ../../../examples/shop/server/schema.sql:tables}}
 ```
 
-`products.updated_at` is the row's **version**: a register never overwrites a
-newer copy with an older one. Stamp it with the clock *at the write*, and never
-behind the value it replaces:
-
-```sql
-UPDATE shop.products SET name = $2, updated_at = clock_timestamp() WHERE id = $1;
-```
-
-Not `now()`: that is when the transaction *began*, and a transaction that
-began first and committed last would stamp an older version than the row it
-replaces.
+`products.updated_at` is a column like any other: a register takes what the
+head office sends, whatever its version, because the order of the messages —
+not a column — says which is the latest. A column that orders versions
+(`#[row(version)]`) belongs to a table a register edits and the head office
+files, such as a record a register corrects.
 
 ### The engine's part: installed for you, or in your migrations
 
@@ -38,8 +32,8 @@ schema of yours by that name needs another: the server refuses to install
 into it, or to read it as its own. There are two ways to get them there.
 
 > **You write**, if you have migrations — the way a system in production
-> should — the engine's schema in one of them: it is
-> [`magic_sync::POSTGRES_SCHEMA`], one SQL script. Then the triggers, in the
+> should — the engine's schema in one of them: its first step,
+> [`magic_sync::plan::migration`]`(1)`, one SQL script. Then the triggers, in the
 > migration that creates the tables, as you would their indexes. You do not
 > write them by hand: [`Engine::triggers`] prints them, from the same
 > declarations the server starts from, one `CREATE TRIGGER` per line:
@@ -135,7 +129,7 @@ a version). `Replica::new` runs [`magic_sync::replica::check`], which refuses
 a database whose triggers are not exactly these; a test of yours runs it too,
 over the database your migrations build.
 
-[`magic_sync::POSTGRES_SCHEMA`]: ../api/server/magic_sync/constant.POSTGRES_SCHEMA.html
+[`magic_sync::plan::migration`]: ../api/server/magic_sync/plan/fn.migration.html
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers
 [`magic_sync::replica::migration`]: ../api/replica/magic_sync/replica/fn.migration.html
 [`magic_sync::replica::install`]: ../api/replica/magic_sync/replica/fn.install.html

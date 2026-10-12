@@ -62,6 +62,12 @@ pub trait Senders: Send + Sync + 'static {
 /// that authenticates its replicas says which it knows with [`Senders`].
 pub struct Anyone(PgPool);
 
+impl std::fmt::Debug for Anyone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Anyone").finish_non_exhaustive()
+    }
+}
+
 impl Anyone {
     /// Every replica known, its uploads filed in a transaction of `pool`.
     #[must_use]
@@ -192,9 +198,9 @@ impl Settings {
 ///
 /// ```no_run
 /// use magic_sync::plan::Replicas;
-/// use magic_sync::run::server::{Anyone, Settings, Transport};
+/// use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 /// use magic_sync::wire::Codec;
-/// use magic_sync::{Error, Server};
+/// use magic_sync::Error;
 /// use std::sync::Arc;
 /// use uuid::Uuid;
 ///
@@ -209,7 +215,7 @@ impl Settings {
 /// }
 ///
 /// # async fn start(pool: sqlx::PgPool, codecs: Vec<Codec<()>>, upload: (Uuid, Vec<u8>)) -> Result<(), Error> {
-/// const REGISTERS: Replicas = Replicas::relation("shop.registers").table("registers").live("active");
+/// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
 ///
 /// let server = Arc::new(
 ///     Server::new(pool.clone(), codecs, REGISTERS, Queues, Anyone::new(pool), Settings::default())
@@ -231,6 +237,15 @@ pub struct Server<S: Senders, T: Transport> {
     transport: T,
     senders: S,
     settings: Settings,
+}
+
+impl<S: Senders, T: Transport> std::fmt::Debug for Server<S, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("engine", &self.engine)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: Senders, T: Transport> Server<S, T> {
@@ -836,8 +851,6 @@ struct Refiling {
     filed: usize,
 }
 
-/// Proof that this process runs the relay: a connection holding the
-/// advisory lock. Drop it, or lose the connection, and the lock is free.
 /// Done notes pruned a transaction at a time.
 const PRUNED_AT_ONCE: i64 = 10_000;
 
@@ -848,6 +861,8 @@ const HELD_HERE: &str = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 
        AND pid = pg_backend_pid() AND granted AND objsubid = 1 \
        AND classid = ($1::bigint >> 32)::oid AND objid = ($1::bigint & 4294967295)::oid)";
 
+/// Proof that this process runs the relay: a connection holding the
+/// advisory lock. Drop it, or lose the connection, and the lock is free.
 struct Lock {
     conn: PgConnection,
 }

@@ -1,6 +1,6 @@
 //! A replica's side: what the server sends, applied table by table through
 //! the codecs, and what the replica wrote, gathered to go up — run by the
-//! [`Replica`](crate::Replica). What a host does here itself is set up the
+//! [`Replica`](crate::run::replica::Replica). What a host does here itself is set up the
 //! database ([`install`], or [`triggers`] and [`check`] for one with
 //! migrations), say how its writes go up ([`Lane`], [`Outbox`]), and ask how
 //! far along they are ([`progress`]).
@@ -316,11 +316,11 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// one left from a table that no longer travels, the engine's being those
 /// named `sync_note_…` and `sync_refuse_…`; or a connection the engine
 /// cannot keep its word on — `synchronous` below `FULL`, `journal_mode`
-/// `OFF` or `MEMORY`, `recursive_triggers` off — which the pool's options
+/// `OFF` or `MEMORY` (of a database with a file), `recursive_triggers` off — which the pool's options
 /// set. [`Replica::new`] runs it; a host with migrations also runs it in a
 /// test, over the database its migrations build.
 ///
-/// [`Replica::new`]: crate::Replica::new
+/// [`Replica::new`]: crate::run::replica::Replica::new
 ///
 /// # Errors
 ///
@@ -415,7 +415,9 @@ fn engines(name: &str) -> bool {
 /// is asked: commits that are not durable (`synchronous` below `FULL`), since
 /// a message is acknowledged once its commit returns; a journal that cannot
 /// roll a transaction back (`journal_mode` `OFF` or `MEMORY`), since a
-/// message is applied whole or not at all; and triggers that do not fire on
+/// message is applied whole or not at all (a database with no file, in memory
+/// or private to the connection, has no crash to survive, and is always in
+/// memory); and triggers that do not fire on
 /// the rows a conflict replaces (`recursive_triggers` off), since a row an
 /// `INSERT OR REPLACE` deletes would then never go up as gone.
 #[cfg(feature = "sqlite")]
@@ -426,12 +428,16 @@ pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
     let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
         .fetch_one(&mut *conn)
         .await?;
+    let file: String =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_one(&mut *conn)
+            .await?;
     let recursive: i64 = sqlx::query_scalar("PRAGMA recursive_triggers")
         .fetch_one(&mut *conn)
         .await?;
     let refused = if synchronous < 2 {
         "its commits are not durable (`synchronous` below FULL): a message acknowledged could be lost"
-    } else if ["off", "memory"].contains(&journal.to_lowercase().as_str()) {
+    } else if !file.is_empty() && ["off", "memory"].contains(&journal.to_lowercase().as_str()) {
         "it cannot roll a transaction back after a crash (`journal_mode` OFF or MEMORY): a message could be half applied"
     } else if recursive == 0 {
         "its triggers miss the rows a conflict replaces (`recursive_triggers` off): a row an \

@@ -207,6 +207,30 @@ async fn until<S: Senders, T: Transport + Send + 'static, F: Future<Output = boo
     tokio::join!(runs, check);
 }
 
+/// What a host holds can be printed in a log or an `assert`, and the print
+/// names the tables, not the database.
+#[sqlx::test(migrations = false)]
+async fn the_server_and_what_it_hands_out_print(pool: PgPool) {
+    world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        codecs(),
+        REPLICAS,
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the server");
+    assert!(format!("{server:?}").starts_with("Server { engine: Engine { tables: ["));
+    assert!(format!("{:?}", server.engine()).contains("items"));
+    assert_eq!(format!("{:?}", Anyone::new(pool)), "Anyone { .. }");
+    assert_eq!(
+        format!("{:?}", codecs()[0]).split(',').next().unwrap(),
+        "Codec { table: \"items\""
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_answered(
     pool: PgPool,
@@ -1061,19 +1085,11 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
 
     spawnable(Engine::triggers(&mut conn, &codecs(), REPLICAS));
     spawnable(crate::row::upsert::<Item>(&mut conn, Vec::new()));
-    spawnable(crate::row::get::<Item>(&mut conn, &Vec::new()));
+    spawnable(crate::row::get_by_keys::<Item>(&mut conn, &[]));
     let engine = server.engine();
     let scope = crate::status::Scope::All;
     spawnable(engine.overview(&mut conn, scope, 1));
-    spawnable(engine.listing(
-        &mut conn,
-        scope,
-        None,
-        crate::status::Page {
-            offset: 0,
-            limit: 1,
-        },
-    ));
+    spawnable(engine.listing(&mut conn, scope, None, crate::status::Page::new(0, 1)));
     spawnable(engine.health(&mut conn, scope, 1));
     spawnable(engine.progress(&mut conn, scope));
     spawnable(engine.row_progress(&mut conn, scope, "items", ""));
@@ -1264,8 +1280,7 @@ async fn a_replica_named_twice_by_its_relation_is_one(pool: PgPool) {
     let server = Server::new(
         pool.clone(),
         codecs(),
-        Replicas::relation("fixture.twice")
-            .table("t_replicas")
+        Replicas::new("fixture.twice", "t_replicas")
             .live("live")
             .partitioned_by("partition_id"),
         wire.clone(),

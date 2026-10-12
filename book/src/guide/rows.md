@@ -39,8 +39,8 @@ For a table that goes down:
 
 The shop's rows use a few more: `schema`, the table's PostgreSQL schema;
 `retired`, the column a register sets on a product it lets go of but must
-keep; `#[row(version)]`, the column whose value only moves forward; and
-`#[row(created)]`, a column written once. Every key and flag the derive takes
+keep; `#[row(version)]`, the column of a record a register edits whose value
+only moves forward; and `#[row(created)]`, a column written once. Every key and flag the derive takes
 — a key of several columns, a view rows are read through, the columns one
 side leaves out, the columns replicas own — is in
 [the derive's reference](../api/server/magic_sync/derive.Row.html), and
@@ -64,5 +64,5 @@ migrations build is all it takes to see it before a deploy.
 
 The derive checks the rest where you write it: a key that is not a field, a
 column named twice, an attribute a table of its kind cannot have (a `sync`
-rule on a record, a version owned by a replica), a key or version of a type
+rule on a record, a version on a table the server sends down), a key or version of a type
 the engine cannot read — each is a compile error pointing at what says it.

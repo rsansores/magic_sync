@@ -66,7 +66,6 @@ pub struct RegisterState {
     pub label: String,
     #[row(replica_owned)]
     pub battery: Option<i32>,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 // ANCHOR_END: both
@@ -85,7 +84,45 @@ pub struct RegisterState {
 pub struct LiveProduct {
     pub id: Uuid,
     pub name: String,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 // ANCHOR_END: active
+
+// ANCHOR: desired
+/// What the head office wants one of a register's settings to be.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(
+    table = "desired_settings",
+    schema = "shop",
+    mirror = "catalog",
+    key = "register_id, id",
+    sync = "assigned(register_id)"
+)]
+pub struct DesiredSetting {
+    pub register_id: Uuid,
+    pub id: Uuid,
+    pub value: String,
+    /// Raised by every change, so the register can tell a new wish from one
+    /// it has carried out.
+    pub revision: i64,
+}
+// ANCHOR_END: desired
+
+// ANCHOR: reported
+/// What one of a register's settings is, as the register reports it.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(
+    table = "reported_settings",
+    schema = "shop",
+    mirror = "record",
+    key = "register_id, id",
+    origin = "register_id"
+)]
+pub struct ReportedSetting {
+    pub register_id: Uuid,
+    pub id: Uuid,
+    pub value: String,
+    #[row(version)]
+    pub reported_at: DateTime<Utc>,
+}
+// ANCHOR_END: reported

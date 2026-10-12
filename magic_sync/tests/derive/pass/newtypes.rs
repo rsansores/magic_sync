@@ -23,7 +23,7 @@ impl Version for Revision {
 }
 
 #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
-#[row(table = "regions", mirror = "catalog", sync = "broadcast")]
+#[row(table = "regions", mirror = "record")]
 pub struct Region {
     pub id: RegionId,
     pub name: String,

@@ -5,11 +5,17 @@ is written in and whatever database it keeps its rows in. The engine's own
 replica (`src/replica.rs`, on SQLite) is one implementation of it; this
 document is the contract that one follows, and any other must.
 
-The messages are in [`proto/sync.proto`](https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto). Generate code for
-your language from it; the engine's own types are generated from it too, and
-a test fails while they differ.
+The messages are in
+[`proto/sync.proto`](https://github.com/rsansores/magic_sync/blob/main/magic_sync/proto/sync.proto).
+Generate code for your language from it; the engine's own types are generated
+from it too, and a test fails while they differ.
 
 The words **must**, **must not** and **should** mean what they mean in RFCs.
+
+Sections 1 to 10 are what a replica does, and the whole of what an
+implementation needs. What the server does with what a replica sends is in
+[Appendix A](#appendix-a-what-the-server-does-with-it): it explains the
+rules, and no replica has to implement any of it.
 
 ---
 
@@ -65,13 +71,13 @@ A **transport acknowledgement** (section 5.1) is what makes the transport
 deliver the next message. It is not the same as telling the server what was
 applied (section 5.2).
 
-A transport that loses a message anyway costs time, not data: the next
-message names the one before it, so the replica knows it missed one and is
-provisioned again (4.1); a replica that leaves messages unconfirmed while
-nothing newer goes to it is provisioned again (section 9), an upload the server did not answer is sent again
-(section 7), and a digest that disagrees provisions the replica again
-(section 8). That is the engine's safety net, not a licence: until it acts,
-the replica holds less than it should.
+A transport that loses a message anyway costs time, not data: the next message
+names the one before it, so the replica knows it missed one and is provisioned
+again (4.1); a replica that leaves messages unconfirmed while nothing newer goes
+to it is provisioned again (A.1), an upload the server did not answer is sent
+again (section 7), and a digest that disagrees provisions the replica again
+(section 8). That is the engine's safety net, not a licence: until it acts, the
+replica holds less than it should.
 
 ---
 
@@ -118,10 +124,10 @@ document its sender speaks (now `1`).
 - The server does the same with an `Up` of a later protocol than its own,
   and drops an `Up` of protocol 0 as malformed.
 
-A message that is **malformed** — bytes that do not decode as a `ToReplica`;
-one of protocol 0 (unset), or of the replica's own protocol or earlier whose
-body it does not know, or that has none; numbers no server sends (4.1) —
-carries nothing a replica can act on: it **must** apply none of it, **should** log it, and
+A message that is **malformed** — bytes that do not decode as a `ToReplica`; one
+of protocol 0 (unset), or of the replica's own protocol or earlier whose body it
+does not know, or that has none; numbers no server sends (4.1) — carries nothing
+a replica can act on: it **must** apply none of it, **should** log it, and
 **must** acknowledge it, so it does not hold back the queue. The digests
 (section 8) find whatever it carried, if it mattered.
 
@@ -129,18 +135,24 @@ What a server sends, field by field — anything else is a number no server
 sends, and the corpus of malformed messages (`tests/golden/malformed.txt`)
 has a case of each:
 
-| Field | What a server sends | Cases |
-|---|---|---|
-| `protocol` | 1 to the replica's own | `no_protocol` |
-| `sequence` | 1 to 2^63 − 1 | `sequence_zero`, `sequence_too_large` |
-| `nonce` | 1 to 2^63 − 1 | `no_nonce`, `nonce_too_large` |
-| `previous` | below `sequence` | `follows_itself`, `follows_a_later_one` |
-| `previous_nonce` | 0 with `previous` 0, and otherwise 1 to 2^63 − 1 | `follows_without_its_nonce`, `follows_nothing_with_a_nonce`, `follows_a_nonce_too_large` |
-| `epoch` | a UUID | `epoch_no_uuid` |
-| `snapshot_id` | a UUID; empty on a message of no snapshot | `snapshot_no_uuid`, `ends_a_snapshot_of_no_id` |
-| `mac` | 16 bytes | `no_mac`, `mac_too_short`, `mac_too_long` |
-| `keys` | one per upsert | `keys_not_one_per_row` |
-| `tables`, `deletes`, `upserts`, `uploads` | no more rows — upserts and deletes together — and no more tables, or uploads, than the replica takes in a message: the server's limits, or more (500 each by default) | `more_rows_than_a_message_carries`, `more_tables_than_a_message_carries`, `ends_more_tables_than_a_message_carries`, `files_more_uploads_than_a_message_carries` |
+- `protocol`: 1 to the replica's own. Cases: `no_protocol`.
+- `sequence`: 1 to 2^63 − 1. Cases: `sequence_zero`, `sequence_too_large`.
+- `nonce`: 1 to 2^63 − 1. Cases: `no_nonce`, `nonce_too_large`.
+- `previous`: below `sequence`. Cases: `follows_itself`, `follows_a_later_one`.
+- `previous_nonce`: 0 with `previous` 0, and otherwise 1 to 2^63 − 1. Cases:
+  `follows_without_its_nonce`, `follows_nothing_with_a_nonce`,
+  `follows_a_nonce_too_large`.
+- `epoch`: a UUID. Cases: `epoch_no_uuid`.
+- `snapshot_id`: a UUID; empty on a message of no snapshot. Cases:
+  `snapshot_no_uuid`, `ends_a_snapshot_of_no_id`.
+- `mac`: 16 bytes. Cases: `no_mac`, `mac_too_short`, `mac_too_long`.
+- `keys`: one per upsert. Cases: `keys_not_one_per_row`.
+- `tables`, `deletes`, `upserts`, `uploads`: no more rows — upserts and deletes
+  together — and no more tables, or uploads, than the replica takes in a
+  message: the server's limits, or more (500 each by default). Cases:
+  `more_rows_than_a_message_carries`, `more_tables_than_a_message_carries`,
+  `ends_more_tables_than_a_message_carries`,
+  `files_more_uploads_than_a_message_carries`.
 
 A row's own fields are the row's to answer for, not the message's: a key
 that does not parse, a row that does not decode, a table the replica does
@@ -246,15 +258,14 @@ their deletes ignored.
    A key both let go of and upserted in one part is held: its upsert comes
    after. A key upserted twice in one part is the last row beside it.
 
-**A row the database refuses is tried again once the rest of its part is
-in, and once the whole message is** — every part of it, the deletes of
-later parts included — each while that takes one more: it may point at a row after it, or take a unique value
-a row after it, or a delete after it, gives up. One that a later part lets
-go of is not tried again: the server let go of it. What is still refused
-then is rejected (section 6). Two rows that swap a unique value cannot be
-taken one at a time — the database checks each row as it is written — so
-both are rejected, and keep what they held, until the server sends them
-otherwise.
+**A row the database refuses is tried again once the rest of its part is in, and
+once the whole message is** — every part of it, the deletes of later parts
+included — each while that takes one more: it may point at a row after it, or
+take a unique value a row after it, or a delete after it, gives up. One that a
+later part lets go of is not tried again: the server let go of it. What is still
+refused then is rejected (section 6). Two rows that swap a unique value cannot
+be taken one at a time — the database checks each row as it is written — so both
+are rejected, and keep what they held, until the server sends them otherwise.
 
 **A row the replica cannot take, or let go of, does not fail the message.**
 If a row does not decode, if the replica's database refuses it for its data
@@ -306,8 +317,9 @@ is malformed (4.1).
   superseded — or names none while one is in progress, is one no server
   sends: malformed (4.0).
 - `EndSnapshot` carries `sequence`, `epoch`, `nonce`, `previous`,
-  `previous_nonce` and `mac`, and follows the same rules as `Down` (4.1). It needs no count of what the snapshot sent:
-  its messages are chained, and one lost is a gap.
+  `previous_nonce` and `mac`, and follows the same rules as `Down` (4.1). It
+  needs no count of what the snapshot sent: its messages are chained, and one
+  lost is a gap.
 
 ### 4.3 Retired rows
 
@@ -366,45 +378,10 @@ within seconds of applying, and again whenever it applied something new,
 or was delivered a message at or below the last it applied. `sequence` 0
 says it has applied nothing yet.
 
-The server checks the seal: one it did not make — a replica that lies, or a
-bug — is ignored, and resets nothing. It ignores a report that does not
-parse, and one of another epoch — unless it last heard the replica apply a
-message of its own epoch: a replica only goes forward, so it follows an
-epoch this database never had, which was restored from a copy older than
-that epoch began. The server provisions that replica again, unless a
-snapshot written for it since is on its way. A sealed one it judges against what it
-recorded sending the replica:
-
-- a message past the last it recorded sending it — or, having recorded
-  none since it last provisioned it, past every number it drew — or one at
-  the sequence of the last it sent it, or of the last it heard applied,
-  with another nonce: the server sealed it, and has no record of it. Its
-  own database was restored from a copy older than what the replica
-  applied. It raises an alarm — whoever runs it should know the database
-  went back — takes a new epoch, with a new secret, drops what it was about
-  to send, and provisions every replica again;
-- a message older than the last it heard the replica applied: the replica
-  was restored from an older copy, and holds less than the server records.
-  The server provisions it again, unless a snapshot written for it since
-  is on its way;
-- otherwise the server counts the rows of every message up to it as held.
-
 A replica with a gap (4.1) **must** say so: `gap`, the sequence of the
 newest message it could not follow, on every `Up` of its first lane, with
 its last applied, until a snapshot begins; and it **must** send one at once
-whenever that sequence grows. The server provisions it again, unless a
-snapshot that began after that message is on its way: a snapshot that began
-before it is one the replica lost the beginning of, or applied before it
-was restored from an older copy.
-A gap past every message the server sent the replica is none it could have
-missed: malformed, and left out.
-
-Neither a gap nor a message older than the last applied carries a seal the
-server can check, so what a replica says of itself provisions it again at
-most once a minute, and twice as long between each time while it keeps
-saying so, up to 32 minutes; one quiet for 64 minutes starts over. One that
-says it sooner is provisioned again once it may: the server notes it for
-then.
+whenever that sequence grows. The server answers with a snapshot (A.2).
 
 ---
 
@@ -443,21 +420,6 @@ it. A row whose key cannot be told is logged and not reported.
   next one when it would leave the first rejection no room — and never
   holds back the confirmation. Rejections count against a message's rows
   as the rows it carries do.
-
-On a rejection of the last message that carried the row, the server
-records the row **refused**: still held for every decision that takes rows
-back — a delete still goes when the row leaves the replica's scope, and a
-refused delete is sent again — and not held for progress, or for digests.
-The row is set aside for that replica, and sent again, or its delete, when
-the relay restarts or on a timer, which is after a deploy on either side
-has had the chance to fix the cause; it is taken once the replica applies a
-later message that carries it. A rejection of a delete re-records the row
-the server took back. A rejection of a message other than the last one that
-carried the row, or of another epoch, names a version that no longer
-matters, or none it was sent, and is left out. The key is read as its table's key (section 3)
-whatever its spelling. A rejection of anything else — a table the server
-does not send, no key or one that is not the table's, a message never sent
-the replica — is malformed and left out. Nobody repairs the row by hand.
 
 ---
 
@@ -502,42 +464,13 @@ For a table the replica writes and the server mirrors:
    upload not answered after a while (minutes) should be sent again; the
    server files the same rows idempotently.
 
-The server files an upload under **the replica it came from** (the transport
-says which), whatever the rows themselves claim: a row of a table keyed by
-its replica that names another replica there is malformed, and left out. A
-row of a table written on both sides is an edit of the columns the replica
-owns, filed only as an update of a row the server has and records the
-replica holding. One it does not record the replica holding while it
-provisions the replica again — the provisioning pending, or written and not
-confirmed — is kept, and filed once it does; otherwise, one of a row the
-replica no longer holds — the server deleted it, or is taking it back — is
-left out: the server's wins. One of a row it never sent the replica is
-malformed, and left out. A
-row the server cannot file, or a delete its database refuses, is kept on the
-server, not lost, and filed later; so are an upload's rows whose filing fails
-as a whole for a reason a resend cannot cure. Either still counts as filed
-for `Filed`. The server keeps, of each row, the newest upload of it: a later
-upload of the row replaces what it kept, or drops it once filed, so what is
-filed later never rolls the row back. So it keeps a row only with its key in
-`keys`: one without is malformed, and left out. What the upload says of the replica — rejections, the last
-applied message, a gap, digests, the backlog — is filed apart from its rows,
-so neither holds back the other. Deletes of a table not keyed by the replica,
-and keys that are not the table's, are malformed and left out. An upload
-beyond the server's limits — more bytes than a message takes, or more rows
-and rejections together than one carries: a rejection counts as a row — is
-malformed: dropped, unanswered,
-so it waits on the replica until a server that takes it runs. A replica's
-limits are the server's, or less. So is an upload from a sender that is no
-replica of the server's.
-
 A replica **may** say what it wrote and the server has not filed yet, in
 `Up.backlog`: per table, rows not sent yet (`unsent`), rows sent and not
-yet `Filed` (`unfiled`), and rows set aside (`set_aside`). The server keeps the last one it was told, with the
-time, and shows the replica as catching up while it is not empty. Say it
+yet `Filed` (`unfiled`), and rows set aside (`set_aside`). Say it
 when it changes — at once when it empties — and not on every write; say it
 again now and then while it is not empty, and to a server whose epoch
 changed, either of which may have lost it. An `Up` without `backlog` leaves
-the last one standing. A replica that never says leaves the server with
+the last one standing (A.3). A replica that never says leaves the server with
 nothing to show, and nothing breaks.
 
 A replica may send its writes on several **lanes** — streams of `Up`s the
@@ -585,53 +518,9 @@ rows the server has not filed yet (section 7): what the server records of
 it is about to change, and a comparison now would find them apart for
 nothing.
 
-The server compares a digest only when the replica has applied every message
-recorded for it (the same epoch and last sequence, sealed by the server), and
-against what it recorded as of that message: when it has sent the replica
-more meanwhile, it waits for the next digests. If they differ, it
-provisions the replica again from scratch (4.2). Digests that differ again
-within a day of the provisioning they caused are a bug no provisioning cures:
-the server logs them and does not act on them. A digest of a table the server
-does not send the replica — a later build's, or one it no longer sends — is
-skipped. Two digests of one table are malformed: none of that `Up`'s digests
-is compared. The server compares a replica's digests at most once every ten
-minutes: those that come sooner are not compared. A replica that skips
-digests loses only this safety net.
-
 ---
 
-## 9. What the server guarantees in return
-
-- Every change committed on the server reaches every replica that should hold
-  the row, as the row is at sending time.
-- A row is sent with every row it points at that the replica lacks, and is
-  taken back only once nothing the replica keeps points at it.
-- Every message carries a number and a random nonce of its own, and the
-  numbers a replica is sent rise within an epoch in the order it is sent
-  them; each names the one before it, number and nonce, so a replica can
-  tell it missed one — even when a restored server numbers a message as
-  one it applied. What a message carries is recorded before it is sent,
-  and a message that the transport did not take is sent again, under the
-  same number and nonce, before anything after it.
-- A replica that leaves the last messages it was sent unconfirmed, while
-  nothing newer goes to it, is provisioned again after a while: the transport
-  may have lost them.
-  One that says it missed a message is provisioned again at once.
-- A server whose database was restored from an older copy finds out from
-  the first replica that says it applied a message the server sealed and
-  that copy has no record of sending it, and provisions every replica
-  again, under a new epoch. A replica restored from an older copy finds
-  out from the next message it is sent, and says so; on a server with
-  nothing to send it, the server finds out from what it says it applied,
-  which is less than it said before.
-- A row the server cannot send to a replica, or that a replica rejected, is
-  set aside and sent again after a fix: it is never silently dropped.
-- An upload is answered with `Filed` only after the transaction that filed it
-  committed.
-
----
-
-## 10. A session, start to finish
+## 9. A session, start to finish
 
 ```
 server                                         replica
@@ -667,7 +556,7 @@ server                                         replica
 
 ---
 
-## 11. Conformance checklist
+## 10. Conformance checklist
 
 The engine's repository holds test vectors, each line a name, what the
 other side makes of the message, and the message in hex; each file's header
@@ -730,3 +619,141 @@ A replica implementation is complete when:
       carried them;
 - [ ] it reports digests with the fingerprint above (optional, recommended);
 - [ ] it says its backlog when it changes (optional, recommended).
+
+---
+
+## Appendix A. What the server does with it
+
+Nothing here is a duty of a replica. It is what the server does with what a
+replica sends, written down so that a replica's author knows why the rules
+above are what they are, and what to expect when a replica breaks one. The
+sections it explains are named at each part.
+
+### A.1 What the server guarantees in return
+
+- Every change committed on the server reaches every replica that should hold
+  the row, as the row is at sending time.
+- A row is sent with every row it points at that the replica lacks, and is
+  taken back only once nothing the replica keeps points at it.
+- Every message carries a number and a random nonce of its own, and the
+  numbers a replica is sent rise within an epoch in the order it is sent
+  them; each names the one before it, number and nonce, so a replica can
+  tell it missed one — even when a restored server numbers a message as
+  one it applied. What a message carries is recorded before it is sent,
+  and a message that the transport did not take is sent again, under the
+  same number and nonce, before anything after it.
+- A replica that leaves the last messages it was sent unconfirmed, while
+  nothing newer goes to it, is provisioned again after a while: the transport
+  may have lost them.
+  One that says it missed a message is provisioned again at once.
+- A server whose database was restored from an older copy finds out from
+  the first replica that says it applied a message the server sealed and
+  that copy has no record of sending it, and provisions every replica
+  again, under a new epoch. A replica restored from an older copy finds
+  out from the next message it is sent, and says so; on a server with
+  nothing to send it, the server finds out from what it says it applied,
+  which is less than it said before.
+- A row the server cannot send to a replica, or that a replica rejected, is
+  set aside and sent again after a fix: it is never silently dropped.
+- An upload is answered with `Filed` only after the transaction that filed it
+  committed.
+
+### A.2 What the server makes of "what I applied" (section 5.2)
+
+The server checks the seal: one it did not make — a replica that lies, or a bug
+— is ignored, and resets nothing. It ignores a report that does not parse, and
+one of another epoch — unless it last heard the replica apply a message of its
+own epoch: a replica only goes forward, so it follows an epoch this database
+never had, which was restored from a copy older than that epoch began. The
+server provisions that replica again, unless a snapshot written for it since is
+on its way. A sealed one it judges against what it recorded sending the replica:
+
+- a message past the last it recorded sending it — or, having recorded
+  none since it last provisioned it, past every number it drew — or one at
+  the sequence of the last it sent it, or of the last it heard applied,
+  with another nonce: the server sealed it, and has no record of it. Its
+  own database was restored from a copy older than what the replica
+  applied. It raises an alarm — whoever runs it should know the database
+  went back — takes a new epoch, with a new secret, drops what it was about
+  to send, and provisions every replica again;
+- a message older than the last it heard the replica applied: the replica
+  was restored from an older copy, and holds less than the server records.
+  The server provisions it again, unless a snapshot written for it since
+  is on its way;
+- otherwise the server counts the rows of every message up to it as held.
+
+A replica with a gap (4.1) is provisioned again, unless a snapshot that
+began after that message is on its way: a snapshot that began before it is
+one the replica lost the beginning of, or applied before it was restored
+from an older copy. A gap past every message the server sent the replica is
+none it could have missed: malformed, and left out.
+
+Neither a gap nor a message older than the last applied carries a seal the
+server can check, so what a replica says of itself provisions it again at
+most once a minute, and twice as long between each time while it keeps
+saying so, up to 32 minutes; one quiet for 64 minutes starts over. One that
+says it sooner is provisioned again once it may: the server notes it for
+then.
+
+### A.3 How the server files an upload (section 7)
+
+The server files an upload under **the replica it came from** (the transport
+says which), whatever the rows themselves claim: a row of a table keyed by its
+replica that names another replica there is malformed, and left out. A row of a
+table written on both sides is an edit of the columns the replica owns, filed
+only as an update of a row the server has and records the replica holding. One
+it does not record the replica holding while it provisions the replica again —
+the provisioning pending, or written and not confirmed — is kept, and filed once
+it does; otherwise, one of a row the replica no longer holds — the server
+deleted it, or is taking it back — is left out: the server's wins. One of a row
+it never sent the replica is malformed, and left out. A row the server cannot
+file, or a delete its database refuses, is kept on the server, not lost, and
+filed later; so are an upload's rows whose filing fails as a whole for a reason
+a resend cannot cure. Either still counts as filed for `Filed`. The server
+keeps, of each row, the newest upload of it: a later upload of the row replaces
+what it kept, or drops it once filed, so what is filed later never rolls the row
+back. So it keeps a row only with its key in `keys`: one without is malformed,
+and left out. What the upload says of the replica — rejections, the last applied
+message, a gap, digests, the backlog — is filed apart from its rows, so neither
+holds back the other. Deletes of a table not keyed by the replica, and keys that
+are not the table's, are malformed and left out. An upload beyond the server's
+limits — more bytes than a message takes, or more rows and rejections together
+than one carries: a rejection counts as a row — is malformed: dropped,
+unanswered, so it waits on the replica until a server that takes it runs. A
+replica's limits are the server's, or less. So is an upload from a sender that
+is no replica of the server's.
+
+The server keeps the last backlog it was told, with the time, and shows the
+replica as catching up while it is not empty.
+
+### A.4 How the server records a rejection (section 6)
+
+On a rejection of the last message that carried the row, the server records the
+row **refused**: still held for every decision that takes rows back — a delete
+still goes when the row leaves the replica's scope, and a refused delete is sent
+again — and not held for progress, or for digests. The row is set aside for that
+replica, and sent again, or its delete, when the relay restarts or on a timer,
+which is after a deploy on either side has had the chance to fix the cause; it
+is taken once the replica applies a later message that carries it. A rejection
+of a delete re-records the row the server took back. A rejection of a message
+other than the last one that carried the row, or of another epoch, names a
+version that no longer matters, or none it was sent, and is left out. The key is
+read as its table's key (section 3) whatever its spelling. A rejection of
+anything else — a table the server does not send, no key or one that is not the
+table's, a message never sent the replica — is malformed and left out. Nobody
+repairs the row by hand.
+
+### A.5 How the server compares digests (section 8)
+
+The server compares a digest only when the replica has applied every message
+recorded for it (the same epoch and last sequence, sealed by the server), and
+against what it recorded as of that message: when it has sent the replica
+more meanwhile, it waits for the next digests. If they differ, it
+provisions the replica again from scratch (4.2). Digests that differ again
+within a day of the provisioning they caused are a bug no provisioning cures:
+the server logs them and does not act on them. A digest of a table the server
+does not send the replica — a later build's, or one it no longer sends — is
+skipped. Two digests of one table are malformed: none of that `Up`'s digests
+is compared. The server compares a replica's digests at most once every ten
+minutes: those that come sooner are not compared. A replica that skips
+digests loses only this safety net.

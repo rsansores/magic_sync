@@ -116,9 +116,9 @@ impl Default for Settings {
 /// of its own, and handed every message the server sends.
 ///
 /// ```no_run
-/// use magic_sync::run::replica::{Settings, Uplink};
+/// use magic_sync::run::replica::{Replica, Settings, Uplink};
 /// use magic_sync::wire::Codec;
-/// use magic_sync::{replica, Error, Replica};
+/// use magic_sync::{replica, Error};
 /// use std::sync::Arc;
 /// use uuid::Uuid;
 ///
@@ -167,6 +167,16 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     /// Per lane, how many rows and rejections the next message passes over
     /// while it looks for one the transport takes: 0 when it is not looking.
     skips: Vec<AtomicUsize>,
+}
+
+impl<P: 'static, I: Identity, U: Uplink> std::fmt::Debug for Replica<P, I, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tables: Vec<_> = self.codecs.iter().map(|c| c.table.name).collect();
+        f.debug_struct("Replica")
+            .field("tables", &tables)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {

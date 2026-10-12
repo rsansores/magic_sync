@@ -5,8 +5,7 @@ export const CONTRACT = 1
 
 /**
  * Where a replica stands, in one word: the first of these that applies.
- * Ordered worst first. It reads back from its JSON too, for a host that
- * takes the state to list from a request.
+ * Ordered worst first.
  */
 export type ReplicaState = "awaiting_fix" | "unreachable" | "catching_up" | "synced";
 
@@ -134,19 +133,19 @@ backlog: Backlog | null, };
  */
 export type ReplicaCounts = { 
 /**
- * Replicas [`ReplicaState::AwaitingFix`].
+ * Replicas whose state is `awaiting_fix`.
  */
 awaiting_fix: number, 
 /**
- * Replicas [`ReplicaState::Unreachable`].
+ * Replicas whose state is `unreachable`.
  */
 unreachable: number, 
 /**
- * Replicas [`ReplicaState::CatchingUp`].
+ * Replicas whose state is `catching_up`.
  */
 catching_up: number, 
 /**
- * Replicas [`ReplicaState::Synced`].
+ * Replicas whose state is `synced`.
  */
 synced: number, };
 
@@ -308,7 +307,7 @@ last_at: string,
 attempts: number, };
 
 /**
- * A replica sends to keep failing to.
+ * A replica that sends keep failing to.
  */
 export type Failing = { 
 /**
@@ -337,7 +336,7 @@ export type Health = {
 /**
  * Nothing waits for a fix. A replica out of reach is not unhealthy — it
  * is the network's to settle, and listed in `failing`; nor is a
- * backlog, unless it stops draining, which the host says when.
+ * backlog, unless it stops draining, which `oldest` shows.
  */
 healthy: boolean, 
 /**
@@ -361,7 +360,7 @@ quarantine: Listed<Quarantined>,
  */
 inbox: Listed<Unfiled>, 
 /**
- * Replicas sends keep failing to.
+ * Replicas that sends keep failing to.
  */
 failing: Listed<Failing>, };
 
@@ -373,7 +372,7 @@ failing: Listed<Failing>, };
  */
 export type Overview = { 
 /**
- * The contract this answer serializes as: [`CONTRACT`].
+ * The contract this answer serializes as: `CONTRACT`.
  */
 contract: number, 
 /**
@@ -403,7 +402,7 @@ tables: Array<TableOverview>, };
  */
 export type Listing = { 
 /**
- * The contract this answer serializes as: [`CONTRACT`].
+ * The contract this answer serializes as: `CONTRACT`.
  */
 contract: number, 
 /**
@@ -480,7 +479,7 @@ tables: Array<TableProgress>, };
  */
 export type Progress = { 
 /**
- * The contract this answer serializes as: [`CONTRACT`].
+ * The contract this answer serializes as: `CONTRACT`.
  */
 contract: number, 
 /**
@@ -507,7 +506,7 @@ state: RowState, };
  */
 export type RowProgress = { 
 /**
- * The contract this answer serializes as: [`CONTRACT`].
+ * The contract this answer serializes as: `CONTRACT`.
  */
 contract: number, 
 /**

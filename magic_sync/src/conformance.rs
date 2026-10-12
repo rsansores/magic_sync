@@ -26,7 +26,6 @@ pub struct Shelf {
     pub aisle: Uuid,
     pub slot: i64,
     pub label: String,
-    #[row(version)]
     pub revision: i64,
 }
 
@@ -42,7 +41,6 @@ pub struct Shelf {
 pub struct Price {
     pub id: Uuid,
     pub cents: i64,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -62,7 +60,6 @@ pub struct Task {
     pub title: String,
     #[row(replica_owned)]
     pub done: bool,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -791,9 +788,7 @@ mod server {
             .await
             .unwrap();
         drop(conn);
-        let replicas = Replicas::relation("fixture.t_replicas")
-            .table("t_replicas")
-            .live("live");
+        let replicas = Replicas::new("fixture.t_replicas", "t_replicas").live("live");
         let kept = Kept::default();
         let settings = Settings {
             limits: Limits {
@@ -1075,9 +1070,7 @@ mod server {
         let server = Server::install(
             pool.clone(),
             codecs(),
-            Replicas::relation("fixture.t_replicas")
-                .table("t_replicas")
-                .live("live"),
+            Replicas::new("fixture.t_replicas", "t_replicas").live("live"),
             kept.clone(),
             Anyone::new(pool.clone()),
             Settings::default(),

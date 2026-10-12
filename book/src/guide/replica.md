@@ -22,7 +22,8 @@ so does every message it applies, on whichever connection of the pool:
 commits that are not durable (`synchronous` below `FULL`, which sqlx's pools
 keep by default), since a message the replica acknowledged must still be
 applied after a power cut; a journal that cannot roll back (`journal_mode`
-`OFF` or `MEMORY`), since a message is applied whole or not at all; and
+`OFF` or `MEMORY`, of a database with a file; one in memory has no crash to
+survive), since a message is applied whole or not at all; and
 triggers that miss the rows a conflict replaces (`recursive_triggers`, off
 by default), since a row an `INSERT OR REPLACE` deletes must go up as gone.
 Set them in the pool's options, so every connection has them:

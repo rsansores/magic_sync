@@ -2249,7 +2249,6 @@ async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: crate:
         id: Uuid,
         name: String,
         price_cents: i64,
-        #[row(version)]
         updated_at: DateTime<Utc>,
     }
 
@@ -2265,9 +2264,7 @@ async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: crate:
     let printed = Engine::triggers(
         &mut conn,
         &[Codec::<()>::json::<Product>(None)],
-        Replicas::relation("shop.registers")
-            .table("registers")
-            .live("active"),
+        Replicas::new("shop.registers", "registers").live("active"),
     )
     .await
     .expect("the triggers");
@@ -2308,6 +2305,40 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
     .await
     .expect("triggers");
     assert_eq!(notes, 1);
+}
+
+/// Each released step of the engine's schema is as it was released and
+/// brings a database to its version: a step is never edited, a later version
+/// is a step of its own.
+#[sqlx::test(migrations = false)]
+async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
+    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0x3931_5e62_776a_f26c];
+    let fnv = |text: &str| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS sync CASCADE")
+        .execute(&mut *conn)
+        .await
+        .expect("drop the schema");
+    for (version, pinned) in (1..=crate::SERVER_SCHEMA_VERSION).zip(released) {
+        let step = migration(version).expect("a released step");
+        assert_eq!(
+            fnv(&step),
+            pinned,
+            "step {version} was edited: {:#x}",
+            fnv(&step)
+        );
+        sqlx::raw_sql(&step)
+            .execute(&mut *conn)
+            .await
+            .expect("the step");
+        assert_eq!(self::version(&mut conn).await.unwrap(), Some(version));
+    }
+    assert_eq!(migration(0), None);
+    assert_eq!(migration(crate::SERVER_SCHEMA_VERSION + 1), None);
 }
 
 #[sqlx::test(migrations = false)]
@@ -2729,19 +2760,15 @@ async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate
     };
     for (replicas, named) in [
         (
-            Replicas::relation("fixture.nowhere").table("t_replicas"),
+            Replicas::new("fixture.nowhere", "t_replicas"),
             "no table or view",
         ),
         (
-            Replicas::relation("fixture.t_replicas")
-                .table("t_replicas")
-                .live("alive"),
+            Replicas::new("fixture.t_replicas", "t_replicas").live("alive"),
             "does not read",
         ),
         (
-            Replicas::relation("fixture.t_replicas")
-                .table("t_replicas")
-                .partitioned_by("retired_at"),
+            Replicas::new("fixture.t_replicas", "t_replicas").partitioned_by("retired_at"),
             "no uuid column `retired_at`",
         ),
     ] {

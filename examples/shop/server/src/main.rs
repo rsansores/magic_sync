@@ -14,9 +14,9 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
-use magic_sync::run::server::{Anyone, Settings, Transport};
+use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 use magic_sync::status::{Listing, Overview, Progress, ReplicaState, RowProgress, Scope};
-use magic_sync::{Error, Server};
+use magic_sync::Error;
 use serde::{Deserialize, Serialize};
 use shop_rows::{codecs, Product, Receipt, REGISTERS};
 use sqlx::PgPool;
@@ -310,10 +310,7 @@ async fn listing(
             &mut conn,
             Scope::All,
             page.state,
-            magic_sync::status::Page {
-                offset: page.offset,
-                limit: 20,
-            },
+            magic_sync::status::Page::new(page.offset, 20),
         )
         .await?;
     Ok(Json(listing))

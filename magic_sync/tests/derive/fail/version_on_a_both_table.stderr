@@ -1,0 +1,5 @@
+error: #[row(version)] orders the reports of a replica's table: only a `record` has one, and a replica takes what the server sends whatever its version
+ --> tests/derive/fail/version_on_a_both_table.rs:7:11
+  |
+7 |     #[row(version)]
+  |           ^^^^^^^

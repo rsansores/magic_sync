@@ -109,8 +109,8 @@ is planned and sent again by the next relay, as after a crash:
 >   draining, rows in quarantine. Each of those means *wait* (the network) or
 >   *deploy a fix* (a bug), never *go fix the data*.
 
-`Settings` holds the knobs: message size limits, notes per pass, the lock's
-key, how often it retries and prunes, how long a send may take and how long
+`Settings` holds the knobs: message size limits, notes per pass, how often it
+retries and prunes, how long a send may take and how long
 a replica it failed to waits, how long a replica may leave what it was sent
 unconfirmed before it is provisioned again, and `role` — a role every
 transaction of the engine's own assumes, when your connecting role has less

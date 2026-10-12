@@ -81,6 +81,41 @@ async fn world_over(pool: SqlitePool, tables: &str, settings: Settings) -> World
     w
 }
 
+/// A replica over a database with no file is a replica: it has no crash to
+/// leave a message half applied through, so the journal it is always in is
+/// not refused.
+#[tokio::test]
+async fn a_replica_over_an_in_memory_database_receives() {
+    let options = "sqlite::memory:"
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .pragma("recursive_triggers", "ON");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    install(&mut pool.acquire().await.unwrap(), &codecs())
+        .await
+        .expect("installed");
+    let replica = Replica::new(
+        pool.clone(),
+        codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .expect("a replica over memory");
+    assert!(format!("{replica:?}").starts_with("Replica { tables: ["));
+    let received = replica.receive(&ending(BASE, 0, "provisioned", &[])).await;
+    assert!(
+        matches!(received, Ok(Received::SnapshotEnded)),
+        "{received:?}"
+    );
+}
+
 impl World {
     /// `bytes` received as a host receives them: nothing a message carries
     /// is an error.
@@ -2622,7 +2657,6 @@ struct Cart {
     id: Uuid,
     #[row(replica_owned)]
     note: String,
-    #[row(version)]
     at: i64,
 }
 
@@ -4319,9 +4353,9 @@ async fn a_table_that_is_not_its_row_is_refused_with_every_difference(pool: Sqli
     );
 }
 
-/// Rows by key are the active ones: on a replica, less the retired.
+/// Rows by key are every one the table holds, a retired row among them.
 #[sqlx::test(migrations = false)]
-async fn rows_by_key_are_the_ones_not_retired(pool: SqlitePool) {
+async fn rows_by_key_include_the_retired(pool: SqlitePool) {
     let w = world(pool).await;
     let [kept, retired, aisle] = ids();
     let shelf = Shelf {
@@ -4358,23 +4392,27 @@ async fn rows_by_key_are_the_ones_not_retired(pool: SqlitePool) {
         vec![crate::row::KeyPart::Uuid(kept)],
         vec![crate::row::KeyPart::Uuid(retired)],
     ];
-    let items = crate::row::get_many::<crate::testkit::Item>(&mut conn, &both)
+    let items = crate::row::get_by_keys::<crate::testkit::Item>(&mut conn, &both)
         .await
         .unwrap();
+    let mut names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["kept", "retired"]);
     assert_eq!(
-        items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        w.texts("SELECT name FROM items WHERE retired_at IS NULL")
+            .await,
         ["kept"]
     );
-    let got = crate::row::get::<Shelf>(
+    let got = crate::row::get_by_keys::<Shelf>(
         &mut conn,
-        &vec![
+        &[vec![
             crate::row::KeyPart::Uuid(aisle),
             crate::row::KeyPart::Int(4),
-        ],
+        ]],
     )
     .await
     .unwrap();
-    assert_eq!(got, Some(shelf));
+    assert_eq!(got, [shelf]);
 }
 
 // ---------------------------------------------------------------------------
@@ -4666,54 +4704,6 @@ async fn what_a_host_spawns_can_be_spawned(pool: SqlitePool) {
         None,
     ));
     spawnable(install(&mut conn, &codecs()));
-}
-
-/// A host writes whole rows on a replica only of a record: a table the
-/// server writes is refused before the database is asked, with how a
-/// replica edits a two-way row.
-#[sqlx::test(migrations = false)]
-async fn a_host_writes_whole_rows_only_of_a_record(pool: SqlitePool) {
-    let w = world(pool).await;
-    let mut conn = w.pool.acquire().await.unwrap();
-    let task = Task {
-        id: Uuid::now_v7(),
-        title: "t".into(),
-        done: false,
-        updated_at: at(0),
-    };
-    match crate::row::upsert(&mut conn, vec![task]).await {
-        Err(Error::Misuse(why)) => assert!(why.contains("UPDATE of those"), "{why}"),
-        other => panic!("{other:?}"),
-    }
-    let price = Price {
-        id: Uuid::now_v7(),
-        cents: 1,
-        updated_at: at(0),
-    };
-    match crate::row::insert_ignore(&mut conn, vec![price]).await {
-        Err(Error::Misuse(why)) => assert!(why.contains("is the server's"), "{why}"),
-        other => panic!("{other:?}"),
-    }
-    let event = Event {
-        id: Uuid::now_v7(),
-        what: "mine".into(),
-    };
-    let written = crate::row::upsert(&mut conn, vec![event.clone()])
-        .await
-        .unwrap();
-    assert_eq!(written, [crate::row::Row::key(&event)]);
-    let other = Event {
-        id: Uuid::now_v7(),
-        what: "other".into(),
-    };
-    let inserted = crate::row::insert_ignore(&mut conn, vec![event, other.clone()])
-        .await
-        .unwrap();
-    assert_eq!(
-        inserted,
-        [crate::row::Row::key(&other)],
-        "the one it held left as it was"
-    );
 }
 
 /// A mapping's failure says why, as text and as debug output.

@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// One table of an upload, as the server filed it: what
-/// [`Server::receive`](crate::Server::receive) answers, for the host to act
+/// [`Server::receive`](crate::run::server::Server::receive) answers, for the host to act
 /// on what its replicas wrote.
 #[derive(Debug)]
 #[non_exhaustive]

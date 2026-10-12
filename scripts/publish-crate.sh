@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Publishes one crate of the workspace at the version of the release, unless
 # crates.io already has that version — so a release that failed half-way is
-# finished by running its jobs again. The tarball was built and verified by
-# CI's `package` job on this very commit, so nothing is compiled here: the
-# token never reaches a build script or a proc macro.
+# finished by running its jobs again. CI's `package` job built and verified
+# the tarball of this very commit; publishing packs that commit again and
+# compiles nothing, so the token never reaches a build script or a proc macro.
 #
 #   scripts/publish-crate.sh <crate> <version>
 #

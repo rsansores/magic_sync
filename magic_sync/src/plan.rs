@@ -44,11 +44,8 @@ use uuid::Uuid;
 /// ```
 /// use magic_sync::plan::Replicas;
 ///
-/// pub const REGISTERS: Replicas = Replicas::relation("shop.registers")
-///     .table("registers")
-///     .live("active");
-/// pub const DEVICES: Replicas = Replicas::relation("fleet.devices")
-///     .table("devices")
+/// pub const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
+/// pub const DEVICES: Replicas = Replicas::new("fleet.devices", "devices")
 ///     .live("enrolled_at IS NOT NULL")
 ///     .partitioned_by("company_id");
 /// ```
@@ -63,21 +60,16 @@ pub struct Replicas {
 impl Replicas {
     /// The replicas are the rows of `relation`, as SQL names it (a table or a
     /// view, with an `id` uuid column) — every one live, in one partition,
-    /// until said otherwise; name the [table](Replicas::table) behind it.
+    /// until said otherwise. `table` is the table behind the relation, as a
+    /// foreign key names it.
     #[must_use]
-    pub const fn relation(relation: &'static str) -> Self {
+    pub const fn new(relation: &'static str, table: &'static str) -> Self {
         Replicas {
             relation,
-            table: "",
+            table,
             live: "true",
             partition: None,
         }
-    }
-
-    /// The table behind the relation, as a foreign key names it: required.
-    #[must_use]
-    pub const fn table(self, table: &'static str) -> Self {
-        Replicas { table, ..self }
     }
 
     /// Which replicas receive anything: an SQL condition on the relation's
@@ -252,13 +244,31 @@ pub(crate) const RECORD_CHUNK: usize = 2_000;
 /// installing at once run one after the other ("SYNCINST").
 const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 
-/// The engine's schema, one script per version: a database at version `n`
-/// runs the scripts after the `n`th, in one transaction. Each script ends by
-/// writing its version.
-const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [crate::POSTGRES_SCHEMA];
+/// The engine's steps, in order, each as released and never edited: the
+/// `n`th (from 1) brings the engine's tables from version `n - 1` to `n`.
+const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] =
+    [include_str!("../sql/postgres/1.sql")];
+
+/// The engine's step to `version` of its schema on the server, as one SQL
+/// script that also records the version it brings it to — `None` for a
+/// version no build of the engine has had yet. [`Server::install`] runs every
+/// step a database lacks, in order; a host with migrations runs each, in one
+/// of its own: the first before the migration that writes
+/// [`Engine::triggers`]' script, and each later one when a release brings it
+/// (its changelog says). A step is never edited once released.
+///
+/// [`Server::install`]: crate::run::server::Server::install
+#[must_use]
+pub fn migration(version: i32) -> Option<String> {
+    let step = MIGRATIONS.get(usize::try_from(version.checked_sub(1)?).ok()?)?;
+    Some(format!(
+        "{step}\nINSERT INTO sync.version (id, version) VALUES (1, {version}) \
+         ON CONFLICT (id) DO UPDATE SET version = excluded.version;\n"
+    ))
+}
 
 /// The server's engine, built once from the codecs and the schema by the
-/// [`Server`](crate::Server), which hands it out for what a host asks of it:
+/// [`Server`](crate::run::server::Server), which hands it out for what a host asks of it:
 /// the triggers it needs ([`Engine::triggers`]), and how far along every
 /// replica is ([`status`](crate::status)).
 pub struct Engine {
@@ -267,6 +277,16 @@ pub struct Engine {
     /// Parents before children.
     pub(crate) order: Vec<usize>,
     pub(crate) replicas: Replicas,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tables: Vec<_> = self.order.iter().map(|&i| self.plans[i].table).collect();
+        f.debug_struct("Engine")
+            .field("tables", &tables)
+            .field("replicas", &self.replicas)
+            .finish_non_exhaustive()
+    }
 }
 
 use crate::Conn;
@@ -676,10 +696,11 @@ async fn migrate(conn: &mut Conn) -> Result<(), Error> {
             crate::SERVER_SCHEMA_VERSION
         )));
     }
-    for script in &MIGRATIONS[from..] {
+    for step in (installed + 1)..=crate::SERVER_SCHEMA_VERSION {
+        let script = migration(step).expect("a step of this build");
         // Not `raw_sql`: its future is not `Send` for every lifetime a
         // host's spawn asks of it.
-        sqlx::Executor::execute(&mut *conn, *script).await?;
+        sqlx::Executor::execute(&mut *conn, script.as_str()).await?;
     }
     Ok(())
 }
@@ -780,7 +801,7 @@ impl Engine {
     /// For a host that has no migrations of its own. Run it before anything
     /// writes a mirrored table — a write before its trigger is never noted —
     /// on a connection that may create triggers. A host with migrations runs
-    /// [`POSTGRES_SCHEMA`](crate::POSTGRES_SCHEMA) in one and writes each
+    /// [`migration`]`(1)` in one and writes each
     /// table's triggers in the migration that creates it, as it does its
     /// indexes; [`Engine::new`] refuses to start while one is missing.
     pub(crate) async fn install(
@@ -841,11 +862,11 @@ impl Engine {
     /// The statements that create every trigger the server needs for
     /// `codecs`, one per line, read off the database `conn` is on: what a
     /// host with migrations writes in the migration that creates the tables —
-    /// after [`POSTGRES_SCHEMA`](crate::POSTGRES_SCHEMA) — and what
-    /// [`Server::install`](crate::Server::install) runs. A mirrored table
+    /// after the engine's first step ([`migration`]) — and what
+    /// [`Server::install`](crate::run::server::Server::install) runs. A mirrored table
     /// notes every write that changes a column it does not leave to the
     /// replicas, and refuses a truncate; a group table notes every write.
-    /// [`Server::new`](crate::Server::new) refuses to start while one is
+    /// [`Server::new`](crate::run::server::Server::new) refuses to start while one is
     /// missing or differs.
     ///
     /// A trigger as printed fires in every session but one whose
@@ -860,7 +881,7 @@ impl Engine {
     /// # async fn print(pool: sqlx::PgPool, codecs: Vec<magic_sync::wire::Codec<()>>) -> Result<(), magic_sync::Error> {
     /// use magic_sync::plan::{Engine, Replicas};
     ///
-    /// const REGISTERS: Replicas = Replicas::relation("shop.registers").table("registers").live("active");
+    /// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
     /// let mut conn = pool.acquire().await?;
     /// println!("{}", Engine::triggers(&mut conn, &codecs, REGISTERS).await?);
     /// # Ok(())
@@ -951,12 +972,6 @@ impl Engine {
     }
 
     async fn read(conn: &mut Conn, tables: &[&Table], replicas: Replicas) -> Result<Self, Error> {
-        if replicas.table.is_empty() {
-            return Err(Error::Misuse(format!(
-                "the replicas of `{}` name no table: `Replicas::table` says which is behind it",
-                replicas.relation
-            )));
-        }
         let needed = crate::SERVER_SCHEMA_VERSION;
         match version(conn).await? {
             Some(v) if v == needed => {}
@@ -3353,7 +3368,7 @@ pub(crate) mod tests {
             .execute(&mut *conn)
             .await
             .expect("drop the schema");
-        sqlx::raw_sql(crate::POSTGRES_SCHEMA)
+        sqlx::raw_sql(&migration(1).expect("the first step"))
             .execute(&mut *conn)
             .await
             .expect("the schema");
