@@ -40,12 +40,12 @@ impl Hand {
         self.answers.lock().unwrap().push_back(outcome);
     }
 
-    fn seen(&self) -> Vec<(i64, Option<i64>, i64)> {
+    fn seen(&self) -> Vec<(i64, i64, i64)> {
         self.seen
             .lock()
             .unwrap()
             .iter()
-            .map(|w| (w.wanted.level, w.held.as_ref().map(|h| h.level), w.version))
+            .map(|w| (w.wanted.level, w.held.level, w.version))
             .collect()
     }
 }
@@ -129,8 +129,13 @@ impl World {
             .unwrap()
     }
 
-    async fn offer(&self) -> usize {
-        self.replica.carry_out_wishes().await.expect("offered")
+    /// Offers the wishes it holds: whether that wrote anything.
+    async fn offer(&self) -> bool {
+        self.replica
+            .carry_out_wishes()
+            .await
+            .expect("offered")
+            .wrote
     }
 }
 
@@ -158,19 +163,19 @@ async fn a_wish_is_carried_out_once_and_its_answer_goes_up_with_the_setting(pool
         Some((None, None, None)),
         "held, unanswered"
     );
-    assert_eq!(w.offer().await, 1);
-    assert_eq!(hand.seen(), [(70, Some(40), 5)]);
+    assert!(w.offer().await);
+    assert_eq!(hand.seen(), [(70, 40, 5)]);
     assert_eq!(w.setting().await, Some((70, 2)), "the wish, a version on");
     assert_eq!(
         w.answered().await,
         Some((Some(5), Some("applied".to_owned()), None))
     );
-    assert_eq!(w.offer().await, 0);
+    assert!(!w.offer().await);
     assert!(matches!(
         w.receive(&message).await,
         Received::AlreadyApplied
     ));
-    assert_eq!(w.offer().await, 0);
+    assert!(!w.offer().await);
     assert_eq!(hand.seen().len(), 1, "carried out once");
 
     let up = w.up(0, false).await.expect("something to say");
@@ -205,7 +210,7 @@ async fn a_wish_refused_or_superseded_leaves_the_setting_as_it_is(pool: SqlitePo
         Some("out of range".to_owned()),
     ));
     assert_eq!(w.answered().await, refused);
-    assert_eq!(w.offer().await, 0, "not offered again");
+    assert!(!w.offer().await, "not offered again");
 
     w.set(45, 2).await;
     w.receive(&down(
@@ -255,7 +260,7 @@ async fn a_wish_waits_until_its_handler_can(pool: SqlitePool) {
         vec![wishes(vec![wished(&w.screen(70, 1), 5, false)])],
     ))
     .await;
-    assert_eq!(w.offer().await, 1);
+    assert!(w.offer().await);
     let waiting = Some((
         Some(5),
         Some("waiting".to_owned()),
@@ -264,9 +269,9 @@ async fn a_wish_waits_until_its_handler_can(pool: SqlitePool) {
     assert_eq!(w.answered().await, waiting);
     let up = w.up(0, false).await.expect("the waiting goes up");
     assert!(up.tables.iter().any(|t| t.table == "sync_wishes"));
-    assert_eq!(w.offer().await, 0, "the same answer, said once");
+    assert!(!w.offer().await, "the same answer, said once");
     assert!(w.up(0, false).await.is_none(), "nothing new to say");
-    assert_eq!(w.offer().await, 1);
+    assert!(w.offer().await);
     assert_eq!(hand.seen().len(), 3);
     assert_eq!(w.setting().await, Some((70, 2)));
     assert_eq!(w.answered().await.unwrap().1.as_deref(), Some("applied"));
@@ -296,8 +301,8 @@ async fn a_wish_cut_short_before_its_answer_is_carried_out_again(pool: SqlitePoo
     }
     assert_eq!(w.answered().await, Some((None, None, None)), "cut short");
     *hand.held.lock().unwrap() = false;
-    assert_eq!(w.offer().await, 1);
-    assert_eq!(hand.seen(), [(70, Some(40), 5), (70, Some(40), 5)]);
+    assert!(w.offer().await);
+    assert_eq!(hand.seen(), [(70, 40, 5), (70, 40, 5)]);
     assert_eq!(w.setting().await, Some((70, 2)), "written once");
 }
 
@@ -330,17 +335,20 @@ async fn a_wish_replaced_while_carried_out_is_not_answered(pool: SqlitePool) {
     .await;
     *hand.held.lock().unwrap() = false;
     hand.go.notify_one();
-    assert_eq!(offering.await, 0, "the answer was to a wish gone");
+    assert!(
+        offering.await,
+        "what the handler set is written, though not answered"
+    );
     assert_eq!(w.setting().await, Some((70, 2)), "what the handler set");
     assert_eq!(w.answered().await, Some((None, None, None)));
-    assert_eq!(w.offer().await, 1);
-    assert_eq!(hand.seen().last(), Some(&(80, Some(70), 6)));
+    assert!(w.offer().await);
+    assert_eq!(hand.seen().last(), Some(&(80, 70, 6)));
     assert_eq!(w.setting().await, Some((80, 3)));
 }
 
 /// A wish the server sends with an answer — none does — is taken without
-/// it, and carried out; a wish of a row the replica holds none of is
-/// answered, and writes nothing.
+/// it; one of a row the replica holds none of waits for the row, its
+/// handler not handed it, and is carried out once the row is there.
 #[sqlx::test(migrations = false)]
 async fn a_wish_takes_no_answer_from_the_server(pool: SqlitePool) {
     let hand = Hand::default();
@@ -356,10 +364,19 @@ async fn a_wish_takes_no_answer_from_the_server(pool: SqlitePool) {
     ))
     .await;
     assert_eq!(w.answered().await, Some((None, None, None)));
-    assert_eq!(w.offer().await, 1);
-    assert_eq!(hand.seen(), [(70, None, 5)]);
-    assert_eq!(w.setting().await, None, "no row to write onto");
-    assert_eq!(w.answered().await.unwrap().1.as_deref(), Some("applied"));
+    assert!(w.offer().await);
+    assert!(hand.seen().is_empty(), "nothing to carry it out on");
+    assert_eq!(w.setting().await, None);
+    let waiting = (
+        Some(5),
+        Some("waiting".to_owned()),
+        Some("this replica holds no such row yet".to_owned()),
+    );
+    assert_eq!(w.answered().await, Some(waiting));
+    w.set(40, 1).await;
+    assert!(w.offer().await);
+    assert_eq!(hand.seen(), [(70, 40, 5)]);
+    assert_eq!(w.setting().await, Some((70, 2)));
 }
 
 /// A wish withdrawn while its answer is on its way up is kept retired until
@@ -382,7 +399,7 @@ async fn a_wish_withdrawn_before_its_answer_is_filed_waits_retired(pool: SqliteP
             .await,
         1
     );
-    assert_eq!(w.offer().await, 0);
+    assert!(!w.offer().await);
     assert_eq!(hand.seen().len(), 1);
     let filed = Body::Filed(Filed {
         uploads: up.uploads.clone(),
@@ -407,7 +424,7 @@ async fn a_wish_of_a_table_this_build_does_not_hold_waits(pool: SqlitePool) {
         vec![wishes(vec![(key, wish.encode_to_vec())])],
     ))
     .await;
-    assert_eq!(w.offer().await, 1);
+    assert!(w.offer().await);
     let (_, outcome, reason) = w.answered().await.unwrap();
     assert_eq!(outcome.as_deref(), Some("waiting"));
     assert!(reason.unwrap().contains("`dials`"));
@@ -558,7 +575,7 @@ async fn a_snapshot_beginning_has_the_replica_say_its_settings_and_answers_again
         .await;
     assert_eq!(noted, ["screens", "sync_wishes"]);
     w.receive(&end(3, "again", &["sync_wishes"])).await;
-    assert_eq!(w.offer().await, 0, "the wish it held, answered");
+    assert!(!w.offer().await, "the wish it held, answered");
     let up = w.up(0, false).await.expect("said again");
     let said: BTreeMap<&str, usize> = up
         .tables
@@ -833,4 +850,324 @@ async fn walk_wishes(pool: SqlitePool, seed: u64) {
                 .collect();
         assert_eq!(noted, holder.noted(), "{at}: what is noted");
     }
+}
+
+/// A world whose wishes `handler` carries out, `adjust` changing its
+/// settings first, over `more` tables besides.
+async fn handled(
+    pool: SqlitePool,
+    handler: impl CarryOut<Screen>,
+    adjust: impl FnOnce(&mut Settings),
+    more: &str,
+) -> World {
+    let mut settings = Settings {
+        wishes: Wishes::new().on::<Screen>(handler),
+        ..Settings::default()
+    };
+    adjust(&mut settings);
+    world_of(
+        pool,
+        &format!("{TABLES}{SCREENS}{more}"),
+        settings,
+        golden_codecs(),
+    )
+    .await
+}
+
+/// A handler that panics, or never answers.
+#[derive(Clone)]
+enum Broken {
+    Panics,
+    Hangs,
+}
+
+impl CarryOut<Screen> for Broken {
+    async fn carry_out(&self, _: Wish<Screen>) -> Outcome {
+        match self {
+            Broken::Panics => panic!("a driver that unwraps"),
+            Broken::Hangs => std::future::pending().await,
+        }
+    }
+}
+
+/// A handler that panics has the wish wait, and one that does not answer in
+/// time too: neither stops the replica.
+async fn broken(pool: SqlitePool, broken: Broken, why: &str) {
+    let w = handled(
+        pool,
+        broken,
+        |s| s.wishes_timeout = std::time::Duration::from_millis(50),
+        "",
+    )
+    .await;
+    w.set(40, 1).await;
+    w.receive(&down(
+        1,
+        "",
+        vec![wishes(vec![wished(&w.screen(70, 1), 5, false)])],
+    ))
+    .await;
+    assert!(w.offer().await);
+    let (_, outcome, reason) = w.answered().await.unwrap();
+    assert_eq!(outcome.as_deref(), Some("waiting"));
+    assert!(reason.as_deref().unwrap().contains(why), "{reason:?}");
+    assert_eq!(w.setting().await, Some((40, 1)));
+    assert!(w.up(0, false).await.is_some(), "the replica goes on");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_handler_that_panics_has_its_wish_wait(pool: SqlitePool) {
+    broken(pool, Broken::Panics, "panicked").await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_handler_that_does_not_answer_in_time_has_its_wish_wait(pool: SqlitePool) {
+    broken(pool, Broken::Hangs, "did not answer").await;
+}
+
+/// A wish the replica's database refuses — a check of its own on the
+/// setting — is refused, with the database's reason; the wishes after it go
+/// on, and the handler is handed it once.
+#[sqlx::test(migrations = false)]
+async fn a_wish_the_database_refuses_is_refused_and_the_rest_go_on(pool: SqlitePool) {
+    let hand = Hand::default();
+    let w = handled(pool, hand.clone(), |_| {}, "").await;
+    w.exec(
+        "CREATE TRIGGER no_high BEFORE UPDATE ON screens WHEN NEW.level > 100 \
+         BEGIN SELECT RAISE(ABORT, 'a level past 100'); END",
+    )
+    .await
+    .unwrap();
+    w.set(40, 1).await;
+    let other = Screen {
+        id: Uuid::from_u128(2),
+        ..w.screen(10, 1)
+    };
+    sqlx::query("INSERT INTO screens VALUES ($1, $2, 10, 1)")
+        .bind(w.me)
+        .bind(other.id)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.receive(&down(
+        1,
+        "",
+        vec![wishes(vec![
+            wished(&w.screen(150, 1), 5, false),
+            wished(&Screen { level: 60, ..other }, 6, false),
+        ])],
+    ))
+    .await;
+    assert!(w.offer().await);
+    let answers: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT outcome, reason FROM sync_wishes ORDER BY row_key")
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(answers[0].0, "refused");
+    assert!(
+        answers[0]
+            .1
+            .as_deref()
+            .unwrap()
+            .contains("a level past 100"),
+        "{answers:?}"
+    );
+    assert_eq!(answers[1], ("applied".to_owned(), None));
+    assert_eq!(hand.seen().len(), 2, "each handed once");
+    assert!(!w.offer().await);
+}
+
+/// A wish withdrawn while another wish's handler runs is not handed to its
+/// handler: each wish is read again just before it is offered.
+#[sqlx::test(migrations = false)]
+async fn a_wish_withdrawn_while_another_is_carried_out_is_not(pool: SqlitePool) {
+    let hand = Hand::default();
+    let w = handled(pool, hand.clone(), |_| {}, "").await;
+    w.set(40, 1).await;
+    let second = Screen {
+        id: Uuid::from_u128(2),
+        ..w.screen(60, 1)
+    };
+    sqlx::query("INSERT INTO screens VALUES ($1, $2, 10, 1)")
+        .bind(w.me)
+        .bind(second.id)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let (gone, row) = wished(&second, 6, false);
+    w.receive(&down(
+        1,
+        "",
+        vec![wishes(vec![
+            wished(&w.screen(70, 1), 5, false),
+            (gone.clone(), row),
+        ])],
+    ))
+    .await;
+    *hand.held.lock().unwrap() = true;
+    let offering = w.offer();
+    tokio::pin!(offering);
+    tokio::select! {
+        _ = &mut offering => panic!("the handler is held"),
+        () = hand.began.notified() => {}
+    }
+    w.receive(&down(2, "", vec![deletes("sync_wishes", vec![gone])]))
+        .await;
+    *hand.held.lock().unwrap() = false;
+    hand.go.notify_one();
+    offering.await;
+    assert_eq!(hand.seen(), [(70, 40, 5)], "the withdrawn one never handed");
+}
+
+/// No wish is offered while a snapshot is in progress: its end may let go
+/// of it. Its end offers what stays.
+#[sqlx::test(migrations = false)]
+async fn no_wish_is_offered_while_a_snapshot_is_in_progress(pool: SqlitePool) {
+    let hand = Hand::default();
+    let w = handled(pool, hand.clone(), |_| {}, "").await;
+    w.set(40, 1).await;
+    w.receive(&begin(
+        1,
+        "s",
+        vec![wishes(vec![wished(&w.screen(70, 1), 5, false)])],
+    ))
+    .await;
+    assert!(!w.offer().await);
+    assert!(hand.seen().is_empty());
+    w.receive(&end(2, "s", &["sync_wishes"])).await;
+    assert!(w.offer().await);
+    assert_eq!(hand.seen().len(), 1);
+}
+
+/// A setting row set aside — it cannot go up as it is — stays set aside
+/// when a snapshot begins: a re-statement writes nothing that would let it
+/// fit.
+#[sqlx::test(migrations = false)]
+async fn a_setting_set_aside_stays_set_aside_when_a_snapshot_begins(pool: SqlitePool) {
+    let hand = Hand::default();
+    let w = handled(pool, hand, |_| {}, "").await;
+    w.set(40, 1).await;
+    w.exec("UPDATE sync_notes SET set_aside = 'too large'")
+        .await
+        .unwrap();
+    w.receive(&begin(1, "s", vec![])).await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes WHERE set_aside IS NOT NULL")
+            .await,
+        1
+    );
+}
+
+/// A replica whose every lane names its tables sends the engine's own on
+/// the first.
+#[sqlx::test(migrations = false)]
+async fn the_engines_table_goes_on_the_first_lane_unless_one_names_it(pool: SqlitePool) {
+    use crate::replica::Lane;
+    let hand = Hand::default();
+    let w = handled(
+        pool,
+        hand,
+        |s| {
+            s.lanes = vec![
+                Lane::new("main", &["readings", "events", "tasks"]),
+                Lane::new("screens", &["screens"]),
+            ];
+        },
+        "",
+    )
+    .await;
+    w.set(40, 1).await;
+    w.receive(&down(
+        1,
+        "",
+        vec![wishes(vec![wished(&w.screen(70, 1), 5, false)])],
+    ))
+    .await;
+    w.offer().await;
+    let up = w.up(0, false).await.expect("the answer");
+    assert!(
+        up.tables.iter().all(|t| t.table == "sync_wishes"),
+        "{:?}",
+        up.tables
+    );
+    let up = w.up(1, false).await.expect("the setting");
+    assert!(up.tables.iter().all(|t| t.table == "screens"));
+}
+
+/// A handler of another row type than its table's codec decodes is
+/// refused when the replica is built, not at the first wish.
+#[sqlx::test(migrations = false)]
+async fn a_handler_of_another_row_type_is_refused_at_start(pool: SqlitePool) {
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "screens",
+        mirror = "setting",
+        key = "replica_id, id",
+        origin = "replica_id"
+    )]
+    struct Other {
+        replica_id: Uuid,
+        id: Uuid,
+        #[row(desired)]
+        level: i64,
+        #[row(version)]
+        revision: i64,
+    }
+    let pool = settled(pool).await;
+    sqlx::raw_sql(&format!("{TABLES}{SCREENS}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    install(&mut pool.acquire().await.unwrap(), &golden_codecs())
+        .await
+        .unwrap();
+    let settings = Settings {
+        wishes: Wishes::new().on::<Other>(Direct),
+        ..Settings::default()
+    };
+    let refused = Replica::new(
+        pool,
+        golden_codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        settings,
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(Error::Misuse(why)) if why.contains("another row type")),
+        "{refused:?}"
+    );
+}
+
+/// A wish whose key came in another spelling of the same key is the same
+/// row's; one whose version cannot move is refused rather than written
+/// with the version it had.
+#[sqlx::test(migrations = false)]
+async fn a_wish_reads_its_key_as_the_tables_and_a_version_that_cannot_move_is_refused(
+    pool: SqlitePool,
+) {
+    let hand = Hand::default();
+    let w = handled(pool, hand.clone(), |_| {}, "").await;
+    w.set(40, i64::MAX).await;
+    let (key, bytes) = wished(&w.screen(70, i64::MAX), 5, true);
+    let mut wish = WireWish::decode(bytes.as_slice()).unwrap();
+    wish.key = Some(WireKey {
+        parts: vec![
+            w.me.to_string().to_uppercase(),
+            Uuid::from_u128(1).simple().to_string(),
+        ],
+    });
+    w.receive(&down(
+        1,
+        "",
+        vec![wishes(vec![(key, wish.encode_to_vec())])],
+    ))
+    .await;
+    assert!(w.offer().await);
+    assert_eq!(hand.seen().len(), 1, "the same row, whatever its spelling");
+    let (_, outcome, reason) = w.answered().await.unwrap();
+    assert_eq!(outcome.as_deref(), Some("refused"));
+    assert!(reason.unwrap().contains("cannot move"));
+    assert_eq!(w.setting().await, Some((40, i64::MAX)));
 }

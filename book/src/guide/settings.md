@@ -63,15 +63,23 @@ replaces its wish, and is carried out again; `withdraw` takes it back.
 ```
 
 The engine offers the handler each wish once the message that brought it is
-committed, with no transaction open: it may take its time and talk to the
-hardware. It answers:
+committed, with no transaction open, in a task of its own: it may take its
+time — up to `wishes_timeout` — and talk to the hardware. It is handed only a
+wish of a row the replica holds (one of a row it does not hold yet waits for
+the row), and, under `if_unchanged`, only while the row is at the version the
+wish is based on. It answers:
 
 - `Applied` — the engine writes the wished columns onto the row, its version
   moved on, and records the answer in the same transaction; both go up;
 - `Refused(why)` — final for this wish; the row stays as it is;
 - `Later(why)` — the wish waits, and is offered again: when you call
   `Replica::offer_wishes` (the hardware came back), after the next message
-  that changes a wish, at start, and every `wishes_every`.
+  that changes a wish, at start, and every `wishes_every` while one waits.
+
+A handler that panics, or does not answer within `wishes_timeout`, has the
+wish wait too; one wish's trouble never holds back another's. A write the
+database refuses (a check of yours on the setting) answers the wish
+`refused`, with the database's reason.
 
 The shop's registers carry out the head office's wishes of their receipt
 footer through their printer (`examples/shop/register/src/main.rs`):

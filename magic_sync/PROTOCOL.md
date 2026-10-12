@@ -365,42 +365,54 @@ it counts all the same.
 A **setting** is a table of the replica's own whose rows go up as a record's
 with a version do (section 7) — a value the replica holds and acts on: a
 module's configuration, a screen's brightness — some columns of which the
-server may **wish** other values. A replica that holds settings holds the
-server's wishes in a table of the engine's, `sync_wishes`: a table written on
-both sides (4.1), its rows encoded as the `Wish` message, its key the wish's
-`id`. A replica that holds none needs none of this section: it rejects the
-rows of `sync_wishes` as those of any table it does not know.
+server may **wish** other values. Which columns a wish sets, and which column
+is the version, is the table's declaration, agreed between the server and the
+replica as the table's encoding is (section 3). A replica that holds settings
+holds the server's wishes in a table of the engine's, `sync_wishes`: a table
+written on both sides (4.1), its rows encoded as the `Wish` message, its key
+the wish's `id`. A replica that holds none needs none of this section: it
+rejects the rows of `sync_wishes` as those of any table it does not know.
 
 A wish is one row of a setting — `table`, `key` — and what the server wants
 it to hold: `wanted`, the row encoded as `table`'s own, of which the replica
-takes the columns its declaration of the table says a wish sets, and nothing
-else. One row has one wish at most; a new one replaces it, under a new
-`version`, a number the server draws at random: only whether an answer is of
-the wish the replica holds matters, never which version is the later. The
-server owns `id` to `note`; the replica owns the answer — `answered`, the
-version it answers, `outcome`, `reason` and `answered_at` — which it **must
-not** take from a message: a wish it takes that it did not hold is one it has
-not answered.
+takes the columns a wish sets, and nothing else. One row has one wish at
+most; a new one replaces it, under a new `version`, a number the server draws
+at random: only whether an answer is of the wish the replica holds matters,
+never which version is the later. The server owns `id` to `note`; the replica
+owns the answer — `answered`, the version it answers, `outcome`, `reason` and
+`answered_at` — which it **must not** take from a message: a wish it takes
+that it did not hold is one it has not answered.
 
 Once the message that brought a wish is committed — **never** inside the
 transaction that applies a message, since carrying one out may take time and
-reach outside the database — the replica carries out every wish it holds, not
-retired (4.3), that it has not answered, or answered `waiting`:
+reach outside the database — and while no snapshot is in progress (4.2: its
+end may let go of a wish), the replica carries out every wish it holds, not
+retired (4.3), that it has not answered, or answered `waiting`. It takes them
+**one at a time, each read again just before**, so a wish replaced or
+withdrawn meanwhile is carried out as it is then, or not at all:
 
-1. It reads `wanted` as `table`'s row. One it cannot read — a table, or an
-   encoding, this build does not know — it answers `waiting`, and carries
-   out with a build that can. One whose key is not `key` it answers
-   `refused`.
-2. With `if_unchanged`, the wish is based on the version `wanted` carries:
-   if the replica holds no row of `key`, or holds it at another version, it
-   answers `superseded`, and does not carry it out — the replica's value
-   stands. Versions are compared as text: an integer decimal, an instant in
-   UTC, RFC 3339, to the microsecond (`2026-10-12T10:00:00.000001Z`).
-3. Otherwise it carries it out, however the setting takes it, and answers
+1. It reads `key` as `table`'s key (section 3) and `wanted` as `table`'s row.
+   A table it holds as no setting, or a row it cannot read — a table or an
+   encoding this build does not know — it answers `waiting`, and carries out
+   with a build that can. A key that is not the table's, a row whose key is
+   not `key`, or a row of another replica than itself (by the setting's
+   origin) it answers `refused`.
+2. A row it does not hold it answers `waiting` (it holds no such row yet),
+   and carries the wish out once it does: it never writes a row a wish
+   names.
+3. With `if_unchanged`, the wish is based on the version `wanted` carries: if
+   the replica holds the row at another version, it answers `superseded`,
+   and does not carry it out — the replica's value stands. Versions are
+   compared as text: an integer decimal; an instant in UTC, RFC 3339,
+   **truncated** toward the past to the microsecond, always six fractional
+   digits and `Z` (`2026-10-12T10:00:00.123456Z` for `.1234567`).
+4. Otherwise it carries it out, however the setting takes it, and answers
    `applied` — then, in **one** transaction, it writes the wished columns
-   onto the row it holds, if it holds one, with its version moved past what
-   it was (an integer one more; an instant now, or a microsecond past the
-   old one when the clock is behind), and records the answer; `refused`,
+   onto the row as it holds it then, its version moved past what it was (an
+   integer one more; an instant now, truncated so, or a microsecond past the
+   old one when the clock is behind), and records the answer: a version that
+   cannot move (an integer at its largest), or a write its database refuses,
+   is answered `refused`, with why, and the row left as it was; `refused`,
    with why — the row as it was — final for that wish; or `waiting`, with
    why, and carries it out again later.
 

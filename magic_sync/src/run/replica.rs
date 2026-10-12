@@ -9,7 +9,7 @@ use crate::envelope::Limits;
 use crate::replica::{self, Care, Lane, Outbox, Received, Stop};
 use crate::run::Backoff;
 use crate::wire::Codec;
-use crate::wish::Wishes;
+use crate::wish::{Offered, Run, Wishes};
 use crate::{Conn, Error};
 use sqlx::SqlitePool;
 use std::future::Future;
@@ -102,6 +102,9 @@ pub struct Settings {
     /// How often a wish its handler could not carry out yet is offered
     /// again, besides when [`Replica::offer_wishes`] asks.
     pub wishes_every: Duration,
+    /// How long a handler has to carry a wish out: one that takes longer
+    /// has the wish wait, and offered again.
+    pub wishes_timeout: Duration,
 }
 
 impl Default for Settings {
@@ -117,6 +120,7 @@ impl Default for Settings {
             digests_every: Duration::from_secs(60 * 60),
             wishes: Wishes::new(),
             wishes_every: Duration::from_secs(60),
+            wishes_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -227,6 +231,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             ("digests_first", settings.digests_first),
             ("digests_every", settings.digests_every),
             ("wishes_every", settings.wishes_every),
+            ("wishes_timeout", settings.wishes_timeout),
             ("outbox.resend_after", settings.outbox.resend_after),
             ("outbox.backlog_every", settings.outbox.backlog_every),
         ];
@@ -351,18 +356,27 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     }
 
     /// Offers every wish not carried out yet, or waiting, to its handler,
-    /// one after another, and sends the answers up. Answers how many it
-    /// answered anew.
-    pub(crate) async fn carry_out_wishes(&self) -> Result<usize, Error> {
-        let answered = self.settings.wishes.offer(&self.pool, &self.codecs).await?;
-        if answered > 0 {
+    /// one after another, and sends up what that wrote.
+    pub(crate) async fn carry_out_wishes(&self) -> Result<Offered, Error> {
+        let Some(me) = self.identity.id(&mut *self.pool.acquire().await?).await? else {
+            return Ok(Offered::default());
+        };
+        let run = Run {
+            pool: self.pool.clone(),
+            me,
+            timeout: self.settings.wishes_timeout,
+        };
+        let offered = self.settings.wishes.offer(&run, &self.codecs).await?;
+        if offered.wrote {
             self.nudge();
         }
-        Ok(answered)
+        Ok(offered)
     }
 
     /// The wishes' loop, until `stopped`: at start, whenever a message
-    /// changed one or the host asks, and every `wishes_every`.
+    /// changed one or the host asks, and every `wishes_every` while one
+    /// waits. A handler under way when it stops is dropped: nothing of it is
+    /// recorded, and it is offered again at the next start.
     async fn wishes(&self, mut stopped: watch::Receiver<bool>) {
         if !self
             .codecs
@@ -374,23 +388,33 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let first = self.settings.backoff.first;
         let mut backoff = first;
         while !*stopped.borrow() {
-            let wait = match self.carry_out_wishes().await {
-                Ok(_) => {
+            let offered = tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stop| *stop) => return,
+                offered = self.carry_out_wishes() => offered,
+            };
+            let wait = match offered {
+                Ok(offered) => {
                     backoff = first;
-                    self.settings.wishes_every
+                    offered.waiting.then_some(self.settings.wishes_every)
                 }
                 Err(e) => {
                     tracing::warn!("sync: wishes not offered, and offered again: {e}");
                     let wait = backoff;
                     backoff = self.settings.backoff.after(wait);
-                    wait
+                    Some(wait)
                 }
             };
             tokio::select! {
                 biased;
                 _ = stopped.wait_for(|stop| *stop) => return,
                 () = self.offer.notified() => {}
-                () = tokio::time::sleep(wait) => {}
+                () = async {
+                    match wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
             }
         }
     }

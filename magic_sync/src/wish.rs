@@ -403,14 +403,17 @@ pub use replica::*;
 #[cfg(feature = "sqlite")]
 mod replica {
     use super::{WishRow, TABLE};
-    use crate::row::Setting;
+    use crate::row::{KeyPart, Setting};
     use crate::wire::Codec;
     use crate::{Conn, Error};
     use sqlx::SqlitePool;
+    use std::any::{Any, TypeId};
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use uuid::Uuid;
 
     /// What the server wishes one setting row to hold, handed to the
     /// replica's handler for the table.
@@ -419,14 +422,37 @@ mod replica {
     pub struct Wish<R> {
         /// The row as wished: its `#[row(desired)]` columns are the wish.
         pub wanted: R,
-        /// The row as the replica holds it now; `None` when it holds none.
-        pub held: Option<R>,
+        /// The row as the replica holds it now.
+        pub held: R,
         /// What the server's host said of the wish: who asked, why.
         pub note: Option<String>,
         /// This wish of the row, drawn at random by the server: a wish
         /// carried out again — after a crash before its answer was recorded,
         /// or by a replica restored from an older copy — has the same one.
         pub version: i64,
+    }
+
+    impl<R> Wish<R> {
+        /// A wish of `held` to become `wanted`, as its handler is handed one:
+        /// for a host's tests of its own handler.
+        #[must_use]
+        pub fn new(wanted: R, held: R, version: i64) -> Self {
+            Wish {
+                wanted,
+                held,
+                note: None,
+                version,
+            }
+        }
+
+        /// The wish, with what the server's host said of it.
+        #[must_use]
+        pub fn with_note(self, note: impl Into<String>) -> Self {
+            Wish {
+                note: Some(note.into()),
+                ..self
+            }
+        }
     }
 
     /// What a replica's handler did with a wish.
@@ -442,18 +468,27 @@ mod replica {
         /// It cannot carry it out now, for this reason: the wish waits, and
         /// is offered again — at [`Replica::offer_wishes`], after the next
         /// message that changes a wish, at start, and every
-        /// `Settings::wishes_every`.
+        /// `Settings::wishes_every` while one waits.
         ///
         /// [`Replica::offer_wishes`]: crate::run::replica::Replica::offer_wishes
         Later(String),
     }
 
     /// Carries a setting's wishes out: the host's, one per setting table,
-    /// handed to the replica in [`Wishes`]. Called with no transaction open —
-    /// it may take its time, and talk to hardware — once per wish, and again
-    /// only if the replica stopped before it recorded the answer, or was
-    /// restored from an older copy: carrying the same wish out twice must
-    /// leave the setting as once does.
+    /// handed to the replica in [`Wishes`]. Called with no transaction open,
+    /// in a task of its own — it may take its time, up to
+    /// `Settings::wishes_timeout`, and talk to hardware — once per wish, and
+    /// again only if the replica stopped before it recorded the answer, or
+    /// was restored from an older copy: carrying the same wish out twice
+    /// must leave the setting as once does. A handler that panics, or does
+    /// not answer in time, has the wish wait, and offered again.
+    ///
+    /// It is handed only a wish of a row the replica holds — one of a row it
+    /// does not hold yet waits for it — and, with `apply = "if_unchanged"`,
+    /// only while the row is at the version the wish is based on. That is
+    /// compared before the handler runs: a write of the row's own while it
+    /// runs is overwritten with the wished columns when it answers
+    /// [`Outcome::Applied`], whatever the row's other columns became.
     pub trait CarryOut<R: Setting>: Send + Sync + 'static {
         /// Carries `wish` out, or says why not.
         fn carry_out(&self, wish: Wish<R>) -> impl Future<Output = Outcome> + Send;
@@ -470,31 +505,37 @@ mod replica {
         }
     }
 
-    type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+    type Fut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-    /// Decodes a row of the table it was asked for.
-    pub(crate) trait Decode: Sync {
-        fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error>;
-    }
-
-    impl<P: Sync + 'static> Decode for Codec<P> {
-        fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
-            Codec::decode_any(self, bytes)
-        }
+    /// How a wish's handler is run.
+    #[derive(Clone)]
+    pub(crate) struct Run {
+        pub(crate) pool: SqlitePool,
+        /// The replica, whose rows alone its wishes are of.
+        pub(crate) me: Uuid,
+        /// How long a handler has to answer.
+        pub(crate) timeout: Duration,
     }
 
     /// A table's handler, its row type erased.
     trait Carrier: Send + Sync {
-        fn carry<'a>(
-            &'a self,
-            pool: &'a SqlitePool,
-            decode: &'a dyn Decode,
+        /// The row type it carries wishes of out.
+        fn row(&self) -> TypeId;
+        /// Carries `wish` out — `wanted`, its row decoded — and records the
+        /// answer.
+        fn carry(
+            self: Arc<Self>,
+            run: Run,
+            wanted: Box<dyn Any + Send>,
             wish: WishRow,
-        ) -> Fut<'a, Result<(), Error>>;
+        ) -> Fut<Result<Offered, Error>>;
     }
 
     struct Typed<R, H> {
         handler: H,
+        /// Outcomes its handler gave whose recording failed for a while:
+        /// recorded again without running the handler again.
+        given: Mutex<HashMap<(Uuid, i64), Outcome>>,
         row: std::marker::PhantomData<fn() -> R>,
     }
 
@@ -554,6 +595,15 @@ mod replica {
         }
     }
 
+    /// What one round of offering did.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Offered {
+        /// Something was written: an answer, a setting.
+        pub(crate) wrote: bool,
+        /// A wish waits, to be offered again.
+        pub(crate) waiting: bool,
+    }
+
     impl Wishes {
         /// No handler yet.
         #[must_use]
@@ -569,23 +619,35 @@ mod replica {
                 R::TABLE,
                 Arc::new(Typed {
                     handler,
+                    given: Mutex::new(HashMap::new()),
                     row: std::marker::PhantomData::<fn() -> R>,
                 }),
             );
             self
         }
 
-        /// Refuses handlers that do not meet `codecs`' settings one for one.
+        /// Refuses handlers that do not meet `codecs`' settings one for one,
+        /// each of the row type its table's codec decodes.
         pub(crate) fn check<P>(&self, codecs: &[Codec<P>]) -> Result<(), Error> {
             for codec in codecs {
                 let setting = codec.table.mirror == crate::row::Mirror::Setting;
-                if setting && !self.carriers.contains_key(codec.table.name) {
-                    return Err(Error::Misuse(format!(
-                        "`{}` is a setting, and nothing carries its wishes out: give it a \
-                         handler in `Settings::wishes` (`Direct` for one that lives only in the \
-                         database)",
-                        codec.table.name
-                    )));
+                match self.carriers.get(codec.table.name) {
+                    None if setting => {
+                        return Err(Error::Misuse(format!(
+                            "`{}` is a setting, and nothing carries its wishes out: give it a \
+                             handler in `Settings::wishes` (`Direct` for one that lives only in \
+                             the database)",
+                            codec.table.name
+                        )))
+                    }
+                    Some(carrier) if setting && carrier.row() != codec.row => {
+                        return Err(Error::Misuse(format!(
+                            "the handler of `{}`'s wishes is for another row type than its \
+                             codec's",
+                            codec.table.name
+                        )))
+                    }
+                    _ => {}
                 }
             }
             for table in self.carriers.keys() {
@@ -602,167 +664,307 @@ mod replica {
         }
 
         /// Offers every wish not carried out yet, or waiting, to its table's
-        /// handler, one after another. Answers how many it answered anew.
+        /// handler, one at a time, each read again just before: a wish
+        /// replaced or withdrawn while another's handler ran is offered as it
+        /// is by then, or not at all. Nothing while a snapshot is in
+        /// progress, which may let go of the wishes it does not name: its
+        /// end offers them. A wish that fails is logged, and the rest go on.
         pub(crate) async fn offer<P: Sync + 'static>(
             &self,
-            pool: &SqlitePool,
+            run: &Run,
             codecs: &[Codec<P>],
-        ) -> Result<usize, Error> {
-            let pending: Vec<WishRow> = sqlx::query_as(&format!(
-                "SELECT id, replica_id, relation, row_key, wanted, version, if_unchanged, note, \
-                        answered, outcome, reason, answered_at \
-                   FROM {TABLE} \
-                  WHERE retired_at IS NULL \
-                    AND (answered IS NOT version OR outcome = 'waiting') \
-                  ORDER BY relation, row_key"
-            ))
-            .fetch_all(pool)
-            .await?;
-            let mut answered = 0;
-            for wish in pending {
-                let before = (wish.answered, wish.outcome.clone(), wish.reason.clone());
-                let id = wish.id;
-                let codec = codecs.iter().find(|c| c.table.name == wish.relation);
-                match (self.carriers.get(wish.relation.as_str()), codec) {
-                    (Some(carrier), Some(codec)) => carrier.carry(pool, codec, wish).await?,
-                    _ => {
-                        let why = format!(
-                            "this build carries out no wish of `{}`: a build that holds it as a \
-                             setting does",
-                            wish.relation
-                        );
-                        answer(pool, &wish, None::<&mut Conn>, "waiting", Some(&why)).await?;
+        ) -> Result<Offered, Error> {
+            let snapshot: Option<Option<String>> =
+                sqlx::query_scalar("SELECT snapshot_id FROM sync_applied WHERE id = 1")
+                    .fetch_optional(&run.pool)
+                    .await?;
+            if snapshot.flatten().is_some_and(|s| !s.is_empty()) {
+                return Ok(Offered::default());
+            }
+            let mut offered = Offered::default();
+            let mut after = (String::new(), String::new());
+            loop {
+                let next: Option<WishRow> = sqlx::query_as(&format!(
+                    "SELECT id, replica_id, relation, row_key, wanted, version, if_unchanged, \
+                            note, answered, outcome, reason, answered_at \
+                       FROM {TABLE} \
+                      WHERE retired_at IS NULL \
+                        AND (answered IS NOT version OR outcome = 'waiting') \
+                        AND (relation, row_key) > ($1, $2) \
+                      ORDER BY relation, row_key LIMIT 1"
+                ))
+                .bind(&after.0)
+                .bind(&after.1)
+                .fetch_optional(&run.pool)
+                .await?;
+                let Some(wish) = next else {
+                    return Ok(offered);
+                };
+                after = (wish.relation.clone(), wish.row_key.clone());
+                let at = format!("{} {}", wish.relation, wish.row_key);
+                match self.settle(run, codecs, wish).await {
+                    Ok(settled) => {
+                        offered.wrote |= settled.wrote;
+                        offered.waiting |= settled.waiting;
+                    }
+                    Err(e) => {
+                        offered.waiting = true;
+                        tracing::warn!(wish = at, "sync: a wish not settled, offered again: {e}");
                     }
                 }
-                let after: Option<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
-                    &format!("SELECT answered, outcome, reason FROM {TABLE} WHERE id = $1"),
-                )
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
-                answered += usize::from(after.is_some_and(|after| after != before));
             }
-            Ok(answered)
+        }
+
+        /// Carries one wish out, or answers why not.
+        async fn settle<P: Sync + 'static>(
+            &self,
+            run: &Run,
+            codecs: &[Codec<P>],
+            wish: WishRow,
+        ) -> Result<Offered, Error> {
+            let codec = codecs.iter().find(|c| c.table.name == wish.relation);
+            let (Some(carrier), Some(codec)) = (self.carriers.get(wish.relation.as_str()), codec)
+            else {
+                let why = format!(
+                    "this build carries out no wish of `{}`: a build that holds it as a setting \
+                     does",
+                    wish.relation
+                );
+                return answer_alone(&run.pool, &wish, "waiting", Some(&why)).await;
+            };
+            // The key as the wire wrote it, read as the table's: in the one
+            // form keys are compared in.
+            let parts: Vec<String> = wish.row_key.split('|').map(str::to_owned).collect();
+            let Ok(key) = codec.key(&parts) else {
+                let why = "a key that is not the table's";
+                return answer_alone(&run.pool, &wish, "refused", Some(why)).await;
+            };
+            let wish = WishRow {
+                row_key: crate::row::key_text(&key),
+                ..wish
+            };
+            match codec.decode_any(&wish.wanted) {
+                Ok(wanted) => carrier.clone().carry(run.clone(), wanted, wish).await,
+                Err(e) => {
+                    let why = format!("this build cannot read the row wished: {e}");
+                    answer_alone(&run.pool, &wish, "waiting", Some(&why)).await
+                }
+            }
         }
     }
 
-    /// Records `outcome` as the answer to `wish`, in `tx` when given, else in
-    /// a transaction of its own — while it is still the wish the replica
-    /// holds, and only when the answer is new: a wish waiting again for the
-    /// same reason sends nothing up.
+    /// Records `outcome` as the answer to `wish` in `conn`'s transaction —
+    /// while it is still the wish the replica holds, and only when the
+    /// answer is new: a wish waiting again for the same reason sends nothing
+    /// up. Answers whether it wrote it.
     async fn answer(
-        pool: &SqlitePool,
+        conn: &mut Conn,
         wish: &WishRow,
-        tx: Option<&mut Conn>,
         outcome: &str,
         reason: Option<&str>,
-    ) -> Result<(), Error> {
-        let sql = format!(
+    ) -> Result<bool, Error> {
+        let written = sqlx::query(&format!(
             "UPDATE {TABLE} SET answered = $2, outcome = $3, reason = $4, \
                     answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
               WHERE id = $1 AND version = $2 AND retired_at IS NULL \
                 AND (answered IS NOT $2 OR outcome IS NOT $3 OR reason IS NOT $4)"
-        );
-        let query = sqlx::query(&sql)
-            .bind(wish.id)
-            .bind(wish.version)
-            .bind(outcome)
-            .bind(reason);
-        match tx {
-            Some(conn) => {
-                query.execute(conn).await?;
-            }
-            None => {
-                let mut conn = pool.acquire().await?;
-                let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
-                query.execute(&mut *tx).await?;
-                tx.commit().await?;
-            }
-        }
-        Ok(())
+        ))
+        .bind(wish.id)
+        .bind(wish.version)
+        .bind(outcome)
+        .bind(reason)
+        .execute(&mut *conn)
+        .await?;
+        Ok(written.rows_affected() > 0)
     }
 
-    impl<R: Setting, H: CarryOut<R>> Carrier for Typed<R, H> {
-        fn carry<'a>(
-            &'a self,
-            pool: &'a SqlitePool,
-            decode: &'a dyn Decode,
-            wish: WishRow,
-        ) -> Fut<'a, Result<(), Error>> {
-            Box::pin(async move {
-                let wanted = match decode.decode_any(&wish.wanted).map(|r| r.downcast::<R>()) {
-                    Ok(Ok(row)) => *row,
-                    Ok(Err(_)) => {
-                        return Err(Error::Misuse(format!(
-                            "the handler of `{}`'s wishes is for `{}`, which is not the row its \
-                             codec decodes",
-                            R::TABLE,
-                            std::any::type_name::<R>()
-                        )))
-                    }
-                    Err(e) => {
-                        let why = format!("this build cannot read the row wished: {e}");
-                        return answer(pool, &wish, None, "waiting", Some(&why)).await;
-                    }
-                };
-                if wanted.key_text() != wish.row_key {
-                    let why = "the row wished is not the row the wish names";
-                    return answer(pool, &wish, None, "refused", Some(why)).await;
-                }
-                let key = wanted.key();
-                let held = {
-                    let mut conn = pool.acquire().await?;
-                    crate::row::get_by_keys::<R>(&mut conn, std::slice::from_ref(&key))
+    /// [`answer`], in a transaction of its own.
+    async fn answer_alone(
+        pool: &SqlitePool,
+        wish: &WishRow,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<Offered, Error> {
+        let mut conn = pool.acquire().await?;
+        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        let wrote = answer(&mut tx, wish, outcome, reason).await?;
+        tx.commit().await?;
+        Ok(Offered {
+            wrote,
+            waiting: outcome == "waiting",
+        })
+    }
+
+    /// A task that is aborted when dropped: a handler cut short by shutdown
+    /// does not run on behind it.
+    struct Aborting<T>(tokio::task::JoinHandle<T>);
+
+    impl<T> Drop for Aborting<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    impl<R: Setting, H: CarryOut<R>> Typed<R, H> {
+        /// The handler's outcome for the wish `id`, run in a task of its own
+        /// — or the one it gave before, when only its recording failed.
+        async fn outcome(self: &Arc<Self>, run: &Run, id: Uuid, wish: Wish<R>) -> Outcome {
+            let key = (id, wish.version);
+            if let Some(outcome) = self.given().get(&key).cloned() {
+                return outcome;
+            }
+            let this = Arc::clone(self);
+            let mut task = Aborting(tokio::spawn(
+                async move { this.handler.carry_out(wish).await },
+            ));
+            match tokio::time::timeout(run.timeout, &mut task.0).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(e)) if e.is_panic() => Outcome::Later("its handler panicked".to_owned()),
+                Ok(Err(_)) => Outcome::Later("its handler was cancelled".to_owned()),
+                Err(_) => Outcome::Later(format!(
+                    "its handler did not answer within {:?}",
+                    run.timeout
+                )),
+            }
+        }
+
+        fn given(&self) -> std::sync::MutexGuard<'_, HashMap<(Uuid, i64), Outcome>> {
+            self.given
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Records `outcome`, the answer to `wish` of the row `key`: an
+        /// applied one written onto the row as it is now, in the same
+        /// transaction. A write the database refuses is the row's answer:
+        /// refused, with why.
+        async fn record(
+            &self,
+            run: &Run,
+            wish: &WishRow,
+            key: &crate::row::Key,
+            wanted: R,
+            outcome: &Outcome,
+        ) -> Result<Offered, Error> {
+            let mut conn = run.pool.acquire().await?;
+            let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+            let (outcome, why) = match outcome {
+                Outcome::Applied => {
+                    let now = crate::row::get_by_keys::<R>(&mut tx, std::slice::from_ref(key))
                         .await?
-                        .pop()
-                };
-                if wish.if_unchanged {
-                    let based = wanted.version_text();
-                    let why = match &held {
-                        None => Some("this replica holds no such row".to_owned()),
-                        Some(held) if held.version_text() != based => Some(format!(
-                            "this replica holds version {} of it, and the wish is based on {based}",
-                            held.version_text()
-                        )),
-                        Some(_) => None,
+                        .pop();
+                    let Some(mut row) = now else {
+                        drop(tx);
+                        return answer_alone(&run.pool, wish, "waiting", Some(NO_ROW)).await;
                     };
-                    if let Some(why) = why {
-                        return answer(pool, &wish, None, "superseded", Some(&why)).await;
+                    let was = row.version_text();
+                    row.take_desired(wanted);
+                    row.raise_version();
+                    if row.version_text() == was {
+                        let why = format!("its version cannot move past {was}");
+                        let wrote = answer(&mut tx, wish, "refused", Some(&why)).await?;
+                        tx.commit().await?;
+                        return Ok(Offered {
+                            wrote,
+                            waiting: false,
+                        });
                     }
+                    crate::row::savepoint(&mut tx).await?;
+                    let written = crate::row::overwrite_except(&mut tx, vec![row], &[]).await;
+                    if let Err(e) = crate::row::released(&mut tx, written).await? {
+                        let why = format!("this replica's database refuses it: {e}");
+                        let wrote = answer(&mut tx, wish, "refused", Some(&why)).await?;
+                        tx.commit().await?;
+                        return Ok(Offered {
+                            wrote,
+                            waiting: false,
+                        });
+                    }
+                    ("applied", None)
                 }
-                let outcome = self
-                    .handler
-                    .carry_out(Wish {
-                        wanted: wanted.clone(),
-                        held,
-                        note: wish.note.clone(),
-                        version: wish.version,
-                    })
-                    .await;
-                let mut conn = pool.acquire().await?;
-                let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
-                match outcome {
-                    Outcome::Applied => {
-                        // What the setting is now, whatever became of the
-                        // wish meanwhile: the handler set it.
-                        let now = crate::row::get_by_keys::<R>(&mut tx, &[key]).await?.pop();
-                        if let Some(mut row) = now {
-                            row.take_desired(wanted);
-                            row.raise_version();
-                            crate::row::overwrite_except(&mut tx, vec![row], &[]).await?;
-                        }
-                        answer(pool, &wish, Some(&mut tx), "applied", None).await?;
-                    }
-                    Outcome::Refused(why) => {
-                        answer(pool, &wish, Some(&mut tx), "refused", Some(&why)).await?;
-                    }
-                    Outcome::Later(why) => {
-                        answer(pool, &wish, Some(&mut tx), "waiting", Some(&why)).await?;
-                    }
-                }
-                tx.commit().await?;
-                Ok(())
+                Outcome::Refused(why) => ("refused", Some(why.as_str())),
+                Outcome::Later(why) => ("waiting", Some(why.as_str())),
+            };
+            let answered = answer(&mut tx, wish, outcome, why).await?;
+            tx.commit().await?;
+            Ok(Offered {
+                wrote: answered || outcome == "applied",
+                waiting: outcome == "waiting",
             })
+        }
+    }
+
+    /// Why a wish waits that is of a row the replica does not hold.
+    const NO_ROW: &str = "this replica holds no such row yet";
+
+    impl<R: Setting, H: CarryOut<R>> Carrier for Typed<R, H> {
+        fn row(&self) -> TypeId {
+            TypeId::of::<R>()
+        }
+
+        fn carry(
+            self: Arc<Self>,
+            run: Run,
+            wanted: Box<dyn Any + Send>,
+            wish: WishRow,
+        ) -> Fut<Result<Offered, Error>> {
+            Box::pin(async move { self.settle(&run, wanted, wish).await })
+        }
+    }
+
+    impl<R: Setting, H: CarryOut<R>> Typed<R, H> {
+        async fn settle(
+            self: Arc<Self>,
+            run: &Run,
+            wanted: Box<dyn Any + Send>,
+            wish: WishRow,
+        ) -> Result<Offered, Error> {
+            let wanted: R = *wanted
+                .downcast::<R>()
+                .expect("Replica::new checks a handler's row is its codec's");
+            let key = wanted.key();
+            let origin = R::ORIGIN.and_then(|o| R::KEY.iter().position(|k| *k == o));
+            if wanted.key_text() != wish.row_key
+                || origin.and_then(|at| key.get(at)) != Some(&KeyPart::Uuid(run.me))
+            {
+                let why = "the row wished is not the row the wish names, of this replica";
+                return answer_alone(&run.pool, &wish, "refused", Some(why)).await;
+            }
+            let held = {
+                let mut conn = run.pool.acquire().await?;
+                crate::row::get_by_keys::<R>(&mut conn, std::slice::from_ref(&key))
+                    .await?
+                    .pop()
+            };
+            let Some(held) = held else {
+                return answer_alone(&run.pool, &wish, "waiting", Some(NO_ROW)).await;
+            };
+            let based = wanted.version_text();
+            if wish.if_unchanged && held.version_text() != based {
+                let why = format!(
+                    "this replica holds version {} of it, and the wish is based on {based}",
+                    held.version_text()
+                );
+                return answer_alone(&run.pool, &wish, "superseded", Some(&why)).await;
+            }
+            let handed = Wish {
+                wanted: wanted.clone(),
+                held,
+                note: wish.note.clone(),
+                version: wish.version,
+            };
+            let outcome = self.outcome(run, wish.id, handed).await;
+            let recorded = self.record(run, &wish, &key, wanted, &outcome).await;
+            let mut given = self.given();
+            match recorded {
+                Ok(_) => {
+                    given.remove(&(wish.id, wish.version));
+                }
+                Err(_) => {
+                    given.insert((wish.id, wish.version), outcome);
+                }
+            }
+            recorded
         }
     }
 }

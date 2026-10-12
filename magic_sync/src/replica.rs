@@ -290,7 +290,7 @@ async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Res
         };
         sqlx::query(&format!(
             "INSERT INTO sync_notes (relation, row_key) SELECT {}, {} FROM {} t{only} \
-             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, set_aside = NULL",
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1",
             literal(table.name),
             key_sql(table, "t"),
             ident(table.name)
@@ -2293,10 +2293,10 @@ pub(crate) fn check_settings<P: Sync + 'static>(
         }
     }
     if lanes.iter().all(|l| !l.tables.is_empty()) {
-        if let Some(codec) = codecs
-            .iter()
-            .find(|c| c.goes_up() && !named.contains(c.table.name))
-        {
+        // The engine's own tables go on the first lane, unless one names them.
+        if let Some(codec) = codecs.iter().find(|c| {
+            c.goes_up() && !named.contains(c.table.name) && c.table.name != crate::wish::TABLE
+        }) {
             return misuse(format!("`{}` goes up on no lane", codec.table.name));
         }
     }
@@ -2592,6 +2592,12 @@ async fn unsent(
     let quoted = |tables: &mut dyn Iterator<Item = &&str>| {
         tables.map(|t| literal(t)).collect::<Vec<_>>().join(", ")
     };
+    // The engine's table of wishes goes where a lane names it; else with
+    // every table no lane names; else on the first lane.
+    let wishes = (std::ptr::eq(lane, &lanes[0])
+        && lanes.iter().all(|l| !l.tables.is_empty())
+        && !lanes.iter().any(|l| l.tables.contains(&crate::wish::TABLE)))
+    .then_some(&crate::wish::TABLE);
     let filter = if lane.tables.is_empty() {
         let others = quoted(&mut lanes.iter().flat_map(|l| l.tables.iter()));
         if others.is_empty() {
@@ -2600,7 +2606,10 @@ async fn unsent(
             format!("AND relation NOT IN ({others})")
         }
     } else {
-        format!("AND relation IN ({})", quoted(&mut lane.tables.iter()))
+        format!(
+            "AND relation IN ({})",
+            quoted(&mut lane.tables.iter().chain(wishes))
+        )
     };
     let now = crate::dialect::NOW;
     Ok(sqlx::query_as(&format!(

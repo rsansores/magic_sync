@@ -786,24 +786,23 @@ impl Holder {
                 wish.table.clone(),
                 wish.key.clone().unwrap_or_default().parts.join("|"),
             );
+            let held = self.settings.get(&row).map(|(_, v)| *v);
             let answer = match read(&wish.table, &wish.wanted) {
                 None => ("waiting", "unread"),
                 Some((key, _, _)) if key != row.1 => ("refused", "another row"),
-                Some((_, _, based))
-                    if wish.if_unchanged
-                        && self.settings.get(&row).map(|(_, v)| *v) != Some(based) =>
-                {
+                Some(_) if held.is_none() => ("waiting", "no such row"),
+                Some((_, _, based)) if wish.if_unchanged && held != Some(based) => {
                     ("superseded", "changed here")
                 }
                 Some((_, value, _)) => {
                     carried.push((wish.id.clone(), wish.version));
                     match handle(&wish) {
                         Handled::Applied => {
-                            if let Some((held, version)) = self.settings.get_mut(&row) {
-                                *held = value;
-                                *version += 1;
-                                self.note(row.clone());
-                            }
+                            let (held, version) =
+                                self.settings.get_mut(&row).expect("a row it holds");
+                            *held = value;
+                            *version += 1;
+                            self.note(row.clone());
                             ("applied", "")
                         }
                         Handled::Refused => ("refused", "no"),

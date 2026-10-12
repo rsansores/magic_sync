@@ -77,6 +77,9 @@ pub type Place<R, P> = fn(&mut R, Uuid, &P);
 /// ```
 pub struct Codec<P> {
     pub(crate) table: Table,
+    /// The row type it encodes and decodes.
+    #[cfg(feature = "sqlite")]
+    pub(crate) row: std::any::TypeId,
     ops: Box<dyn Ops<P>>,
 }
 
@@ -202,6 +205,8 @@ impl<P: Sync + 'static> Codec<P> {
             ..Table::of::<R>()
         };
         Self {
+            #[cfg(feature = "sqlite")]
+            row: std::any::TypeId::of::<R>(),
             ops: Box::new(Typed {
                 owned: table.replica_owned(),
                 #[cfg(feature = "postgres")]
