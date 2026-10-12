@@ -395,6 +395,7 @@ DECLARE
     v_new_key TEXT;
     v_old_key TEXT;
     v_note    BIGINT;
+    v_newest  BIGINT;
     v_parent  TEXT;
     v_parts   INTEGER;
 BEGIN
@@ -417,11 +418,20 @@ BEGIN
         SELECT string_agg(v_old ->> k, '|' ORDER BY n) INTO v_old_key
           FROM unnest(v_key) WITH ORDINALITY AS a(k, n);
     END IF;
+    -- A row that moved to another partition is gone from the one it was
+    -- in: noted there first, so its first note keeps what it pointed at.
+    IF v_old_key = v_new_key AND TG_ARGV[1] <> ''
+       AND v_old ->> TG_ARGV[1] IS DISTINCT FROM v_new ->> TG_ARGV[1] THEN
+        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
+        VALUES ('row', TG_ARGV[0], v_old_key, (v_old ->> TG_ARGV[1])::UUID)
+        RETURNING id INTO v_note;
+    END IF;
     IF v_new_key IS NOT NULL THEN
         INSERT INTO sync.notes (kind, relation, row_key, partition_id)
         VALUES ('row', TG_ARGV[0], v_new_key,
                 CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_new ->> TG_ARGV[1])::UUID END)
-        RETURNING id INTO v_note;
+        RETURNING id INTO v_newest;
+        v_note := coalesce(v_note, v_newest);
     END IF;
     -- A row deleted, or whose key changed: the old key is gone.
     IF v_old_key IS DISTINCT FROM v_new_key AND v_old_key IS NOT NULL THEN

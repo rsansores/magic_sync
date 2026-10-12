@@ -2415,7 +2415,9 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
          UPDATE fixture.t_counters SET seen = 1;
          UPDATE fixture.t_counters SET name = 'd';
          UPDATE fixture.t_logs SET line = 'm';
-         UPDATE fixture.t_counters SET id = '{log}', partition_id = '{b}', kind_id = NULL;"
+         UPDATE fixture.t_counters SET id = '{log}', partition_id = '{b}', kind_id = NULL;
+         UPDATE fixture.t_counters SET kind_id = '{kind}';
+         UPDATE fixture.t_counters SET partition_id = '{a}';"
     ))
     .execute(&mut *conn)
     .await
@@ -2443,7 +2445,12 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
             // A key that changed: the new one where it is now, the old one
             // where it was, with what the row as it was pointed at.
             ("t_counters".into(), log.to_string(), Some(b), None),
-            ("t_counters".into(), counter.to_string(), Some(a), pointed),
+            ("t_counters".into(), counter.to_string(), Some(a), pointed.clone()),
+            ("t_counters".into(), log.to_string(), Some(b), None),
+            // A row that moved: where it was, whose replicas let it go —
+            // its first note, with what it pointed at — and where it is now.
+            ("t_counters".into(), log.to_string(), Some(b), pointed),
+            ("t_counters".into(), log.to_string(), Some(a), None),
         ]
     );
 }

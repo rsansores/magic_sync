@@ -154,7 +154,8 @@ table as the engine knows it (a partitioned table by its own name, not its
 partition's), the row's key in the order the row declares it, the columns it
 pointed at other mirrored rows with before the change, and the id of the
 transaction. A key that changed notes the old key too, in the partition it
-was in. Because
+was in, and a row that moved to another partition is noted in the one it
+left as well. Because
 the note is written by a trigger in the same transaction, **no write path can
 forget to note**, and a rolled-back change leaves no note. `TRUNCATE` is
 refused on a mirrored table, because it would remove rows without a note.
