@@ -644,7 +644,9 @@ says how to read it.
   of its own points at, a snapshot cut short and the one that supersedes
   it, a message lost on the way, the gap after it and what comes during the
   gap, the answer to an upload, a version older than the one held, a field
-  the replica does not know, a new epoch. Each message says what the
+  the replica does not know, a new epoch, a wish of a setting the replica
+  holds — carried through a provisioning — and its withdrawal. Each message
+  says what the
   replica makes of it (`applied`, `ended`, `filed`, `already`, `gap`, or
   `lost` on the way), and each step is followed by a `holds` line: what
   the replica then holds, as JSON.
@@ -658,8 +660,9 @@ says how to read it.
 - `tests/golden/to_server_verdicts.txt`: uploads a replica sends after a
   provisioning, a change and a take-back it applied — a refused delete
   with what it applied, an edit of a two-way row, a delete of a row of its
-  own, a refused sweep, a row of its own held back, a gap, what it applied
-  said again lower, of another
+  own, a refused sweep, a row of its own held back, an answer to a wish and
+  to one withdrawn, a setting and an older version of it, a gap, what it
+  applied said again lower, of another
   epoch, and past anything sent — each with what the server makes of it.
 
 A replica implementation is complete when:

@@ -118,6 +118,14 @@ pub fn codecs() -> Vec<Codec<()>> {
     ]
 }
 
+/// Every table of the golden corpora, parents first: the suite's, and a
+/// setting, whose wishes travel as the engine's own table.
+pub fn golden_codecs() -> Vec<Codec<()>> {
+    let mut codecs = codecs();
+    codecs.push(Codec::json::<Screen>(None));
+    codecs
+}
+
 /// A row of a JSON table, as the server sends it.
 #[cfg(feature = "sqlite")]
 pub fn json<R: Row + Serialize>(row: &R) -> Vec<u8> {
@@ -584,6 +592,8 @@ mod server {
     CREATE TABLE fixture.readings (replica_id UUID NOT NULL, id UUID NOT NULL, value BIGINT NOT NULL,
         at BIGINT NOT NULL, PRIMARY KEY (replica_id, id));
     CREATE TABLE fixture.events (id UUID PRIMARY KEY, what TEXT NOT NULL);
+    CREATE TABLE fixture.screens (replica_id UUID NOT NULL, id UUID NOT NULL, level BIGINT NOT NULL,
+        revision BIGINT NOT NULL, PRIMARY KEY (replica_id, id));
     ";
 
     /// Where what a replica says of itself, and does to two-way rows and its
@@ -593,6 +603,13 @@ mod server {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/golden/to_server_verdicts.txt"
     );
+
+    /// The wishes of the verdicts: one the replica holds, one withdrawn
+    /// before it answered; and the setting rows they are of.
+    const WISHED: &str = "0192f6a0-0000-7000-8000-00000000f001";
+    const WITHDRAWN: &str = "0192f6a0-0000-7000-8000-00000000f003";
+    const SCREEN: &str = "0192f6a0-0000-7000-8000-00000000f002";
+    const OTHER_SCREEN: &str = "0192f6a0-0000-7000-8000-00000000f004";
 
     const RESYNC: &str =
         "INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');";
@@ -624,7 +641,14 @@ mod server {
             "UPDATE fixture.items SET name = 'a2' WHERE name = 'a';
              UPDATE fixture.shelves SET label = 'top2', revision = 1800000000001 WHERE slot = 1;
              UPDATE fixture.prices SET cents = 250, updated_at = '2027-01-15 08:00:01+00';
-             UPDATE fixture.tasks SET title = 'recount', updated_at = '2027-01-15 08:00:01+00';",
+             UPDATE fixture.tasks SET title = 'recount', updated_at = '2027-01-15 08:00:01+00';
+             INSERT INTO sync.sync_wishes (id, replica_id, relation, row_key, wanted, version,
+                                           if_unchanged, note)
+             VALUES ('0192f6a0-0000-7000-8000-00000000f001', '0192f6a0-0000-7000-8000-0000000000aa',
+                     'screens',
+                     '0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002',
+                     convert_to('{\"replica_id\":\"0192f6a0-0000-7000-8000-0000000000aa\",\"id\":\"0192f6a0-0000-7000-8000-00000000f002\",\"level\":\"70\",\"revision\":\"3\"}', 'UTF8'),
+                     7, false, 'ops');",
             None,
         ),
         // A row the replica refuses (its own check): it keeps what it had.
@@ -648,6 +672,8 @@ mod server {
         ("lost", "UPDATE fixture.items SET name = 'a3' WHERE name = 'a2';", None),
         ("gap", "UPDATE fixture.items SET name = 'a4' WHERE name = 'a3';", None),
         ("healed", RESYNC, None),
+        // The wish withdrawn: the replica lets go of it.
+        ("withdrawn", "DELETE FROM sync.sync_wishes;", None),
         // The replica's upload, filed, answered.
         ("filed", "", None),
         // A row whose version is older than the one the replica holds — a
@@ -689,67 +715,71 @@ mod server {
     const HOLDS: &[(&str, &str)] = &[
         (
             "rows",
-            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"]}"#,
+            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"],"wishes":[]}"#,
         ),
         (
             "again",
-            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"]}"#,
+            r#"{"items":["a","b"],"prices":["9007199254740993"],"rejected":[],"shelves":["top 1800000000000","bottom 1800000000000"],"tasks":["count 1"],"wishes":[]}"#,
         ),
         (
             "update",
-            r#"{"items":["a2","b"],"prices":["250"],"rejected":[],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b"],"prices":["250"],"rejected":[],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "refused",
-            r#"{"items":["a2","b"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001","bottom 1800000000000"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "delete",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "cut",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "snapshot",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "lost",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "gap",
-            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a2","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
         ),
         (
             "healed",
-            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":["screens 0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002 7"]}"#,
+        ),
+        (
+            "withdrawn",
+            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
         ),
         (
             "filed",
-            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a4","b retired"],"prices":["250"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
         ),
         (
             "older",
-            r#"{"items":["a4","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a4","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
         ),
         (
             "unknown_field",
-            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
         ),
         (
             "epoch",
-            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"]}"#,
+            r#"{"items":["a5","b retired"],"prices":["125"],"rejected":["shelves 0192f6a0-0000-7000-8000-000000000b01|1"],"shelves":["top2 1800000000001"],"tasks":["recount 1"],"wishes":[]}"#,
         ),
         (
             "emptied",
-            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[]}"#,
+            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[],"wishes":[]}"#,
         ),
         (
             "empty_snapshot",
-            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[]}"#,
+            r#"{"items":["b retired"],"prices":[],"rejected":[],"shelves":[],"tasks":[],"wishes":[]}"#,
         ),
     ];
 
@@ -808,7 +838,7 @@ mod server {
         };
         let server = Server::install(
             pool.clone(),
-            codecs(),
+            golden_codecs(),
             replicas,
             kept.clone(),
             Anyone::new(pool.clone()),
@@ -820,7 +850,7 @@ mod server {
         // rejections past the two a message down carries here.
         let filer = Server::new(
             pool.clone(),
-            codecs(),
+            golden_codecs(),
             replicas,
             kept.clone(),
             Anyone::new(pool.clone()),
@@ -1036,8 +1066,11 @@ mod server {
                       # already, gap — or `lost`, which the transport loses. After a step,\n\
                       # `holds step json`: what the replica then holds, per table its rows as\n\
                       # text (items: name, and ` retired`; shelves: label and revision; prices:\n\
-                      # cents; tasks: title and done), and its rejections as `table key`.\n\
-                      # The replica: its own check refuses a shelf labelled `refused`; after\n\
+                      # cents; tasks: title and done; wishes: the setting's table, its row's\n\
+                      # key and the wish's version), and its rejections as `table key`.\n\
+                      # The replica: it holds a setting, `screens`, which the server wishes at\n\
+                      # `update` and withdraws at `withdrawn`; its own check refuses a shelf\n\
+                      # labelled `refused`; after\n\
                       # `rows` it marks its task done (its own column), has that filed, and\n\
                       # writes a receipt pointing at item b; at `filed`, the golden upload's\n\
                       # rows are its own, sent under its number.\n\
@@ -1070,7 +1103,12 @@ mod server {
              INSERT INTO fixture.tasks (id, title, done, updated_at) VALUES
                ('0192f6a0-0000-7000-8000-000000000d01', 'count', false, '2027-01-15 08:00:00+00');
              INSERT INTO fixture.readings VALUES
-               ('{REPLICA}', '0192f6a0-0000-7000-8000-000000000e01', 7, 1);"
+               ('{REPLICA}', '0192f6a0-0000-7000-8000-000000000e01', 7, 1);
+             INSERT INTO sync.sync_wishes (id, replica_id, relation, row_key, wanted, version,
+                                           if_unchanged)
+             VALUES ('{WISHED}', '{REPLICA}', 'screens', '{REPLICA}|{SCREEN}', '\\x7b7d', 7, false),
+                    ('{WITHDRAWN}', '{REPLICA}', 'screens', '{REPLICA}|{OTHER_SCREEN}', '\\x7b7d',
+                     8, false);"
         ))
         .execute(&mut *conn)
         .await
@@ -1078,7 +1116,7 @@ mod server {
         let kept = Kept::default();
         let server = Server::install(
             pool.clone(),
-            codecs(),
+            golden_codecs(),
             Replicas::new("fixture.t_replicas", "t_replicas").live("live"),
             kept.clone(),
             Anyone::new(pool.clone()),
@@ -1088,10 +1126,12 @@ mod server {
         .unwrap();
         let pass = || async { while server.pass_now().await.unwrap().unwrap_or_default() > 0 {} };
         pass().await;
-        sqlx::raw_sql("DELETE FROM fixture.prices")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+        sqlx::raw_sql(&format!(
+            "DELETE FROM fixture.prices; DELETE FROM sync.sync_wishes WHERE id = '{WITHDRAWN}';"
+        ))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         pass().await;
         // What it was sent: its provisioning, ended; the price taken back.
         let mut sent = Vec::new();
@@ -1197,8 +1237,73 @@ mod server {
             }],
             ..up(0)
         };
+        // Its answer to a wish, as it sends one up: the wish as it holds
+        // it, and its own columns.
+        let answer = |id: &str, screen: &str, version: u64, number: u64| Up {
+            tables: vec![Table {
+                table: "sync_wishes".to_owned(),
+                upserts: vec![crate::envelope::Wish {
+                    id: id.to_owned(),
+                    replica_id: REPLICA.to_owned(),
+                    table: "screens".to_owned(),
+                    key: Some(key(&[REPLICA, screen])),
+                    wanted: b"{}".to_vec(),
+                    version,
+                    answered: version,
+                    outcome: "applied".to_owned(),
+                    answered_at: "2027-01-15T08:00:02.000000Z".to_owned(),
+                    ..crate::envelope::Wish::default()
+                }
+                .encode_to_vec()],
+                keys: vec![key(&[id])],
+                deletes: Vec::new(),
+            }],
+            ..up(number)
+        };
+        // A setting of its own, as it is.
+        let setting = |level: i64, revision: i64, number: u64| Up {
+            tables: vec![Table {
+                table: "screens".to_owned(),
+                upserts: vec![crate::wire::json_encode(
+                    "screens",
+                    &crate::row::Table::of::<Screen>().columns,
+                    &Screen {
+                        replica_id: replica,
+                        id: SCREEN.parse().unwrap(),
+                        level,
+                        revision,
+                    },
+                )
+                .unwrap()],
+                keys: vec![key(&[REPLICA, SCREEN])],
+                deletes: Vec::new(),
+            }],
+            ..up(number)
+        };
         let lines: Vec<(&str, &str, Up)> = vec![
             ("refused_delete", "confirmed,quarantined", refused_delete),
+            // Once it confirmed its provisioning, an answer to a wish withdrawn
+            // is the server's withdrawal winning, not an edit kept for later.
+            (
+                "answer",
+                "filed,answered",
+                answer(WISHED, SCREEN, 7, 0x0192_f6a0_0000_7004),
+            ),
+            (
+                "answer_withdrawn",
+                "filed,unheld",
+                answer(WITHDRAWN, OTHER_SCREEN, 8, 0x0192_f6a0_0000_7005),
+            ),
+            (
+                "setting",
+                "filed,set",
+                setting(40, 9, 0x0192_f6a0_0000_7006),
+            ),
+            (
+                "setting_older",
+                "filed,set",
+                setting(20, 3, 0x0192_f6a0_0000_7007),
+            ),
             ("edit", "filed,edited", edit),
             ("delete", "filed,gone", delete),
             (
@@ -1221,7 +1326,9 @@ mod server {
                       # per upload — confirmed: what it applied recorded; filed: answered;\n\
                       # edited: its column of a two-way row written; gone: its own row deleted;\n\
                       # quarantined: the row it refused set aside; held_back: the row of its\n\
-                      # own it held back set aside, with no alarm; provisioned: provisioned\n\
+                      # own it held back set aside, with no alarm; answered: its answer to a\n\
+                      # wish kept beside it; unheld: its answer to a wish withdrawn left out;\n\
+                      # set: its setting written, older version or not; provisioned: provisioned\n\
                       # again; restored: a new epoch, every replica provisioned again. Each\n\
                       # after a provisioning, a change and a take-back the replica applied.\n\
                       # Generated and filed by conformance::server.\n";
@@ -1282,6 +1389,40 @@ mod server {
                     }
                     "quarantined" => scalar(quarantined).await == before.0 + 1,
                     "held_back" => scalar(set_aside).await == before.1 + 1,
+                    "answered" => {
+                        scalar(
+                            "SELECT count(*) FROM sync.sync_wishes WHERE replica_id = $1 \
+                               AND answered = version AND outcome = 'applied'",
+                        )
+                        .await
+                            == 1
+                    }
+                    "unheld" => {
+                        scalar(
+                            "SELECT count(*) FROM sync.sync_wishes WHERE replica_id = $1 \
+                               AND answered IS NOT NULL",
+                        )
+                        .await
+                            == 1
+                            && scalar("SELECT count(*) FROM sync.inbox WHERE $1 IS NOT NULL").await
+                                == 0
+                    }
+                    "set" => {
+                        let screen = crate::wire::json_decode::<Screen>(
+                            "screens",
+                            &crate::row::Table::of::<Screen>().columns,
+                            &up.tables[0].upserts[0],
+                        )
+                        .unwrap();
+                        sqlx::query_as::<_, (i64, i64)>(
+                            "SELECT level, revision FROM fixture.screens WHERE replica_id = $1",
+                        )
+                        .bind(replica)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap()
+                            == (screen.level, screen.revision)
+                    }
                     "provisioned" => scalar(resyncs).await == 1,
                     "restored" => {
                         sqlx::query_scalar::<_, bool>("SELECT epoch <> $1::uuid FROM sync.epoch")

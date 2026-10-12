@@ -3,17 +3,11 @@
 //! answer and the setting it changed going up together.
 
 use super::*;
-use crate::conformance::Screen;
 use crate::envelope::Wish as WireWish;
 use crate::wish::{CarryOut, Direct, Outcome, Wish, Wishes};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
-
-const SCREENS: &str = "
-CREATE TABLE screens (replica_id BLOB NOT NULL, id BLOB NOT NULL, level INTEGER NOT NULL,
-    revision INTEGER NOT NULL, PRIMARY KEY (replica_id, id));
-";
 
 /// A handler that answers as it is told, and remembers what it was handed.
 /// While `held` it waits, once it said it began, until it is let go.
@@ -56,18 +50,18 @@ impl Hand {
     }
 }
 
-fn wish_codecs() -> Vec<Codec<()>> {
-    let mut codecs = codecs();
-    codecs.push(Codec::json::<Screen>(None));
-    codecs
-}
-
 async fn wish_world(pool: SqlitePool, hand: &Hand) -> World {
     let settings = Settings {
         wishes: Wishes::new().on::<Screen>(hand.clone()),
         ..Settings::default()
     };
-    world_of(pool, &format!("{TABLES}{SCREENS}"), settings, wish_codecs()).await
+    world_of(
+        pool,
+        &format!("{TABLES}{SCREENS}"),
+        settings,
+        golden_codecs(),
+    )
+    .await
 }
 
 /// The wish of the row `screen` (by its key), as a server sends it.
@@ -428,7 +422,7 @@ async fn a_replica_refuses_a_setting_with_no_handler_and_a_handler_of_none(pool:
         .execute(&pool)
         .await
         .unwrap();
-    install(&mut pool.acquire().await.unwrap(), &wish_codecs())
+    install(&mut pool.acquire().await.unwrap(), &golden_codecs())
         .await
         .unwrap();
     let new = |codecs: Vec<Codec<()>>, wishes: Wishes| {
@@ -441,7 +435,7 @@ async fn a_replica_refuses_a_setting_with_no_handler_and_a_handler_of_none(pool:
             Replica::new(pool, codecs, Uuid::now_v7(), Uplinked::default(), settings).await
         }
     };
-    let refused = new(wish_codecs(), Wishes::new()).await;
+    let refused = new(golden_codecs(), Wishes::new()).await;
     assert!(
         matches!(&refused, Err(Error::Misuse(why)) if why.contains("nothing carries")),
         "{refused:?}"
@@ -451,7 +445,7 @@ async fn a_replica_refuses_a_setting_with_no_handler_and_a_handler_of_none(pool:
         matches!(&refused, Err(Error::Misuse(why)) if why.contains("no setting")),
         "{refused:?}"
     );
-    new(wish_codecs(), Wishes::new().on::<Screen>(Direct))
+    new(golden_codecs(), Wishes::new().on::<Screen>(Direct))
         .await
         .expect("a setting and its handler");
 }
@@ -556,4 +550,261 @@ async fn a_snapshot_beginning_has_the_replica_say_its_settings_and_answers_again
     )
     .unwrap();
     assert_eq!((wish.answered, wish.outcome.as_str()), (5, "applied"));
+}
+
+// ---------------------------------------------------------------------------
+// The replica against the protocol's model of it, at random: wishes sent,
+// replaced and withdrawn, snapshots, the host's own writes, wishes carried
+// out and refused and waiting, uploads answered — the same messages and the
+// same decisions to both, and after every step the replica holds the
+// settings, the wishes and the answers the model does, and has noted for
+// the server what the model has.
+
+/// What a handler decides of a wish, the same for the replica and the
+/// model: of its version, and of the round.
+fn decide(version: u64, round: u64) -> crate::model::Handled {
+    use crate::model::Handled;
+    match (version ^ round) % 7 {
+        0 | 1 => Handled::Refused,
+        2 => Handled::Later,
+        _ => Handled::Applied,
+    }
+}
+
+/// A handler that decides as [`decide`] does, the round its own.
+#[derive(Clone, Default)]
+struct Decides(Arc<Mutex<u64>>);
+
+impl CarryOut<Screen> for Decides {
+    async fn carry_out(&self, wish: Wish<Screen>) -> Outcome {
+        let round = *self.0.lock().unwrap();
+        match decide(u64::try_from(wish.version).unwrap(), round) {
+            crate::model::Handled::Applied => Outcome::Applied,
+            crate::model::Handled::Refused => Outcome::Refused("no".to_owned()),
+            crate::model::Handled::Later => Outcome::Later("away".to_owned()),
+        }
+    }
+}
+
+fn read_screen(_: &str, bytes: &[u8]) -> Option<(String, i64, i64)> {
+    let row: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let number = |field: &str| row[field].as_str()?.parse::<i64>().ok();
+    Some((
+        format!("{}|{}", row["replica_id"].as_str()?, row["id"].as_str()?),
+        number("level")?,
+        number("revision")?,
+    ))
+}
+
+fn write_screen(_: &str, key: &str, level: i64, revision: i64) -> Vec<u8> {
+    let (replica, id) = key.split_once('|').expect("a screen's key");
+    json(&Screen {
+        replica_id: replica.parse().unwrap(),
+        id: id.parse().unwrap(),
+        level,
+        revision,
+    })
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_replica_carries_wishes_out_as_the_protocol_says_whatever_comes(pool: SqlitePool) {
+    walk_wishes(pool, 3).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_replica_carries_wishes_out_as_the_protocol_says_another_way(pool: SqlitePool) {
+    walk_wishes(pool, 11).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_replica_carries_wishes_out_as_the_protocol_says_a_third_way(pool: SqlitePool) {
+    walk_wishes(pool, 29).await;
+}
+
+async fn walk_wishes(pool: SqlitePool, seed: u64) {
+    use crate::model::{held_wishes, Holder, Model, Row};
+    let round = Decides::default();
+    let settings = Settings {
+        wishes: Wishes::new().on::<Screen>(round.clone()),
+        ..Settings::default()
+    };
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{SCREENS}"),
+        settings,
+        golden_codecs(),
+    )
+    .await;
+    let mut walk = crate::testkit::Walk(seed);
+    let mut model = Model::default();
+    model.receive(
+        &ending(BASE, 0, "provisioned", &[]),
+        &crate::model::Rules::ANY,
+    );
+    let mut holder = Holder::default();
+    // The server's wishes: by screen, the version and what it wishes.
+    let mut asked: BTreeMap<u128, (u64, Screen, bool)> = BTreeMap::new();
+    let mut n = 0;
+    let screen = |id: u128, level: i64, revision: i64| Screen {
+        replica_id: w.me,
+        id: Uuid::from_u128(id),
+        level,
+        revision,
+    };
+    let row_of = |id: u128| {
+        (
+            "screens".to_owned(),
+            format!("{}|{}", w.me, Uuid::from_u128(id)),
+        )
+    };
+    for step in 0..120 {
+        let at = format!("seed {seed}, step {step}");
+        let id = 1 + walk.below(3) as u128;
+        let row = row_of(id);
+        match walk.below(10) {
+            // The server wishes a screen, or withdraws its wish.
+            0..=2 => {
+                n += 1;
+                let tables = if walk.below(4) == 0 {
+                    asked.remove(&id);
+                    vec![deletes(
+                        "sync_wishes",
+                        vec![wished(&screen(id, 0, 0), 1, false).0],
+                    )]
+                } else {
+                    let held = holder.settings.get(&row).map_or(1, |(_, v)| *v);
+                    let based = if walk.below(4) == 0 { held - 1 } else { held };
+                    let wanted = screen(id, walk.below(100) as i64, based);
+                    let version = walk.next() >> 1;
+                    let unchanged = walk.below(2) == 0;
+                    asked.insert(id, (version, wanted.clone(), unchanged));
+                    vec![wishes(vec![wished(&wanted, version, unchanged)])]
+                };
+                let message = down(n, "", tables);
+                w.receive(&message).await;
+                model.receive(&message, &crate::model::Rules::ANY);
+                holder.forget(&model);
+            }
+            // The server provisions it again: every wish it has, in a
+            // snapshot.
+            3 => {
+                let name = format!("s{step}");
+                let rows = asked
+                    .values()
+                    .map(|(version, wanted, unchanged)| wished(wanted, *version, *unchanged))
+                    .collect();
+                n += 1;
+                let begun = numbered(BASE + n, 0, &name, vec![wishes(rows)]);
+                w.receive(&begun).await;
+                model.receive(&begun, &crate::model::Rules::ANY);
+                holder.began(&model);
+                n += 1;
+                let ended = end(n, &name, &["sync_wishes"]);
+                w.receive(&ended).await;
+                model.receive(&ended, &crate::model::Rules::ANY);
+                holder.forget(&model);
+            }
+            // The host writes a screen of its own.
+            4 => {
+                holder.write(&row, walk.below(100) as i64);
+                let (level, revision) = holder.settings[&row];
+                sqlx::query(
+                    "INSERT INTO screens (replica_id, id, level, revision) VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (replica_id, id) DO UPDATE SET level = excluded.level, \
+                            revision = excluded.revision",
+                )
+                .bind(w.me)
+                .bind(Uuid::from_u128(id))
+                .bind(level)
+                .bind(revision)
+                .execute(&w.pool)
+                .await
+                .unwrap();
+            }
+            // The replica carries out what it holds.
+            5..=7 => {
+                let r = walk.next();
+                *round.0.lock().unwrap() = r;
+                w.offer().await;
+                holder.carry(&model, read_screen, |wish| decide(wish.version, r));
+            }
+            // What it wrote goes up, and is filed.
+            _ => {
+                let real = w.up(0, false).await;
+                let modelled = holder.up(write_screen);
+                let said = |up: Option<&Up>| -> BTreeSet<(String, String)> {
+                    up.map(|up| {
+                        up.tables
+                            .iter()
+                            .filter(|t| t.table == "screens" || t.table == "sync_wishes")
+                            .flat_map(|t| {
+                                t.keys.iter().map(|k| (t.table.clone(), k.parts.join("|")))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+                };
+                assert_eq!(
+                    said(real.as_ref()),
+                    said(modelled.as_ref()),
+                    "{at}: what goes up"
+                );
+                if let Some(up) = real {
+                    w.receive(
+                        &Body::Filed(Filed {
+                            uploads: up.uploads,
+                        })
+                        .encoded(),
+                    )
+                    .await;
+                }
+                if let Some(up) = modelled {
+                    holder.filed(&up.uploads);
+                    holder.forget(&model);
+                }
+            }
+        }
+        let settings: BTreeMap<Row, (i64, i64)> = sqlx::query_as::<_, (Uuid, Uuid, i64, i64)>(
+            "SELECT replica_id, id, level, revision FROM screens",
+        )
+        .fetch_all(&w.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(r, i, l, v)| (("screens".to_owned(), format!("{r}|{i}")), (l, v)))
+        .collect();
+        assert_eq!(settings, holder.settings, "{at}: the settings");
+        let held: BTreeMap<String, (u64, Option<(u64, String)>)> =
+            sqlx::query_as::<_, (Uuid, i64, Option<i64>, Option<String>)>(
+                "SELECT id, version, answered, outcome FROM sync_wishes WHERE retired_at IS NULL",
+            )
+            .fetch_all(&w.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, version, answered, outcome)| {
+                let answer = answered.zip(outcome).map(|(a, o)| (a as u64, o));
+                (id.to_string(), (version as u64, answer))
+            })
+            .collect();
+        let modelled: BTreeMap<String, (u64, Option<(u64, String)>)> = held_wishes(&model)
+            .into_iter()
+            .map(|wish| {
+                let answer = holder
+                    .answers
+                    .get(&wish.id)
+                    .map(|(a, o, _)| (*a, o.clone()));
+                (wish.id, (wish.version, answer))
+            })
+            .collect();
+        assert_eq!(held, modelled, "{at}: the wishes and their answers");
+        let noted: BTreeSet<(String, String)> =
+            sqlx::query_as("SELECT relation, row_key FROM sync_notes")
+                .fetch_all(&w.pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        assert_eq!(noted, holder.noted(), "{at}: what is noted");
+    }
 }

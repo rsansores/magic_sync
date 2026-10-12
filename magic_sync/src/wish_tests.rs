@@ -4,6 +4,7 @@
 use super::*;
 pub(super) use crate::conformance::Screen;
 use crate::envelope::{Key as WireKey, Table as WireTable, Up, Wish};
+use crate::model;
 use crate::row::Row as _;
 use crate::status::WishState;
 use crate::wish::{WishRow, TABLE};
@@ -58,15 +59,7 @@ impl World {
     }
 }
 
-/// The wishes a modelled replica holds, as the server sent them.
-pub(super) fn held_wishes(model: &Model) -> Vec<Wish> {
-    model
-        .rows
-        .iter()
-        .filter(|((table, _), _)| table == TABLE)
-        .map(|(_, bytes)| Wish::decode(bytes.as_slice()).expect("a wish"))
-        .collect()
-}
+pub(super) use crate::model::held_wishes;
 
 /// `replica`'s answer to the wish `wish`, as it sends it up.
 pub(super) fn answer(wish: &Wish, outcome: &str, reason: &str) -> Up {
@@ -488,4 +481,436 @@ async fn a_replica_with_a_wish_to_carry_out_is_catching_up(pool: crate::DbPool) 
          export default {json} satisfies WishListing\n"
     );
     crate::status::tests::matches_contract("fixtures/wishes.ts", &text);
+}
+
+// ---------------------------------------------------------------------------
+// The walk: wishes, local writes, answers and restores of either side, at
+// random, against replicas written from the protocol; and at every point the
+// system settles, both sides show the same.
+
+/// A setting carried out only while unchanged.
+#[derive(
+    sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
+)]
+#[row(
+    table = "dials",
+    schema = "fixture",
+    mirror = "setting",
+    key = "replica_id, id",
+    origin = "replica_id",
+    apply = "if_unchanged"
+)]
+struct Dial {
+    replica_id: Uuid,
+    id: Uuid,
+    #[row(desired)]
+    level: i64,
+    #[row(version)]
+    revision: i64,
+}
+
+const DIALS: &str = "
+CREATE TABLE fixture.dials (
+    replica_id UUID NOT NULL, id UUID NOT NULL, level BIGINT NOT NULL, revision BIGINT NOT NULL,
+    PRIMARY KEY (replica_id, id));
+";
+
+/// Both settings' rows travel as the same JSON: their key, level and
+/// revision.
+fn read_setting(_: &str, bytes: &[u8]) -> Option<(String, i64, i64)> {
+    let row: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let number = |field: &str| row[field].as_str()?.parse::<i64>().ok();
+    Some((
+        format!("{}|{}", row["replica_id"].as_str()?, row["id"].as_str()?),
+        number("level")?,
+        number("revision")?,
+    ))
+}
+
+fn write_setting(_: &str, key: &str, level: i64, revision: i64) -> Vec<u8> {
+    let (replica, id) = key.split_once('|').expect("a setting's key");
+    serde_json::to_vec(&serde_json::json!({
+        "replica_id": replica, "id": id,
+        "level": level.to_string(), "revision": revision.to_string(),
+    }))
+    .unwrap()
+}
+
+/// A replica of the walk: what the protocol says it holds, and its own.
+#[derive(Clone, Default)]
+struct Walked {
+    model: Model,
+    holder: crate::model::Holder,
+}
+
+impl World {
+    /// Passes, deliveries and uploads until nothing moves: each replica
+    /// says what it applied and sends what it wrote, the server files it and
+    /// answers; a snapshot beginning has a replica say its settings again.
+    async fn settle_wishes(&self, wire: &Wire, replicas: &mut BTreeMap<Uuid, Walked>) {
+        // Time enough passes for every wait to be over: a replica that
+        // asks to be provisioned again too soon is, then.
+        sqlx::raw_sql(
+            "UPDATE sync.replicas SET retry_after = NULL, asked_at = NULL; \
+             UPDATE sync.notes SET noted_at = now() WHERE noted_at > now()",
+        )
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        for _ in 0..80 {
+            let passed = self.pass(wire).await;
+            let mut moved = passed.done + passed.sent > 0;
+            for (replica, walked) in replicas.iter_mut() {
+                while let Some(bytes) = wire.next(*replica) {
+                    let begins = match envelope::ToReplica::decode(bytes.as_slice())
+                        .ok()
+                        .and_then(|m| m.body)
+                    {
+                        Some(Body::Down(d)) => d.previous == 0,
+                        Some(Body::EndSnapshot(e)) => e.previous == 0,
+                        _ => false,
+                    };
+                    let received = walked.model.receive(&bytes, &Rules::ANY);
+                    if begins
+                        && matches!(
+                            received,
+                            crate::model::Received::Applied | crate::model::Received::Ended
+                        )
+                    {
+                        walked.holder.began(&walked.model);
+                    }
+                    walked.holder.forget(&walked.model);
+                    wire.acknowledge(*replica);
+                    moved = true;
+                }
+                if let Some(up) = walked.model.up() {
+                    crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &()).await;
+                    walked.model.delivered(&up);
+                    moved = true;
+                }
+                if let Some(up) = walked.holder.up(write_setting) {
+                    crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &()).await;
+                    walked.holder.filed(&up.uploads);
+                    walked.holder.forget(&walked.model);
+                    moved = true;
+                }
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("did not settle");
+    }
+
+    /// The server's copy of `replica`'s settings.
+    async fn settings_of(&self, replica: Uuid) -> BTreeMap<model::Row, (i64, i64)> {
+        let mut out = BTreeMap::new();
+        for table in ["screens", "dials"] {
+            let rows: Vec<(Uuid, Uuid, i64, i64)> = sqlx::query_as(&format!(
+                "SELECT replica_id, id, level, revision FROM fixture.{table} WHERE replica_id = $1"
+            ))
+            .bind(replica)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap();
+            for (replica, id, level, revision) in rows {
+                out.insert(
+                    (table.to_owned(), format!("{replica}|{id}")),
+                    (level, revision),
+                );
+            }
+        }
+        out
+    }
+
+    /// The server's wishes for `replica`: id, version, state, reason.
+    async fn wishes_of(&self, replica: Uuid) -> BTreeMap<String, (u64, String)> {
+        let rows: Vec<(Uuid, i64, String)> = sqlx::query_as(&format!(
+            "SELECT w.id, w.version, {} FROM sync.sync_wishes w WHERE w.replica_id = $1",
+            crate::wish::STATE
+        ))
+        .bind(replica)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(id, version, state)| (id.to_string(), (version as u64, state)))
+            .collect()
+    }
+}
+
+/// Wishes of two settings — one carried out always, one only while
+/// unchanged — wished, wished again and withdrawn at random, while the
+/// replicas write their settings themselves, carry wishes out or refuse them
+/// or cannot yet, and either side is restored from an older copy: once the
+/// system settles, every setting is the same on the server and on its
+/// replica, every wish the replica holds is the one the server has, and its
+/// answer the one the server shows; and no replica carried a wish out twice
+/// but after it was restored from an older copy.
+#[sqlx::test(migrations = false)]
+async fn wishes_walked_at_random_leave_both_sides_showing_the_same(pool: crate::DbPool) {
+    walk_wishes(pool, 5).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn wishes_walked_at_random_another_way_leave_both_sides_showing_the_same(
+    pool: crate::DbPool,
+) {
+    walk_wishes(pool, 7).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn wishes_walked_at_random_a_third_way_leave_both_sides_showing_the_same(
+    pool: crate::DbPool,
+) {
+    walk_wishes(pool, 42).await;
+}
+
+async fn walk_wishes(pool: crate::DbPool, seed: u64) {
+    let (replicas, partition) = founded(&pool, &format!("{SCREENS}{DIALS}")).await;
+    let codecs = vec![
+        Codec::new::<Item, ItemRow>(to_wire, from_wire, None),
+        Codec::json::<Screen>(None),
+        Codec::json::<Dial>(None),
+    ];
+    let world = &provisioned(pool, codecs, replicas, partition).await;
+    use crate::model::Handled;
+    let mut walk = crate::testkit::Walk(seed);
+    let wire = Wire::new(seed);
+    let mut walked: BTreeMap<Uuid, Walked> = world
+        .replicas
+        .iter()
+        .map(|r| {
+            (
+                *r,
+                Walked {
+                    model: world.follower(*r),
+                    holder: crate::model::Holder::default(),
+                },
+            )
+        })
+        .collect();
+    let rows = |replica: Uuid| -> Vec<model::Row> {
+        ["screens", "dials"]
+            .into_iter()
+            .flat_map(|table| {
+                (1..=2_u128).map(move |id| {
+                    (
+                        table.to_owned(),
+                        format!("{replica}|{}", Uuid::from_u128(id)),
+                    )
+                })
+            })
+            .collect()
+    };
+    for (replica, w) in &mut walked {
+        for row in rows(*replica) {
+            w.holder.write(&row, 0);
+        }
+    }
+    world.settle_wishes(&wire, &mut walked).await;
+    // Per replica, each wish it answered for good since its database was
+    // last restored: its handler is never handed one of them again.
+    let mut answered: BTreeMap<Uuid, BTreeSet<(String, u64)>> = BTreeMap::new();
+    let mut copies: BTreeMap<Uuid, Walked> = BTreeMap::new();
+    // What the walk did, so that a seed that misses a case says so.
+    let mut did: BTreeSet<&str> = BTreeSet::new();
+    let mut backed_up = false;
+    for _ in 0..160 {
+        let replica = walk.pick(&world.replicas).unwrap();
+        let all = rows(replica);
+        let row = all[walk.below(all.len())].clone();
+        let (table, key) = (row.0.clone(), row.1.clone());
+        let id = Uuid::parse_str(key.split_once('|').unwrap().1).unwrap();
+        match walk.below(100) {
+            0..30 => {
+                let level = walk.below(100) as i64 + 1;
+                let seen = world
+                    .settings_of(replica)
+                    .await
+                    .get(&row)
+                    .map_or(1, |(_, v)| *v);
+                let based = if walk.below(4) == 0 { seen - 1 } else { seen };
+                let mut tx = world.pool.begin().await.unwrap();
+                if table == "screens" {
+                    let wanted = Screen {
+                        replica_id: replica,
+                        id,
+                        level,
+                        revision: based,
+                    };
+                    crate::wish::desire(&mut tx, &world.codecs, wanted, None)
+                        .await
+                        .unwrap();
+                } else {
+                    let wanted = Dial {
+                        replica_id: replica,
+                        id,
+                        level,
+                        revision: based,
+                    };
+                    crate::wish::desire(&mut tx, &world.codecs, wanted, None)
+                        .await
+                        .unwrap();
+                }
+                tx.commit().await.unwrap();
+            }
+            30..38 => {
+                let key = vec![
+                    crate::row::KeyPart::Uuid(replica),
+                    crate::row::KeyPart::Uuid(id),
+                ];
+                let mut tx = world.pool.begin().await.unwrap();
+                if table == "screens" {
+                    crate::wish::withdraw::<Screen>(&mut tx, &key)
+                        .await
+                        .unwrap();
+                } else {
+                    crate::wish::withdraw::<Dial>(&mut tx, &key).await.unwrap();
+                }
+                tx.commit().await.unwrap();
+            }
+            38..53 => {
+                let level = walk.below(100) as i64 + 1;
+                walked.get_mut(&replica).unwrap().holder.write(&row, level);
+            }
+            53..73 => {
+                let w = walked.get_mut(&replica).unwrap();
+                let choice = walk.below(100);
+                let handled = w.holder.carry(&w.model, read_setting, |_| match choice {
+                    0..60 => Handled::Applied,
+                    60..75 => Handled::Refused,
+                    _ => Handled::Later,
+                });
+                let done = answered.entry(replica).or_default();
+                for wish in handled {
+                    assert!(
+                        !done.contains(&wish),
+                        "seed {seed}: {replica} carried {wish:?} out again"
+                    );
+                }
+                for (id, (version, outcome, _)) in &w.holder.answers {
+                    if let Some(said) = ["applied", "refused", "superseded"]
+                        .into_iter()
+                        .find(|o| o == outcome)
+                    {
+                        done.insert((id.clone(), *version));
+                        did.insert(said);
+                    }
+                }
+            }
+            73..90 => world.settle_wishes(&wire, &mut walked).await,
+            90..93 => {
+                copies.insert(replica, walked[&replica].clone());
+            }
+            93..96 => {
+                if let Some(copy) = copies.remove(&replica) {
+                    // Its database, as the copy was; what it answered
+                    // since is forgotten with it.
+                    walked.insert(replica, copy);
+                    answered.remove(&replica);
+                    did.insert("a replica restored");
+                }
+            }
+            96..98 => {
+                crate::testkit::back_up(
+                    &mut world.pool.acquire().await.unwrap(),
+                    &["fixture", "sync"],
+                )
+                .await;
+                backed_up = true;
+            }
+            _ => {
+                if std::mem::take(&mut backed_up) {
+                    // A server restored from an older copy wishes again
+                    // what it wished then: a wish answered since may be
+                    // carried out again.
+                    answered.clear();
+                    did.insert("the server restored");
+                    crate::testkit::restore(
+                        &mut world.pool.acquire().await.unwrap(),
+                        &["fixture", "sync"],
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    // Settled: every wish carried out or refused — none waits — and every
+    // replica says what it holds, which finds a server restored from an
+    // older copy.
+    for _ in 0..10 {
+        world.settle_wishes(&wire, &mut walked).await;
+        let mut moved = false;
+        for (replica, w) in &mut walked {
+            let up = w.model.digests(&["sync_wishes"]);
+            crate::testkit::file(&world.pool, &world.codecs, &up, *replica, &()).await;
+            let handled = w.holder.carry(&w.model, read_setting, |wish| {
+                if wish.version % 3 == 0 {
+                    Handled::Refused
+                } else {
+                    Handled::Applied
+                }
+            });
+            moved |= !handled.is_empty();
+        }
+        world.settle_wishes(&wire, &mut walked).await;
+        if !moved && walked.values().all(|w| w.holder.noted().is_empty()) {
+            break;
+        }
+    }
+    assert_eq!(
+        did,
+        BTreeSet::from([
+            "a replica restored",
+            "the server restored",
+            "applied",
+            "refused",
+            "superseded"
+        ]),
+        "seed {seed}: what the walk did"
+    );
+    for (replica, w) in &walked {
+        assert!(
+            w.holder.noted().is_empty(),
+            "seed {seed}: {replica} has writes unfiled"
+        );
+        assert_eq!(
+            world.settings_of(*replica).await,
+            w.holder.settings,
+            "seed {seed}: {replica}'s settings, server and replica"
+        );
+        let held: BTreeMap<String, u64> = crate::model::held_wishes(&w.model)
+            .into_iter()
+            .map(|wish| (wish.id, wish.version))
+            .collect();
+        let server = world.wishes_of(*replica).await;
+        assert_eq!(
+            server
+                .iter()
+                .map(|(id, (v, _))| (id.clone(), *v))
+                .collect::<BTreeMap<_, _>>(),
+            held,
+            "seed {seed}: {replica}'s wishes, server and replica; it applied {:?}, gap {}; the server: {:?}",
+            w.model.applied,
+            w.model.gap,
+            sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<String>)>(
+                "SELECT c.last_sequence, r.applied_sequence, r.last_error FROM sync.chains c \
+                   FULL JOIN sync.replicas r USING (replica_id) WHERE replica_id = $1"
+            )
+            .bind(replica)
+            .fetch_optional(&world.pool)
+            .await
+            .unwrap(),
+        );
+        for (id, (version, state)) in &server {
+            let (answered, outcome, _) = &w.holder.answers[id];
+            assert_eq!(
+                (answered, outcome),
+                (version, state),
+                "seed {seed}: {replica}'s answer to {id}, replica and server"
+            );
+        }
+    }
 }

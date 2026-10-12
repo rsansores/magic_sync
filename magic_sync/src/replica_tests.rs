@@ -10,7 +10,8 @@
 
 use super::*;
 use crate::conformance::{
-    codecs, json, nonce_of, settled, Event, Price, Reading, Shelf, Task, Uplinked,
+    codecs, golden_codecs, json, nonce_of, settled, Event, Price, Reading, Screen, Shelf, Task,
+    Uplinked,
 };
 use crate::envelope::{
     Backlog, Down, EndSnapshot, Filed, Key as WireKey, Limits, Table, ToReplica, ENVELOPE_ROOM,
@@ -36,6 +37,12 @@ CREATE TABLE events (id BLOB PRIMARY KEY NOT NULL, what TEXT NOT NULL);
 CREATE TABLE receipts (id INTEGER PRIMARY KEY, item_id BLOB NOT NULL REFERENCES items (id));
 CREATE TABLE quotes (id INTEGER PRIMARY KEY,
     price_id BLOB NOT NULL REFERENCES prices (id) DEFERRABLE INITIALLY DEFERRED);
+";
+
+/// A setting of the replica's own: a screen, whose level the server may wish.
+const SCREENS: &str = "
+CREATE TABLE screens (replica_id BLOB NOT NULL, id BLOB NOT NULL, level INTEGER NOT NULL,
+    revision INTEGER NOT NULL, PRIMARY KEY (replica_id, id));
 ";
 
 const EPOCH: &str = "0192f6a0-0000-7000-8000-000000000001";
@@ -291,7 +298,17 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 /// says it is: the suite's, with a check of its own that refuses a shelf
 /// labelled `refused`.
 async fn golden_replica(pool: SqlitePool) -> World {
-    let w = world(settled(pool).await).await;
+    let settings = Settings {
+        wishes: crate::wish::Wishes::new().on::<Screen>(crate::wish::Direct),
+        ..Settings::default()
+    };
+    let w = world_of(
+        settled(pool).await,
+        &format!("{TABLES}{SCREENS}"),
+        settings,
+        golden_codecs(),
+    )
+    .await;
     w.exec(
         "CREATE TRIGGER no_refused BEFORE UPDATE ON shelves WHEN NEW.label = 'refused' \
          BEGIN SELECT RAISE(ABORT, 'a label this replica refuses'); END",
@@ -314,6 +331,11 @@ async fn golden_holds(w: &World) -> serde_json::Value {
         "prices": all("SELECT CAST(cents AS TEXT) FROM prices").await,
         "tasks": all("SELECT title || ' ' || done FROM tasks").await,
         "rejected": w.rejected().await,
+        "wishes": all(
+            "SELECT relation || ' ' || row_key || ' ' || version FROM sync_wishes \
+             WHERE retired_at IS NULL ORDER BY 1",
+        )
+        .await,
     })
 }
 

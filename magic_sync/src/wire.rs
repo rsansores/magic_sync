@@ -622,7 +622,7 @@ pub(crate) fn json_encode<R: serde::Serialize>(
 }
 
 /// A row [`json_encode`] wrote, read back.
-fn json_decode<R: serde::de::DeserializeOwned>(
+pub(crate) fn json_decode<R: serde::de::DeserializeOwned>(
     table: &str,
     columns: &[row::Column],
     bytes: &[u8],
