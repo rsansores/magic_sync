@@ -20,7 +20,10 @@ pub async fn print_triggers(pool: &PgPool) -> Result<(), Error> {
         "{}",
         Engine::triggers(&mut conn, &codecs(), REGISTERS).await?
     );
-    println!("{}", Engine::indexes(&mut conn, &codecs(), REGISTERS).await?);
+    println!(
+        "{}",
+        Engine::indexes(&mut conn, &codecs(), REGISTERS).await?
+    );
     Ok(())
 }
 // ANCHOR_END: triggers
