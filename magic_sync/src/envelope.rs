@@ -244,7 +244,8 @@ impl Limits {
         Ok(Limits { rows, bytes })
     }
 
-    /// Rows a message carries, at most.
+    /// Rows a message carries, at most — an upload's rejections counted
+    /// among them.
     #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
@@ -263,13 +264,45 @@ impl Limits {
     }
 }
 
+/// Why `body` is more than a message within `limits` carries — more rows
+/// (upserts and deletes together), or more tables or uploads, than its
+/// rows — when it is: no server sends one, and a replica takes none.
+#[cfg(feature = "sqlite")]
+pub(crate) fn oversized(body: &Body, limits: &Limits) -> Option<String> {
+    let (rows, entries) = match body {
+        Body::Down(down) => (
+            down.tables
+                .iter()
+                .map(|t| t.upserts.len() + t.deletes.len())
+                .sum(),
+            down.tables.len(),
+        ),
+        Body::EndSnapshot(end) => (0, end.tables.len()),
+        Body::Filed(filed) => (0, filed.uploads.len()),
+    };
+    (rows > limits.rows || entries > limits.rows).then(|| {
+        format!(
+            "{rows} rows in {entries} entries, and a message carries {} at most",
+            limits.rows
+        )
+    })
+}
+
 /// One replica's rows made into messages within `limits`, a row at a time,
-/// in the order given: a new message begins when the current one is full,
-/// and a row larger than a message can carry goes alone. Each row keeps its
-/// key beside it, and every byte the rows add to a message counts — their
-/// framing and their tables' included — so a message never outgrows the
-/// limit by more than [`ENVELOPE_ROOM`] holds. It holds one message at most:
-/// what a replica is sent is never in memory whole.
+/// in the order given — upserts parents first, then deletes children first:
+/// a new message begins when the current one is full, and a row larger than
+/// a message can carry goes alone. Each row keeps its key beside it, and
+/// every byte the rows add to a message counts — their framing and their
+/// tables' included — so a message never outgrows the limit by more than
+/// [`ENVELOPE_ROOM`] holds. It holds one message at most: what a replica is
+/// sent is never in memory whole.
+///
+/// A table with rows both to hold and to let go of keeps them in one
+/// message, so a unique value one row lets go of is there for the other to
+/// take (PROTOCOL.md 4.1): from its first upsert to its last delete is a
+/// span, and a message that fills up inside spans ends before the earliest
+/// of them that does not open it, which goes on in the next. Only a span
+/// that does not fit one message on its own is split.
 #[cfg(feature = "postgres")]
 pub(crate) struct Packer {
     limits: Limits,
@@ -277,39 +310,78 @@ pub(crate) struct Packer {
     tables: Vec<Table>,
     count: usize,
     bytes: usize,
+    /// The tables with deletes to come whose span has not begun.
+    dropping: std::collections::BTreeSet<String>,
+    /// The spans begun and not over, earliest first.
+    spans: Vec<Span>,
+}
+
+/// Where a table's span begins in the message being filled: the part it
+/// begins at, and the rows and bytes before it.
+#[cfg(feature = "postgres")]
+struct Span {
+    table: String,
+    at: usize,
+    count: usize,
+    bytes: usize,
+    /// Whether its deletes began: the next table's end it.
+    deleting: bool,
 }
 
 #[cfg(feature = "postgres")]
 impl Packer {
-    /// Messages of the snapshot `snapshot` (empty: of none).
-    pub(crate) fn new(snapshot: &str, limits: Limits) -> Self {
+    /// Messages of the snapshot `snapshot` (empty: of none), letting go of
+    /// rows of the tables `dropping`.
+    pub(crate) fn new(
+        snapshot: &str,
+        limits: Limits,
+        dropping: std::collections::BTreeSet<String>,
+    ) -> Self {
         Packer {
             limits,
             snapshot: snapshot.to_owned(),
             tables: Vec::new(),
             count: 0,
             bytes: 0,
+            dropping,
+            spans: Vec::new(),
         }
     }
 
     /// Adds a row of `table` — `Some` bytes to hold, `None` to let go of —
-    /// and answers the message it completed, when there was no room left
+    /// and answers the messages it completed, when there was no room left
     /// for it in the current one.
-    pub(crate) fn push(&mut self, table: &str, row: Option<Vec<u8>>, key: Key) -> Option<Down> {
+    pub(crate) fn push(&mut self, table: &str, row: Option<Vec<u8>>, key: Key) -> Vec<Down> {
         use prost::Message as _;
+        if row.is_none() {
+            self.spans.retain(|s| !s.deleting || s.table == table);
+            for span in self.spans.iter_mut().filter(|s| s.table == table) {
+                span.deleting = true;
+            }
+        }
         let weight = row.as_ref().map_or(0, |row| framed(row.len())) + framed(key.encoded_len());
-        let open = self.tables.last().is_some_and(|t| t.table == table);
-        let opening = opened(table);
-        let added = weight + if open { 0 } else { opening };
-        let full = self.count > 0
-            && (self.count >= self.limits.rows || self.bytes + added > self.limits.largest_row());
-        let done = full.then(|| self.finish()).flatten();
+        let mut done = Vec::new();
+        while self.full(table, weight) {
+            match self.before_spans() {
+                Some(before) => done.push(before),
+                None => done.extend(self.finish()),
+            }
+        }
+        if row.is_some() && self.dropping.remove(table) {
+            self.spans.push(Span {
+                table: table.to_owned(),
+                at: self.tables.len(),
+                count: self.count,
+                bytes: self.bytes,
+                deleting: false,
+            });
+        }
         if self.tables.last().is_none_or(|t| t.table != table) {
             self.tables.push(Table {
                 table: table.to_owned(),
                 ..Table::default()
             });
-            self.bytes += opening;
+            self.bytes += opened(table);
         }
         self.count += 1;
         self.bytes += weight;
@@ -324,35 +396,87 @@ impl Packer {
         done
     }
 
-    /// The message begun and not yet answered, if any.
+    /// Whether a row of `table` weighing `weight` finds no room in the
+    /// message being filled.
+    fn full(&self, table: &str, weight: usize) -> bool {
+        let open = self.tables.last().is_some_and(|t| t.table == table);
+        let added = weight + if open { 0 } else { opened(table) };
+        self.count > 0
+            && (self.count >= self.limits.rows || self.bytes + added > self.limits.largest_row())
+    }
+
+    /// The message being filled up to the earliest span that does not open
+    /// it, which stays to go on in the next; the spans before it, split
+    /// already, are spans no more. `None` when every span opens it, or there
+    /// is none.
+    pub(crate) fn before_spans(&mut self) -> Option<Down> {
+        let first = self.spans.iter().position(|s| s.count > 0)?;
+        let mark = self.spans.remove(first);
+        self.spans.drain(..first);
+        let rest = self.tables.split_off(mark.at);
+        let before = std::mem::replace(&mut self.tables, rest);
+        let done = self.message(before);
+        (self.count, self.bytes) = (self.count - mark.count, self.bytes - mark.bytes);
+        for span in &mut self.spans {
+            span.at -= mark.at;
+            span.count -= mark.count;
+            span.bytes -= mark.bytes;
+        }
+        self.spans.insert(
+            0,
+            Span {
+                at: 0,
+                count: 0,
+                bytes: 0,
+                ..mark
+            },
+        );
+        Some(done)
+    }
+
+    /// The message begun and not yet answered, if any: a span it holds is
+    /// split.
     pub(crate) fn finish(&mut self) -> Option<Down> {
         if self.tables.is_empty() {
             return None;
         }
         (self.count, self.bytes) = (0, 0);
-        Some(Down {
+        self.spans.clear();
+        let tables = std::mem::take(&mut self.tables);
+        Some(self.message(tables))
+    }
+
+    fn message(&self, tables: Vec<Table>) -> Down {
+        Down {
             snapshot_id: self.snapshot.clone(),
-            tables: std::mem::take(&mut self.tables),
+            tables,
             ..Down::default()
-        })
+        }
     }
 }
 
-/// One replica's rows as messages within `limits`, in their order, as a
-/// [`Packer`] makes them.
+/// One replica's rows as messages within `limits`, as the relay gives them
+/// to a [`Packer`]: every table's upserts, in their order, then every
+/// table's deletes, in the reverse one.
 #[cfg(all(test, feature = "postgres"))]
 pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
-    let mut packer = Packer::new(snapshot, limits);
+    let dropping = tables
+        .iter()
+        .filter(|t| !t.deletes.is_empty())
+        .map(|t| t.table.clone())
+        .collect();
+    let mut packer = Packer::new(snapshot, limits, dropping);
     let mut out = Vec::new();
+    let mut deletes = Vec::new();
     for table in tables {
-        let mut keys = table.keys.into_iter();
-        let upserts = table
-            .upserts
-            .into_iter()
-            .map(|row| (Some(row), keys.next()));
-        let deletes = table.deletes.into_iter().map(|key| (None, Some(key)));
-        for (row, key) in upserts.chain(deletes) {
-            out.extend(packer.push(&table.table, row, key.unwrap_or_default()));
+        for (row, key) in table.upserts.into_iter().zip(table.keys) {
+            out.extend(packer.push(&table.table, Some(row), key));
+        }
+        deletes.push((table.table, table.deletes));
+    }
+    for (table, keys) in deletes.into_iter().rev() {
+        for key in keys {
+            out.extend(packer.push(&table, None, key));
         }
     }
     out.extend(packer.finish());
@@ -562,6 +686,126 @@ mod tests {
                 );
             }
             assert_eq!(carried, offered, "every row, once");
+        }
+    }
+
+    /// Whatever the rows and the limits, a table's deletes go in the message
+    /// of its upserts whenever the rows from its first upsert to its last
+    /// delete fit one message on their own; and the rows go in the order
+    /// given, each once.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_tables_deletes_go_with_its_upserts_whenever_they_fit_one_message() {
+        let mut walk = crate::testkit::Walk(0x51A7);
+        for _ in 0..500 {
+            let limits = Limits {
+                rows: 1 + walk.below(12),
+                bytes: ENVELOPE_ROOM + 20 + walk.below(300),
+            };
+            let tables: Vec<Table> = (0..1 + walk.below(5))
+                .map(|t| {
+                    let n = walk.below(6);
+                    let key = |at: usize| Key {
+                        parts: vec![format!("{t}-{at}")],
+                    };
+                    Table {
+                        table: format!("t{t}"),
+                        upserts: (0..n).map(|_| vec![7; walk.below(60)]).collect(),
+                        keys: (0..n).map(key).collect(),
+                        deletes: (n..n + walk.below(4)).map(key).collect(),
+                    }
+                })
+                .collect();
+            // The stream as given: (table, key, whether it is let go of).
+            let stream = |tables: &[Table]| -> Vec<(String, String, bool)> {
+                let ups = tables.iter().flat_map(|t| {
+                    t.keys
+                        .iter()
+                        .map(|k| (t.table.clone(), k.parts[0].clone(), false))
+                });
+                let dels = tables.iter().rev().flat_map(|t| {
+                    t.deletes
+                        .iter()
+                        .map(|k| (t.table.clone(), k.parts[0].clone(), true))
+                });
+                ups.chain(dels).collect()
+            };
+            let packed = pack(tables.clone(), "", limits);
+            let carried: Vec<(String, String, bool)> = packed
+                .iter()
+                .flat_map(|m| {
+                    m.tables.iter().flat_map(|t| {
+                        let dels = t
+                            .deletes
+                            .iter()
+                            .map(|k| (t.table.clone(), k.parts[0].clone(), true));
+                        let ups = t
+                            .keys
+                            .iter()
+                            .map(|k| (t.table.clone(), k.parts[0].clone(), false));
+                        // A part's deletes come before its upserts only
+                        // where the table's deletes follow its upserts.
+                        ups.chain(dels)
+                    })
+                })
+                .collect();
+            assert_eq!(carried, stream(&tables), "in order, each once");
+            for (at, table) in tables.iter().enumerate() {
+                if table.upserts.is_empty() || table.deletes.is_empty() {
+                    continue;
+                }
+                let span: Vec<Table> = tables[at..]
+                    .iter()
+                    .map(|t| Table {
+                        deletes: if t.table == table.table {
+                            t.deletes.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        ..t.clone()
+                    })
+                    .chain(tables[at + 1..].iter().map(|t| Table {
+                        upserts: Vec::new(),
+                        keys: Vec::new(),
+                        ..t.clone()
+                    }))
+                    .collect();
+                let mut alone = Packer::new("", limits, std::collections::BTreeSet::new());
+                let mut messages = 0;
+                for (t, key, gone) in stream(&span) {
+                    let at = span.iter().position(|s| s.table == t).expect("its table");
+                    let row = (!gone).then(|| {
+                        let i = span[at].keys.iter().position(|k| k.parts[0] == key);
+                        span[at].upserts[i.expect("its row")].clone()
+                    });
+                    messages += alone.push(&t, row, Key { parts: vec![key] }).len();
+                }
+                messages += usize::from(alone.finish().is_some());
+                if messages > 1 {
+                    continue;
+                }
+                let holding = |gone: bool| -> Vec<usize> {
+                    let mut at: Vec<usize> = packed
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| {
+                            m.tables.iter().any(|t| {
+                                t.table == table.table
+                                    && !(if gone { &t.deletes } else { &t.keys }).is_empty()
+                            })
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    at.dedup();
+                    at
+                };
+                assert_eq!(
+                    (holding(false).len(), holding(true)),
+                    (1, holding(false)),
+                    "{}: its upserts and deletes in one message, of {limits:?}",
+                    table.table
+                );
+            }
         }
     }
 

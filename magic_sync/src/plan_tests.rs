@@ -23,8 +23,9 @@
 //! - after every delivery, a replica holds no row whose parent it lacks;
 //! - no message carries a row its replica holds already at that version
 //!   (every write gives a row a version of its own), but a snapshot;
-//! - a pass that planned every pending note sends a replica only rows it
-//!   should hold, and takes back only rows it should not;
+//! - a pass sends a replica only rows it should hold, and takes back only
+//!   rows it should not — wherever the notes it did not plan, beyond its
+//!   batch or parked, cannot reach the row;
 //! - whenever the system settles, each live replica holds exactly what it
 //!   should, every row as it is now, and the engine records exactly that.
 
@@ -56,6 +57,10 @@ CREATE TABLE fixture.t_kinds (
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+-- Follows a table with no rule of its own: it goes where its kind goes.
+CREATE TABLE fixture.t_kind_notes (
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID NOT NULL REFERENCES fixture.t_kinds (id),
+    text TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_customers (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
@@ -140,6 +145,7 @@ CREATE VIEW t_kinds AS SELECT * FROM fixture.t_kinds WHERE retired_at IS NULL;
 CREATE VIEW t_products AS SELECT * FROM fixture.t_products WHERE retired_at IS NULL;
 CREATE VIEW t_customers AS SELECT * FROM fixture.t_customers WHERE retired_at IS NULL;
 CREATE VIEW t_emails AS SELECT * FROM fixture.t_emails WHERE retired_at IS NULL;
+CREATE VIEW t_kind_notes AS SELECT * FROM fixture.t_kind_notes WHERE retired_at IS NULL;
 CREATE VIEW t_calls AS SELECT * FROM fixture.t_calls WHERE retired_at IS NULL;
 CREATE VIEW t_orders AS SELECT * FROM fixture.t_orders WHERE retired_at IS NULL;
 CREATE VIEW t_phones AS SELECT * FROM fixture.t_phones WHERE retired_at IS NULL;
@@ -149,7 +155,7 @@ CREATE VIEW t_accounts AS SELECT * FROM fixture.t_accounts WHERE retired_at IS N
 CREATE VIEW t_tasks AS SELECT * FROM fixture.t_tasks WHERE retired_at IS NULL;
 CREATE VIEW t_task_lines AS SELECT * FROM fixture.t_task_lines WHERE retired_at IS NULL;
 DO $$ DECLARE t TEXT; BEGIN
-  FOREACH t IN ARRAY ARRAY['t_families', 't_kinds', 't_products', 't_customers', 't_emails',
+  FOREACH t IN ARRAY ARRAY['t_families', 't_kinds', 't_kind_notes', 't_products', 't_customers', 't_emails',
       't_phones', 't_calls', 't_orders', 't_sizes', 't_bins', 't_accounts', 't_tasks', 't_task_lines'] LOOP
     EXECUTE format('CREATE TRIGGER bump BEFORE UPDATE ON fixture.%I FOR EACH ROW EXECUTE FUNCTION fixture.bump()', t);
   END LOOP;
@@ -197,6 +203,24 @@ struct Kind {
     #[serde(serialize_with = "poisoned")]
     name: String,
     family_id: Option<Uuid>,
+    rev: i64,
+    retired_at: Option<DateTime<Utc>>,
+}
+
+/// A follower of a table with no rule of its own.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "t_kind_notes",
+    schema = "fixture",
+    mirror = "catalog",
+    sync = "follows(kind_id)"
+)]
+#[row(active = "t_kind_notes", retired = "retired_at")]
+struct KindNote {
+    id: Uuid,
+    partition_id: Uuid,
+    kind_id: Uuid,
+    text: String,
     rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
@@ -427,6 +451,7 @@ pub(super) fn codecs() -> Vec<Codec<()>> {
         Codec::json::<Customer>(None),
         Codec::json::<Product>(None),
         Codec::json::<Tally>(None),
+        Codec::json::<KindNote>(None),
         Codec::json::<Kind>(None),
         Codec::json::<Family>(None),
         Codec::json::<TaskLine>(None),
@@ -454,6 +479,7 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
     ("t_phones", &["kind_id"], "t_kinds"),
     ("t_calls", &["customer_id", "number"], "t_phones"),
     ("t_emails", &["customer_id"], "t_customers"),
+    ("t_kind_notes", &["kind_id"], "t_kinds"),
     ("t_orders", &["customer_id"], "t_customers"),
     ("t_orders", &["referrer_id"], "t_customers"),
     ("t_bins", &["size_code"], "t_sizes"),
@@ -467,6 +493,7 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
 /// The tables that follow another: the follower, its column, the parent.
 const FOLLOWS: &[(&str, &str, &str)] = &[
     ("t_emails", "customer_id", "t_customers"),
+    ("t_kind_notes", "kind_id", "t_kinds"),
     ("t_phones", "customer_id", "t_customers"),
     ("t_task_lines", "task_id", "t_tasks"),
 ];
@@ -479,6 +506,7 @@ const KEYS: &[(&str, &[&str])] = &[
     ("t_tallies", &["id"]),
     ("t_customers", &["id"]),
     ("t_emails", &["id"]),
+    ("t_kind_notes", &["id"]),
     ("t_phones", &["customer_id", "number"]),
     ("t_calls", &["id"]),
     ("t_orders", &["id"]),
@@ -730,18 +758,7 @@ impl World {
             outcome.parked,
             &self.history[self.history.len().saturating_sub(8)..]
         );
-        // What a change not planned — beyond the batch, or parked — would
-        // send or keep, the pass cannot know: it is minimal once it planned
-        // every change there is.
-        let planned_all: bool = sqlx::query_scalar(
-            "SELECT NOT EXISTS (SELECT 1 FROM sync.notes WHERE done_at IS NULL)",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .expect("pending");
-        if planned_all {
-            assert_minimal(&mut tx, drawn, &held, &self.history).await;
-        }
+        assert_minimal(&mut tx, drawn, &held, &self.history).await;
         if chance(6) {
             // Replicas heard while the pass is still recording: what they
             // say waits on what it locked, or goes in beside it.
@@ -856,8 +873,11 @@ impl World {
                 let rejected = model.rejections.clone();
                 if model.receive(&bytes, &RULES) == Received::Applied {
                     for ((row, bytes), held) in carried.iter().zip(held) {
+                        // One it would not let go of the server counts as
+                        // lacking, and sends whole when it wants it again.
+                        let kept = rejected.get(row).is_some_and(|r| r.reason == "pointed at");
                         assert!(
-                            held.as_ref() != Some(bytes),
+                            kept || held.as_ref() != Some(bytes),
                             "{replica} was sent {row:?} again at the version it holds; last steps: {:#?}",
                             &self.history[self.history.len().saturating_sub(8)..]
                         );
@@ -969,11 +989,13 @@ impl World {
     }
 
     /// The engine records `replica` holding exactly what it holds — what it
-    /// took as taken, what it refused as refused.
+    /// took as taken, what it refused as refused, as the planner reads it —
+    /// and the status counts what it took, table by table.
     async fn assert_recorded(&mut self, replica: Uuid) {
-        let recorded: Vec<(String, String, bool)> = sqlx::query_as(
-            "SELECT relation, row_key, refused IS NOT NULL FROM sync.held WHERE replica_id = $1",
-        )
+        let recorded: Vec<(String, String, bool)> = sqlx::query_as(&format!(
+            "SELECT relation, row_key, {} FROM sync.held h WHERE replica_id = $1",
+            crate::plan::REFUSED
+        ))
         .bind(replica)
         .fetch_all(&mut *self.conn)
         .await
@@ -1015,6 +1037,21 @@ impl World {
                 "{replica}: recorded {what} other than it is:\n  recorded, not so {:?}\n  so, not recorded {:?}\n  last steps: {:#?}",
                 recorded.difference(holds).collect::<Vec<_>>(),
                 holds.difference(&recorded).collect::<Vec<_>>(),
+                self.last_steps(),
+            );
+        }
+        let progress = self
+            .engine
+            .progress(&mut self.conn, crate::status::Scope::Replicas(&[replica]))
+            .await
+            .expect("progress");
+        for table in progress.replicas.iter().flat_map(|r| &r.tables) {
+            let took = held.iter().filter(|(t, _)| *t == table.table).count();
+            assert_eq!(
+                (table.holds + table.to_remove, table.in_flight),
+                (i64::try_from(took).expect("rows"), 0),
+                "{replica}: the status counts {} other than it took; last steps: {:#?}",
+                table.table,
                 self.last_steps(),
             );
         }
@@ -1365,7 +1402,8 @@ impl Oracle {
 
 /// A pass sends each replica only rows it should hold, or held already —
 /// a change not planned yet may still point at it there — and takes back
-/// only rows it should not hold: what `tx` — the pass, recorded and not
+/// only rows it should not hold, wherever the changes it did not plan leave
+/// that to judge ([`Unplanned`]): what `tx` — the pass, recorded and not
 /// A message in an outbox, as it is kept: its parts, and its body.
 #[derive(sqlx::FromRow)]
 struct Outboxed {
@@ -1401,6 +1439,7 @@ async fn assert_minimal(
         return;
     }
     let oracle = Oracle::read(&mut *tx).await;
+    let unplanned = Unplanned::read(&mut *tx, &oracle).await;
     let mut should: BTreeMap<Uuid, BTreeSet<Row>> = BTreeMap::new();
     for (replica, message) in written {
         let Some(crate::envelope::Body::Down(down)) =
@@ -1417,7 +1456,9 @@ async fn assert_minimal(
             for key in &table.keys {
                 let row = (table.table.clone(), key.parts.join("|"));
                 assert!(
-                    should.contains(&row) || held.contains(&(replica, row.0.clone(), row.1.clone())),
+                    !unplanned.judges(replica, &row)
+                        || should.contains(&row)
+                        || held.contains(&(replica, row.0.clone(), row.1.clone())),
                     "{replica} was sent {row:?}, which it should not hold, nor held; last steps: {:#?}",
                     &history[history.len().saturating_sub(8)..]
                 );
@@ -1425,12 +1466,101 @@ async fn assert_minimal(
             for key in &table.deletes {
                 let row = (table.table.clone(), key.parts.join("|"));
                 assert!(
-                    !should.contains(&row),
+                    !unplanned.judges(replica, &row) || !should.contains(&row),
                     "{replica} was told to let go of {row:?}, which it should hold; last steps: {:#?}",
                     &history[history.len().saturating_sub(8)..]
                 );
             }
         }
+    }
+}
+
+/// What the changes a pass did not plan — beyond its batch, or parked —
+/// leave it unable to know: a row's place on a replica is judged against the
+/// rows as they are now only where no such change can reach it. A change
+/// reaches the rows connected to the one it changed — through what points at
+/// what now, or pointed before it — so what is judged is every row whose
+/// connected rows no unplanned change touched, on a replica no unplanned
+/// change names; and nothing while a group's members changed unplanned.
+struct Unplanned {
+    everything: bool,
+    replicas: BTreeSet<Uuid>,
+    /// The connected rows a change touched, by a row of them.
+    reached: BTreeSet<Row>,
+    /// Each row's connected rows, by the one that stands for them.
+    of: BTreeMap<Row, Row>,
+}
+
+impl Unplanned {
+    async fn read(conn: &mut Conn, oracle: &Oracle) -> Self {
+        let touched: Vec<Row> = sqlx::query_as(
+            "SELECT relation, row_key FROM sync.notes \
+              WHERE done_at IS NULL AND kind IN ('row', 'retry') \
+             UNION ALL SELECT p.relation, p.row_key FROM sync.pointed p \
+               JOIN sync.notes n ON n.id = p.note WHERE n.done_at IS NULL",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("changed, and pointed at before");
+        let replicas: BTreeSet<Uuid> = sqlx::query_scalar(
+            "SELECT replica_id FROM sync.notes \
+              WHERE done_at IS NULL AND kind IN ('resync', 'assigned')",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("replicas")
+        .into_iter()
+        .collect();
+        let everything: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM sync.notes \
+                             WHERE done_at IS NULL AND kind NOT IN ('row', 'retry', 'resync', 'assigned'))",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("members");
+        // Rows connected through what points at what, as a forest.
+        let mut of: BTreeMap<Row, Row> = BTreeMap::new();
+        fn root(of: &mut BTreeMap<Row, Row>, row: &Row) -> Row {
+            let mut at = row.clone();
+            while let Some(up) = of.get(&at).filter(|up| **up != at) {
+                at = up.clone();
+            }
+            of.insert(row.clone(), at.clone());
+            at
+        }
+        let join = |of: &mut BTreeMap<Row, Row>, a: &Row, b: &Row| {
+            let (a, b) = (root(of, a), root(of, b));
+            if a != b {
+                of.insert(a, b);
+            }
+        };
+        for (r, row) in &oracle.rows {
+            root(&mut of, r);
+            for (child, columns, parent) in REFERENCES {
+                if *child == r.0 {
+                    if let Some(k) = key_of(row, columns) {
+                        join(&mut of, r, &((*parent).to_owned(), k));
+                    }
+                }
+            }
+        }
+        let reached = touched.iter().map(|r| root(&mut of, r)).collect();
+        Unplanned {
+            everything,
+            replicas,
+            reached,
+            of,
+        }
+    }
+
+    /// Whether `row`'s place on `replica` can be judged against the rows as
+    /// they are now.
+    fn judges(&self, replica: Uuid, row: &Row) -> bool {
+        let mut at = row;
+        while let Some(up) = self.of.get(at).filter(|up| *up != at) {
+            at = up;
+        }
+        !self.everything && !self.replicas.contains(&replica) && !self.reached.contains(at)
     }
 }
 
@@ -1533,6 +1663,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
     let customers = uuids(conn, "t_customers", partition).await;
     let lists = uuids(conn, "t_lists", partition).await;
     let emails = uuids(conn, "t_emails", partition).await;
+    let kind_notes = uuids(conn, "t_kind_notes", partition).await;
     let orders = uuids(conn, "t_orders", partition).await;
     let calls = uuids(conn, "t_calls", partition).await;
     let tallies = uuids(conn, "t_tallies", partition).await;
@@ -1577,7 +1708,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(105);
+    let choice = walk.below(109);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1596,11 +1727,12 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         walk.pick(&tasks),
         walk.pick(&lines),
     );
-    let (call, tally, other_list, other_customer) = (
+    let (call, tally, other_list, other_customer, kind_note) = (
         walk.pick(&calls),
         walk.pick(&tallies),
         walk.pick(&lists),
         walk.pick(&customers),
+        walk.pick(&kind_notes),
     );
     let small = i32::try_from(walk.below(4)).expect("small");
     let other = partitions[walk.below(partitions.len())];
@@ -1735,9 +1867,14 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         101 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, &big),
         // A parent deleted before what points at it points elsewhere.
         102 => write!(conn, "SELECT fixture.replace_family($1, $2) WHERE $1 IS NOT NULL", family, walk.pick(&families)),
+        // A follower of a table with no rule: it goes where its kind goes.
+        103 => write!(conn, "INSERT INTO fixture.t_kind_notes (id, partition_id, kind_id, text) VALUES ($1, $2, $3, 'n')", new, partition, kind),
+        104 => write!(conn, "UPDATE fixture.t_kind_notes SET kind_id = $2 WHERE id = $1", kind_note, kind),
+        105 => write!(conn, &format!("UPDATE fixture.t_kind_notes SET {RETIRE} WHERE id = $1"), kind_note),
+        106 => write!(conn, "DELETE FROM fixture.t_kind_notes WHERE id = $1", kind_note),
         // Planning a row's changes fails, until a deploy: the relay parks
         // them.
-        103 => return Step::Park(i64::from(small)),
+        107 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -2415,7 +2552,9 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
          UPDATE fixture.t_counters SET seen = 1;
          UPDATE fixture.t_counters SET name = 'd';
          UPDATE fixture.t_logs SET line = 'm';
-         UPDATE fixture.t_counters SET id = '{log}', partition_id = '{b}', kind_id = NULL;"
+         UPDATE fixture.t_counters SET id = '{log}', partition_id = '{b}', kind_id = NULL;
+         UPDATE fixture.t_counters SET kind_id = '{kind}';
+         UPDATE fixture.t_counters SET partition_id = '{a}';"
     ))
     .execute(&mut *conn)
     .await
@@ -2443,7 +2582,17 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
             // A key that changed: the new one where it is now, the old one
             // where it was, with what the row as it was pointed at.
             ("t_counters".into(), log.to_string(), Some(b), None),
-            ("t_counters".into(), counter.to_string(), Some(a), pointed),
+            (
+                "t_counters".into(),
+                counter.to_string(),
+                Some(a),
+                pointed.clone()
+            ),
+            ("t_counters".into(), log.to_string(), Some(b), None),
+            // A row that moved: where it was, whose replicas let it go —
+            // its first note, with what it pointed at — and where it is now.
+            ("t_counters".into(), log.to_string(), Some(b), pointed),
+            ("t_counters".into(), log.to_string(), Some(a), None),
         ]
     );
 }

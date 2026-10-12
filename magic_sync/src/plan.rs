@@ -356,6 +356,12 @@ enum Set {
     Kept(usize, bool),
 }
 
+/// Whether the replica a row of `sync.held` as `h` is of refused the row: the
+/// last version sent it is the one it refused. One sent again since is on its
+/// way. What plans, what the status shows and what is compared ask this one
+/// question.
+pub(crate) const REFUSED: &str = "coalesce(h.refused >= h.sequence, false)";
+
 /// What the replica `replica` holds of the row of the relation `relation`
 /// (SQL text both) whose key is the text `key`, as `alias(replica_id,
 /// row_key, noted, refused)` — nothing, for one provisioned; refused while
@@ -365,7 +371,7 @@ enum Set {
 fn holds(join: &str, alias: &str, replica: &str, relation: &str, key: &str) -> String {
     format!(
         "{join} LATERAL (SELECT h.replica_id, h.row_key, h.noted, \
-                                coalesce(h.refused >= h.sequence, false) AS refused \
+                                {REFUSED} AS refused \
                            FROM sync.held h \
                           WHERE h.replica_id = {replica} AND h.relation = {relation} AND h.row_key = {key} \
                             AND NOT EXISTS (SELECT 1 FROM sync_live provisioned \
@@ -391,7 +397,7 @@ fn holders(relation: &str, key: &str) -> String {
 /// refused` (see [`holds`]), looked up key by key.
 fn held_by_key(relation: &str, keys: &str) -> String {
     format!(
-        "SELECT h.replica_id, h.row_key, h.noted, coalesce(h.refused >= h.sequence, false) AS refused \
+        "SELECT h.replica_id, h.row_key, h.noted, {REFUSED} AS refused \
            FROM ({keys}) AS k(row_key) \
           CROSS JOIN LATERAL (SELECT * FROM sync.held h \
                                WHERE h.relation = {relation} AND h.row_key = k.row_key OFFSET 0) h"
@@ -402,7 +408,7 @@ fn held_by_key(relation: &str, keys: &str) -> String {
 /// as [`held_by_key`] does, looked up replica by replica.
 fn held_by_replica(relation: &str, replicas: &str) -> String {
     format!(
-        "SELECT h.replica_id, h.row_key, h.noted, coalesce(h.refused >= h.sequence, false) AS refused \
+        "SELECT h.replica_id, h.row_key, h.noted, {REFUSED} AS refused \
            FROM ({replicas}) AS r(replica_id) \
           CROSS JOIN LATERAL (SELECT * FROM sync.held h \
                                WHERE h.replica_id = r.replica_id AND h.relation = {relation} OFFSET 0) h"
@@ -2640,6 +2646,28 @@ impl Engine {
          WHERE NOT EXISTS (SELECT 1 FROM sync_kept k WHERE k.replica_id = d.replica_id \
                               AND k.rel = d.rel AND k.row_key = d.row_key)";
 
+    /// Per replica, the tables the plan takes rows of back from it.
+    pub(crate) async fn dropping(
+        &self,
+        conn: &mut Conn,
+    ) -> Result<BTreeMap<Uuid, BTreeSet<String>>, Error> {
+        let rows: Vec<(Uuid, i32)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT d.replica_id, d.rel FROM ({}) AS d",
+            Self::DROPPED
+        ))
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut dropping: BTreeMap<Uuid, BTreeSet<String>> = BTreeMap::new();
+        for (replica, i) in rows {
+            let table = usize::try_from(i).map_or("", |i| self.table(i));
+            dropping
+                .entry(replica)
+                .or_default()
+                .insert(table.to_owned());
+        }
+        Ok(dropping)
+    }
+
     /// Every replica the plan sends to, takes from or provisions.
     pub(crate) async fn touched(&self, conn: &mut Conn) -> Result<BTreeSet<Uuid>, Error> {
         Ok(sqlx::query_scalar("SELECT replica_id FROM sync_touched")
@@ -3063,6 +3091,7 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
     let rows: Vec<Noted> = sqlx::query_as(&format!(
         "SELECT id, kind, relation, row_key, replica_id, previous \
            FROM sync.notes WHERE done_at IS NULL AND parked_at IS NULL AND {READABLE} \
+            AND noted_at <= now() \
           ORDER BY id LIMIT $1"
     ))
     .bind(limit)
@@ -3078,8 +3107,9 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
 }
 
 /// The statement that notes the provisioning from scratch of each replica
-/// `source` names — `(id, partition)` — unless one is pending for it: a
-/// replica is provisioned once, however many reasons ask for it, and its
+/// `source` names — `(id, partition)` — unless one is pending for it, and
+/// due: a replica is provisioned once, however many reasons ask for it (one
+/// noted for later is carried out with it), and its
 /// snapshot, planned with the changes of its pass, carries them rather than
 /// a second message. Every provisioning is noted through it.
 pub(crate) fn resync_sql(source: &str) -> String {
@@ -3087,7 +3117,8 @@ pub(crate) fn resync_sql(source: &str) -> String {
         "INSERT INTO sync.notes (kind, replica_id, partition_id) \
          SELECT DISTINCT ON (r.id) 'resync', r.id, r.partition FROM ({source}) AS r(id, partition) \
           WHERE NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
-                               AND p.replica_id = r.id AND p.done_at IS NULL)"
+                               AND p.replica_id = r.id AND p.done_at IS NULL \
+                               AND p.noted_at <= now())"
     )
 }
 

@@ -84,21 +84,14 @@ impl Error {
     /// Whether the database refused what a statement wrote, rather than
     /// failed: the same rows are refused the same way, others may pass, and
     /// the engine leaves the refused ones out rather than stopping on them.
-    /// On a replica, a constraint (a trigger's `RAISE` included), a value of
-    /// the wrong type, or one too large — the rows' — and nothing else: a
-    /// statement the engine got wrong (too many variables, say) is not the
-    /// rows' to answer for.
+    /// On a replica, anything the database answers but a failure of its
+    /// storage: a constraint, a trigger's `RAISE` or its own error, a value
+    /// of the wrong type or too large — what a message carries never stops
+    /// the replica, and a statement the engine got wrong is refused and
+    /// reported, to be sent again once a fix is deployed.
     #[cfg(feature = "sqlite")]
     pub(crate) fn is_refusal(&self) -> bool {
-        const TOOBIG: i32 = 18;
-        const CONSTRAINT: i32 = 19;
-        const MISMATCH: i32 = 20;
-        let Error::Database(sqlx::Error::Database(db)) = self else {
-            return false;
-        };
-        db.code()
-            .and_then(|code| code.parse::<i32>().ok())
-            .is_some_and(|code| matches!(code & 0xff, TOOBIG | CONSTRAINT | MISMATCH))
+        matches!(self, Error::Database(sqlx::Error::Database(_))) && !self.is_transient()
     }
 }
 

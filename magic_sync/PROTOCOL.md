@@ -140,6 +140,7 @@ has a case of each:
 | `snapshot_id` | a UUID; empty on a message of no snapshot | `snapshot_no_uuid`, `ends_a_snapshot_of_no_id` |
 | `mac` | 16 bytes | `no_mac`, `mac_too_short`, `mac_too_long` |
 | `keys` | one per upsert | `keys_not_one_per_row` |
+| `tables`, `deletes`, `upserts`, `uploads` | no more rows — upserts and deletes together — and no more tables, or uploads, than the replica takes in a message: the server's limits, or more (500 each by default) | `more_rows_than_a_message_carries`, `more_tables_than_a_message_carries`, `ends_more_tables_than_a_message_carries`, `files_more_uploads_than_a_message_carries` |
 
 A row's own fields are the row's to answer for, not the message's: a key
 that does not parse, a row that does not decode, a table the replica does
@@ -201,6 +202,10 @@ message it applied, and checks, in order:
 Then the replica applies `tables` **in the order given**. The server puts
 parents' rows before their children's, and children's deletes before their
 parents', so in that order no row ever points at a row the replica lacks.
+It keeps a table's deletes in the message that carries its upserts: the
+rows from a table's first upsert to its last delete are split across
+messages only when they do not fit one on their own. So a unique value one
+row lets go of is there, in the same message, for another row to take.
 
 For each `Table`:
 
@@ -239,12 +244,17 @@ their deletes ignored.
    - a row the replica had retired (4.3) becomes live again.
 
    A key both let go of and upserted in one part is held: its upsert comes
-   after. A key upserted twice in one part is the last row beside it. A row the database refuses is tried again once the rest of the
-   part are in, while that takes one more: it may point at a row after it,
-   or take a unique value a row after it gives up. Two rows that swap a
-   unique value cannot be taken one at a time — the database checks each
-   row as it is written — so both are rejected, and keep what they held,
-   until the server sends them otherwise.
+   after. A key upserted twice in one part is the last row beside it.
+
+**A row the database refuses is tried again once the rest of its part is
+in, and once the whole message is** — every part of it, the deletes of
+later parts included — each while that takes one more: it may point at a row after it, or take a unique value
+a row after it, or a delete after it, gives up. One that a later part lets
+go of is not tried again: the server let go of it. What is still refused
+then is rejected (section 6). Two rows that swap a unique value cannot be
+taken one at a time — the database checks each row as it is written — so
+both are rejected, and keep what they held, until the server sends them
+otherwise.
 
 **A row the replica cannot take, or let go of, does not fail the message.**
 If a row does not decode, if the replica's database refuses it for its data
@@ -257,11 +267,14 @@ refuses — because the row it points at is not held, or because rows point
 at a value of it the message changed or let go of: a constraint that fails
 the commit is the replica finding such a row, never a failure of its
 storage. The replica applies the message again, row by row, finds the rows
-at fault, and applies it once more with them rejected before they are
-tried. Only a failure of the
-replica's own storage (the database is unavailable, the disk is full, the
-file is damaged) fails the message: then the replica **must not**
-acknowledge it, and it will be delivered again.
+at fault — by the database's own check of its keys — and applies it once
+more with them rejected before they are tried; and should the database
+still refuse it for what no row of it explains, it applies it with every
+row of it rejected, so that the rest of what it says stands. Anything else
+the database answers of a row — a trigger's own error included — refuses
+that row. Only a failure of the replica's own storage (the database is
+unavailable, the disk is full, the file is damaged) fails the message: then
+the replica **must not** acknowledge it, and it will be delivered again.
 
 ### 4.2 Snapshots
 
@@ -301,8 +314,11 @@ is malformed (4.1).
 A replica that must let go of a row that one of its own rows still points at
 (a receipt that names an order) keeps the row and marks it retired: a column
 the replica owns, set to when it was retired. Retired rows are out of
-everything the replica offers its users, but stay for what points at them. A
-retired row the server sends again becomes live.
+everything the replica offers its users, but stay for what points at them,
+and only that long: once nothing does, the replica lets go of them as of a
+delete — it looks after every message it applies — and says nothing of one
+it cannot. A retired row holds none of its unique values against a live one.
+A retired row the server sends again becomes live.
 
 A row of a table written on both sides that the replica edited, and whose
 edit the server has not filed yet (section 7), is retired too when it is let
@@ -386,8 +402,9 @@ missed: malformed, and left out.
 Neither a gap nor a message older than the last applied carries a seal the
 server can check, so what a replica says of itself provisions it again at
 most once a minute, and twice as long between each time while it keeps
-saying so, up to 32 minutes; one quiet for 64 minutes starts over. Until then
-the server leaves it as it is, and the replica's next `Up` says it again.
+saying so, up to 32 minutes; one quiet for 64 minutes starts over. One that
+says it sooner is provisioned again once it may: the server notes it for
+then.
 
 ---
 
@@ -398,7 +415,9 @@ A row the replica could not take, or could not let go of (4.1), is a
 the one the row came beside, `keys[i]`, or its delete's — why,
 and the `(epoch, sequence)` of the message that carried the row, or its
 delete — for a row the end of a snapshot could not let go of, the
-`EndSnapshot`'s. A row whose key cannot be told is logged and not reported.
+`EndSnapshot`'s; for a row held retired for the replica's edits (4.3) that
+it could not let go of once they were filed, the message that let go of
+it. A row whose key cannot be told is logged and not reported.
 
 - The replica **must** record a rejection in the same transaction that left
   the row out, so it cannot be lost.
@@ -420,7 +439,10 @@ delete — for a row the end of a snapshot could not let go of, the
 - It keeps what the server said within bounds: a reason **may** be cut (to
   512 bytes), and rows of a table it does not know, named or keyed longer
   than that, are logged rather than kept — no server sends such a table. So
-  any rejection fits a message up, and never holds back the confirmation.
+  any rejection fits a message up — the backlog (section 7) waiting for the
+  next one when it would leave the first rejection no room — and never
+  holds back the confirmation. Rejections count against a message's rows
+  as the rows it carries do.
 
 On a rejection of the last message that carried the row, the server
 records the row **refused**: still held for every decision that takes rows
@@ -450,8 +472,9 @@ For a table the replica writes and the server mirrors:
    noted: it is the server's already. A row of a table written on both sides
    begins on the server; the replica edits only its own columns of it, and
    only those edits go up: it **must** refuse an insert of one, an update
-   of a column it does not own, and a delete unless the table is keyed by
-   the replica. A record without a version is history, written once.
+   of a column it does not own, and a delete of one but a row keyed by
+   itself, in a table keyed by the replica. A record without a version is
+   history, written once.
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only
@@ -484,9 +507,12 @@ says which), whatever the rows themselves claim: a row of a table keyed by
 its replica that names another replica there is malformed, and left out. A
 row of a table written on both sides is an edit of the columns the replica
 owns, filed only as an update of a row the server has and records the
-replica holding: one of a row it is taking back, or of one it does not
-record the replica holding while it provisions it again, is kept and filed
-later; one of a row it never sent the replica is malformed, and left out. A
+replica holding. One it does not record the replica holding while it
+provisions the replica again — the provisioning pending, or written and not
+confirmed — is kept, and filed once it does; otherwise, one of a row the
+replica no longer holds — the server deleted it, or is taking it back — is
+left out: the server's wins. One of a row it never sent the replica is
+malformed, and left out. A
 row the server cannot file, or a delete its database refuses, is kept on the
 server, not lost, and filed later; so are an upload's rows whose filing fails
 as a whole for a reason a resend cannot cure. Either still counts as filed
@@ -497,8 +523,9 @@ filed later never rolls the row back. So it keeps a row only with its key in
 applied message, a gap, digests, the backlog — is filed apart from its rows,
 so neither holds back the other. Deletes of a table not keyed by the replica,
 and keys that are not the table's, are malformed and left out. An upload
-beyond the server's limits — more bytes than a message takes, or more rows,
-or more rejections, than one carries — is malformed: dropped, unanswered,
+beyond the server's limits — more bytes than a message takes, or more rows
+and rejections together than one carries: a rejection counts as a row — is
+malformed: dropped, unanswered,
 so it waits on the replica until a server that takes it runs. A replica's
 limits are the server's, or less. So is an upload from a sender that is no
 replica of the server's.
@@ -530,7 +557,11 @@ backlog, and the last applied message.
 
 From time to time (hourly is reasonable), a replica **should** report what it
 holds of every table the server sends it, in `Up.digests`, together with the
-`(epoch, sequence, nonce, mac)` of the last message it applied (5.2):
+`(epoch, sequence, nonce, mac)` of the last message it applied (5.2). It
+**must** leave out a table it wrote rows of that the server has not filed
+(`Filed`, 4.4): the server records a row the replica deleted as held until
+it files the delete — in the transaction that files it, it records the row
+held no more.
 
 - `table`: the table;
 - `count`: how many rows it holds, **leaving out** rows it retired (4.3) and
@@ -548,6 +579,11 @@ for each key, sorted:
 
 Test vectors: no keys → `0xcbf29ce484222325`; the single key `a` →
 `0x089bdc07b544e7b2`.
+
+A replica **must** leave out of its digests every table of which it wrote
+rows the server has not filed yet (section 7): what the server records of
+it is about to change, and a comparison now would find them apart for
+nothing.
 
 The server compares a digest only when the replica has applied every message
 recorded for it (the same epoch and last sequence, sealed by the server), and
@@ -654,6 +690,11 @@ says how to read it.
   of `to_replica.txt` before its upload is answered — its rows, its
   rejections and what it applied; its digests; the same with a seal the
   server never made — each with what the server makes of it.
+- `tests/golden/to_server_verdicts.txt`: uploads a replica sends after a
+  provisioning, a change and a take-back it applied — a refused delete
+  with what it applied, an edit of a two-way row, a delete of a row of its
+  own, a refused sweep, a gap, what it applied said again lower, of another
+  epoch, and past anything sent — each with what the server makes of it.
 
 A replica implementation is complete when:
 

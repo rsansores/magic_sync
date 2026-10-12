@@ -12,6 +12,7 @@
 //! in `sync.inbox` as it came, and filed again after a deploy.
 
 use crate::envelope::{self, Up};
+use crate::plan::REFUSED;
 use crate::relay::{resync, stored};
 use crate::replica::{codec_of, keys_of, UpProgress};
 use crate::row::{key_text, Key};
@@ -61,7 +62,8 @@ impl Unfiled {
     }
 
     /// Row `at` of `table`, `codec`'s when the server mirrors it; `None`
-    /// when the replica gave no key with it, which breaks the protocol.
+    /// when the replica gave no key with it, or one that is not the table's,
+    /// which breaks the protocol.
     fn row<P: Sync + 'static>(
         codec: Option<&Codec<P>>,
         table: &envelope::Table,
@@ -81,22 +83,36 @@ impl Unfiled {
             keys: vec![key.clone()],
             deletes: Vec::new(),
         };
-        Some(Self::of(table, kept_key(codec, key), part, reason))
+        Some(Self::of(table, Self::key(codec, key)?, part, reason))
     }
 
+    /// `key` as [`kept_key`] keeps it; `None`, logged, for one that is not
+    /// its mirrored table's.
+    fn key<P: Sync + 'static>(codec: Option<&Codec<P>>, key: &envelope::Key) -> Option<String> {
+        let kept = kept_key(codec, key);
+        if kept.is_none() {
+            tracing::error!(
+                table = codec.map(|c| c.table.name),
+                "upload: a key that is not its table's — malformed, left out"
+            );
+        }
+        kept
+    }
+
+    /// A delete of `table`, as [`Unfiled::row`] keeps a row.
     fn delete<P: Sync + 'static>(
         codec: Option<&Codec<P>>,
         table: &envelope::Table,
         key: envelope::Key,
         reason: &str,
-    ) -> Self {
-        let text = kept_key(codec, &key);
+    ) -> Option<Self> {
+        let text = Self::key(codec, &key)?;
         let part = envelope::Table {
             table: table.table.clone(),
             deletes: vec![key],
             ..envelope::Table::default()
         };
-        Self::of(table, text, part, reason)
+        Some(Self::of(table, text, part, reason))
     }
 
     /// Every row and delete of `upload`, each a part of its own.
@@ -111,7 +127,7 @@ impl Unfiled {
                 table
                     .deletes
                     .iter()
-                    .map(|key| Self::delete(codec, table, key.clone(), reason)),
+                    .filter_map(|key| Self::delete(codec, table, key.clone(), reason)),
             );
         }
         parts
@@ -119,12 +135,13 @@ impl Unfiled {
 }
 
 /// A row's key as the inbox keeps it: as its table's codec writes it, or as
-/// it came, for a table this server does not mirror or a key that is not
-/// its table's.
-fn kept_key<P: Sync + 'static>(codec: Option<&Codec<P>>, key: &envelope::Key) -> String {
-    codec
-        .and_then(|codec| codec.key(&key.parts).ok())
-        .map_or_else(|| stored(&key.parts.join("|")), |key| key_text(&key))
+/// it came, for a table this server does not mirror. A key that is not its
+/// mirrored table's is no row of it: malformed, `None`.
+fn kept_key<P: Sync + 'static>(codec: Option<&Codec<P>>, key: &envelope::Key) -> Option<String> {
+    let Some(codec) = codec else {
+        return Some(stored(&key.parts.join("|")));
+    };
+    codec.key(&key.parts).ok().map(|key| key_text(&key))
 }
 
 /// Where the sender stands with the server, read once, its row locked for
@@ -191,12 +208,41 @@ pub(crate) async fn file<P: Sync + 'static>(
             Vec::new()
         }
     };
+    said_apart(conn, codecs, sender, &standing, upload).await?;
+    Ok(filed)
+}
+
+/// What [`file`] does with an upload from `sender` whose filing failed as a
+/// whole, in a transaction of its own, for `reason`: its rows kept in the
+/// inbox, and what it says of its sender filed.
+pub(crate) async fn file_failed<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    upload: &Up,
+    sender: Uuid,
+    reason: &str,
+    inbox: i64,
+) -> Result<(), Error> {
+    let standing = standing(conn, sender).await?;
+    keep_whole(conn, codecs, sender, upload, reason, inbox).await?;
+    said_apart(conn, codecs, sender, &standing, upload).await
+}
+
+/// What `upload` says of `sender`, filed apart from its rows: a failure of
+/// it is logged, and holds back nothing else.
+async fn said_apart<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    sender: Uuid,
+    standing: &Standing,
+    upload: &Up,
+) -> Result<(), Error> {
     crate::row::savepoint(conn).await?;
-    let said = said(conn, codecs, sender, &standing, upload).await;
+    let said = said(conn, codecs, sender, standing, upload).await;
     if let Err(e) = crate::row::released(conn, said).await? {
         tracing::error!(%sender, "sync: what a replica said of itself could not be filed — left out: {e}");
     }
-    Ok(filed)
+    Ok(())
 }
 
 /// The rows of `upload` filed; what of them could not be is kept in the
@@ -235,13 +281,16 @@ async fn supersede<P: Sync + 'static>(
     for table in &upload.tables {
         let codec = codec_of(codecs, &table.table);
         for key in table.keys.iter().chain(&table.deletes) {
-            rows.0.push(stored(&table.table));
-            rows.1.push(kept_key(codec, key));
+            if let Some(key) = kept_key(codec, key) {
+                rows.0.push(stored(&table.table));
+                rows.1.push(key);
+            }
         }
     }
     Ok(sqlx::query_as(
         "WITH gone AS (DELETE FROM sync.inbox i USING unnest($2::text[], $3::text[]) AS u(t, k) \
-                        WHERE i.replica_id = $1 AND i.relation = u.t AND i.row_key = u.k \
+                        WHERE i.replica_id = $1 AND md5(i.relation) = md5(u.t) \
+                          AND md5(i.row_key) = md5(u.k) AND i.relation = u.t AND i.row_key = u.k \
                         RETURNING length(i.upload) AS bytes) \
          SELECT count(*), coalesce(sum(bytes), 0)::int8 FROM gone",
     )
@@ -271,7 +320,7 @@ async fn file_tables<P: Sync + 'static>(
                 table
                     .deletes
                     .iter()
-                    .map(|key| Unfiled::delete::<P>(None, table, key.clone(), why)),
+                    .filter_map(|key| Unfiled::delete::<P>(None, table, key.clone(), why)),
             );
             continue;
         };
@@ -312,7 +361,7 @@ async fn file_tables<P: Sync + 'static>(
         } else {
             let (gone, refused) =
                 delete(conn, codec, &keys_of(codec, &table.deletes), sender).await?;
-            unfiled.extend(refused.into_iter().map(|(key, why)| {
+            unfiled.extend(refused.into_iter().filter_map(|(key, why)| {
                 let key = envelope::Key {
                     parts: key.iter().map(ToString::to_string).collect(),
                 };
@@ -506,7 +555,8 @@ async fn standing(conn: &mut Conn, sender: Uuid) -> Result<Standing, Error> {
 /// The server letting go of `keys`, rows `sender` deleted — of its own rows
 /// only — each it refuses for its data (a row of the server's that still
 /// points at it) answered apart with why, so one refused delete holds back
-/// nothing else.
+/// nothing else. What `sender` let go of it no longer holds, nor has on its
+/// way back: what it says it holds next leaves them out.
 async fn delete<P: Sync + 'static>(
     conn: &mut Conn,
     codec: &Codec<P>,
@@ -516,16 +566,31 @@ async fn delete<P: Sync + 'static>(
     if keys.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    if let Ok(gone) = delete_guarded(conn, codec, keys, sender).await? {
-        return Ok((gone, Vec::new()));
-    }
-    let mut gone = Vec::new();
-    let mut refused = Vec::new();
-    for key in keys {
-        match delete_guarded(conn, codec, std::slice::from_ref(key), sender).await? {
-            Ok(one) => gone.extend(one),
-            Err(e) => refused.push((key.clone(), e.to_string())),
+    let (gone, refused) = match delete_guarded(conn, codec, keys, sender).await? {
+        Ok(gone) => (gone, Vec::new()),
+        Err(_) => {
+            let mut gone = Vec::new();
+            let mut refused = Vec::new();
+            for key in keys {
+                match delete_guarded(conn, codec, std::slice::from_ref(key), sender).await? {
+                    Ok(one) => gone.extend(one),
+                    Err(e) => refused.push((key.clone(), e.to_string())),
+                }
+            }
+            (gone, refused)
         }
+    };
+    let texts: Vec<String> = gone.iter().map(key_text).collect();
+    for sql in [
+        "DELETE FROM sync.held WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+        "DELETE FROM sync.gone WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+    ] {
+        sqlx::query(sql)
+            .bind(sender)
+            .bind(codec.table.name)
+            .bind(&texts)
+            .execute(&mut *conn)
+            .await?;
     }
     Ok((gone, refused))
 }
@@ -826,26 +891,46 @@ async fn gap(conn: &mut Conn, replica: Uuid, standing: &Standing, gap: u64) -> R
 const ASKED: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Provisions `replica` again, `why` as it says it — it missed a message,
-/// or holds less than recorded — unless it asked for one too soon: what it
+/// or holds less than recorded — but not sooner than it may ask: what it
 /// says of itself is not sealed, and a replica that says it on every upload
-/// must not have the server send it everything on every round trip. Its
-/// next upload says it again.
+/// must not have the server send it everything on every round trip. One
+/// that asks too soon is provisioned once it may, its provisioning noted
+/// for then.
 async fn asked(conn: &mut Conn, replica: Uuid, why: &str) -> Result<(), Error> {
-    let due: bool = sqlx::query_scalar(
-        "SELECT asked_at IS NULL \
-             OR asked_at <= now() - make_interval(secs => $2 * power(2, least(asks - 1, 5))) \
+    let due: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+        "SELECT CASE WHEN asked_at > now() - make_interval(secs => $2 * power(2, least(asks - 1, 5))) \
+                     THEN asked_at + make_interval(secs => $2 * power(2, least(asks - 1, 5))) END \
            FROM sync.replicas WHERE replica_id = $1",
     )
     .bind(replica)
     .bind(ASKED.as_secs_f64())
     .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or(true);
-    if !due {
-        tracing::warn!(%replica, why, "sync: a replica asks to be provisioned again too soon after the last time — not yet");
-        return Ok(());
-    }
-    if !resync(conn, replica).await? {
+    .await?;
+    let noted = match due.flatten() {
+        None => resync(conn, replica).await?,
+        Some(at) => {
+            // Asked for then: what it asks after waits from then.
+            let deferred = sqlx::query(
+                "WITH noted AS ( \
+                     INSERT INTO sync.notes (kind, replica_id, partition_id, noted_at) \
+                     SELECT 'resync', $1, partition_id, $2 FROM sync.replicas WHERE replica_id = $1 \
+                        AND NOT EXISTS (SELECT 1 FROM sync.notes p WHERE p.kind = 'resync' \
+                                           AND p.replica_id = $1 AND p.done_at IS NULL) \
+                     RETURNING replica_id) \
+                 UPDATE sync.replicas r SET asked_at = $2, asks = r.asks + 1 \
+                   FROM noted n WHERE r.replica_id = n.replica_id",
+            )
+            .bind(replica)
+            .bind(at)
+            .execute(&mut *conn)
+            .await?;
+            if deferred.rows_affected() > 0 {
+                tracing::warn!(%replica, why, %at, "sync: a replica asks to be provisioned again too soon after the last time — it is, then");
+            }
+            return Ok(());
+        }
+    };
+    if !noted {
         return Ok(());
     }
     tracing::warn!(%replica, why, "sync: a replica holds less than recorded — it is provisioned again");
@@ -912,13 +997,13 @@ async fn compare<P: Sync + 'static>(
     let (last, held): (
         Option<i64>,
         sqlx::types::Json<BTreeMap<String, Vec<String>>>,
-    ) = sqlx::query_as(
+    ) = sqlx::query_as(&format!(
         "SELECT (SELECT last_sequence FROM sync.chains WHERE replica_id = $1), \
                     coalesce((SELECT jsonb_object_agg(relation, keys) FROM ( \
-                       SELECT relation, jsonb_agg(row_key) AS keys FROM sync.held \
-                        WHERE replica_id = $1 AND relation = ANY($2) AND refused IS NULL \
-                        GROUP BY relation) t), '{}')",
-    )
+                       SELECT relation, jsonb_agg(row_key) AS keys FROM sync.held h \
+                        WHERE replica_id = $1 AND relation = ANY($2) AND NOT {REFUSED} \
+                        GROUP BY relation) t), '{{}}')"
+    ))
     .bind(replica)
     .bind(&names)
     .fetch_one(&mut *conn)
@@ -1085,7 +1170,8 @@ async fn keep(
             "INSERT INTO sync.inbox AS i \
                (replica_id, relation, row_key, upload, reason, first_at, attempts) \
              VALUES ($1, $2, $3, $4, $5, coalesce($6, now()), $7) \
-             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET upload = EXCLUDED.upload, \
+             ON CONFLICT (replica_id, md5(relation), md5(row_key)) \
+             DO UPDATE SET upload = EXCLUDED.upload, \
                reason = EXCLUDED.reason, first_at = EXCLUDED.first_at, last_at = now(), \
                attempts = EXCLUDED.attempts",
         )
@@ -1105,7 +1191,7 @@ async fn keep(
 /// Keeps every row and delete of an upload from `replica`, each as a part
 /// of its own, when filing it failed as a whole for a reason a retry cannot
 /// change — while its part of the inbox holds fewer than `inbox`. What it
-/// says of the replica is of its moment, and not kept.
+/// says of the replica is of its moment, and not kept: it is filed apart.
 pub(crate) async fn keep_whole<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -1159,8 +1245,9 @@ pub(crate) async fn newest(conn: &mut Conn) -> Result<i64, Error> {
 /// age. Only the rows it carried are filed: what it said of its moment —
 /// what it refused, applied, missed, held, had not sent — is out of date by
 /// now, and was filed when it came. One filing of a replica runs at a time,
-/// its uploads and its inbox alike: a part an upload of its row superseded
-/// meanwhile is gone, and files nothing.
+/// its uploads and its inbox alike, and what files is the part as the inbox
+/// holds it then: an upload of its row since replaced it, or dropped it,
+/// and `kept` as it was read is never filed over it.
 pub(crate) async fn refile<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -1168,6 +1255,17 @@ pub(crate) async fn refile<P: Sync + 'static>(
     known: &P,
 ) -> Result<bool, Error> {
     use prost::Message as _;
+    one_at_a_time(conn, kept.replica_id).await?;
+    let Some(kept): Option<Kept> = sqlx::query_as(
+        "DELETE FROM sync.inbox WHERE id = $1 \
+         RETURNING id, replica_id, upload, first_at, attempts",
+    )
+    .bind(kept.id)
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(true);
+    };
     let up = Up::decode(kept.upload.as_slice()).map_err(|e| Error::Malformed {
         table: "sync.inbox".to_owned(),
         reason: e.to_string(),
@@ -1178,16 +1276,8 @@ pub(crate) async fn refile<P: Sync + 'static>(
             ours: envelope::PROTOCOL,
         });
     }
-    one_at_a_time(conn, kept.replica_id).await?;
-    let taken = sqlx::query("DELETE FROM sync.inbox WHERE id = $1")
-        .bind(kept.id)
-        .execute(&mut *conn)
-        .await?;
-    if taken.rows_affected() == 0 {
-        return Ok(true);
-    }
     let (_, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known).await?;
-    keep(conn, kept.replica_id, &unfiled, &mut Keeping::Again(kept)).await?;
+    keep(conn, kept.replica_id, &unfiled, &mut Keeping::Again(&kept)).await?;
     Ok(unfiled.is_empty())
 }
 

@@ -69,6 +69,9 @@ COMMENT ON COLUMN sync.notes.id IS
     'Rises with every note. Writers of one row take turns on its lock, so the notes of a row '
     'rise in the order their changes committed: a version of the row sent while its newest '
     'note was n holds every change noted up to n, and none after.';
+COMMENT ON COLUMN sync.notes.noted_at IS
+    'When it was noted — or, for a provisioning a replica asked for too soon, when it may be '
+    'carried out: no pass plans it before.';
 COMMENT ON COLUMN sync.notes.done_at IS
     'When the relay recorded what the note asked for and wrote its messages to the outbox. '
     'NULL: pending.';
@@ -349,12 +352,15 @@ CREATE TABLE sync.inbox (
     attempts   INTEGER     NOT NULL DEFAULT 1
 );
 
-CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, relation, row_key);
+-- By a digest of the text: a sender's table and key may be longer than an
+-- index entry takes.
+CREATE UNIQUE INDEX inbox_row ON sync.inbox (replica_id, md5(relation), md5(row_key));
 
 COMMENT ON TABLE sync.inbox IS
     'What replicas uploaded that the server could not file for a reason a retry cannot '
     'change: a table it does not mirror, a row that does not decode, a row or a delete its '
-    'database refuses, an edit of a two-way row it does not record the replica holding — or '
+    'database refuses, an edit of a two-way row it does not record the replica holding while '
+    'it provisions it again — or '
     'every row of an upload whose filing failed as a whole. Never repaired by hand: a deploy '
     'that fixes the cause lets the next retry file it.';
 COMMENT ON COLUMN sync.inbox.relation IS
@@ -392,6 +398,7 @@ DECLARE
     v_new_key TEXT;
     v_old_key TEXT;
     v_note    BIGINT;
+    v_newest  BIGINT;
     v_parent  TEXT;
     v_parts   INTEGER;
 BEGIN
@@ -414,11 +421,20 @@ BEGIN
         SELECT string_agg(v_old ->> k, '|' ORDER BY n) INTO v_old_key
           FROM unnest(v_key) WITH ORDINALITY AS a(k, n);
     END IF;
+    -- A row that moved to another partition is gone from the one it was
+    -- in: noted there first, so its first note keeps what it pointed at.
+    IF v_old_key = v_new_key AND TG_ARGV[1] <> ''
+       AND v_old ->> TG_ARGV[1] IS DISTINCT FROM v_new ->> TG_ARGV[1] THEN
+        INSERT INTO sync.notes (kind, relation, row_key, partition_id)
+        VALUES ('row', TG_ARGV[0], v_old_key, (v_old ->> TG_ARGV[1])::UUID)
+        RETURNING id INTO v_note;
+    END IF;
     IF v_new_key IS NOT NULL THEN
         INSERT INTO sync.notes (kind, relation, row_key, partition_id)
         VALUES ('row', TG_ARGV[0], v_new_key,
                 CASE WHEN TG_ARGV[1] = '' THEN NULL ELSE (v_new ->> TG_ARGV[1])::UUID END)
-        RETURNING id INTO v_note;
+        RETURNING id INTO v_newest;
+        v_note := coalesce(v_note, v_newest);
     END IF;
     -- A row deleted, or whose key changed: the old key is gone.
     IF v_old_key IS DISTINCT FROM v_new_key AND v_old_key IS NOT NULL THEN

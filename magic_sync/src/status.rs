@@ -11,7 +11,7 @@
 //! Every answer a dashboard reads serializes as the JSON of contract
 //! [`CONTRACT`], and carries that number.
 
-use crate::plan::{parse_key, stale, Engine};
+use crate::plan::{parse_key, stale, Engine, REFUSED};
 
 pub use crate::replica::UpProgress;
 use crate::Error;
@@ -824,7 +824,7 @@ impl Engine {
                           {} AS outdated \
                      FROM sync.held h CROSS JOIN sync.epoch e \
                      LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
-                    WHERE h.relation = $1 AND h.replica_id = ANY($2) AND h.refused IS NULL) \
+                    WHERE h.relation = $1 AND h.replica_id = ANY($2) AND NOT {REFUSED}) \
              SELECT coalesce(w.replica_id, h.replica_id), \
                     count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
                     count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed), \
@@ -1272,7 +1272,7 @@ impl Engine {
             .filter(|r| r.unconfirmed)
             .map(|r| r.replica)
             .collect();
-        let counted: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+        let counted: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&format!(
             "WITH c AS ( \
                  SELECT h.relation, h.replica_id, count(*) AS in_flight, 0 AS quarantined, 0 AS unfiled \
                    FROM sync.epoch e CROSS JOIN unnest($1::uuid[]) AS u(replica_id) \
@@ -1280,7 +1280,7 @@ impl Engine {
                    JOIN sync.held h ON h.replica_id = u.replica_id \
                                    AND h.sequence > CASE WHEN r.applied_epoch = e.epoch \
                                                          THEN coalesce(r.applied_sequence, 0) ELSE 0 END \
-                  WHERE h.refused IS NULL \
+                  WHERE NOT {REFUSED} \
                   GROUP BY 1, 2 \
                  UNION ALL \
                  SELECT relation, replica_id, 0, count(*), 0 FROM sync.quarantine \
@@ -1290,7 +1290,7 @@ impl Engine {
                   WHERE replica_id = ANY($2) AND relation IS NOT NULL GROUP BY 1, 2) \
              SELECT relation, sum(in_flight)::int8, sum(quarantined)::int8, sum(unfiled)::int8, \
                     count(DISTINCT replica_id) \
-               FROM c GROUP BY 1",
+               FROM c GROUP BY 1"),
         )
         .bind(&unconfirmed)
         .bind(scoped.ids())

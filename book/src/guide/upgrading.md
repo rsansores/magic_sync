@@ -55,6 +55,11 @@ and a deploy's worth of traffic: change declarations on purpose. A change
 to how a codec encodes a row that leaves its columns alone is not seen:
 provision the replicas yourself ([Provisioning](provisioning.md)).
 
+On a replica, what it wrote of a table its build does not send up — one
+that no longer goes up, or not yet, after a rollback — stays, set aside and
+counted in the backlog, and goes up once a build that sends it runs: rolling
+a replica back and forward again loses none of its writes.
+
 ## The protocol
 
 Every message carries the protocol it speaks, [`PROTOCOL`]: a new kind of

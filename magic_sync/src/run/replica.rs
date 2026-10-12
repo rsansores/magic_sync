@@ -5,6 +5,7 @@
 //! own, and hands every message the server sends to [`Replica::receive`],
 //! acknowledging it to the transport only once that returned `Ok`.
 
+use crate::envelope::Limits;
 use crate::replica::{self, Care, Lane, Outbox, Received, Stop};
 use crate::run::Backoff;
 use crate::wire::Codec;
@@ -73,6 +74,10 @@ pub trait Uplink: Send + Sync + 'static {
 pub struct Settings {
     /// How much one message up carries.
     pub outbox: Outbox,
+    /// How much one message from the server carries, at most: rows — its
+    /// upserts and deletes together — and tables, or uploads it answers.
+    /// One that carries more is malformed. The server's limits, or more.
+    pub inbound: Limits,
     /// The streams up, the main one first: it carries what the engine says
     /// besides the replica's rows.
     pub lanes: Vec<Lane>,
@@ -96,6 +101,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             outbox: Outbox::default(),
+            inbound: Limits::default(),
             lanes: vec![Lane::new("main", &[])],
             idle: Duration::from_secs(1),
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
@@ -170,8 +176,9 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// is; `uplink` how a message reaches the server. Refused, too, when the
     /// settings cannot send up: no lane, a table on two lanes or on none.
     /// What an earlier run set aside, because it could not go up as it was,
-    /// is offered again: this build may send it; what it wrote of a table
-    /// that no longer goes up is dropped, for it never will.
+    /// is offered again: this build may send it. What the replica wrote of
+    /// a table this build does not send up stays, set aside and counted in
+    /// the backlog, for a build that does.
     ///
     /// # Errors
     ///
@@ -201,13 +208,6 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         }
         let mut conn = pool.acquire().await?;
         replica::check(&mut conn, &codecs).await?;
-        let dropped = replica::forsake(&mut conn, &codecs).await?;
-        if dropped > 0 {
-            tracing::warn!(
-                dropped,
-                "sync: writes of tables that no longer go up, which never will — dropped"
-            );
-        }
         let offered = replica::retry_set_aside(&mut conn).await?;
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");
@@ -238,14 +238,19 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     ///
     /// The message must come again: the replica's storage failed
     /// ([`Error::Database`]), or it speaks a later protocol than this build
-    /// ([`Error::Protocol`]). Nothing of it was applied.
+    /// ([`Error::Protocol`]). Nothing of it was applied. Nothing it carries
+    /// is an error: what the database refuses of it is rejected, row by row
+    /// — every row of it when the database refuses it for what no row
+    /// explains — and a message even that does not apply is
+    /// [`Received::Malformed`].
     pub async fn receive(&self, bytes: &[u8]) -> Result<Received, Error> {
         let mut care = Care::default();
         let received = loop {
             let mut conn = self.pool.acquire().await?;
             let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
             replica::settled(&mut tx).await?;
-            let stop = match replica::receive(&mut tx, &self.codecs, bytes, &care).await {
+            let limits = &self.settings.inbound;
+            let stop = match replica::receive(&mut tx, &self.codecs, bytes, limits, &care).await {
                 // A key checked at commit may refuse it: a row of the
                 // message is at fault, and found once applied carefully.
                 Ok(received) => match tx.commit().await {
@@ -260,10 +265,17 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             // The database may have rolled the transaction back under it: a
             // connection that no longer knows whether it is in one goes.
             conn.close_on_drop();
-            match stop {
-                Stop::Culprits(culprits) => care.refuse(culprits)?,
-                Stop::Failed(e) if e.is_refusal() && care.heed() => {}
+            let again = match stop {
+                Stop::Culprits(culprits) => care.refuse(culprits) || care.heed(),
+                Stop::Failed(e) if e.is_refusal() => care.heed(),
                 Stop::Failed(e) => return Err(e),
+            };
+            if !again {
+                // Refused with every row of it refused: nothing a message
+                // changes is at fault, and this one never applies.
+                return Ok(replica::malformed(
+                    "the database refuses it even with every row of it refused".to_owned(),
+                ));
             }
         };
         if matches!(
@@ -399,6 +411,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             None
         };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        replica::identified(&mut tx, id).await?;
         let outgoing = replica::outbox(
             &mut tx,
             &self.codecs,

@@ -388,35 +388,50 @@ async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
     );
 }
 
-/// What a replica wrote of a table that no longer goes up — its triggers
-/// dropped, as `check` requires — never will: its notes are dropped when
-/// the replica starts, rather than counted in the backlog for ever.
+/// What a replica wrote of a table that the build it was rolled back to
+/// does not send up stays, set aside and counted, and goes up once a build
+/// that sends it runs again: a downgrade loses no write.
 #[sqlx::test(migrations = false)]
-async fn notes_of_a_table_that_no_longer_goes_up_are_dropped(pool_: SqlitePool) {
+async fn writes_a_downgrade_does_not_send_go_up_after_the_upgrade(pool_: SqlitePool) {
     let pool = pool(pool_).await;
-    sqlx::query(
-        "INSERT INTO sync_notes (relation, row_key) VALUES ('retired_table', 'a'), ('events', 'b'); \
-         INSERT INTO sync_leaving (relation, row_key) VALUES ('retired_table', 'a')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    Replica::new(
-        pool.clone(),
-        codecs(),
-        Uuid::now_v7(),
-        Uplinked::default(),
-        settings(),
-    )
-    .await
-    .unwrap();
-    let left: Vec<String> = sqlx::query_scalar(
-        "SELECT relation FROM sync_notes UNION ALL SELECT relation FROM sync_leaving",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(left, ["events"]);
+    let event = Uuid::now_v7();
+    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'kept')")
+        .bind(event)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let older = || -> Vec<Codec<()>> {
+        codecs()
+            .into_iter()
+            .filter(|c| c.table.name != "events")
+            .collect()
+    };
+    let (me, uplink) = (Uuid::now_v7(), Uplinked::default());
+    for (build, goes) in [(older(), false), (codecs(), true)] {
+        replica::install(&mut pool.acquire().await.unwrap(), &build)
+            .await
+            .unwrap();
+        let replica = Replica::new(pool.clone(), build, me, uplink.clone(), settings())
+            .await
+            .unwrap();
+        replica.send_lane(0, false).await.unwrap();
+        let (_, up) = uplink.taken().pop().expect("a message");
+        let sent: Vec<&str> = up.tables.iter().map(|t| t.table.as_str()).collect();
+        let progress = replica::progress(&mut pool.acquire().await.unwrap())
+            .await
+            .unwrap();
+        if goes {
+            assert_eq!(sent, ["events"]);
+            assert_eq!(up.tables[0].keys[0].parts, [event.to_string()]);
+        } else {
+            assert!(sent.is_empty());
+            assert_eq!(
+                (progress[0].table.as_str(), progress[0].set_aside),
+                ("events", 1),
+                "set aside, and counted"
+            );
+        }
+    }
 }
 
 /// When digests are due is the database's, not the process's: a replica

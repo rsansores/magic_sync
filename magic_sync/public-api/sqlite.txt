@@ -81,7 +81,6 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Lane
 #[non_exhaustive] pub struct magic_sync::replica::Outbox
 pub magic_sync::replica::Outbox::backlog_every: core::time::Duration
 pub magic_sync::replica::Outbox::limits: magic_sync::envelope::Limits
-pub magic_sync::replica::Outbox::rejections: core::num::nonzero::NonZeroUsize
 pub magic_sync::replica::Outbox::resend_after: core::time::Duration
 impl core::clone::Clone for magic_sync::replica::Outbox
 pub fn magic_sync::replica::Outbox::clone(&self) -> Self
@@ -272,6 +271,7 @@ pub magic_sync::run::replica::Settings::backoff: magic_sync::run::Backoff
 pub magic_sync::run::replica::Settings::digests_every: core::time::Duration
 pub magic_sync::run::replica::Settings::digests_first: core::time::Duration
 pub magic_sync::run::replica::Settings::idle: core::time::Duration
+pub magic_sync::run::replica::Settings::inbound: magic_sync::envelope::Limits
 pub magic_sync::run::replica::Settings::lanes: alloc::vec::Vec<magic_sync::replica::Lane>
 pub magic_sync::run::replica::Settings::outbox: magic_sync::replica::Outbox
 pub magic_sync::run::replica::Settings::send_timeout: core::time::Duration
@@ -394,6 +394,7 @@ pub magic_sync::Settings::backoff: magic_sync::run::Backoff
 pub magic_sync::Settings::digests_every: core::time::Duration
 pub magic_sync::Settings::digests_first: core::time::Duration
 pub magic_sync::Settings::idle: core::time::Duration
+pub magic_sync::Settings::inbound: magic_sync::envelope::Limits
 pub magic_sync::Settings::lanes: alloc::vec::Vec<magic_sync::replica::Lane>
 pub magic_sync::Settings::outbox: magic_sync::replica::Outbox
 pub magic_sync::Settings::send_timeout: core::time::Duration

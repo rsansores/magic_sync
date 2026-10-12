@@ -154,7 +154,8 @@ table as the engine knows it (a partitioned table by its own name, not its
 partition's), the row's key in the order the row declares it, the columns it
 pointed at other mirrored rows with before the change, and the id of the
 transaction. A key that changed notes the old key too, in the partition it
-was in. Because
+was in, and a row that moved to another partition is noted in the one it
+left as well. Because
 the note is written by a trigger in the same transaction, **no write path can
 forget to note**, and a rolled-back change leaves no note. `TRUNCATE` is
 refused on a mirrored table, because it would remove rows without a note.
@@ -383,10 +384,11 @@ what the server knows about it**, never what the rows claim:
 - a record is kept from its first delivery, or the newest report wins when it
   has a `VERSION`;
 - a two-way table takes only the columns the replica owns, and only of a row
-  the server has and records the replica holding: an edit of a row it is
-  taking back, or of one it forgot the replica holds while it provisions it
-  again, waits; one of a row the replica was never sent is refused — a
-  replica never creates a two-way row;
+  the server has and records the replica holding: an edit of one it forgot
+  the replica holds while it provisions it again waits; one of a row it
+  deleted or is taking back is dropped, the server's change winning; one of
+  a row the replica was never sent is refused — a replica never creates a
+  two-way row;
 - a catalog is refused, because replicas do not write the server's tables;
 - a replica deletes only its own rows.
 

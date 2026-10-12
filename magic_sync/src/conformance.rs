@@ -171,6 +171,8 @@ pub struct Uplinked {
     pub hanging: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     /// Every send it was asked to make.
     pub attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Every message it was handed, taken or not, since last asked.
+    pub offered: std::sync::Arc<std::sync::Mutex<Vec<crate::envelope::Up>>>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -184,6 +186,8 @@ impl crate::run::replica::Uplink for Uplinked {
         use prost::Message as _;
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let up = crate::envelope::Up::decode(message.as_slice()).expect("an upload");
+        self.offered.lock().unwrap().push(up.clone());
         if self.hanging.lock().unwrap().contains(&lane) {
             std::future::pending::<()>().await;
         }
@@ -196,7 +200,6 @@ impl crate::run::replica::Uplink for Uplinked {
                 });
             }
         }
-        let up = crate::envelope::Up::decode(message.as_slice()).expect("an upload");
         if self
             .cannot_take
             .lock()
@@ -428,6 +431,51 @@ pub fn malformed() -> Vec<(&'static str, Outcome, Vec<u8>)> {
             "malformed",
             one(end(101, 100, "")),
         ),
+        // More than a message carries, as a replica takes them by default.
+        (
+            "more_rows_than_a_message_carries",
+            "malformed",
+            with(|d| {
+                d.tables.push(Table {
+                    table: "items".to_owned(),
+                    deletes: vec![crate::envelope::Key::default(); 501],
+                    ..Table::default()
+                });
+            }),
+        ),
+        (
+            "more_tables_than_a_message_carries",
+            "malformed",
+            with(|d| {
+                d.tables = vec![
+                    Table {
+                        table: "items".to_owned(),
+                        ..Table::default()
+                    };
+                    501
+                ];
+            }),
+        ),
+        (
+            "ends_more_tables_than_a_message_carries",
+            "malformed",
+            one(Body::EndSnapshot(EndSnapshot {
+                snapshot_id: snapshot.to_owned(),
+                tables: vec!["items".to_owned(); 501],
+                sequence: 101,
+                epoch: EPOCH.to_owned(),
+                nonce: nonce_of(101),
+                mac: SEAL.to_vec(),
+                ..EndSnapshot::default()
+            })),
+        ),
+        (
+            "files_more_uploads_than_a_message_carries",
+            "malformed",
+            one(Body::Filed(crate::envelope::Filed {
+                uploads: (1..=501).collect(),
+            })),
+        ),
         // A key that does not parse is left out, and the rest applied.
         (
             "a_delete_of_a_key_that_does_not_parse",
@@ -490,7 +538,8 @@ fn the_malformed_corpus_is_the_one_checked_in() {
                   # EndSnapshot 100 of epoch 0192f6a0-0000-7000-8000-00000000e90c, nonce\n\
                   # 0x5eed000000000064, sealed with sixteen bytes 0x5e, of nothing, makes of each\n\
                   # what `outcome` says: `malformed`\n\
-                  # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2).\n";
+                  # is acknowledged and applies nothing (PROTOCOL.md 3, 4.0, 4.1, 4.2). It\n\
+                  # takes 500 rows a message, and 500 tables or uploads, at most.\n";
     let text: String = malformed()
         .iter()
         .map(|(case, outcome, bytes)| format!("{case} {outcome} {}\n", hex(bytes)))
@@ -527,6 +576,14 @@ mod server {
         at BIGINT NOT NULL, PRIMARY KEY (replica_id, id));
     CREATE TABLE fixture.events (id UUID PRIMARY KEY, what TEXT NOT NULL);
     ";
+
+    /// Where what a replica says of itself, and does to two-way rows and its
+    /// own, is kept with what the server makes of each: built as a replica
+    /// would send it, filed by the server's suite.
+    const VERDICTS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/to_server_verdicts.txt"
+    );
 
     const RESYNC: &str =
         "INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '0192f6a0-0000-7000-8000-0000000000aa');";
@@ -755,6 +812,18 @@ mod server {
         )
         .await
         .unwrap();
+        // The uploads are a replica's of default limits: rows and
+        // rejections past the two a message down carries here.
+        let filer = Server::new(
+            pool.clone(),
+            codecs(),
+            replicas,
+            kept.clone(),
+            Anyone::new(pool.clone()),
+            Settings::default(),
+        )
+        .await
+        .unwrap();
         let uploads = std::fs::read_to_string(GOLDEN_UP).expect("the golden uploads");
         let mut snapshots: Vec<String> = Vec::new();
         let mut out = String::new();
@@ -783,7 +852,7 @@ mod server {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
             *kept.takes.lock().unwrap() = *takes;
             if *step == "filed" {
-                file_uploads(&server, &pool, &uploads).await;
+                file_uploads(&filer, &pool, &uploads).await;
             }
             loop {
                 sqlx::query("UPDATE sync.replicas SET retry_after = NULL")
@@ -971,5 +1040,238 @@ mod server {
                       # Generated by conformance::server; applied by the replica conformance\n\
                       # suite, which reads each step by its name.\n";
         matches_golden(GOLDEN, &format!("{header}{}", sent(pool).await));
+    }
+
+    /// What the server makes of what a replica says, and of what it does to
+    /// rows written on both sides and its own — each upload as a replica
+    /// sends it, after a provisioning, a change and a take-back it applied:
+    /// the server's own outcome, held against the line's.
+    #[sqlx::test(migrations = false)]
+    async fn the_server_makes_of_each_upload_what_the_verdicts_say(pool: crate::DbPool) {
+        use crate::envelope::{Key, Rejected, Table, Up};
+        let replica: Uuid = REPLICA.parse().unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        crate::plan::tests::install(&mut conn).await;
+        sqlx::raw_sql(SCHEMA).execute(&mut *conn).await.unwrap();
+        sqlx::query("UPDATE sync.epoch SET epoch = $1::uuid, secret = '\\x5eed'")
+            .bind(EPOCH)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        crate::envelope::PINNED_NONCES.set(Some(nonce_of(1)));
+        sqlx::raw_sql(&format!(
+            "INSERT INTO fixture.t_replicas VALUES ('{REPLICA}', true);
+             INSERT INTO fixture.prices VALUES
+               ('0192f6a0-0000-7000-8000-000000000c01', 250, '2027-01-15 08:00:00+00');
+             INSERT INTO fixture.tasks (id, title, done, updated_at) VALUES
+               ('0192f6a0-0000-7000-8000-000000000d01', 'count', false, '2027-01-15 08:00:00+00');
+             INSERT INTO fixture.readings VALUES
+               ('{REPLICA}', '0192f6a0-0000-7000-8000-000000000e01', 7, 1);"
+        ))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let kept = Kept::default();
+        let server = Server::install(
+            pool.clone(),
+            codecs(),
+            Replicas::relation("fixture.t_replicas")
+                .table("t_replicas")
+                .live("live"),
+            kept.clone(),
+            Anyone::new(pool.clone()),
+            Settings::default(),
+        )
+        .await
+        .unwrap();
+        let pass = || async { while server.pass_now().await.unwrap().unwrap_or_default() > 0 {} };
+        pass().await;
+        sqlx::raw_sql("DELETE FROM fixture.prices")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        pass().await;
+        // What it was sent: its provisioning, ended; the price taken back.
+        let mut sent = Vec::new();
+        for bytes in std::mem::take(&mut *kept.sent.lock().unwrap()) {
+            match ToReplica::decode(bytes.as_slice()).unwrap().body {
+                Some(Body::Down(m)) => sent.push((
+                    m.sequence,
+                    !m.tables.is_empty() && m.tables.iter().all(|t| t.upserts.is_empty()),
+                )),
+                Some(Body::EndSnapshot(m)) => sent.push((m.sequence, false)),
+                _ => {}
+            }
+        }
+        let first = sent.first().expect("a provisioning").0;
+        let ended: i64 = sqlx::query_scalar("SELECT snapshot_end FROM sync.chains")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        let took = sent
+            .iter()
+            .find(|(_, takes)| *takes)
+            .expect("a take-back")
+            .0;
+        let last = sent.last().expect("a message").0;
+        let key = |parts: &[&str]| Key {
+            parts: parts.iter().map(|p| (*p).to_owned()).collect(),
+        };
+        let confirming = |sequence: u64| crate::testkit::confirmation(&pool, replica, sequence);
+        let up = |number: u64| Up {
+            uploads: vec![number],
+            protocol: crate::envelope::PROTOCOL,
+            ..Up::default()
+        };
+        let rejection = |table: &str, parts: &[&str], sequence: u64| Up {
+            rejected: vec![Rejected {
+                table: table.to_owned(),
+                key: Some(key(parts)),
+                reason: "a check of its own".to_owned(),
+                epoch: EPOCH.to_owned(),
+                sequence,
+            }],
+            ..up(0)
+        };
+        let task = Task {
+            id: "0192f6a0-0000-7000-8000-000000000d01".parse().unwrap(),
+            title: "count".to_owned(),
+            done: true,
+            updated_at: "2027-01-15T08:00:00Z".parse().unwrap(),
+        };
+        let edit = Up {
+            tables: vec![Table {
+                table: "tasks".to_owned(),
+                upserts: vec![crate::wire::json_encode(
+                    "tasks",
+                    &crate::row::Table::of::<Task>().columns,
+                    &task,
+                )
+                .unwrap()],
+                keys: vec![key(&["0192f6a0-0000-7000-8000-000000000d01"])],
+                deletes: Vec::new(),
+            }],
+            ..up(0x0192_f6a0_0000_7002)
+        };
+        let delete = Up {
+            tables: vec![Table {
+                table: "readings".to_owned(),
+                deletes: vec![key(&[REPLICA, "0192f6a0-0000-7000-8000-000000000e01"])],
+                ..Table::default()
+            }],
+            ..up(0x0192_f6a0_0000_7003)
+        };
+        let elsewhere = Up {
+            epoch: "0192f6a0-0000-7000-8000-0000000e90ff".to_owned(),
+            sequence: 1,
+            nonce: 1,
+            mac: SEAL.to_vec(),
+            ..up(0)
+        };
+        // A replica says what it refused with the last message it applied.
+        let refused_delete = Up {
+            rejected: rejection("prices", &["0192f6a0-0000-7000-8000-000000000c01"], took).rejected,
+            ..confirming(last).await
+        };
+        let lines: Vec<(&str, &str, Up)> = vec![
+            ("refused_delete", "confirmed,quarantined", refused_delete),
+            ("edit", "filed,edited", edit),
+            ("delete", "filed,gone", delete),
+            (
+                "refused_sweep",
+                "quarantined",
+                rejection(
+                    "tasks",
+                    &["0192f6a0-0000-7000-8000-00000000dead"],
+                    u64::try_from(ended).unwrap(),
+                ),
+            ),
+            ("gap", "provisioned", Up { gap: last, ..up(0) }),
+            ("behind", "provisioned", confirming(first).await),
+            ("elsewhere", "provisioned", elsewhere),
+            ("unknown", "restored", confirming(last + 1_000).await),
+        ];
+        let header =
+            "# What the server makes of what a replica says, and does: `name outcomes hex`\n\
+                      # per upload — confirmed: what it applied recorded; filed: answered;\n\
+                      # edited: its column of a two-way row written; gone: its own row deleted;\n\
+                      # quarantined: the row it refused set aside; provisioned: provisioned\n\
+                      # again; restored: a new epoch, every replica provisioned again. Each\n\
+                      # after a provisioning, a change and a take-back the replica applied.\n\
+                      # Generated and filed by conformance::server.\n";
+        let text: String = lines
+            .iter()
+            .map(|(name, outcomes, up)| format!("{name} {outcomes} {}\n", hex(&up.encode_to_vec())))
+            .collect();
+        matches_golden(VERDICTS, &format!("{header}{text}"));
+
+        let scalar = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .bind(replica)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND replica_id = $1 \
+                         AND done_at IS NULL";
+        let quarantined = "SELECT count(*) FROM sync.quarantine \
+                             WHERE replica_id = $1 AND cause = 'replica'";
+        for (name, outcomes, bytes) in golden(&std::fs::read_to_string(VERDICTS).unwrap()) {
+            // Each judged on its own: no provisioning pending, none asked lately.
+            sqlx::raw_sql(
+                "UPDATE sync.notes SET done_at = now() WHERE kind = 'resync';
+                 UPDATE sync.replicas SET asked_at = NULL, asks = 0",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let before = scalar(quarantined).await;
+            let up = Up::decode(bytes.as_slice()).unwrap();
+            server.receive(replica, &bytes).await.unwrap();
+            let outcomes: Vec<&str> = outcomes.split(',').collect();
+            for outcome in &outcomes {
+                let holds = match *outcome {
+                    "confirmed" => {
+                        scalar("SELECT applied_sequence FROM sync.replicas WHERE replica_id = $1")
+                            .await
+                            == i64::try_from(up.sequence).unwrap()
+                    }
+                    "filed" => kept.sent.lock().unwrap().iter().any(|bytes| {
+                        matches!(ToReplica::decode(bytes.as_slice()).unwrap().body,
+                                 Some(Body::Filed(f)) if f.uploads == up.uploads)
+                    }),
+                    "edited" => {
+                        scalar("SELECT count(*) FROM fixture.tasks WHERE done AND $1 IS NOT NULL")
+                            .await
+                            == 1
+                    }
+                    "gone" => {
+                        scalar("SELECT count(*) FROM fixture.readings WHERE replica_id = $1").await
+                            == 0
+                    }
+                    "quarantined" => scalar(quarantined).await == before + 1,
+                    "provisioned" => scalar(resyncs).await == 1,
+                    "restored" => {
+                        sqlx::query_scalar::<_, bool>("SELECT epoch <> $1::uuid FROM sync.epoch")
+                            .bind(EPOCH)
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap()
+                    }
+                    other => panic!("{name}: an outcome this suite does not know: {other}"),
+                };
+                assert!(holds, "{name}: not {outcome}");
+            }
+            if !outcomes.contains(&"provisioned") && !outcomes.contains(&"restored") {
+                assert_eq!(
+                    scalar(resyncs).await,
+                    0,
+                    "{name}: nothing provisioned again"
+                );
+            }
+        }
     }
 }

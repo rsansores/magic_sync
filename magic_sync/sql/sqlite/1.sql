@@ -9,6 +9,14 @@ CREATE TABLE sync_version (
     version INTEGER NOT NULL
 );
 
+-- Which replica this is, once it knows: a row of a table written on both
+-- sides and keyed by its replica is this one's to delete only when keyed by
+-- it.
+CREATE TABLE sync_replica (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    replica BLOB    NOT NULL
+);
+
 -- Present only while the engine applies what the server sent, inside that
 -- transaction: the triggers note no write it makes, and refuse none.
 CREATE TABLE sync_applying (
@@ -83,10 +91,13 @@ CREATE TABLE sync_rejections (
 
 -- Rows of tables written on both sides the server let go of while what this
 -- replica wrote of them had not reached it: kept retired, and let go of once
--- the server files it.
+-- the server files it. `epoch` and `sequence` are the message that let go
+-- of it, which a rejection names should the replica not manage to then.
 CREATE TABLE sync_leaving (
-    relation TEXT NOT NULL,
-    row_key  TEXT NOT NULL,
+    relation TEXT    NOT NULL,
+    row_key  TEXT    NOT NULL,
+    epoch    TEXT    NOT NULL,
+    sequence INTEGER NOT NULL,
     PRIMARY KEY (relation, row_key)
 );
 

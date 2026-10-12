@@ -1105,3 +1105,67 @@ async fn a_status_read_is_one_snapshot(pool: crate::DbPool) {
         .await
         .unwrap();
 }
+
+/// A row a replica refused and is sent again is on its way, as the planner
+/// counts it: neither held, nor missing, and still set aside until the
+/// replica applies the message that carries it.
+#[sqlx::test(migrations = false)]
+async fn a_refused_row_sent_again_is_on_its_way(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Rejected};
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Fake::default();
+    let one = world.item("one").await;
+    world.pass(&wire).await;
+    let carried = world.last_sent(a).await;
+    let mut said = crate::testkit::confirmation(&world.pool, a, carried).await;
+    said.rejected = vec![Rejected {
+        table: "items".to_owned(),
+        key: Some(WireKey {
+            parts: vec![one.to_string()],
+        }),
+        reason: "a check of its own".to_owned(),
+        epoch: world.epoch().await.to_string(),
+        sequence: carried,
+    }];
+    crate::testkit::file(&world.pool, &world.codecs, &said, a, &()).await;
+    world
+        .exec(
+            "UPDATE fixture.items SET name = $3 WHERE id = $1 AND partition_id = $2",
+            one,
+            "one, renamed",
+        )
+        .await;
+    world.pass(&wire).await;
+    assert!(world.last_sent(a).await > carried, "sent again");
+
+    let mut conn = world.pool.acquire().await.unwrap();
+    let progress = world
+        .engine
+        .progress(&mut conn, Scope::Replicas(&[a]))
+        .await
+        .unwrap();
+    let items = progress.replicas[0]
+        .tables
+        .iter()
+        .find(|t| t.table == "items")
+        .unwrap();
+    assert_eq!(
+        (
+            items.should,
+            items.holds,
+            items.in_flight,
+            items.quarantined
+        ),
+        (1, 0, 1, 1),
+        "{items:?}"
+    );
+    let places = states_of(
+        world
+            .engine
+            .row_progress(&mut conn, Scope::Replicas(&[a]), "items", &one.to_string())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(places, [(a, RowState::Quarantined)]);
+}

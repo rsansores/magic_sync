@@ -4,23 +4,20 @@
 //! engine's replica (the other build): where the two disagree, one of them
 //! breaks the protocol, and the conformance suite says which.
 
-use crate::envelope::{Body, ToReplica};
+use crate::envelope::{Body, ToReplica, Up};
 use prost::Message as _;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "postgres")]
 use {
-    crate::envelope::{Rejected, Up},
-    crate::relay::Transport,
-    crate::testkit::Walk,
-    crate::Error,
-    std::collections::VecDeque,
-    std::future::Future,
-    std::sync::Mutex,
-    uuid::Uuid,
+    crate::envelope::Rejected, crate::relay::Transport, crate::testkit::Walk, crate::Error,
+    std::collections::VecDeque, std::future::Future, std::sync::Mutex, uuid::Uuid,
 };
 
 /// A row, by its table and its key's text.
 pub(crate) type Row = (String, String);
+
+/// A row, with the bytes that carried it.
+type Carried = (Row, Vec<u8>);
 
 /// What a replica's data is: which rows it refuses to take, and which rows
 /// each points at.
@@ -129,6 +126,9 @@ pub(crate) struct Model {
     /// Rows a row of its own points at, in a table with nothing to retire
     /// them by: it cannot let them go.
     pub(crate) pinned: BTreeSet<Row>,
+    /// Rows a row of its own points at by their unique value: one that
+    /// changes it is refused.
+    pub(crate) anchored: BTreeSet<Row>,
     /// Rows a row of its own points at, in a table it retires by: let go
     /// of, they are retired — kept, and out of what it holds.
     pub(crate) retiring: BTreeSet<Row>,
@@ -170,8 +170,27 @@ impl Model {
         let Some(body) = message.body else {
             return Received::Malformed;
         };
+        // More than a message carries, as a replica takes them by default.
+        let most = crate::envelope::Limits::default().rows();
+        let (rows, entries) = match &body {
+            Body::Down(d) => (
+                d.tables
+                    .iter()
+                    .map(|t| t.upserts.len() + t.deletes.len())
+                    .sum(),
+                d.tables.len(),
+            ),
+            Body::EndSnapshot(e) => (0, e.tables.len()),
+            Body::Filed(f) => (0, f.uploads.len()),
+        };
+        if rows > most || entries > most {
+            return Received::Malformed;
+        }
         let (place, ends) = match &body {
-            Body::Filed(_) => return Received::Filed,
+            Body::Filed(_) => {
+                self.collect(rules);
+                return Received::Filed;
+            }
             Body::Down(d) => {
                 if d.tables.iter().any(|t| t.keys.len() != t.upserts.len()) {
                     return Received::Malformed;
@@ -252,19 +271,25 @@ impl Model {
             Body::Down(down) => {
                 let naming = !down.snapshot_id.is_empty();
                 self.taken.clear();
+                // Per table held, the rows it is yet to take.
+                let mut pending: Vec<(usize, Vec<Carried>)> = Vec::new();
                 for table in down.tables {
                     let holds = (rules.holds)(&table.table);
                     if holds {
-                        let gone = table
+                        let gone: Vec<Row> = table
                             .deletes
                             .iter()
                             .map(|key| (table.table.clone(), key.parts.join("|")))
                             .collect();
+                        // Refused earlier in the message, and let go of now.
+                        for (_, rows) in &mut pending {
+                            rows.retain(|(row, _)| !gone.contains(row));
+                        }
                         self.let_go(gone, sequence, rules);
                     }
-                    let mut pending = Vec::new();
+                    let mut rows = Vec::new();
                     // A key twice in a part: the last row beside it is the one.
-                    let rows: BTreeMap<String, usize> = table
+                    let last: BTreeMap<String, usize> = table
                         .keys
                         .iter()
                         .enumerate()
@@ -272,7 +297,7 @@ impl Model {
                         .collect();
                     for (at, (bytes, key)) in table.upserts.iter().zip(&table.keys).enumerate() {
                         let row = (table.table.clone(), key.parts.join("|"));
-                        if rows[&row.1] != at {
+                        if last[&row.1] != at {
                             continue;
                         }
                         if naming {
@@ -282,41 +307,34 @@ impl Model {
                         }
                         let beside =
                             (rules.key)(&table.table, bytes).is_some_and(|own| own != row.1);
+                        // Of a table it does not know, named or keyed longer
+                        // than it keeps: logged, not kept (6).
+                        if !holds && (row.0.len() > 512 || row.1.len() > 512) {
+                            continue;
+                        }
                         if !holds || beside || (rules.refuses)(&table.table, bytes) {
                             self.reject(row, "refused", sequence);
                         } else {
-                            pending.push((row, bytes.clone()));
+                            rows.push((row, bytes.clone()));
                         }
-                    }
-                    // One refused for what the replica holds is tried again
-                    // once the rest are in, while that takes one more.
-                    let mut taken = Vec::new();
-                    loop {
-                        let mut again = Vec::new();
-                        let mut took = false;
-                        for (row, bytes) in std::mem::take(&mut pending) {
-                            if !self.fits(&row, &bytes, rules) {
-                                again.push((row, bytes));
-                                continue;
-                            }
-                            took = true;
-                            self.rejections.remove(&row);
-                            taken.push(row.1.clone());
-                            self.retired.remove(&row);
-                            self.rows.insert(row, bytes);
-                        }
-                        if again.is_empty() || !took {
-                            for (row, _) in again {
-                                self.reject(row, "refused", sequence);
-                            }
-                            break;
-                        }
-                        pending = again;
                     }
                     if holds {
-                        self.taken.push((table.table, taken));
+                        self.taken.push((table.table, Vec::new()));
+                        let entry = self.taken.len() - 1;
+                        while self.take(entry, &mut rows, rules) {}
+                        pending.push((entry, rows));
                     }
                 }
+                // One refused for what the replica holds is tried again —
+                // once the rest of its part is in, and once the whole
+                // message is — while that takes one more.
+                while pending.iter_mut().fold(false, |took, (entry, rows)| {
+                    self.take(*entry, rows, rules) || took
+                }) {}
+                for (row, _) in pending.into_iter().flat_map(|(_, rows)| rows) {
+                    self.reject(row, "refused", sequence);
+                }
+                self.collect(rules);
                 Received::Applied
             }
             Body::EndSnapshot(end) => {
@@ -341,13 +359,33 @@ impl Model {
                 let epoch = self.applied.as_ref().map(|(e, _)| e.clone());
                 self.rejections
                     .retain(|(t, _), r| (rules.holds)(t) || Some(&r.epoch) == epoch.as_ref());
+                self.collect(rules);
                 Received::Ended
             }
         }
     }
 
-    /// Whether the database takes `row` as it stands: no other row holds
-    /// its unique value, and — where it checks them — it holds what the row
+    /// Takes what of `rows` fits, as the table entry `entry` of the last
+    /// message, leaving the rest: answers whether it took any.
+    fn take(&mut self, entry: usize, rows: &mut Vec<Carried>, rules: &Rules) -> bool {
+        let mut took = false;
+        for (row, bytes) in std::mem::take(rows) {
+            if !self.fits(&row, &bytes, rules) {
+                rows.push((row, bytes));
+                continue;
+            }
+            took = true;
+            self.rejections.remove(&row);
+            self.taken[entry].1.push(row.1.clone());
+            self.retired.remove(&row);
+            self.rows.insert(row, bytes);
+        }
+        took
+    }
+
+    /// Whether the database takes `row` as it stands: no other live row
+    /// holds its unique value — a retired one keeps it only for what points
+    /// at it — and — where it checks them — it holds what the row
     /// points at, or the row points at itself.
     fn fits(&self, row: &Row, bytes: &[u8], rules: &Rules) -> bool {
         let present =
@@ -355,10 +393,17 @@ impl Model {
         if rules.checked && !(rules.parents)(&row.0, bytes).iter().all(present) {
             return false;
         }
+        let held = self.rows.get(row).or_else(|| self.retired.get(row));
+        if self.anchored.contains(row)
+            && held
+                .is_some_and(|held| (rules.unique)(&row.0, held) != (rules.unique)(&row.0, bytes))
+        {
+            return false;
+        }
         let Some(value) = (rules.unique)(&row.0, bytes) else {
             return true;
         };
-        !self.rows.iter().chain(&self.retired).any(|(other, b)| {
+        !self.rows.iter().any(|(other, b)| {
             other.0 == row.0 && other != row && (rules.unique)(&other.0, b).as_ref() == Some(&value)
         })
     }
@@ -370,6 +415,24 @@ impl Model {
     /// the database refuses — kept by a trigger, or pointed at by a row of
     /// the server's that stays — which is kept, rejected.
     fn let_go(&mut self, rows: Vec<Row>, sequence: u64, rules: &Rules) {
+        for row in self.letting_go(rows, rules) {
+            self.reject(row, "pointed at", sequence);
+        }
+    }
+
+    /// Lets go of the rows it retired that nothing keeps any more, as it
+    /// would let go of them on a delete (4.3) — after every message it
+    /// applies — and says nothing of one it cannot.
+    fn collect(&mut self, rules: &Rules) {
+        let retired: Vec<Row> = self.retired.keys().cloned().collect();
+        let rejected = self.rejections.clone();
+        self.letting_go(retired, rules);
+        self.rejections = rejected;
+    }
+
+    /// What [`Model::let_go`] does but reject: answers the rows it could
+    /// not let go of.
+    fn letting_go(&mut self, rows: Vec<Row>, rules: &Rules) -> Vec<Row> {
         let asked: BTreeSet<Row> = rows.into_iter().collect();
         let held: BTreeSet<Row> = asked
             .iter()
@@ -421,10 +484,13 @@ impl Model {
             })
             .cloned()
             .collect();
+        // What stays — live, or retired — refuses to let go what it points
+        // at.
         loop {
             let refused: BTreeSet<Row> = self
                 .rows
                 .iter()
+                .chain(&self.retired)
                 .filter(|(row, _)| !going.contains(*row) && !retiring.contains(*row))
                 .flat_map(|(row, bytes)| (rules.parents)(&row.0, bytes))
                 .filter(|parent| going.contains(parent))
@@ -434,6 +500,7 @@ impl Model {
             }
             going.retain(|row| !refused.contains(row));
         }
+        let mut refused = Vec::new();
         for row in held {
             if retiring.contains(&row) {
                 if let Some(bytes) = self.rows.remove(&row) {
@@ -445,9 +512,10 @@ impl Model {
                 self.retired.remove(&row);
                 self.rejections.remove(&row);
             } else {
-                self.reject(row, "pointed at", sequence);
+                refused.push(row);
             }
         }
+        refused
     }
 
     fn reject(&mut self, row: Row, reason: &str, sequence: u64) {
@@ -503,7 +571,6 @@ impl Model {
     }
 
     /// The last message it applied, as it gives it back to the server.
-    #[cfg(feature = "postgres")]
     fn confirm(&self, up: &mut Up) {
         if let Some((epoch, sequence)) = &self.applied {
             (up.epoch, up.sequence) = (epoch.clone(), *sequence);
@@ -513,8 +580,7 @@ impl Model {
 
     /// What it holds of each of `tables`, with the last message it applied:
     /// the digests a replica reports now and then (PROTOCOL.md section 8),
-    /// leaving out the rows it rejected.
-    #[cfg(feature = "postgres")]
+    /// leaving out the rows it retired or rejected.
     pub(crate) fn digests(&self, tables: &[&str]) -> Up {
         let mut up = Up {
             protocol: crate::envelope::PROTOCOL,

@@ -561,10 +561,12 @@ async fn count(pool: &PgPool, sql: &str) -> i64 {
 
 /// An upload whose filing fails for a reason no resend cures is kept whole,
 /// answered so the replica stops sending it, and filed after a fix; an
-/// upload that fails again holds back no other.
+/// upload that fails again holds back no other. What it says of its sender
+/// is filed all the same: what it applied is recorded.
 #[sqlx::test(migrations = false)]
 async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool: PgPool) {
-    let (_, [a, b]) = world(&pool).await;
+    let (partition, [a, b]) = world(&pool).await;
+    item(&pool, partition, "sent").await;
     let wire = Wire::default();
     let senders = Broken {
         pool: pool.clone(),
@@ -580,17 +582,45 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     )
     .await
     .unwrap();
+    while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
 
-    for (replica, number) in [(a, 7), (b, 8)] {
-        let filed = server
-            .receive(
-                replica,
-                &upload(number, "readings", vec![reading(replica, "kept")]),
+    let applied = |replica: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT applied_sequence FROM sync.replicas WHERE replica_id = $1",
             )
+            .bind(replica)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for (replica, number) in [(a, 7), (b, 8)] {
+        let last: i64 =
+            sqlx::query_scalar("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
+                .bind(replica)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut up = envelope::Up::decode(
+            upload(number, "readings", vec![reading(replica, "kept")]).as_slice(),
+        )
+        .unwrap();
+        let said = crate::testkit::confirmation(&pool, replica, last as u64).await;
+        (up.epoch, up.sequence, up.nonce, up.mac) =
+            (said.epoch, said.sequence, said.nonce, said.mac);
+        let filed = server
+            .receive(replica, &up.encode_to_vec())
             .await
             .expect("no reason to send it again");
         assert!(filed.is_empty());
         assert_eq!(wire.filed(replica), [number], "answered");
+        assert_eq!(
+            applied(replica).await,
+            Some(last),
+            "what it applied, recorded"
+        );
     }
     assert_eq!(
         count(
@@ -802,9 +832,21 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
             .map(str::to_owned),
         ),
     );
-    let tables: Vec<String> = ["items", "readings", "logs", "nope", "", "it\0ems"]
+    // Text past what a btree entry takes, that does not compress: what a
+    // sender may say is bounded only by the message.
+    let long = |walk: &mut crate::testkit::Walk, len: usize| -> String {
+        (0..len / 16)
+            .map(|_| format!("{:016x}", walk.next()))
+            .collect()
+    };
+    parts.extend([
+        long(&mut walk, 3200),
+        format!("{}{}", items[0], long(&mut walk, 3200)),
+    ]);
+    let mut tables: Vec<String> = ["items", "readings", "logs", "nope", "", "it\0ems"]
         .map(str::to_owned)
         .to_vec();
+    tables.extend([long(&mut walk, 3200), long(&mut walk, 6400)]);
     let epochs = [
         epoch.to_string(),
         epoch.to_string().to_uppercase(),
@@ -957,6 +999,16 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
         assert_eq!(
             count(
                 &pool,
+                "SELECT count(*) FROM sync.inbox WHERE relation IN ('items', 'readings', 'logs') \
+                   AND row_key !~ '^[0-9a-f-]{36}(\\|[0-9a-f-]{36})?$'"
+            )
+            .await,
+            0,
+            "step {step}: kept a key that is not its mirrored table's"
+        );
+        assert_eq!(
+            count(
+                &pool,
                 "SELECT count(*) FROM sync.replicas r LEFT JOIN sync.chains c USING (replica_id) \
                   WHERE r.applied_sequence > c.last_sequence \
                      OR (r.applied_sequence IS NOT NULL AND c.last_sequence IS NULL)"
@@ -1066,8 +1118,8 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
     }
 }
 
-/// An upload beyond the server's limits — more bytes, more rows or more
-/// rejections than a message carries — or from a sender that is no replica
+/// An upload beyond the server's limits — more bytes, or more rows and
+/// rejections together than a message carries — or from a sender that is no replica
 /// is dropped unanswered: nothing of it filed, nothing recorded of its
 /// sender. One within them is filed.
 #[sqlx::test(migrations = false)]
@@ -1113,6 +1165,14 @@ async fn an_upload_beyond_the_limits_or_from_no_replica_is_dropped_unanswered(po
             ),
         ),
         (a, rejected(3).encode_to_vec()),
+        (a, {
+            let mut up = envelope::Up::decode(
+                upload(3, "readings", vec![reading(a, "one, and two rejections")]).as_slice(),
+            )
+            .unwrap();
+            up.rejected = rejected(2).rejected;
+            up.encode_to_vec()
+        }),
         (
             stranger,
             upload(4, "readings", vec![reading(stranger, "a stranger's")]),

@@ -378,6 +378,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
             }
             drop_outbox(conn, &snapshots, i64::MAX, false).await?;
         }
+        let mut dropping = self.engine.dropping(conn).await?;
         let ids: BTreeMap<Uuid, String> = snapshots
             .iter()
             .map(|replica| (*replica, Uuid::now_v7().to_string()))
@@ -392,7 +393,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 .into_iter()
                 .map(|replica| {
                     let snapshot = ids.get(&replica).map_or("", String::as_str);
-                    (replica, Packer::new(snapshot, self.limits))
+                    let dropping = dropping.remove(&replica).unwrap_or_default();
+                    (replica, Packer::new(snapshot, self.limits, dropping))
                 })
                 .collect(),
             snapshots: ids.clone(),
@@ -749,15 +751,19 @@ impl Writer {
             .packers
             .get_mut(&replica)
             .expect("a packer per replica");
-        if let Some(done) = packer.push(table, bytes, wire) {
+        for done in packer.push(table, bytes, wire) {
             self.ready(replica, Body::Down(done));
         }
-        if self.buffered > BUFFERED {
-            // Every replica's message being filled, ended early: what a
-            // pass holds stays bounded however many replicas it fills at once.
+        // Every replica's message being filled, ended early: what a pass
+        // holds stays bounded however many replicas it fills at once — at
+        // its spans while that is enough, else whole.
+        for early in [Packer::before_spans, Packer::finish] {
+            if self.buffered <= BUFFERED {
+                break;
+            }
             let replicas: Vec<Uuid> = self.packers.keys().copied().collect();
             for replica in replicas {
-                if let Some(done) = self.packers.get_mut(&replica).and_then(Packer::finish) {
+                if let Some(done) = self.packers.get_mut(&replica).and_then(early) {
                     self.ready(replica, Body::Down(done));
                 }
             }
