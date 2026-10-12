@@ -18,5 +18,10 @@ export { default as RowPlaces } from './vue/RowPlaces.vue'
 export { useRowPlaces } from './vue/useRowPlaces.js'
 export type { RowPlacesOptions } from './vue/useRowPlaces.js'
 
+// The wishes of the replicas' settings, and how each replica answered.
+export { default as WishList } from './vue/WishList.vue'
+export { useWishes } from './vue/useWishes.js'
+export type { WishesOptions } from './vue/useWishes.js'
+
 // Everything framework-free, also as `magic_sync_dashboard/core`.
 export * from './core/index.js'

@@ -5,6 +5,7 @@ import { CONTRACT } from './contract/types.js'
 import {
   knowsReplicaState,
   placeMoodOf,
+  wishMoodOf,
   readsContract,
   type Mood,
   type PlaceMood,
@@ -70,6 +71,8 @@ export function describeReplica(r: ReplicaRow, speech: Speech): string[] {
   else if (r.pending > 0) out.push(t('replica.pending', { n: r.pending }))
   else if (r.unconfirmed) out.push(t('replica.applying'))
   if (r.backlog) out.push(t('replica.backlog', { n: r.backlog.unsent + r.backlog.unfiled }))
+  for (const state of ['waiting', 'pending', 'refused', 'superseded'] as const)
+    if (r.wishes[state] > 0) out.push(t(`replica.wishes.${state}`, { n: r.wishes[state] }))
   if (out.length === 0)
     out.push(r.heardAt == null ? t('replica.never') : t('replica.heard', { since: ago(r.heardAt, speech) }))
   return out
@@ -143,6 +146,11 @@ export function describeState(state: string, t: Translate): string {
 
 /** What a row is to a replica: its mood, and the word for it. An unknown
  * state is named as it came, neither settled nor a problem. */
+export function describeWish(state: string, t: Translate): { mood: PlaceMood; label: string } {
+  const mood = wishMoodOf(state)
+  return { mood, label: mood === 'unknown' ? t('wish.unknown', { state }) : t(`wish.${state}`) }
+}
+
 export function describePlace(state: string, t: Translate): { mood: PlaceMood; label: string } {
   const mood = placeMoodOf(state)
   return { mood, label: mood === 'unknown' ? t('row.unknown', { state }) : t(`row.${state}`) }

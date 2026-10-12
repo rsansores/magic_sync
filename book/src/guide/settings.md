@@ -105,3 +105,7 @@ still ends showing the same value on both sides.
 `pending` until the register answers this wish; then `applied`, `refused`,
 `superseded`, or `waiting` with the handler's reason — the module that does
 not answer, say, which the head office could not see otherwise.
+
+The dashboard counts each replica's wishes by where they stand, and
+`Engine::wishes` lists a scope's, those that need attention first, for
+`WishList` to show ([The dashboard](dashboard.md)).

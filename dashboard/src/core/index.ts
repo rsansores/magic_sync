@@ -2,7 +2,15 @@
 // dashboard works out from them and says — no framework.
 
 export * from './contract/types.js'
-export { summarize, pageOf, progressOf, nameOf, readsContract, knowsReplicaState } from './derive.js'
+export {
+  summarize,
+  pageOf,
+  progressOf,
+  nameOf,
+  readsContract,
+  knowsReplicaState,
+  wishMoodOf,
+} from './derive.js'
 export type {
   Mood,
   PlaceMood,
@@ -25,6 +33,7 @@ export {
   describeShare,
   describeState,
   describePlace,
+  describeWish,
   tableMood,
   percent,
 } from './describe.js'

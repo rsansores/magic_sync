@@ -32,7 +32,13 @@ export default {
         "state": "catching_up",
         "unconfirmed": true,
         "unfiled": 0,
-        "waiting_since": "2026-01-01T00:00:00.123456Z"
+        "waiting_since": "2026-01-01T00:00:00.123456Z",
+        "wishes": {
+          "pending": 0,
+          "refused": 0,
+          "superseded": 0,
+          "waiting": 0
+        }
       }
     ],
     "total": 1

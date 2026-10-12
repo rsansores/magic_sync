@@ -14,7 +14,9 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   is the server, the `sqlite` feature a replica, and a build with both (or
   neither) does not compile. `magic_sync_derive` is the derive, re-exported as
   `magic_sync::Row` and `magic_sync::Columns`. `magic_sync_dashboard` (npm) is
-  the dashboard for Vue 3, released at the same version.
+  the dashboard for Vue 3, released at the same version: `SyncDashboard`,
+  `RowPlaces` for where one row is, `WishList` for the wishes of the
+  replicas' settings, and each headless (`use…`) for a host's own components.
 - **Tables are declared once**, as the struct that is the row
   (`#[derive(Row)]`): where it lives, which way it travels (`catalog`,
   `record`, `both`), which replicas hold which rows (`broadcast`,
@@ -46,8 +48,10 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   `Engine::indexes`, `replica::triggers`); `check` holds a database to exactly
   those.
 - **Status.** `status` answers for a dashboard, over a scope, in one
-  snapshot: the overview, a paged listing, health, progress, and where one row
-  is. Every answer serializes as JSON of a versioned contract.
+  snapshot: the overview, a paged listing, health, progress, where one row
+  is, and the wishes of the replicas' settings (`Engine::wishes`; each
+  replica counts its own, and one with a wish not carried out is catching
+  up). Every answer serializes as JSON of a versioned contract.
 - **The replica protocol** (`PROTOCOL.md`, `proto/sync.proto`) is written for
   a replica in any language, with test vectors (`tests/golden`) that the
   engine's own replica is held to.

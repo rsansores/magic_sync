@@ -6,6 +6,7 @@ import {
   describeReplica,
   describeState,
   describeTable,
+  describeWish,
   mismatchOf,
   type Speech,
 } from './describe.js'
@@ -107,5 +108,27 @@ describe('a value an engine newer than the dashboard added', () => {
     expect(describePlace('holds', t)).toEqual({ mood: 'holds', label: 'Holds it' })
     expect(describePlace('teleporting', t)).toEqual({ mood: 'unknown', label: 'Unknown (teleporting)' })
     expect(describePlace('teleporting', translator('es')).label).toBe('Desconocido (teleporting)')
+  })
+})
+
+describe('wishes', () => {
+  const synced = summarize(overview, { now: AT, name: (r) => r }).worst.find((r) => r.state === 'synced')!
+
+  it('says what a replica has not carried out, and what it answered otherwise', () => {
+    const asked = { ...synced, wishes: { pending: 2, waiting: 1, refused: 1, superseded: 0 } }
+    expect(describeReplica(asked, speech())).toEqual([
+      '1 setting waits until it can be carried out.',
+      '2 settings to carry out.',
+      'It refused 1 setting.',
+    ])
+    expect(describeReplica(asked, speech(AT, 'es'))[1]).toBe('2 ajustes por aplicar.')
+  })
+
+  it('names where a wish stands, and one a later engine answers', () => {
+    const t = translator('en')
+    expect(describeWish('superseded', t)).toEqual({ mood: 'set_aside', label: 'Changed there first' })
+    expect(describeWish('applied', t)).toEqual({ mood: 'holds', label: 'Applied' })
+    expect(describeWish('waiting', t).mood).toBe('moving')
+    expect(describeWish('postponed', t)).toEqual({ mood: 'unknown', label: 'Unknown (postponed)' })
   })
 })
