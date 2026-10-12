@@ -638,7 +638,13 @@ where
     async fn write(&self, conn: &mut Conn, rows: Vec<R>, how: How) -> Result<Vec<Key>, Error> {
         match how {
             #[cfg(feature = "sqlite")]
-            How::AllButOwned => row::overwrite_except(conn, rows, &self.owned).await,
+            // A retired row sent again is live again in the same write: one
+            // whose unique values a live row holds is refused with it.
+            How::AllButOwned => {
+                let keys = row::overwrite_except(conn, rows, &self.owned).await?;
+                row::unretire_by_keys::<R>(conn, &keys).await?;
+                Ok(keys)
+            }
             #[cfg(feature = "postgres")]
             How::OnlyOwned(sender) => row::update_held(conn, rows, &self.owned, sender).await,
             #[cfg(feature = "postgres")]
@@ -805,9 +811,8 @@ where
                     });
                 }
             }
-            let (held, again) = self.guarded(conn, pending, How::AllButOwned).await?;
+            let (_, again) = self.guarded(conn, pending, How::AllButOwned).await?;
             refused.extend(again);
-            row::unretire_by_keys::<R>(conn, &held).await?;
             Ok(refused)
         })
     }

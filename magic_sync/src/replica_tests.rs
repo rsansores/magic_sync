@@ -2229,6 +2229,44 @@ fn uniquely_named_items() -> String {
     format!("{TABLES}CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;")
 }
 
+/// A retired row sent again with a unique value a live row holds is refused
+/// as any row is, keeping what it held — not a message applied again.
+#[sqlx::test(migrations = false)]
+async fn a_retired_row_sent_again_with_a_live_rows_value_is_refused(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [first, second] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![item(first, "sku")])],
+    ))
+    .await;
+    w.exec(&format!(
+        "INSERT INTO receipts (item_id) VALUES (x'{}')",
+        first.simple()
+    ))
+    .await
+    .unwrap();
+    let mut part = upserts("items", vec![item(second, "sku")]);
+    part.deletes = vec![key(&[&first.to_string()])];
+    w.receive(&down(2, "", vec![part])).await;
+    let again = w.replica.again.load(std::sync::atomic::Ordering::Relaxed);
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("items", vec![item(first, "sku")])],
+    ))
+    .await;
+    assert_eq!(
+        w.replica.again.load(std::sync::atomic::Ordering::Relaxed),
+        again,
+        "applied again"
+    );
+    assert_eq!(w.rejected().await, [format!("items {first}")]);
+    let retired = "SELECT count(*) FROM items WHERE retired_at IS NOT NULL";
+    assert_eq!(w.count(retired).await, 1);
+}
+
 /// A key a later part of a message upserts again is that part's row: one
 /// an earlier part sent of it, refused, is not tried again once the rest of
 /// the message is in — it would take the older row over the newer.
