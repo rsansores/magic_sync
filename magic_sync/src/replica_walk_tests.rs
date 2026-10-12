@@ -1,7 +1,10 @@
 //! A replica walked at random against a model of it: a server sends what a
 //! server sends — rows of a tree that points at itself, under names unique
-//! among the live ones and given again once let go of; prices of items and
-//! shelves labelled in either case, through keys checked at commit; deletes,
+//! among the live ones and given again once let go of, in the same pass or
+//! a later one; prices of items and shelves labelled in either case, a
+//! label moving from one shelf to another or two shelves swapping theirs,
+//! through keys checked at commit; bins of items keyed by the replica,
+//! which it deletes of its own and keeps retired under a sticker; deletes,
 //! snapshots, new epochs, each pass packed as a server packs it, a table's
 //! rows that come together in one part, a few rows a message — and now and
 //! then what none sends: a row beside another's key, one that does not
@@ -9,16 +12,18 @@
 //! more rows than a message carries, a row of twenty thousand bytes, a table
 //! named past what is kept; through a transport that loses, and redelivers,
 //! of this epoch or an earlier one; the host writes, rewrites and deletes its
-//! own rows — receipts, quotes and tags pointing at the server's, readings
-//! written while a message is applied; the uplink fails for a while and for
+//! own rows — receipts, quotes, tags and stickers pointing at the server's,
+//! readings and events written while a message is applied; the uplink fails for a while and for
 //! good; and the power goes, in the middle of a message, of an upload, of a
 //! write, after a send. After every step the replica holds what the
 //! protocol's model of it holds — retired rows let go of once nothing keeps
 //! them, its edits held for as long as the host's writes say they are not
 //! filed — digests what the model holds, confirms nothing it has not told
 //! every refusal of, keeps what it stores bounded, and has lost no write:
-//! each is either still noted or filed with its latest content. At the end,
-//! with the faults gone, everything it wrote is filed, once, as it is.
+//! each is either still noted or filed with its latest content — and no
+//! message is applied again but for a row at fault. At the end, with the
+//! faults gone, everything it wrote is filed, once, as it is, and it holds
+//! what the server holds for it, but the rows it said it refused.
 
 use super::*;
 use crate::model::{self, Model, Rules};
@@ -32,6 +37,7 @@ const SHELVES: usize = 3;
 const PRICES: u128 = 3;
 const READINGS: u128 = 4;
 const TASKS: u128 = 3;
+const BINS: u128 = 3;
 
 /// The walk's tables: the suite's, its items a tree — each under a parent,
 /// the root under itself — named uniquely among the live ones; a price of
@@ -50,7 +56,49 @@ fn tables() -> String {
         )
         + "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;
            CREATE TABLE tags (id INTEGER PRIMARY KEY, \
-             label TEXT NOT NULL REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);"
+             label TEXT NOT NULL REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);
+           CREATE TABLE bins (replica_id BLOB NOT NULL, id BLOB NOT NULL, \
+             item_id BLOB NOT NULL REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED, \
+             note TEXT NOT NULL, at INTEGER NOT NULL, retired_at TEXT, PRIMARY KEY (replica_id, id));
+           CREATE TABLE stickers (id INTEGER PRIMARY KEY, replica_id BLOB NOT NULL, \
+             bin_id BLOB NOT NULL, FOREIGN KEY (replica_id, bin_id) REFERENCES bins (replica_id, id));"
+}
+
+/// A bin of an item, written on both sides and keyed by the replica it is
+/// of: the replica deletes its own, and keeps one a sticker of its own is
+/// on retired, and the item it holds with it.
+#[derive(
+    sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
+)]
+#[row(
+    table = "bins",
+    schema = "fixture",
+    mirror = "both",
+    sync = "broadcast",
+    key = "replica_id, id",
+    origin = "replica_id",
+    retired = "retired_at"
+)]
+struct Bin {
+    replica_id: Uuid,
+    id: Uuid,
+    item_id: Uuid,
+    #[row(replica_owned)]
+    note: String,
+    at: i64,
+}
+
+/// The suite's tables, and bins.
+fn walk_codecs() -> Vec<Codec<()>> {
+    let mut codecs = codecs();
+    codecs.push(Codec::json::<Bin>(None));
+    codecs
+}
+
+/// The item a bin is of.
+fn bin_item(bytes: &[u8]) -> String {
+    let value: serde_json::Value = serde_json::from_slice(bytes).expect("a bin");
+    value["item_id"].as_str().expect("an item").to_owned()
 }
 
 /// The aisle of the walk's shelves.
@@ -127,9 +175,10 @@ const RULES: Rules = Rules {
             let id = value["id"].as_str().expect("an id").to_owned();
             vec![("items".to_owned(), id)]
         }
+        "bins" => vec![("items".to_owned(), bin_item(bytes))],
         _ => Vec::new(),
     },
-    retires: |table| matches!(table, "items" | "tasks"),
+    retires: |table| matches!(table, "items" | "tasks" | "bins"),
     key: |table, bytes| {
         if table == "items" {
             item_of(bytes).map(|row| row.id)
@@ -137,7 +186,7 @@ const RULES: Rules = Rules {
             None
         }
     },
-    holds: |table| matches!(table, "items" | "shelves" | "prices" | "tasks"),
+    holds: |table| matches!(table, "items" | "shelves" | "prices" | "tasks" | "bins"),
     unique: |table, bytes| match table {
         "items" => item_of(bytes).map(|row| row.name),
         "shelves" => Some(label_of(bytes).to_lowercase()),
@@ -167,6 +216,12 @@ struct Server {
     prices: BTreeMap<Uuid, (i64, i64)>,
     /// Tasks, written on both sides: their title and version, here.
     tasks: BTreeMap<Uuid, (String, i64)>,
+    /// The replica's bins: their item and version.
+    bins: BTreeMap<Uuid, (Uuid, i64)>,
+    /// The replica it writes to.
+    me: Uuid,
+    /// Every row the replica said it could not take or let go of.
+    refused: BTreeSet<model::Row>,
     /// What the transport holds for the replica, in order.
     queue: VecDeque<Vec<u8>>,
     /// Everything delivered of its epoch, to deliver again; and of the
@@ -241,6 +296,21 @@ impl Server {
         (key(&[&id.to_string()]), json(&price))
     }
 
+    fn bin(&self, id: Uuid, item: Uuid, version: i64) -> (WireKey, Vec<u8>) {
+        let bin = Bin {
+            replica_id: self.me,
+            id,
+            item_id: item,
+            note: String::new(),
+            at: version,
+        };
+        (self.bin_key(id), json(&bin))
+    }
+
+    fn bin_key(&self, id: Uuid) -> WireKey {
+        key(&[&self.me.to_string(), &id.to_string()])
+    }
+
     fn task(id: Uuid, title: &str, version: i64) -> (WireKey, Vec<u8>) {
         let task = Task {
             id,
@@ -288,23 +358,45 @@ impl Server {
         // Its own keys hold: an item with a price goes with it, but in a
         // pass of items alone, which keeps it.
         let mut unpriced = Vec::new();
+        let mut unbinned = Vec::new();
         gone.retain(|g| {
             let id: Uuid = g.parts[0].parse().unwrap();
-            if !self.prices.contains_key(&id) {
+            let bins: Vec<Uuid> = self
+                .bins
+                .iter()
+                .filter(|(_, (item, _))| *item == id)
+                .map(|(bin, _)| *bin)
+                .collect();
+            if !self.prices.contains_key(&id) && bins.is_empty() {
                 return true;
             }
             if held_again {
                 return false;
             }
-            self.prices.remove(&id);
-            unpriced.push(key(&[&id.to_string()]));
+            if self.prices.remove(&id).is_some() {
+                unpriced.push(key(&[&id.to_string()]));
+            }
+            for bin in bins {
+                self.bins.remove(&bin);
+                unbinned.push(self.bin_key(bin));
+            }
             true
         });
+        let mut freed = Vec::new();
         for key in &gone {
             if let Some((name, _)) = self.items.remove(&key.parts[0].parse().unwrap()) {
-                self.gone_names.push(name);
+                freed.push(name);
             }
         }
+        // Now and then the name of an item let go of in this very pass: the
+        // delete frees it for the upsert, whichever comes first.
+        if let (Some(name), false) = (freed.first(), items.is_empty()) {
+            if walk.below(2) == 0 {
+                let at = walk.below(items.len());
+                items[at].1 = name.clone();
+            }
+        }
+        self.gone_names.extend(freed);
         for (id, name, parent) in &items {
             self.items.insert(*id, (name.clone(), *parent));
         }
@@ -349,10 +441,37 @@ impl Server {
                 self.shelves.remove(&at);
                 unshelved.push(key(&[&AISLE.to_string(), &at.to_string()]));
             } else {
-                // Each slot's labels its own, in either case, or another.
-                let label = [format!("s{slot}"), format!("S{slot}"), format!("t{slot}")]
-                    [walk.below(3)]
-                .clone();
+                // A label of any slot's, in either case: one another slot
+                // holds moves — that slot takes a free one in the same pass
+                // — or the two swap, which the replica cannot take.
+                let label = ["a", "A", "b", "B", "c", "C", "d"][walk.below(7)].to_owned();
+                let holder = self
+                    .shelves
+                    .iter()
+                    .find(|(s, l)| **s != at && l.eq_ignore_ascii_case(&label))
+                    .map(|(s, _)| *s);
+                if let Some(other) = holder {
+                    let swap = walk.below(3) == 0;
+                    let theirs = if swap {
+                        self.shelves.get(&at).cloned()
+                    } else {
+                        ["a", "b", "c", "d", "e", "f"]
+                            .into_iter()
+                            .find(|l| !self.shelves.values().any(|h| h.eq_ignore_ascii_case(l)))
+                            .map(str::to_owned)
+                    };
+                    match theirs {
+                        Some(theirs) => {
+                            self.shelves.insert(other, theirs.clone());
+                            shelves.push(Self::shelf(other, &theirs));
+                        }
+                        None => {
+                            self.shelves.remove(&other);
+                            let other = other.to_string();
+                            unshelved.push(key(&[&AISLE.to_string(), &other]));
+                        }
+                    }
+                }
                 self.shelves.insert(at, label.clone());
                 shelves.push(Self::shelf(at, &label));
             }
@@ -394,6 +513,23 @@ impl Server {
                 tasks.push(Self::task(id, &title, version));
             }
         }
+        let mut bins = Vec::new();
+        if !held_again && walk.below(3) == 0 {
+            let id = Uuid::from_u128(400 + walk.below(BINS as usize) as u128);
+            let held: Vec<Uuid> = self.items.keys().copied().collect();
+            match walk.pick(&held) {
+                Some(item) if walk.below(4) > 0 => {
+                    let version = i64::try_from(self.last).unwrap();
+                    self.bins.insert(id, (item, version));
+                    bins.push(self.bin(id, item, version));
+                }
+                _ => {
+                    if self.bins.remove(&id).is_some() {
+                        unbinned.push(self.bin_key(id));
+                    }
+                }
+            }
+        }
         // The rows in the order a pass lists them.
         let row =
             |table: &str, (key, bytes): (WireKey, Vec<u8>)| (table.to_owned(), Some(bytes), key);
@@ -406,6 +542,8 @@ impl Server {
         rows.extend(shelves.into_iter().map(|r| row("shelves", r)));
         rows.extend(prices.into_iter().map(|r| row("prices", r)));
         rows.extend(tasks.into_iter().map(|r| row("tasks", r)));
+        rows.extend(bins.into_iter().map(|r| row("bins", r)));
+        rows.extend(unbinned.into_iter().map(|k| gone_row("bins", k)));
         rows.extend(untasked.into_iter().map(|k| gone_row("tasks", k)));
         rows.extend(unpriced.into_iter().map(|k| gone_row("prices", k)));
         rows.extend(unshelved.into_iter().map(|k| gone_row("shelves", k)));
@@ -452,8 +590,15 @@ impl Server {
     /// more rows than it takes, a row larger than most, a table named longer
     /// than it keeps.
     fn hostile(&mut self, walk: &mut Walk) {
-        let tables = match walk.below(3) {
+        let tables = match walk.below(5) {
             0 => vec![deletes("ghosts", vec![key(&["g"]); 501])],
+            3 => vec![deletes("ghosts", Vec::new()); 501],
+            4 => {
+                let uploads = (1..=501).collect();
+                self.queue
+                    .push_back(Body::Filed(Filed { uploads }).encoded());
+                return;
+            }
             1 => {
                 let id = Uuid::from_u128(1 + walk.below(ITEMS as usize) as u128);
                 let name = format!("fine{}", "x".repeat(20_000 + walk.below(1000)));
@@ -493,6 +638,11 @@ impl Server {
                     .iter()
                     .map(|(id, (t, v))| upserts("tasks", vec![Self::task(*id, t, *v)])),
             )
+            .chain(
+                self.bins
+                    .iter()
+                    .map(|(id, (item, v))| upserts("bins", vec![self.bin(*id, *item, *v)])),
+            )
             .collect();
         let mut begins = true;
         for chunk in rows.chunks(2) {
@@ -503,8 +653,8 @@ impl Server {
         let (sequence, nonce, previous, previous_nonce) = self.next(begins);
         let end = Body::EndSnapshot(EndSnapshot {
             snapshot_id: id.clone(),
-            tables: ["items", "shelves", "prices", "tasks", "ghosts"]
-                [..4 + usize::from(walk.below(4) == 0)]
+            tables: ["items", "shelves", "prices", "tasks", "bins", "ghosts"]
+                [..5 + usize::from(walk.below(4) == 0)]
                 .iter()
                 .map(|t| (*t).to_owned())
                 .collect(),
@@ -543,6 +693,11 @@ impl Server {
     /// Files what the replica sent up: rows as a server files them, and
     /// what it says of itself. Answers the upload's number, to answer.
     fn file(&mut self, up: &Up, me: Uuid) -> Option<u64> {
+        for rejected in &up.rejected {
+            let key = rejected.key.as_ref().map(|k| k.parts.join("|"));
+            self.refused
+                .insert((rejected.table.clone(), key.unwrap_or_default()));
+        }
         for table in &up.tables {
             for row in &table.upserts {
                 let value: serde_json::Value = serde_json::from_slice(row).expect("json");
@@ -574,6 +729,17 @@ impl Server {
                     }
                     other => panic!("an upload of `{other}`"),
                 }
+            }
+            if table.table == "bins" {
+                // Its own bins, which the server lets go of, and sends the
+                // replica the delete of, as of any row it lets go of.
+                for key in &table.deletes {
+                    assert_eq!(key.parts[0], me.to_string(), "another replica's bin");
+                    self.bins.remove(&key.parts[1].parse().unwrap());
+                }
+                let gone = self.numbered("", vec![deletes("bins", table.deletes.clone())], false);
+                self.queue.push_back(gone);
+                continue;
             }
             for key in &table.deletes {
                 assert_eq!(table.table, "readings", "deletes of history");
@@ -702,7 +868,7 @@ fn settings() -> Settings {
 
 async fn boot(file: &sqlx::sqlite::SqliteConnectOptions, me: Uuid, uplink: &Uplinked) -> Node {
     let pool = SqlitePool::connect_with(file.clone()).await.unwrap();
-    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings())
+    let replica = Replica::new(pool.clone(), walk_codecs(), me, uplink.clone(), settings())
         .await
         .unwrap();
     Node { pool, replica }
@@ -767,10 +933,20 @@ async fn pins(pool: &SqlitePool, edits: &Edits, model: &mut Model) {
         .chain(tagged.iter().cloned())
         .collect();
     model.anchored = tagged;
+    let mine = |sql: &'static str| async move {
+        sqlx::query_as::<_, (Uuid, Uuid)>(sql)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(me, id)| ("bins".to_owned(), format!("{me}|{id}")))
+            .collect::<BTreeSet<model::Row>>()
+    };
     model.retiring = ids("SELECT item_id FROM receipts")
         .await
         .into_iter()
         .map(|id| ("items".to_owned(), id))
+        .chain(mine("SELECT replica_id, bin_id FROM stickers").await)
         .chain(
             edits
                 .0
@@ -787,6 +963,7 @@ async fn deliver(
     edits: &mut Edits,
     model: &mut Model,
     bytes: &[u8],
+    at: &str,
 ) -> (model::Received, Received) {
     if let Ok(ToReplica {
         body: Some(Body::Filed(filed)),
@@ -796,8 +973,21 @@ async fn deliver(
         edits.filed(&filed.uploads);
     }
     pins(&node.pool, edits, model).await;
+    let before = model.rejections.clone();
     let expected = model.receive(bytes, &RULES);
+    let again = &node.replica.again;
+    let tries = again.load(std::sync::atomic::Ordering::Relaxed);
     let received = node.replica.receive(bytes).await.expect("applied");
+    // Applied again only for a row at fault, which it then rejects.
+    let culprit = model
+        .rejections
+        .iter()
+        .any(|(row, r)| before.get(row) != Some(r));
+    assert!(
+        culprit || again.load(std::sync::atomic::Ordering::Relaxed) == tries,
+        "{at}: applied again with no row at fault: {expected:?}, {:?}",
+        ToReplica::decode(bytes)
+    );
     (expected, received)
 }
 
@@ -848,6 +1038,16 @@ async fn held_rows(pool: &SqlitePool, retired: bool) -> BTreeMap<model::Row, Str
                 .map(|(id, content)| ((table.to_owned(), id.to_string()), content)),
         );
     }
+    let bins: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(&format!(
+        "SELECT replica_id, id, item_id FROM bins WHERE retired_at {which}"
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    held.extend(
+        bins.into_iter()
+            .map(|(me, id, item)| (("bins".to_owned(), format!("{me}|{id}")), item.to_string())),
+    );
     if !retired {
         let shelves: Vec<(Uuid, i64, String)> =
             sqlx::query_as("SELECT aisle, slot, label FROM shelves")
@@ -868,9 +1068,10 @@ fn digests_are_the_models(model: &Model, edits: &Edits, up: &Up, at: &str) {
     if up.digests.is_empty() {
         return;
     }
-    let tables: Vec<&str> = ["items", "shelves", "prices", "tasks"]
+    let tables: Vec<&str> = ["items", "shelves", "prices", "tasks", "bins"]
         .into_iter()
         .filter(|table| *table != "tasks" || edits.0.is_empty())
+        .filter(|table| *table != "bins" || model.deleted.is_empty())
         .collect();
     let modelled = model.digests(&tables);
     assert_eq!(
@@ -898,6 +1099,7 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
                     "items" => name_of(bytes),
                     "prices" => cents_of(bytes).to_string(),
                     "shelves" => label_of(bytes),
+                    "bins" => bin_item(bytes),
                     _ => title_of(bytes),
                 };
                 (row.clone(), content)
@@ -935,13 +1137,16 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
 /// confirms nothing it has not told every refusal of.
 async fn keeps_its_word(pool: &SqlitePool, host: &Host, model: &Model, at: &str) {
     let notes = count(pool, "SELECT count(*) FROM sync_notes").await;
-    let rows = i64::try_from(host.readings.len() + host.events.len() + host.done.len()).unwrap();
+    let rows = i64::try_from(host.readings.len() + host.events.len() + host.done.len()).unwrap()
+        + i64::try_from(BINS).unwrap();
     assert!(notes <= rows, "{at}: {notes} notes of {rows} rows");
     let rejections = count(pool, "SELECT count(*) FROM sync_rejections").await;
     assert!(rejections <= i64::try_from(model.rejections.len()).unwrap());
     let named = count(pool, "SELECT count(*) FROM sync_snapshot_keys").await;
     assert!(
-        named <= i64::try_from(ITEMS + PRICES + TASKS).unwrap() + i64::try_from(SHELVES).unwrap(),
+        named
+            <= i64::try_from(ITEMS + PRICES + TASKS + BINS).unwrap()
+                + i64::try_from(SHELVES).unwrap(),
         "{at}: {named} named"
     );
     let leaving = count(pool, "SELECT count(*) FROM sync_leaving").await;
@@ -1018,7 +1223,7 @@ async fn count(pool: &SqlitePool, sql: &str) -> i64 {
 
 /// One seeded walk.
 async fn walk(pool: SqlitePool, seed: u64) {
-    let w = world_over(pool, &tables(), Settings::default()).await;
+    let w = world_of(pool, &tables(), Settings::default(), walk_codecs()).await;
     w.exec(BUGS).await.unwrap();
     let file = (*w.pool.connect_options()).clone();
     let (me, uplink) = (w.me, w.uplink.clone());
@@ -1039,6 +1244,9 @@ async fn walk(pool: SqlitePool, seed: u64) {
         shelves: BTreeMap::new(),
         prices: BTreeMap::new(),
         tasks: BTreeMap::new(),
+        bins: BTreeMap::new(),
+        me,
+        refused: BTreeSet::new(),
         queue: VecDeque::new(),
         delivered: vec![provisioned],
         past: Vec::new(),
@@ -1073,9 +1281,9 @@ async fn walk(pool: SqlitePool, seed: u64) {
         let action = if quiet {
             20 + walk.below(4)
         } else {
-            walk.below(32)
+            walk.below(34)
         };
-        if matches!(action, 6..=9 | 24) {
+        if matches!(action, 6..=9 | 24 | 32) {
             copy = None;
         }
         match action {
@@ -1098,7 +1306,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 if let Some(old) = walk.pick(&(0..from.len()).collect::<Vec<_>>()) {
                     let bytes = from[old].clone();
                     let (expected, received) =
-                        deliver(&node, &mut host.edits, &mut model, &bytes).await;
+                        deliver(&node, &mut host.edits, &mut model, &bytes, &at).await;
                     assert!(
                         same(&model, &expected, &received),
                         "{at}: again, {expected:?} of {:?}, and the replica {received:?}",
@@ -1115,7 +1323,8 @@ async fn walk(pool: SqlitePool, seed: u64) {
                         .await
                         .unwrap();
                     let limits = Limits::default();
-                    let _ = receive(&mut tx, &codecs(), bytes, &limits, &Care::default()).await;
+                    let _ =
+                        receive(&mut tx, &walk_codecs(), bytes, &limits, &Care::default()).await;
                     drop(tx);
                     conn.close_on_drop();
                 }
@@ -1203,7 +1412,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 let mut tx = node.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
                 let outgoing = outbox(
                     &mut tx,
-                    &codecs(),
+                    &walk_codecs(),
                     &settings.lanes,
                     lane,
                     &settings.outbox,
@@ -1215,6 +1424,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 tx.commit().await.unwrap();
                 if let Some(outgoing) = &outgoing {
                     host.edits.carried(&outgoing.up);
+                    model.carried(&outgoing.up);
                 }
                 if let (Some(outgoing), 0) = (outgoing, walk.below(2)) {
                     answers.extend(server.file(&outgoing.up, me));
@@ -1248,6 +1458,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 let went = node.replica.send_lane(lane, walk.below(5) == 0).await;
                 for up in uplink.offered.lock().unwrap().drain(..) {
                     host.edits.carried(&up);
+                    model.carried(&up);
                     digests_are_the_models(&model, &host.edits, &up, &at);
                 }
                 assert!(
@@ -1391,6 +1602,52 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     }
                 }
             }
+            // The host deletes a bin of its own, live or retired — not one
+            // a sticker is on, which the database refuses.
+            32 => {
+                let held: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM bins")
+                    .fetch_all(&node.pool)
+                    .await
+                    .unwrap();
+                if let Some(id) = walk.pick(&held) {
+                    let deleted = sqlx::query("DELETE FROM bins WHERE id = $1")
+                        .bind(id)
+                        .execute(&node.pool)
+                        .await;
+                    if deleted.is_ok_and(|d| d.rows_affected() > 0) {
+                        let row = ("bins".to_owned(), format!("{me}|{id}"));
+                        model.rows.remove(&row);
+                        model.retired.remove(&row);
+                        model.deleted.insert(row, None);
+                    }
+                }
+            }
+            // A sticker of the replica's own goes on a bin, or comes off.
+            33 => {
+                let held: Vec<Uuid> =
+                    sqlx::query_scalar("SELECT id FROM bins WHERE retired_at IS NULL")
+                        .fetch_all(&node.pool)
+                        .await
+                        .unwrap();
+                match walk.pick(&held) {
+                    Some(id) if walk.below(2) == 0 => {
+                        sqlx::query("INSERT INTO stickers (replica_id, bin_id) VALUES ($1, $2)")
+                            .bind(me)
+                            .bind(id)
+                            .execute(&node.pool)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        sqlx::query(
+                            "DELETE FROM stickers WHERE id = (SELECT min(id) FROM stickers)",
+                        )
+                        .execute(&node.pool)
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
             // The server sends what none sends: too many rows, a row of
             // twenty thousand bytes, a table named past what is kept.
             31 => server.hostile(&mut walk),
@@ -1430,15 +1687,31 @@ async fn walk(pool: SqlitePool, seed: u64) {
                         let id = Uuid::from_u128(200 + walk.below(READINGS as usize) as u128);
                         (id, i64::try_from(walk.below(1000)).unwrap(), host.clock)
                     });
+                    // And records an event, now and then: history goes up on
+                    // a lane of its own meanwhile.
+                    let event = (walk.below(6) == 0).then(|| walk.uuid());
                     let writing = async {
                         if let Some((id, value, clock)) = during {
                             write_reading(&node.pool, me, id, value, clock).await;
                         }
+                        if let Some(id) = event {
+                            sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'meanwhile')")
+                                .bind(id)
+                                .execute(&node.pool)
+                                .await
+                                .unwrap();
+                        }
                     };
-                    let ((expected, received), ()) =
-                        tokio::join!(deliver(&node, &mut host.edits, &mut model, &bytes), writing);
+                    let ((expected, received), ()) = tokio::join!(
+                        deliver(&node, &mut host.edits, &mut model, &bytes, &at),
+                        writing
+                    );
                     if let Some((id, value, _)) = during {
                         host.read(format!("{me}|{id}"), value);
+                        copy = None;
+                    }
+                    if let Some(id) = event {
+                        host.events.insert(id.to_string());
                         copy = None;
                     }
                     assert!(
@@ -1457,7 +1730,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
     // Quiet: everything goes, and is answered, until nothing is left.
     for round in 0..200 {
         while let Some(bytes) = server.queue.pop_front() {
-            deliver(&node, &mut host.edits, &mut model, &bytes).await;
+            deliver(&node, &mut host.edits, &mut model, &bytes, "the end").await;
         }
         let mut said = false;
         for lane in 0..2 {
@@ -1466,6 +1739,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
             said |= node.replica.send_lane(lane, digests).await.unwrap().message;
             for up in uplink.offered.lock().unwrap().drain(..) {
                 host.edits.carried(&up);
+                model.carried(&up);
                 digests_are_the_models(&model, &host.edits, &up, "the end");
             }
         }
@@ -1498,6 +1772,41 @@ async fn walk(pool: SqlitePool, seed: u64) {
     let _ = std::fs::remove_file(&copy_path);
     let at = format!("seed {seed:#x}, the end");
     holds_what_the_model_holds(&node.pool, &model, &at).await;
+    // And what the server holds for it, but the rows it rejected: no row
+    // the server let go of stays live here, none it holds is missing.
+    let rejected: BTreeSet<model::Row> = model
+        .rejections
+        .keys()
+        .chain(&server.refused)
+        .cloned()
+        .collect();
+    let live: BTreeSet<model::Row> = held_rows(&node.pool, false)
+        .await
+        .into_keys()
+        .filter(|row| !rejected.contains(row))
+        .collect();
+    let row = |table: &str, key: String| (table.to_owned(), key);
+    let servers: BTreeSet<model::Row> = server
+        .items
+        .keys()
+        .map(|id| row("items", id.to_string()))
+        .chain(server.prices.keys().map(|id| row("prices", id.to_string())))
+        .chain(server.tasks.keys().map(|id| row("tasks", id.to_string())))
+        .chain(
+            server
+                .bins
+                .keys()
+                .map(|id| row("bins", format!("{me}|{id}"))),
+        )
+        .chain(
+            server
+                .shelves
+                .keys()
+                .map(|slot| row("shelves", format!("{AISLE}|{slot}"))),
+        )
+        .filter(|row| !rejected.contains(row))
+        .collect();
+    assert_eq!(live, servers, "{at}: what the server holds for it");
     assert_eq!(
         count(&node.pool, "SELECT count(*) FROM sync_notes").await,
         0,

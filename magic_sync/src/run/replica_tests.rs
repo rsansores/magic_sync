@@ -395,11 +395,6 @@ async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
 async fn writes_a_downgrade_does_not_send_go_up_after_the_upgrade(pool_: SqlitePool) {
     let pool = pool(pool_).await;
     let event = Uuid::now_v7();
-    sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'kept')")
-        .bind(event)
-        .execute(&pool)
-        .await
-        .unwrap();
     let older = || -> Vec<Codec<()>> {
         codecs()
             .into_iter()
@@ -411,6 +406,14 @@ async fn writes_a_downgrade_does_not_send_go_up_after_the_upgrade(pool_: SqliteP
         replica::install(&mut pool.acquire().await.unwrap(), &build)
             .await
             .unwrap();
+        if !goes {
+            // Written while the earlier build runs: its note trigger stays.
+            sqlx::query("INSERT INTO events (id, what) VALUES ($1, 'kept')")
+                .bind(event)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let replica = Replica::new(pool.clone(), build, me, uplink.clone(), settings())
             .await
             .unwrap();

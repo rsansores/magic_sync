@@ -31,20 +31,25 @@ send   = wanted − held          (rows to hold, or that changed)
 delete = held − wanted          (rows to let go)
 ```
 
-Then it records the new held set. A change is never "an event that must be
-delivered"; it is a reason to compare two sets again. That single choice is
-what makes everything else in this document possible:
+Then it records the new held set, and the messages that carry the
+difference. A change is never "an event that must be delivered"; it is a
+reason to compare two sets again. That single choice is what makes everything
+else in this document possible:
 
-- A row that could not be sent is simply not recorded as held. The next
-  comparison finds it missing and sends it again — **as it is then**, not as
-  it was.
+- A row a replica did not take, or that the replica refused, is not counted
+  as held. The next comparison finds it missing and sends it again — **as it
+  is then**, not as it was. (A message the transport has not taken yet waits
+  as it was written, in the order it was written, until it does; a later
+  change to the row follows it.)
 - Nothing needs to be replayed in order. If a replica misses messages, the
   next comparison catches it up from the current state.
 - Repair is a comparison too. Provisioning a replica from scratch is "compare
   against an empty held set".
 
 Payloads are always rebuilt from the current rows. The engine never stores the
-content of a change, only *that* something changed.
+content of a change, only *that* something changed: what it keeps of a message
+is the message itself, until the transport has taken it: an outbox, not a log
+to replay.
 
 ---
 
@@ -77,7 +82,6 @@ A table is declared once, as the Rust struct that is its row, implementing
 | `Catalog` | the server | down to the replicas that should hold its rows |
 | `Record` | a replica | up to the server |
 | `Both` | both, column by column | the columns the replicas own (`#[row(replica_owned)]`) go up; the rest go down |
-| `ServerOnly` | the server | nowhere |
 
 ### Which replicas hold which rows? (`sync`, for tables that go down)
 
@@ -242,7 +246,10 @@ for every serial column, before its relay runs.)
 Every row the delta sends is read once and encoded once by its codec, however
 many replicas get it, in the plan's snapshot, a chunk of rows at a time: what
 the relay holds in memory is a chunk, and one message being filled per
-replica, however much it sends. A row that cannot go — it does
+replica, however much it sends. Filling many replicas' messages at once, it
+ends them early past a bound — never between a table's deletes and its
+upserts, which a unique value moving from one row to another needs in one
+message. A row that cannot go — it does
 not encode, or no message could carry it — is planned around: the plan runs
 again with it blocked, so it is not sent, what points at it is not sent
 either, and a replica holding an older version of it has that version taken
@@ -332,7 +339,10 @@ The replica applies a message in one transaction ([`replica::apply`]):
   the server's latest, even after a restore or a clock set back.
 - A row it had retired is offered again and becomes live.
 - A row it is told to let go of is deleted or, if a row of its own still points
-  at it, retired (its `RETIRED` column set). A sale keeps its customer.
+  at it, retired (its `RETIRED` column set). A sale keeps its customer. A
+  retired row is let go of for good once nothing that stays points at it,
+  children first: after the message is applied, in a transaction of its own,
+  so a row that cannot go never makes a message run again.
 
 Then it tells the server the last message it applied — its number, its nonce
 and the seal it came with. Until it does, what the server recorded in 4.4 is
@@ -390,7 +400,11 @@ what the server knows about it**, never what the rows claim:
   a row the replica was never sent is refused — a replica never creates a
   two-way row;
 - a catalog is refused, because replicas do not write the server's tables;
-- a replica deletes only its own rows.
+- a replica deletes only its own rows, and the server lets go of its copy
+  of one only where the replica had applied every message that carried the
+  row: otherwise the replica may have taken the row again from a message
+  still on its way, and the server's own delete follows it (the protocol,
+  [Appendix A.3](protocol.md#a3-how-the-server-files-an-upload-section-7)).
 
 The host passes its own knowledge of the sender as a value of its choosing
 (the `P` in `Codec<P>`), and each codec may stamp rows with it.

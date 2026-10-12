@@ -80,6 +80,42 @@ the head office, whatever order they arrive in:
 {{#include ../../snippets/src/rows.rs:reported}}
 ```
 
+On the server, with the triggers [`Engine::triggers`] prints beside them
+([Tables](tables.md)):
+
+```sql
+CREATE TABLE shop.desired_settings (
+    register_id UUID NOT NULL REFERENCES shop.registers (id),
+    id          UUID NOT NULL,
+    value       TEXT NOT NULL,
+    revision    BIGINT NOT NULL,
+    PRIMARY KEY (register_id, id)
+);
+
+CREATE TABLE shop.reported_settings (
+    register_id UUID NOT NULL REFERENCES shop.registers (id),
+    id          UUID NOT NULL,
+    value       TEXT NOT NULL,
+    reported_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (register_id, id)
+);
+```
+
+On the register, the same two tables as SQLite stores them:
+
+```sql
+CREATE TABLE desired_settings (
+    register_id BLOB NOT NULL, id BLOB NOT NULL,
+    value TEXT NOT NULL, revision INTEGER NOT NULL,
+    PRIMARY KEY (register_id, id)
+);
+CREATE TABLE reported_settings (
+    register_id BLOB NOT NULL, id BLOB NOT NULL,
+    value TEXT NOT NULL, reported_at TEXT NOT NULL,
+    PRIMARY KEY (register_id, id)
+);
+```
+
 Both are keyed by the register and the setting's id, so a wish and its report
 share their key. The wish carries a `revision` the head office raises on
 every change. Nothing in the engine compares it: a table the server sends
@@ -112,9 +148,8 @@ carried out a second time.
 > loses power between the two carries the wish out again. Make it
 > idempotent.
 
-> **Planned:** an engine primitive for this pair — a desired table, a
-> reported one, and the once-per-revision bookkeeping — so that the register's
-> half is declared rather than written. Until then, this is the recipe.
+> **Note:** the engine has no primitive for this pair: the register's half,
+> carrying a wish out once per revision, is the host's to write, as above.
 
 ## Archived rows replicas should not hold
 
@@ -129,7 +164,10 @@ CREATE VIEW shop.live_products AS SELECT * FROM shop.products WHERE archived_at 
 ```
 
 Archiving a product takes it back from every register — retired where a
-receipt still points at it. Leave `active` out and archived products travel
+receipt still points at it. The view decides what is sent for its own sake,
+not what may travel: an archived product a row the register holds points at
+still goes there, as that row's parent, and leaves once nothing points at it.
+Leave `active` out and archived products travel
 like any other, with their `archived_at` as data, for the register to show as
 archived.
 
@@ -143,3 +181,5 @@ Give rows and replicas a partition column, and name it:
 
 Every table that goes down carries `company_id`; a `broadcast` product reaches
 only its company's registers. The triggers `Engine::triggers` prints note it.
+
+[`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers

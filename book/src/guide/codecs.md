@@ -16,7 +16,11 @@ table itself.
 `Codec::json` sends a row as a JSON object of its columns, each value as its
 field's serde writes it — a 64-bit integer as its decimal text, which a
 reader holding numbers as doubles would otherwise round: nothing else to
-declare. That is the simple way, and the one to start with.
+declare, as long as serde writes each field under its own name. A field with
+`#[serde(rename = "…")]`, a `rename_all` on the row, or a part brought in with
+`#[sqlx(flatten)]` that serde nests instead of flattening (give the field
+`#[serde(flatten)]` too) makes every row of the table fail to encode, the first
+time one travels. That is the simple way, and the one to start with.
 
 `Codec::new` sends it as a protobuf message of your own, with a mapping each
 way — smaller on the wire, and a schema a replica in another language can

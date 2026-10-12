@@ -153,8 +153,14 @@ impl<P: Sync + 'static> Codec<P> {
     /// the field's serde writes it — but an `i64` field as its decimal text,
     /// which a JSON number would round past 2^53 for a replica that reads
     /// numbers as doubles. A field serde names otherwise than itself does not
-    /// encode. `place` stamps a row a replica uploads; one of a table keyed
-    /// by its replica must name its sender, as with [`Codec::new`].
+    /// encode. That holds for `#[serde(rename)]` and `rename_all` on the
+    /// row, and for a part flattened in with `#[sqlx(flatten)]` unless the
+    /// field also says `#[serde(flatten)]`, so that serde writes the part's
+    /// fields beside the row's: otherwise every row of the table fails to
+    /// encode ([`Error::Misuse`]), the first time one travels.
+    ///
+    /// `place` stamps a row a replica uploads; one of a table keyed by its
+    /// replica must name its sender, as with [`Codec::new`].
     pub fn json<R>(place: Option<Place<R, P>>) -> Self
     where
         R: Row + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned,
@@ -169,8 +175,7 @@ impl<P: Sync + 'static> Codec<P> {
         )
     }
 
-    /// The codec of `R`, encoded and decoded so. A server-only row has none,
-    /// and does not build.
+    /// The codec of `R`, encoded and decoded so.
     fn typed<R>(
         encoding: &'static str,
         encode: Encode<R>,
@@ -180,12 +185,6 @@ impl<P: Sync + 'static> Codec<P> {
     where
         R: Row + Clone + Send + Sync,
     {
-        const {
-            assert!(
-                !matches!(R::MIRROR, Mirror::ServerOnly),
-                "a server-only row does not travel: it has no codec"
-            );
-        }
         // A replica files nothing: placing a row is the server's.
         #[cfg(feature = "sqlite")]
         let place = {
@@ -302,6 +301,13 @@ impl<P: Sync + 'static> Codec<P> {
         server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired> {
         self.ops.retire(conn, keys, held, server)
+    }
+
+    /// A replica letting go of the retired rows of `keys` nothing that
+    /// stays points at ([`row::collect_by_keys`]): answers how many went.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn collect<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
+        self.ops.collect(conn, keys)
     }
 
     /// The keys of `keys` this replica holds, retired or not.
@@ -477,6 +483,8 @@ trait Ops<P>: Send + Sync {
         held: &'a [Key],
         server: &'a [(&'a str, Option<&'a str>)],
     ) -> Fut<'a, row::Retired>;
+    #[cfg(feature = "sqlite")]
+    fn collect<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
@@ -629,7 +637,13 @@ where
     async fn write(&self, conn: &mut Conn, rows: Vec<R>, how: How) -> Result<Vec<Key>, Error> {
         match how {
             #[cfg(feature = "sqlite")]
-            How::AllButOwned => row::overwrite_except(conn, rows, &self.owned).await,
+            // A retired row sent again is live again in the same write: one
+            // whose unique values a live row holds is refused with it.
+            How::AllButOwned => {
+                let keys = row::overwrite_except(conn, rows, &self.owned).await?;
+                row::unretire_by_keys::<R>(conn, &keys).await?;
+                Ok(keys)
+            }
             #[cfg(feature = "postgres")]
             How::OnlyOwned(sender) => row::update_held(conn, rows, &self.owned, sender).await,
             #[cfg(feature = "postgres")]
@@ -796,9 +810,8 @@ where
                     });
                 }
             }
-            let (held, again) = self.guarded(conn, pending, How::AllButOwned).await?;
+            let (_, again) = self.guarded(conn, pending, How::AllButOwned).await?;
             refused.extend(again);
-            row::unretire_by_keys::<R>(conn, &held).await?;
             Ok(refused)
         })
     }
@@ -875,6 +888,11 @@ where
         Box::pin(row::retire_by_keys::<R>(conn, keys, held, server))
     }
 
+    #[cfg(feature = "sqlite")]
+    fn collect<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
+        Box::pin(row::collect_by_keys::<R>(conn, keys))
+    }
+
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
         Box::pin(row::delete_by_keys::<R>(conn, keys))
@@ -922,5 +940,88 @@ where
     #[cfg(feature = "sqlite")]
     fn orphaned<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Vec<Key>> {
         Box::pin(row::orphaned::<R>(conn, keys))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Columns, serde::Serialize, serde::Deserialize,
+    )]
+    struct Label {
+        label: String,
+    }
+
+    /// A part flattened in for sqlx, and for serde too.
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Row, serde::Serialize, serde::Deserialize,
+    )]
+    #[row(table = "flat", mirror = "catalog")]
+    struct Flat {
+        id: Uuid,
+        #[sqlx(flatten)]
+        #[serde(flatten)]
+        part: Label,
+    }
+
+    /// A part flattened in for sqlx only: serde nests it.
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Row, serde::Serialize, serde::Deserialize,
+    )]
+    #[row(table = "nested", mirror = "catalog")]
+    struct Nested {
+        id: Uuid,
+        #[sqlx(flatten)]
+        part: Label,
+    }
+
+    /// A field serde writes under another name.
+    #[derive(
+        sqlx::FromRow, Clone, Debug, PartialEq, crate::Row, serde::Serialize, serde::Deserialize,
+    )]
+    #[row(table = "renamed", mirror = "catalog")]
+    struct Renamed {
+        id: Uuid,
+        #[serde(rename = "name")]
+        title: String,
+    }
+
+    fn encoded<R: Row + serde::Serialize>(row: &R) -> Result<Vec<u8>, Error> {
+        json_encode(R::TABLE, &Table::of::<R>().columns, row)
+    }
+
+    #[test]
+    fn a_part_flattened_for_serde_too_travels_as_json() {
+        let row = Flat {
+            id: Uuid::nil(),
+            part: Label { label: "x".into() },
+        };
+        let bytes = encoded(&row).unwrap();
+        let columns = Table::of::<Flat>().columns;
+        assert_eq!(json_decode::<Flat>("flat", &columns, &bytes).unwrap(), row);
+    }
+
+    #[test]
+    fn a_field_serde_writes_otherwise_than_its_name_does_not_encode() {
+        let renamed = Renamed {
+            id: Uuid::nil(),
+            title: "x".into(),
+        };
+        let nested = Nested {
+            id: Uuid::nil(),
+            part: Label { label: "x".into() },
+        };
+        for error in [
+            encoded(&renamed).unwrap_err(),
+            encoded(&nested).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, Error::Misuse(why) if why.contains("by its name")),
+                "{error}"
+            );
+        }
     }
 }

@@ -20,6 +20,10 @@ pub async fn print_triggers(pool: &PgPool) -> Result<(), Error> {
         "{}",
         Engine::triggers(&mut conn, &codecs(), REGISTERS).await?
     );
+    println!(
+        "{}",
+        Engine::indexes(&mut conn, &codecs(), REGISTERS).await?
+    );
     Ok(())
 }
 // ANCHOR_END: triggers
@@ -27,18 +31,12 @@ pub async fn print_triggers(pool: &PgPool) -> Result<(), Error> {
 // ANCHOR: transport_errors
 /// The network: a retry may get the message through.
 pub fn unreachable(e: impl Display) -> Error {
-    Error::Transport {
-        reason: e.to_string(),
-        transient: true,
-    }
+    Error::transport(true, e.to_string())
 }
 
 /// This message, never: the transport will not take it.
 pub fn refused(e: impl Display) -> Error {
-    Error::Transport {
-        reason: e.to_string(),
-        transient: false,
-    }
+    Error::transport(false, e.to_string())
 }
 // ANCHOR_END: transport_errors
 
@@ -84,7 +82,7 @@ impl Senders for Companies {
 /// An operator's "send it everything again".
 pub async fn send_everything_again(pool: &PgPool, register: Uuid) -> Result<(), Error> {
     let mut tx = pool.begin().await?;
-    magic_sync::plan::note_resync(&mut tx, None, register).await?;
+    magic_sync::plan::note_resync(&mut tx, register, None).await?;
     tx.commit().await?;
     Ok(())
 }

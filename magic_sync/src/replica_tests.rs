@@ -57,14 +57,23 @@ async fn world_with(pool: SqlitePool, settings: Settings) -> World {
 }
 
 async fn world_over(pool: SqlitePool, tables: &str, settings: Settings) -> World {
+    world_of(pool, tables, settings, codecs()).await
+}
+
+async fn world_of(
+    pool: SqlitePool,
+    tables: &str,
+    settings: Settings,
+    codecs: Vec<Codec<()>>,
+) -> World {
     let pool = settled(pool).await;
     sqlx::raw_sql(tables).execute(&pool).await.expect("tables");
-    install(&mut pool.acquire().await.unwrap(), &codecs())
+    install(&mut pool.acquire().await.unwrap(), &codecs)
         .await
         .expect("installed");
     let me = Uuid::now_v7();
     let uplink = Uplinked::default();
-    let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings)
+    let replica = Replica::new(pool.clone(), codecs, me, uplink.clone(), settings)
         .await
         .expect("a replica");
     let w = World {
@@ -1311,13 +1320,18 @@ async fn a_message_carries_what_the_replica_takes_at_most(pool: SqlitePool) {
     };
     let w = world_with(pool, settings).await;
     let ghost = |n: u8| upserts("ghosts", vec![(key(&[&n.to_string()]), vec![n])]);
-    let logged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _logging = tracing::subscriber::set_default(Counted(logged.clone()));
-    let received = w
-        .receive(&down(1, "", vec![ghost(1), ghost(2), ghost(3)]))
-        .await;
+    let parts = vec![ghost(1), ghost(2), ghost(3)];
+    let foreign = foreign_rows(&codecs(), &parts);
+    assert_eq!(
+        foreign,
+        [(
+            "ghosts",
+            vec!["1".to_owned(), "2".to_owned(), "3".to_owned()]
+        )],
+        "one table to reject and log, however many parts name it"
+    );
+    let received = w.receive(&down(1, "", parts)).await;
     assert!(matches!(received, Received::Applied(_)), "{received:?}");
-    assert_eq!(logged.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(w.rejected().await, ["ghosts 1", "ghosts 2", "ghosts 3"]);
     let four = down(2, "", vec![ghost(1), ghost(2), ghost(3), ghost(4)]);
     assert!(matches!(w.receive(&four).await, Received::Malformed(_)));
@@ -1331,25 +1345,6 @@ async fn a_message_carries_what_the_replica_takes_at_most(pool: SqlitePool) {
         w.receive(&filed.encoded()).await,
         Received::Malformed(_)
     ));
-}
-
-/// Counts the error events logged.
-struct Counted(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-impl tracing::Subscriber for Counted {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.is_event() && *metadata.level() == tracing::Level::ERROR
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 /// Shapes no server sends cost nothing: rows with keys not one per row are
@@ -2220,6 +2215,68 @@ fn uniquely_named_items() -> String {
     format!("{TABLES}CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;")
 }
 
+/// A retired row sent again with a unique value a live row holds is refused
+/// as any row is, keeping what it held — not a message applied again.
+#[sqlx::test(migrations = false)]
+async fn a_retired_row_sent_again_with_a_live_rows_value_is_refused(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [first, second] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![item(first, "sku")])],
+    ))
+    .await;
+    w.exec(&format!(
+        "INSERT INTO receipts (item_id) VALUES (x'{}')",
+        first.simple()
+    ))
+    .await
+    .unwrap();
+    let mut part = upserts("items", vec![item(second, "sku")]);
+    part.deletes = vec![key(&[&first.to_string()])];
+    w.receive(&down(2, "", vec![part])).await;
+    let again = w.replica.again.load(std::sync::atomic::Ordering::Relaxed);
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("items", vec![item(first, "sku")])],
+    ))
+    .await;
+    assert_eq!(
+        w.replica.again.load(std::sync::atomic::Ordering::Relaxed),
+        again,
+        "applied again"
+    );
+    assert_eq!(w.rejected().await, [format!("items {first}")]);
+    let retired = "SELECT count(*) FROM items WHERE retired_at IS NOT NULL";
+    assert_eq!(w.count(retired).await, 1);
+}
+
+/// A key a later part of a message upserts again is that part's row: one
+/// an earlier part sent of it, refused, is not tried again once the rest of
+/// the message is in — it would take the older row over the newer.
+#[sqlx::test(migrations = false)]
+async fn a_refused_row_a_later_part_sends_again_is_not_tried_again(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [held, sent] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(held, "a")])]))
+        .await;
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            upserts("items", vec![item(sent, "a")]),
+            upserts("prices", Vec::new()),
+            upserts("items", vec![item(sent, "b")]),
+            deletes("items", vec![key(&[&held.to_string()])]),
+        ],
+    ))
+    .await;
+    assert_eq!(w.items().await, ["b"]);
+    assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
+}
+
 /// A row retired for what pointed at it is let go of once nothing does —
 /// in the next message the replica applies, whatever it carries — and
 /// while it stays, its unique values are no live row's: the server's next
@@ -2256,6 +2313,98 @@ async fn a_retired_row_goes_once_nothing_points_at_it(pool: SqlitePool) {
     assert!(w.rejected().await.is_empty());
 }
 
+/// A retired row listed to be collected, row by row, and sent again by a
+/// message applied meanwhile is live: the collection of that one row
+/// leaves it.
+#[sqlx::test(migrations = false)]
+async fn a_row_sent_again_while_listed_for_collection_stays(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [id] = ids();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(id, "sku")])]))
+        .await;
+    let x = id.simple();
+    w.exec(&format!("INSERT INTO receipts (item_id) VALUES (x'{x}')"))
+        .await
+        .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![deletes("items", vec![key(&[&id.to_string()])])],
+    ))
+    .await;
+    w.exec("DELETE FROM receipts").await.unwrap();
+    let codecs = codecs();
+    let items = codec_of(&codecs, "items").unwrap();
+    let mut conn = w.pool.acquire().await.unwrap();
+    let listed = collectable(&mut conn, items).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    w.receive(&down(3, "", vec![upserts("items", vec![item(id, "sku")])]))
+        .await;
+    let gone = collected(&mut conn, &[items], Some(&listed[0]))
+        .await
+        .unwrap();
+    assert_eq!(gone, 0);
+    assert_eq!(w.items().await, ["sku"]);
+}
+
+/// A retired row a live row of the server's still points at stays — even
+/// through a key checked at commit — and costs the messages after it
+/// nothing: none is applied again for it.
+#[sqlx::test(migrations = false)]
+async fn a_retired_row_a_live_one_points_at_stays_and_costs_nothing(pool: SqlitePool) {
+    let tables = TABLES.replace(
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL,",
+        "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL \
+         REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED,",
+    );
+    let w = world_over(pool, &tables, Settings::default()).await;
+    let [id] = ids();
+    let price = Price {
+        id,
+        cents: 1,
+        updated_at: at(1),
+    };
+    w.receive(&down(
+        1,
+        "",
+        vec![
+            upserts("items", vec![item(id, "a")]),
+            upserts("prices", vec![(key(&[&id.to_string()]), json(&price))]),
+        ],
+    ))
+    .await;
+    let x = id.simple();
+    w.exec(&format!(
+        "INSERT INTO receipts (item_id) VALUES (x'{x}'); INSERT INTO quotes (price_id) VALUES (x'{x}')"
+    ))
+    .await
+    .unwrap();
+    w.receive(&down(
+        2,
+        "",
+        vec![
+            deletes("prices", vec![key(&[&id.to_string()])]),
+            deletes("items", vec![key(&[&id.to_string()])]),
+        ],
+    ))
+    .await;
+    assert_eq!(w.rejected().await, [format!("prices {id}")]);
+    w.exec("DELETE FROM receipts").await.unwrap();
+    let again = w.replica.again.load(std::sync::atomic::Ordering::Relaxed);
+    for n in 3..6 {
+        w.receive(&down(n, "", vec![upserts("shelves", Vec::new())]))
+            .await;
+    }
+    assert_eq!(
+        w.replica.again.load(std::sync::atomic::Ordering::Relaxed),
+        again,
+        "applied again"
+    );
+    let retired = "SELECT count(*) FROM items WHERE retired_at IS NOT NULL";
+    assert_eq!(w.count(retired).await, 1, "its price points at it");
+    assert_eq!(w.rejected().await, [format!("prices {id}")]);
+}
+
 /// A unique index over a table with a retired column must leave the
 /// retired rows out: one that does not would keep a retired row's value
 /// from every row the server sends after it.
@@ -2279,6 +2428,34 @@ async fn a_unique_index_over_retired_rows_is_refused(pool: SqlitePool) {
         (
             "CREATE UNIQUE INDEX items_name ON items (name) WHERE \"retired_at\" IS NULL",
             false,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name)\n  WHERE Retired_At\tIS NULL",
+            false,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE (retired_at IS NULL)",
+            false,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE name <> '' AND retired_at IS NULL",
+            false,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL OR name = ''",
+            true,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL AND (name = '' OR 1)",
+            false,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL AND name <> '' OR name = 'x'",
+            true,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE (retired_at IS NULL AND name <> '' OR name = 'x')",
+            true,
         ),
         (
             "CREATE UNIQUE INDEX shelves_label ON shelves (label)",
@@ -2734,6 +2911,90 @@ async fn a_replica_deletes_only_its_own_rows_of_a_two_way_table(pool: SqlitePool
     assert_eq!(noted, [format!("{me}|{mine}")]);
 }
 
+/// The suite's tables, and carts.
+fn with_carts() -> Vec<Codec<()>> {
+    let mut codecs = codecs();
+    codecs.push(Codec::json::<Cart>(None));
+    codecs
+}
+
+const CARTS: &str = "CREATE TABLE carts (replica_id BLOB NOT NULL, id BLOB NOT NULL, \
+    note TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (replica_id, id));";
+
+/// A cart of `replica_id`, as the server sends it at version `at`.
+fn cart_of(replica_id: Uuid, id: Uuid, at: i64) -> (WireKey, Vec<u8>) {
+    let row = Cart {
+        replica_id,
+        id,
+        note: String::new(),
+        at,
+    };
+    (key(&[&replica_id.to_string(), &id.to_string()]), json(&row))
+}
+
+/// A row the replica deleted of its own, in a two-way table, is not taken
+/// again from a message the server sent before it filed the delete — the
+/// server lets go of it once it files it, so the replica would hold a row
+/// nobody holds for it — and the replica says it held it back, so the
+/// server does not count it held. Once the delete is filed, the row is the
+/// server's to send again.
+#[sqlx::test(migrations = false)]
+async fn a_row_the_replica_deleted_is_not_taken_again_until_the_delete_is_filed(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{CARTS}"),
+        Settings::default(),
+        with_carts(),
+    )
+    .await;
+    let id = Uuid::now_v7();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("carts", vec![cart_of(w.me, id, 1)])],
+    ))
+    .await;
+    assert!(w.up(0, false).await.is_some(), "what was applied");
+    w.exec(&format!("DELETE FROM carts WHERE id = x'{}'", id.simple()))
+        .await
+        .unwrap();
+    let late = w
+        .receive(&down(
+            2,
+            "",
+            vec![upserts("carts", vec![cart_of(w.me, id, 2)])],
+        ))
+        .await;
+    assert!(
+        matches!(&late, Received::Applied(a) if a.iter().all(|a| a.keys.is_empty())),
+        "{late:?}"
+    );
+    assert_eq!(w.count("SELECT count(*) FROM carts").await, 0);
+    assert_eq!(w.rejected().await, [format!("carts {}|{id}", w.me)]);
+    let up = w.up(0, false).await.expect("the delete");
+    assert_eq!(up.tables[0].deletes.len(), 1);
+    assert!(
+        matches!(up.rejected.as_slice(), [r] if r.held_back),
+        "{:?}",
+        up.rejected
+    );
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads,
+        })
+        .encoded(),
+    )
+    .await;
+    w.receive(&down(
+        3,
+        "",
+        vec![upserts("carts", vec![cart_of(w.me, id, 3)])],
+    ))
+    .await;
+    assert_eq!(w.count("SELECT count(*) FROM carts").await, 1);
+    assert!(w.rejected().await.is_empty());
+}
+
 /// A table with writes of the replica's the server has not filed is left
 /// out of its digests: what it holds of it is about to change on the
 /// server, which the comparison would take for a replica gone astray.
@@ -2770,6 +3031,108 @@ async fn digests_leave_out_a_table_with_writes_not_filed(pool: SqlitePool) {
     .await;
     let up = w.up(0, true).await.unwrap();
     assert_eq!(digested(&up), ["items", "shelves", "prices", "tasks"]);
+}
+
+/// Digests read before the host wrote a table go without that table's:
+/// the outbox that sends them, in the transaction it reads the notes in,
+/// leaves out every table with a note by then — the write may go in the
+/// same message, and the server would compare what it is about to change.
+#[sqlx::test(migrations = false)]
+async fn digests_leave_out_a_table_written_since_they_were_read(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{CARTS}"),
+        Settings::default(),
+        with_carts(),
+    )
+    .await;
+    let id = Uuid::now_v7();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("carts", vec![cart_of(w.me, id, 1)])],
+    ))
+    .await;
+    assert!(w.up(0, false).await.is_some());
+    let mut conn = w.pool.acquire().await.unwrap();
+    let read = held(&mut conn, &with_carts()).await.unwrap();
+    drop(conn);
+    w.exec(&format!("DELETE FROM carts WHERE id = x'{}'", id.simple()))
+        .await
+        .unwrap();
+    let mut tx = w.pool.begin().await.unwrap();
+    let lanes = Settings::default().lanes;
+    let up = outbox(
+        &mut tx,
+        &with_carts(),
+        &lanes,
+        0,
+        &Outbox::default(),
+        Some(read),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .up;
+    assert_eq!(up.tables[0].deletes.len(), 1);
+    assert!(!up.digests.is_empty());
+    assert!(
+        up.digests.iter().all(|d| d.table != "carts"),
+        "{:?}",
+        up.digests
+    );
+}
+
+/// The host deletes its rows while the replica sends its digests: whenever
+/// the delete lands — before they are read, while, or after — no message
+/// carries a table's digest beside a write of it.
+#[sqlx::test(migrations = false)]
+async fn a_delete_racing_the_digests_never_goes_beside_its_tables(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{CARTS}"),
+        Settings::default(),
+        with_carts(),
+    )
+    .await;
+    for n in 1..=100 {
+        let id = Uuid::now_v7();
+        w.receive(&down(
+            n,
+            "",
+            vec![upserts("carts", vec![cart_of(w.me, id, 1)])],
+        ))
+        .await;
+        while w.up(0, false).await.is_some() {}
+        let delete = format!("DELETE FROM carts WHERE id = x'{}'", id.simple());
+        // Later each round, across the whole of the send.
+        let late = async {
+            tokio::time::sleep(std::time::Duration::from_micros(20 * (n % 25))).await;
+            w.exec(&delete).await
+        };
+        let (sent, deleted) = tokio::join!(w.replica.send_lane(0, true), late);
+        sent.unwrap();
+        deleted.unwrap();
+        for (_, up) in w.uplink.taken() {
+            for table in &up.tables {
+                assert!(
+                    up.digests.iter().all(|d| d.table != table.table),
+                    "round {n}: `{}` digested beside a write of it",
+                    table.table
+                );
+            }
+        }
+        while let Some(up) = w.up(0, false).await {
+            w.receive(
+                &Body::Filed(Filed {
+                    uploads: up.uploads,
+                })
+                .encoded(),
+            )
+            .await;
+        }
+    }
 }
 
 /// A record is the replica's: the server sends none of it and lets go of
@@ -3599,6 +3962,56 @@ async fn a_witness_from_before_a_failure_blames_no_row_after_it(pool: SqlitePool
     );
 }
 
+/// What the transport took while a refusal was narrowed down is no witness
+/// once the search is over — nothing left of it to send, or a message with
+/// no row refused for good since: a row it refuses after is not blamed.
+async fn a_witness_from_a_search_that_ended_blames_no_row_after_it(
+    pool: SqlitePool,
+    ended_by_refusal: bool,
+) {
+    {
+        let w = world(pool).await;
+        w.exec("DELETE FROM sync_notes").await.unwrap();
+        events(&w, &["one", "two"]).await;
+        *w.uplink.cannot_take.lock().unwrap() =
+            Some(|up: &Up| up.tables.iter().map(|t| t.upserts.len()).sum::<usize>() > 1);
+        w.replica.send_lane(0, false).await.expect("halved");
+        w.replica.send_lane(0, false).await.expect("one taken");
+        assert_eq!(w.uplink.taken().len(), 1);
+        // The rest of it went another way.
+        w.exec("DELETE FROM sync_notes WHERE sent_at IS NULL")
+            .await
+            .unwrap();
+        *w.uplink.cannot_take.lock().unwrap() = None;
+        *w.uplink.refusing.lock().unwrap() = Some(false);
+        if ended_by_refusal {
+            w.receive(&down(1, "", vec![upserts("prices", Vec::new())]))
+                .await;
+        }
+        let _ = w.replica.send_lane(0, false).await;
+        events(&w, &["three"]).await;
+        for _ in 0..4 {
+            let _ = w.replica.send_lane(0, false).await;
+        }
+        assert_eq!(
+            w.count("SELECT count(*) FROM sync_notes WHERE set_aside IS NOT NULL")
+                .await,
+            0,
+            "ended by a refusal: {ended_by_refusal}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_witness_from_a_search_with_nothing_left_blames_no_row_after_it(pool: SqlitePool) {
+    a_witness_from_a_search_that_ended_blames_no_row_after_it(pool, false).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_witness_before_a_refusal_with_no_row_blames_no_row_after_it(pool: SqlitePool) {
+    a_witness_from_a_search_that_ended_blames_no_row_after_it(pool, true).await;
+}
+
 /// A transport that refuses every message for good — a revoked credential, a
 /// host that answers 403 — says nothing of any one row: nothing is set aside
 /// on its word, whatever the number of rows, and it goes on being asked.
@@ -4173,6 +4586,22 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
     assert!(told.up.backlog.is_some());
 }
 
+/// What the replica stored of the backlog it last told, it reads in a shape
+/// of its own: one it cannot read — another build's — it never told, and
+/// tells now, rather than fail every message up.
+#[sqlx::test(migrations = false)]
+async fn a_backlog_told_in_a_shape_it_cannot_read_is_told_again(pool: SqlitePool) {
+    let w = world(pool).await;
+    events(&w, &["x"]).await;
+    w.up(0, false).await.expect("sent");
+    w.exec("UPDATE sync_backlog SET backlog = '[{\"table\":\"events\",\"later\":true}]'")
+        .await
+        .unwrap();
+    events(&w, &["y"]).await;
+    let up = w.up(0, false).await.expect("sent");
+    assert_eq!(up.backlog.expect("told").tables[0].unsent, 1);
+}
+
 /// A clock set back makes nothing wait for it to come round again: an upload
 /// sent "in the future" goes again.
 #[sqlx::test(migrations = false)]
@@ -4478,8 +4907,12 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
             "the trigger `sync_note_events_delete` is missing",
         ),
         (
-            "CREATE TRIGGER sync_note_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
-            "the trigger `sync_note_gone_insert` is not one of the engine's",
+            "CREATE TRIGGER sync_refuse_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
+            "the trigger `sync_refuse_gone_insert` is not one of the engine's",
+        ),
+        (
+            "CREATE TRIGGER sync_note_items_insert AFTER INSERT ON items BEGIN SELECT 1; END",
+            "the trigger `sync_note_items_insert` is not one of the engine's",
         ),
     ];
     for (case, why) in cases {
@@ -4548,7 +4981,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0x47bb_3d66_46ff_fe83];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [0xe5dd_b8ea_c465_953a];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

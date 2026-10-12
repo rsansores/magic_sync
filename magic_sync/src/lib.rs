@@ -24,11 +24,18 @@
 //!
 //! # Public dependencies
 //!
-//! The engine works over [`sqlx`] 0.8: the pools, connections and
-//! transactions a host hands it are sqlx's, and a database error is
-//! [`sqlx::Error`] ([`Error::Database`]). A table that travels as protobuf
-//! is a [`prost`] 0.14 message. A new major version of either is a new major
-//! version of this crate.
+//! What a host passes to the engine or reads back is another crate's type,
+//! and a new major version of any of them is a new major version of this
+//! crate:
+//!
+//! - [`sqlx`] 0.8: the pools, connections and transactions a host hands the
+//!   engine, and the database error ([`Error::Database`], [`sqlx::Error`]).
+//! - [`prost`] 0.14: a table that travels as protobuf is a message of it.
+//! - [`uuid`] 1: replicas, partitions and keys are [`uuid::Uuid`]s.
+//! - [`chrono`] 0.4: the times a status carries are its `DateTime<Utc>`.
+//! - [`serde`] 1: a table that travels as JSON ([`wire::Codec::json`]) is a
+//!   row that is `Serialize` and `Deserialize`, and the dashboard's
+//!   documents are serialized with it.
 
 #![warn(missing_docs, clippy::missing_errors_doc)]
 
@@ -110,10 +117,10 @@ pub use row::{Columns, Row};
 /// |---|---|
 /// | `table` | the table's name (required) |
 /// | `schema` | its PostgreSQL schema; `public` when left out |
-/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server), `both` (each side its own columns) or `server` (it never travels) — required |
+/// | `mirror` | where it lives: `catalog` (written on the server, held by replicas), `record` (written on a replica, held by the server) or `both` (each side its own columns) — required |
 /// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names: a uuid, or an `Option` of one), `follows(col)` (wherever the row `col` points at goes: one column, the whole of a foreign key into a mirrored table) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
 /// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]), and a field of the row itself — not of a part flattened in |
-/// | `active` | for `catalog` and `both`, the relation the rows replicas hold are read through on the server — `view` or `schema.view` (a name has no dot), a view that leaves out the rows no replica should hold |
+/// | `active` | for `catalog` and `both`, the relation the rows the table's rule sends are read through on the server — `view` or `schema.view` (a name has no dot), a view that leaves out the rows no replica is sent for their own sake; one it leaves out still travels while a row a replica holds points at it |
 /// | `retired` | for `catalog` and `both`, the column a replica sets on a row it lets go of but must keep, because a row of its own points at it. It is left out of the row as a rule; a row that has it as a field too gets it back as the server sends it, which is live |
 /// | `origin` | for `record` and `both`, the uuid key column naming the replica a row belongs to: a replica deletes only its own rows |
 /// | `unmirrored` | columns one side's table has that the row leaves out: `unmirrored = "archived_at, notes"` |

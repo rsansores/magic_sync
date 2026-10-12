@@ -100,7 +100,10 @@ build is one side): run `cargo fmt` and `cargo clippy` with
 - **dependencies** — `cargo deny check` (advisories, licenses, sources and
   unmaintained crates anywhere in the graph; `deny.toml`) of the workspace, the
   example's two programs and the book's snippets; **unused** — `cargo machete`
-  over every workspace.
+  over every workspace. A scheduled workflow (`advisories.yml`) runs the
+  advisories check daily, on days nothing is pushed, and Dependabot proposes
+  the new versions of the actions, the crates and the dashboard's and the
+  example page's npm packages.
 - **workflows** — zizmor over `.github/`: every action pinned to a commit,
   no token left behind by a checkout, no expression injected into a script.
 - **test-server** — the server's suite against PostgreSQL 14 and 18, and the

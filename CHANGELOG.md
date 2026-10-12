@@ -2,55 +2,69 @@
 
 ## 0.1.0 — unreleased
 
-The first release: the engine extracted from the system it was built in.
+The first release. `magic_sync` keeps partial copies of PostgreSQL tables on
+SQLite replicas and brings back what the replicas write, offline-first: for
+every replica the server records what it holds, works out what it should hold,
+and sends the difference. Schemas: server 1, replica 1. Protocol 1. Dashboard
+contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 
-- `#[derive(Row)]` / `#[derive(Columns)]` (`magic_sync_derive`): one struct is
-  one table; every convention is a declaration. A misuse is a compile error
-  pointing at what says it; a table that is not its row is refused when the
-  server or a replica starts.
-- Codecs: `Codec::json` (an object of the row's columns, 64-bit integers as
-  text) and `Codec::new` (a protobuf message of your own).
-- `Server` and `Replica` runners: what a host builds, runs and hands what
-  arrives. The steps they are built on are the engine's own.
-- `Server::install`, `replica::install` and `replica::check` for the engine's
-  schema and triggers; each side checks a schema version of its own. On the server the
-  schema is installed or upgraded in one transaction, one process at a time,
-  and `Engine::triggers` prints the triggers a host's migrations write; the
-  server refuses to start while one is missing, disabled or different. On a
-  replica, `replica::install` migrates and installs in one transaction,
-  `plan::migration` and `replica::migration` write each released step (never edited) and
-  `replica::triggers` the triggers for a host's migrations, and `check`
-  holds the database to exactly those, and every connection to settings
-  the engine can keep its word on.
-- Replicas are provisioned when they become live or move partition, and
-  forgotten when they stop being live; no host call needed.
-- The replica protocol (`PROTOCOL.md`, `proto/sync.proto`), version 1; the
-  engine's messages are generated from `sync.proto`, and a replica
-  conformance suite applies the server's own messages (`tests/golden`).
-- The shop example: a head office and its registers, each with a page, over
-  a transport that keeps the protocol's contract (a queue per register in
-  the head office's database, each message acknowledged by its id).
-- The book: the shop, built step by step from an empty project; how the
-  engine works; the protocol; upgrading. It is published with each release,
-  with the API reference of both sides.
-- `status`: what the engine answers about itself, for a dashboard — the
-  overview (replicas counted per state and the worst listed, each table's
-  state, without counting what any replica should hold), a paged listing of
-  the replicas, health over a scope, progress, where one row is. Every read
-  takes a scope, counts live replicas only and is one snapshot; every answer
-  serializes as JSON of a versioned contract, with the server's time.
-- `Up.backlog`: a replica says what it wrote and the server has not filed,
-  and the server shows it.
-- A pass records what each replica will hold, and writes the messages that
-  carry it to that replica's outbox, before anything is sent; the outbox is
-  sent in order, and a replica out of reach keeps its own while the others
-  are sent to. Messages are chained — each names the one before it, by
-  number and random nonce — and sealed, so a replica that missed one says
-  so and is provisioned again, and a server or a replica restored from an
-  older copy is found out, however many numbers it drew since. A row a replica
-  refuses stays recorded as refused, and a rejection names the message that
-  refused it.
-- `magic_sync_dashboard` (npm): the dashboard for Vue 3 — a ready-made
-  component styled through CSS variables, and the same without its looks
-  (`useSyncDashboard`) for a host with its own design system. English and
-  Spanish; it fetches nothing. Its types are generated from the engine's.
+### What it is
+
+- **The crates.** `magic_sync` is built for one side: the `postgres` feature
+  is the server, the `sqlite` feature a replica, and a build with both (or
+  neither) does not compile. `magic_sync_derive` is the derive, re-exported as
+  `magic_sync::Row` and `magic_sync::Columns`. `magic_sync_dashboard` (npm) is
+  the dashboard for Vue 3, released at the same version.
+- **Tables are declared once**, as the struct that is the row
+  (`#[derive(Row)]`): where it lives, which way it travels (`catalog`,
+  `record`, `both`), which replicas hold which rows (`broadcast`,
+  `assigned`, `grouped`, `follows`, or none: a row goes where a row that
+  travels points at it, read from the foreign keys). A misuse is a compile
+  error; a table that is not its row, a missing or different trigger, or a
+  missing index is refused when the server or a replica starts.
+- **Codecs.** `Codec::json` (an object of the row's columns, 64-bit integers
+  as text) and `Codec::new` (a protobuf message of your own).
+- **Runners.** `Server` and `Replica` run what a host builds; the host
+  provides the transport (`Transport`, `Uplink`) and what it knows of a
+  sender (`Senders`). The steps they are built on are the engine's own.
+- **Installation.** The engine's schema is installed by `Server::install` and
+  `replica::install`, or written into the host's migrations
+  (`plan::migration`, `replica::migration`, `Engine::triggers`,
+  `Engine::indexes`, `replica::triggers`); `check` holds a database to exactly
+  those.
+- **Status.** `status` answers for a dashboard, over a scope, in one
+  snapshot: the overview, a paged listing, health, progress, and where one row
+  is. Every answer serializes as JSON of a versioned contract.
+- **The replica protocol** (`PROTOCOL.md`, `proto/sync.proto`) is written for
+  a replica in any language, with test vectors (`tests/golden`) that the
+  engine's own replica is held to.
+- **The shop** example, a head office and its registers with a page each, and
+  **the book**, which builds it step by step, explains the engine and carries
+  the protocol; both sides' API reference is published with it.
+
+### What it guarantees
+
+- No committed change is lost: it is noted in the transaction that makes it,
+  recorded with the messages that carry it, and sent until the transport takes
+  it.
+- A replica converges to what it should hold, never holds a row without the
+  rows it points at, and never goes back in time: messages are numbered,
+  chained and sealed per epoch, so a gap, a restored replica and a restored
+  server are each found out and provisioned again.
+- A failure holds back only what it is about. A transient failure (the network,
+  the database) waits and retries; a permanent one (a row that does not encode,
+  a value a replica refuses) is narrowed to the row, set aside, and retried
+  after a deploy. Nobody repairs data by hand.
+- What a replica writes is filed under the replica that sent it, whatever the
+  rows claim; an upload is answered only once filed, and a replica forgets a
+  write only on that answer.
+- Progress counts only what a replica confirmed it applied.
+- An hourly fingerprint of what each replica holds catches what nothing
+  foresaw.
+
+### The API
+
+`Error::Transport` and `Error::Host` are `#[non_exhaustive]`: build them with
+`Error::transport(transient, reason)` and `Error::host(transient, reason)`.
+What a host can name on each side is listed in `magic_sync/public-api/`, and
+CI holds the crate to it. The API is young and may change before 1.0.

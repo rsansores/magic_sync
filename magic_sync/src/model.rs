@@ -65,6 +65,9 @@ pub(crate) struct Rejection {
     pub(crate) epoch: String,
     pub(crate) sequence: u64,
     pub(crate) reported: bool,
+    /// A row of its own it deleted, not taken while the delete is on its
+    /// way (4.1).
+    pub(crate) held_back: bool,
 }
 
 /// The snapshot in progress: the message that began it, and what it named.
@@ -126,15 +129,24 @@ pub(crate) struct Model {
     /// Rows a row of its own points at, in a table with nothing to retire
     /// them by: it cannot let them go.
     pub(crate) pinned: BTreeSet<Row>,
-    /// Rows a row of its own points at by their unique value: one that
-    /// changes it is refused.
+    /// Rows a row of its own points at by their unique value: a message
+    /// that leaves no row holding that value refuses the row that changed
+    /// it — the database's key, checked at commit, finds it — and is
+    /// applied again with it refused.
     pub(crate) anchored: BTreeSet<Row>,
+    /// Rows the message being applied again refuses before they are tried.
+    refusing: BTreeSet<Row>,
     /// Rows a row of its own points at, in a table it retires by: let go
     /// of, they are retired — kept, and out of what it holds.
     pub(crate) retiring: BTreeSet<Row>,
     /// Rows it retired, as the bytes that carried them: sent again, they
     /// are live again; let go of again, they go, or are refused.
     pub(crate) retired: BTreeMap<Row, Vec<u8>>,
+    /// Rows of its own it deleted, of a table keyed by it, whose deletes
+    /// the server has not filed, each with the upload that last carried
+    /// its delete: not taken again meanwhile, but reported held back (4.1),
+    /// until the answer to that upload (4.4).
+    pub(crate) deleted: BTreeMap<Row, Option<u64>>,
     /// What the last message it applied took, per table entry: the keys of
     /// the rows it holds from it.
     pub(crate) taken: Vec<(String, Vec<String>)>,
@@ -158,6 +170,7 @@ impl Model {
     /// `bytes` from the server, applied as section 4 says, in one step: the
     /// transport is acknowledged once this returns.
     pub(crate) fn receive(&mut self, bytes: &[u8], rules: &Rules) -> Received {
+        let before = self.clone();
         let Ok(message) = ToReplica::decode(bytes) else {
             return Received::Malformed;
         };
@@ -187,7 +200,9 @@ impl Model {
             return Received::Malformed;
         }
         let (place, ends) = match &body {
-            Body::Filed(_) => {
+            Body::Filed(f) => {
+                self.deleted
+                    .retain(|_, carried| !carried.is_some_and(|n| f.uploads.contains(&n)));
                 self.collect(rules);
                 return Received::Filed;
             }
@@ -281,9 +296,15 @@ impl Model {
                             .iter()
                             .map(|key| (table.table.clone(), key.parts.join("|")))
                             .collect();
-                        // Refused earlier in the message, and let go of now.
+                        // Refused earlier in the message, and let go of or
+                        // sent again now.
+                        let again: Vec<Row> = table
+                            .keys
+                            .iter()
+                            .map(|key| (table.table.clone(), key.parts.join("|")))
+                            .collect();
                         for (_, rows) in &mut pending {
-                            rows.retain(|(row, _)| !gone.contains(row));
+                            rows.retain(|(row, _)| !gone.contains(row) && !again.contains(row));
                         }
                         self.let_go(gone, sequence, rules);
                     }
@@ -300,6 +321,10 @@ impl Model {
                         if last[&row.1] != at {
                             continue;
                         }
+                        if self.deleted.contains_key(&row) {
+                            self.reject(row, "held back", sequence, true);
+                            continue;
+                        }
                         if naming {
                             if let Some(snapshot) = &mut self.snapshot {
                                 snapshot.named.insert(row.clone());
@@ -312,8 +337,12 @@ impl Model {
                         if !holds && (row.0.len() > 512 || row.1.len() > 512) {
                             continue;
                         }
-                        if !holds || beside || (rules.refuses)(&table.table, bytes) {
-                            self.reject(row, "refused", sequence);
+                        if !holds
+                            || beside
+                            || (rules.refuses)(&table.table, bytes)
+                            || self.refusing.contains(&row)
+                        {
+                            self.reject(row, "refused", sequence, false);
                         } else {
                             rows.push((row, bytes.clone()));
                         }
@@ -332,7 +361,27 @@ impl Model {
                     self.take(*entry, rows, rules) || took
                 }) {}
                 for (row, _) in pending.into_iter().flat_map(|(_, rows)| rows) {
-                    self.reject(row, "refused", sequence);
+                    self.reject(row, "refused", sequence, false);
+                }
+                let broken: BTreeSet<Row> = before
+                    .anchored
+                    .iter()
+                    .filter_map(|row| {
+                        let value = (rules.unique)(&row.0, before.rows.get(row)?)?;
+                        let held = self.rows.iter().any(|(other, bytes)| {
+                            other.0 == row.0
+                                && (rules.unique)(&other.0, bytes) == Some(value.clone())
+                        });
+                        (!held).then(|| row.clone())
+                    })
+                    .collect();
+                if !broken.is_empty() {
+                    let refusing = before.refusing.union(&broken).cloned().collect();
+                    *self = before;
+                    self.refusing = refusing;
+                    let received = self.receive(bytes, rules);
+                    self.refusing.clear();
+                    return received;
                 }
                 self.collect(rules);
                 Received::Applied
@@ -393,13 +442,6 @@ impl Model {
         if rules.checked && !(rules.parents)(&row.0, bytes).iter().all(present) {
             return false;
         }
-        let held = self.rows.get(row).or_else(|| self.retired.get(row));
-        if self.anchored.contains(row)
-            && held
-                .is_some_and(|held| (rules.unique)(&row.0, held) != (rules.unique)(&row.0, bytes))
-        {
-            return false;
-        }
         let Some(value) = (rules.unique)(&row.0, bytes) else {
             return true;
         };
@@ -416,7 +458,7 @@ impl Model {
     /// the server's that stays — which is kept, rejected.
     fn let_go(&mut self, rows: Vec<Row>, sequence: u64, rules: &Rules) {
         for row in self.letting_go(rows, rules) {
-            self.reject(row, "pointed at", sequence);
+            self.reject(row, "pointed at", sequence, false);
         }
     }
 
@@ -518,7 +560,7 @@ impl Model {
         refused
     }
 
-    fn reject(&mut self, row: Row, reason: &str, sequence: u64) {
+    fn reject(&mut self, row: Row, reason: &str, sequence: u64, held_back: bool) {
         let epoch = self
             .applied
             .as_ref()
@@ -531,6 +573,7 @@ impl Model {
                 epoch,
                 sequence,
                 reported: false,
+                held_back,
             },
         );
     }
@@ -555,6 +598,7 @@ impl Model {
                 reason: r.reason.clone(),
                 epoch: r.epoch.clone(),
                 sequence: r.sequence,
+                held_back: r.held_back,
             })
             .collect();
         let mut up = Up {
@@ -601,6 +645,22 @@ impl Model {
             });
         }
         up
+    }
+
+    /// `up` was made: the deletes of rows of its own it carries go under
+    /// its number, forgotten once the server answers it.
+    pub(crate) fn carried(&mut self, up: &Up) {
+        let Some(number) = up.uploads.first() else {
+            return;
+        };
+        for part in &up.tables {
+            for key in &part.deletes {
+                let row = (part.table.clone(), key.parts.join("|"));
+                if let Some(carried) = self.deleted.get_mut(&row) {
+                    *carried = Some(*number);
+                }
+            }
+        }
     }
 
     /// The uplink took `up`.
@@ -728,15 +788,14 @@ impl Transport for Wire {
             } else {
                 failed.0 += 1;
             }
-            Err(Error::Transport {
-                reason: if refused {
+            Err(Error::transport(
+                !refused,
+                if refused {
                     "refused\0 for good"
                 } else {
                     "the network"
-                }
-                .into(),
-                transient: !refused,
-            })
+                },
+            ))
         } else {
             self.queues
                 .lock()

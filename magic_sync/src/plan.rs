@@ -269,7 +269,8 @@ pub fn migration(version: i32) -> Option<String> {
 
 /// The server's engine, built once from the codecs and the schema by the
 /// [`Server`](crate::run::server::Server), which hands it out for what a host asks of it:
-/// the triggers it needs ([`Engine::triggers`]), and how far along every
+/// the triggers and indexes it needs ([`Engine::triggers`],
+/// [`Engine::indexes`]), and how far along every
 /// replica is ([`status`](crate::status)).
 pub struct Engine {
     pub(crate) plans: Vec<Plan>,
@@ -675,6 +676,105 @@ async fn live_triggers(conn: &mut Conn) -> Result<Vec<LiveTrigger>, Error> {
     .await?)
 }
 
+/// An index the planner's lookups need: on `on`, led by `columns`, in
+/// any order.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Index {
+    on: Relation,
+    columns: Vec<String>,
+}
+
+impl Index {
+    fn ddl(&self) -> String {
+        let columns: Vec<String> = self.columns.iter().map(|c| ident(c)).collect();
+        format!(
+            "CREATE INDEX {} ON {} ({});",
+            ident(&self.name()),
+            self.on.sql(),
+            columns.join(", ")
+        )
+    }
+
+    /// Its name: its table's and its columns', as far as a name holds them,
+    /// and a digest of them apart — the same names joined otherwise, a
+    /// table `a_b` on `c` and a table `a` on `b, c`, are other indexes.
+    fn name(&self) -> String {
+        let name = format!("{}_{}", self.on.name, self.columns.join("_"));
+        let apart = format!("{}\0{}", self.on.name, self.columns.join("\0"));
+        let digest = apart.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        let mut cut = name.len().min(41);
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}_sync_{digest:016x}", &name[..cut])
+    }
+
+    /// Whether one of `live` serves it: a valid b-tree index, of every row,
+    /// whose first key columns are its columns.
+    fn served(&self, live: &[LiveIndex]) -> bool {
+        let mut needed: Vec<&str> = self.columns.iter().map(String::as_str).collect();
+        needed.sort_unstable();
+        live.iter().any(|index| {
+            let mut leading: Vec<&str> = index
+                .columns
+                .iter()
+                .take(needed.len())
+                .map(|c| c.as_deref().unwrap_or_default())
+                .collect();
+            leading.sort_unstable();
+            index.on() == self.on && leading == needed
+        })
+    }
+}
+
+/// An index of the database: its table, and its key columns in order, an
+/// expression as `None`.
+#[derive(sqlx::FromRow)]
+struct LiveIndex {
+    schema: String,
+    table: String,
+    columns: Vec<Option<String>>,
+}
+
+impl LiveIndex {
+    fn on(&self) -> Relation {
+        Relation {
+            schema: self.schema.clone(),
+            name: self.table.clone(),
+        }
+    }
+}
+
+/// Every valid b-tree index of every row of a table of `relations`.
+async fn live_indexes(
+    conn: &mut Conn,
+    relations: &BTreeSet<&Relation>,
+) -> Result<Vec<LiveIndex>, Error> {
+    let schemas: Vec<&str> = relations.iter().map(|r| r.schema.as_str()).collect();
+    let names: Vec<&str> = relations.iter().map(|r| r.name.as_str()).collect();
+    Ok(sqlx::query_as(
+        "SELECT n.nspname::text AS schema, c.relname::text AS table, \
+                array_agg(a.attname::text ORDER BY k.n) AS columns \
+           FROM unnest($1::text[], $2::text[]) AS r(schema, name) \
+           JOIN pg_namespace n ON n.nspname = r.schema \
+           JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = r.name \
+           JOIN pg_index i ON i.indrelid = c.oid \
+           JOIN pg_class ic ON ic.oid = i.indexrelid \
+           JOIN pg_am am ON am.oid = ic.relam \
+           CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, n) \
+           LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum \
+          WHERE i.indisvalid AND i.indpred IS NULL AND am.amname = 'btree' \
+            AND k.n <= i.indnkeyatts \
+          GROUP BY i.indexrelid, n.nspname, c.relname",
+    )
+    .bind(&schemas)
+    .bind(&names)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
 /// Brings the engine's schema to this build's version, in the caller's
 /// transaction: one process at a time, every missing step or none.
 async fn migrate(conn: &mut Conn) -> Result<(), Error> {
@@ -738,11 +838,13 @@ async fn version(conn: &mut Conn) -> Result<Option<i32>, Error> {
 impl Engine {
     /// Reads the foreign keys between the mirrored tables and each grouped
     /// table's group tables from the catalog, and checks that every table is
-    /// its row column for column and that every trigger the engine needs is
-    /// there as [`Engine::triggers`] writes it. Fails on a declaration the
-    /// schema cannot honour — a table that differs from its row, a `follows`
-    /// column that is not a key, a group table that does not have the columns
-    /// a group needs, a cycle — and on a trigger missing or different.
+    /// its row column for column, that every trigger the engine needs is
+    /// there as [`Engine::triggers`] writes it, and that an index serves each
+    /// of the planner's lookups ([`Engine::indexes`]). Fails on a declaration
+    /// the schema cannot honour — a table that differs from its row, a
+    /// `follows` column that is not a key, a group table that does not have
+    /// the columns a group needs, a cycle — on a trigger missing or
+    /// different, and on an index missing.
     pub(crate) async fn new(
         conn: &mut Conn,
         tables: &[&Table],
@@ -787,14 +889,24 @@ impl Engine {
                 wrong.join("\n")
             )));
         }
+        let missing = engine.indexes_missing(conn).await?;
+        if !missing.is_empty() {
+            let ddl: Vec<String> = missing.iter().map(Index::ddl).collect();
+            return Err(Error::Misuse(format!(
+                "the planner looks rows up by columns no index leads with — create the indexes \
+                 Engine::indexes prints, in a migration:\n{}",
+                ddl.join("\n")
+            )));
+        }
         Ok(engine)
     }
 
     /// [`Engine::new`], having first brought the database to what it needs,
     /// in the caller's transaction and one process at a time: the engine's
-    /// schema installed or upgraded, and every trigger missing or different
+    /// schema installed or upgraded, every trigger missing or different
     /// written as [`Engine::triggers`] does (and any of the engine's on a
-    /// table no longer declared dropped). A table mirrored for the first time
+    /// table no longer declared dropped), and every index missing created as
+    /// [`Engine::indexes`] prints it. A table mirrored for the first time
     /// that already has rows is sent whole: every live replica is provisioned
     /// again. Idempotent.
     ///
@@ -845,6 +957,9 @@ impl Engine {
                 unnoted |= has_rows;
             }
             sqlx::Executor::execute(&mut *conn, expected.ddl().as_str()).await?;
+        }
+        for index in engine.indexes_missing(conn).await? {
+            sqlx::Executor::execute(&mut *conn, index.ddl().as_str()).await?;
         }
         if unnoted {
             // Rows written while their table was not noted reached no
@@ -906,6 +1021,86 @@ impl Engine {
             .map(Trigger::ddl)
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+
+    /// The statements that create every index the planner's lookups need
+    /// for `codecs` and the database `conn` is on does not have, one per
+    /// line: what a host with migrations writes beside the triggers
+    /// ([`Engine::triggers`]), and what
+    /// [`Server::install`](crate::run::server::Server::install) runs. The
+    /// planner finds rows by the columns that point at a mirrored table's
+    /// rows, a row's replica or partition, and a group's members and
+    /// assignments — on a large table, a lookup no index serves reads the
+    /// whole table on every pass. An index that leads with those columns,
+    /// in any order, serves; [`Server::new`](crate::run::server::Server::new)
+    /// refuses to start while one is missing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::triggers`].
+    pub async fn indexes<P: std::marker::Sync + 'static>(
+        conn: &mut Conn,
+        codecs: &[Codec<P>],
+        replicas: Replicas,
+    ) -> Result<String, Error> {
+        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        let engine = Self::read(conn, &tables, replicas).await?;
+        Ok(engine
+            .indexes_missing(conn)
+            .await?
+            .iter()
+            .map(Index::ddl)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    /// The indexes the planner's lookups need: the columns of a mirrored
+    /// table that point at another, its route's column — its replica, the
+    /// row it follows, its partition, the one it is sent by — and each
+    /// group's members by their row and by their group, and its
+    /// assignments by their group and by their replica.
+    fn indexes_needed(&self) -> BTreeSet<Index> {
+        let mut out = BTreeSet::new();
+        let mut need = |on: &Relation, columns: Vec<String>| {
+            out.insert(Index {
+                on: on.clone(),
+                columns,
+            });
+        };
+        for plan in &self.plans {
+            for reference in &plan.references {
+                need(&plan.relation, reference.columns.clone());
+            }
+            match plan.route {
+                Route::Broadcast => {
+                    if let Some(partition) = self.replicas.partition {
+                        need(&plan.relation, vec![partition.to_owned()]);
+                    }
+                }
+                Route::Assigned(column) | Route::Follows(column) => {
+                    need(&plan.relation, vec![column.to_owned()]);
+                }
+                Route::Referenced | Route::Grouped { .. } => {}
+            }
+            if let Some(g) = &plan.group {
+                need(&g.members, g.member_row.clone());
+                need(&g.members, g.group.iter().map(|(m, _)| m.clone()).collect());
+                need(
+                    &g.assigned,
+                    g.group.iter().map(|(_, a)| a.clone()).collect(),
+                );
+                need(&g.assigned, vec![g.assigned_replica.clone()]);
+            }
+        }
+        out
+    }
+
+    /// The indexes the planner needs that no index of the database serves.
+    async fn indexes_missing(&self, conn: &mut Conn) -> Result<Vec<Index>, Error> {
+        let needed = self.indexes_needed();
+        let relations: BTreeSet<&Relation> = needed.iter().map(|i| &i.on).collect();
+        let live = live_indexes(conn, &relations).await?;
+        Ok(needed.into_iter().filter(|i| !i.served(&live)).collect())
     }
 
     fn triggers_needed(&self) -> Vec<Trigger> {
@@ -1383,8 +1578,8 @@ impl Engine {
     async fn redeclared(&self, conn: &mut Conn) -> Result<(), Error> {
         let declared = self.declared();
         let before: Option<Option<String>> = sqlx::query_scalar(
-            "UPDATE sync.version v SET declared = md5($1) FROM sync.version was \
-              WHERE v.declared IS DISTINCT FROM md5($1) RETURNING was.declared",
+            "UPDATE sync.version v SET declared = encode(sync.digest($1), 'hex') FROM sync.version was \
+              WHERE v.declared IS DISTINCT FROM encode(sync.digest($1), 'hex') RETURNING was.declared",
         )
         .bind(&declared)
         .fetch_optional(&mut *conn)
@@ -1399,7 +1594,7 @@ impl Engine {
             "DELETE FROM sync.gone WHERE relation <> ALL($1)",
             "DELETE FROM sync.quarantine WHERE relation <> ALL($1)",
             "UPDATE sync.notes SET done_at = now() \
-              WHERE done_at IS NULL AND kind = 'row' AND relation <> ALL($1)",
+              WHERE done_at IS NULL AND kind IN ('row', 'retry') AND relation <> ALL($1)",
         ] {
             sqlx::query(sql).bind(&tables).execute(&mut *conn).await?;
         }
@@ -2718,10 +2913,21 @@ impl Engine {
             );
             if asked.fresh && matches!(plan.route, Route::Broadcast) {
                 // Every row for every replica of its partition: the rows
-                // are put in order, each then joined to its replicas, so
-                // what goes is never sorted whole.
+                // of the partitions provisioned are put in order, each then
+                // joined to its replicas, so what goes is never sorted
+                // whole.
+                let provisioned = match self.replicas.partition {
+                    Some(column) => format!(
+                        "WHERE t.{} IN (SELECT s.partition FROM {} \
+                                         WHERE s.id IN (SELECT replica_id FROM sync_live WHERE fresh))",
+                        ident(column),
+                        self.replicas_sql()
+                    ),
+                    None => String::new(),
+                };
                 parts.push(format!(
-                    "(SELECT {i}, t.key, s.id FROM (SELECT {key} AS key, t.* FROM {} t ORDER BY 1 OFFSET 0) t \
+                    "(SELECT {i}, t.key, s.id FROM (SELECT {key} AS key, t.* FROM {} t {provisioned} \
+                                                   ORDER BY 1 OFFSET 0) t \
                        CROSS JOIN LATERAL (SELECT s.id FROM {} WHERE {} AND {fresh} OFFSET 0) s)",
                     plan.active,
                     self.replicas_sql(),
@@ -3083,7 +3289,7 @@ impl Noted {
 
 /// The notes this build reads: one it cannot, from a later build, is left
 /// where a later build finds it, and holds back none behind it.
-const READABLE: &str =
+pub(crate) const READABLE: &str =
     "((kind IN ('row', 'retry') AND relation IS NOT NULL AND row_key IS NOT NULL) \
      OR (kind = 'members' AND relation IS NOT NULL AND previous IS NOT NULL) \
      OR (kind = 'assigned' AND relation IS NOT NULL AND replica_id IS NOT NULL) \
@@ -3146,8 +3352,8 @@ pub(crate) fn resync_sql(source: &str) -> String {
 /// [`Error::Database`] when the database fails.
 pub async fn note_resync(
     conn: &mut Conn,
-    partition: Option<Uuid>,
     replica: Uuid,
+    partition: Option<Uuid>,
 ) -> Result<(), Error> {
     sqlx::query(&resync_sql("SELECT $1::uuid, $2::uuid"))
         .bind(replica)
@@ -3176,13 +3382,17 @@ pub(crate) async fn prune(
     limit: i64,
 ) -> Result<u64, Error> {
     // A note of a row a replica holds a version from before it says what
-    // that version pointed at: it stays while the replica holds it.
+    // that version pointed at: it stays while the replica holds it — or may
+    // keep it, refusing the row's take-back.
     let done = sqlx::query(
         "DELETE FROM sync.notes WHERE id IN (SELECT n.id FROM sync.notes n \
            WHERE n.done_at < now() - make_interval(secs => $1) \
              AND NOT EXISTS (SELECT 1 FROM sync.held h WHERE n.kind = 'row' \
                                 AND h.relation = n.relation AND h.row_key = n.row_key \
                                 AND h.noted < n.id) \
+             AND NOT EXISTS (SELECT 1 FROM sync.gone g WHERE n.kind = 'row' \
+                                AND g.relation = n.relation AND g.row_key = n.row_key \
+                                AND g.noted < n.id) \
            ORDER BY n.done_at LIMIT $2)",
     )
     .bind(age.as_secs_f64())

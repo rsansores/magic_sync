@@ -82,9 +82,8 @@ pub trait Transport: Send + Sync + 'static {
 /// Rows to send or take back a pass reads at a time.
 const PAGE: usize = 20_000;
 
-/// Bytes of rows a pass may hold in the messages it fills before it ends
-/// them all early.
-const BUFFERED: usize = 64 << 20;
+/// Bytes of rows a pass holds, as a server runs it: see [`Relay::buffered`].
+pub(crate) const BUFFERED: usize = 64 << 20;
 
 /// Bytes of messages one replica's sending reads from its outbox at a time.
 const SENT_AT_ONCE: usize = 8 << 20;
@@ -117,6 +116,9 @@ pub(crate) struct Relay<'a, P> {
     pub(crate) bound: Bound,
     /// Replicas sent to at once.
     pub(crate) concurrency: usize,
+    /// Bytes of rows a pass may hold in the messages it fills, or reads in
+    /// one chunk, before it ends them early, and writes the messages ready.
+    pub(crate) buffered: usize,
 }
 
 /// What recording a pass did.
@@ -167,6 +169,14 @@ struct Writer {
     ready_bytes: usize,
     /// Bytes of rows in the messages being filled.
     buffered: usize,
+    /// How many it may hold, and the ready messages carry before they are
+    /// written.
+    room: usize,
+    /// What the last sweep of the messages being filled could not free —
+    /// open spans — less what has gone since: the next sweep waits for
+    /// `room` more than this, so spans that stay open cost one sweep per
+    /// `room` bytes, not one per row.
+    stuck: usize,
     /// Per replica, the last message written, its sequence and nonce: what
     /// the next one follows. A replica provisioned is absent until its
     /// snapshot's first message, which follows nothing.
@@ -194,6 +204,16 @@ impl<P: Sync + 'static> Relay<'_, P> {
         let notes = pending(conn, self.batch).await?;
         if notes.is_empty() {
             return Ok(Outcome::default());
+        }
+        // An engine that sends no table down has nothing to plan: its notes
+        // — a replica to provision — are done with nothing written.
+        if self.engine.order.is_empty() {
+            let done: Vec<i64> = notes.iter().map(|n| n.id).collect();
+            crate::plan::mark_done(conn, &done).await?;
+            return Ok(Outcome {
+                done: done.len(),
+                ..Outcome::default()
+            });
         }
         let (mut delta, notes, parked) = self.plan(conn, notes).await?;
         let mut outcome = Outcome {
@@ -398,6 +418,8 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 })
                 .collect(),
             snapshots: ids.clone(),
+            room: self.buffered,
+            stuck: 0,
             ready: Vec::new(),
             rows: 0,
             ready_bytes: 0,
@@ -449,7 +471,7 @@ impl<P: Sync + 'static> Relay<'_, P> {
                     (keys, end)
                 };
                 let (mut keys, mut end) = chunk_of(RECORD_CHUNK);
-                let fit = self.engine.fitting(conn, *i, &keys, BUFFERED).await?;
+                let fit = self.engine.fitting(conn, *i, &keys, self.buffered).await?;
                 if fit < keys.len() {
                     (keys, end) = chunk_of(fit);
                 }
@@ -685,10 +707,10 @@ impl<P: Sync + 'static> Relay<'_, P> {
                     tokio::time::timeout(self.timeout, transport.send(replica, message, &id))
                         .await
                         .unwrap_or_else(|_| {
-                            Err(Error::Transport {
-                                reason: format!("no answer within {:?}", self.timeout),
-                                transient: true,
-                            })
+                            Err(Error::transport(
+                                true,
+                                format!("no answer within {:?}", self.timeout),
+                            ))
                         });
                 if let Err(e) = went {
                     failure = Some(e);
@@ -755,18 +777,17 @@ impl Writer {
             self.ready(replica, Body::Down(done));
         }
         // Every replica's message being filled, ended early: what a pass
-        // holds stays bounded however many replicas it fills at once — at
-        // its spans while that is enough, else whole.
-        for early in [Packer::before_spans, Packer::finish] {
-            if self.buffered <= BUFFERED {
-                break;
-            }
+        // holds stays bounded however many replicas it fills at once, by a
+        // message each — what a span holds goes on, as it fits one.
+        self.stuck = self.stuck.min(self.buffered);
+        if self.buffered > self.room + self.stuck {
             let replicas: Vec<Uuid> = self.packers.keys().copied().collect();
             for replica in replicas {
-                if let Some(done) = self.packers.get_mut(&replica).and_then(early) {
+                if let Some(done) = self.packers.get_mut(&replica).and_then(Packer::relieve) {
                     self.ready(replica, Body::Down(done));
                 }
             }
+            self.stuck = self.buffered;
         }
     }
 
@@ -817,7 +838,7 @@ impl Writer {
     /// of bytes, or `all`.
     async fn flush(&mut self, conn: &mut Conn, all: bool) -> Result<(), Error> {
         if self.ready.is_empty()
-            || (!all && self.rows < RECORD_CHUNK && self.ready_bytes < BUFFERED)
+            || (!all && self.rows < RECORD_CHUNK && self.ready_bytes < self.room)
         {
             return Ok(());
         }
@@ -920,20 +941,19 @@ impl Writer {
             .execute(&mut *conn)
             .await?;
         }
+        // Taken back as it was noted: refused, it is held again so.
         sqlx::query(
-            "DELETE FROM sync.held h \
-              USING unnest($1::uuid[], $2::text[], $3::text[]) AS d(r, t, k) \
-              WHERE h.replica_id = d.r AND h.relation = d.t AND h.row_key = d.k",
-        )
-        .bind(&gone.0)
-        .bind(&gone.1)
-        .bind(&gone.2)
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query(
-            "INSERT INTO sync.gone (replica_id, relation, row_key, sequence) \
-             SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
-             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET sequence = EXCLUDED.sequence",
+            "WITH u AS (SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bigint[]) \
+                            AS u(r, t, k, s)), \
+                  d AS (DELETE FROM sync.held h USING u \
+                         WHERE h.replica_id = u.r AND h.relation = u.t AND h.row_key = u.k \
+                        RETURNING h.replica_id, h.relation, h.row_key, h.noted) \
+             INSERT INTO sync.gone AS g (replica_id, relation, row_key, sequence, noted) \
+             SELECT u.r, u.t, u.k, u.s, coalesce(d.noted, 0) FROM u \
+               LEFT JOIN d ON d.replica_id = u.r AND d.relation = u.t AND d.row_key = u.k \
+             ON CONFLICT (replica_id, relation, row_key) DO UPDATE SET \
+               sequence = EXCLUDED.sequence, \
+               noted = CASE WHEN EXCLUDED.noted = 0 THEN g.noted ELSE EXCLUDED.noted END",
         )
         .bind(&gone.0)
         .bind(&gone.1)

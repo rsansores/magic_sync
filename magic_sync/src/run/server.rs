@@ -259,7 +259,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// [`Error::Misuse`] when the database is not what the engine needs —
     /// its schema at another version, a table that is not its row column for
     /// column, a trigger missing or different from what [`Engine::triggers`]
-    /// prints — or for a declaration the schema cannot honour, or settings
+    /// prints, an index [`Engine::indexes`] prints — or for a declaration the schema cannot honour, or settings
     /// the server cannot run with; [`Error::Database`] when the database
     /// fails.
     pub async fn new(
@@ -284,7 +284,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// for a host with no migrations of its own: in one transaction, and one
     /// process at a time, the engine's schema installed or upgraded and every
     /// trigger missing or different written (any of the engine's on a table
-    /// no longer declared dropped). A table mirrored for the first time that
+    /// no longer declared dropped), and every index the planner needs that
+    /// none serves created. A table mirrored for the first time that
     /// already has rows is sent whole. Run it before anything writes a
     /// mirrored table — a write before its trigger is never noted — on a
     /// pool whose connections may create triggers.
@@ -462,10 +463,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
             )
             .await
             .unwrap_or_else(|_| {
-                Err(Error::Transport {
-                    reason: format!("no answer within {:?}", self.settings.send_timeout),
-                    transient: true,
-                })
+                Err(Error::transport(
+                    true,
+                    format!("no answer within {:?}", self.settings.send_timeout),
+                ))
             });
             match sent {
                 Err(e) if e.is_transient() => return Err(e),
@@ -528,6 +529,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 bytes: i64::try_from(self.settings.outbox_bytes.get()).unwrap_or(i64::MAX),
             },
             concurrency: usize::try_from(self.settings.concurrency.get()).unwrap_or(usize::MAX),
+            buffered: relay::BUFFERED,
         }
     }
 
@@ -637,11 +639,13 @@ impl<S: Senders, T: Transport> Server<S, T> {
         }
     }
 
-    /// Plans the parked notes again and sends the quarantine again; answers
-    /// the walk that files the inbox again, a page at a time beside the
-    /// passes, up to what it holds now.
+    /// Plans the parked notes again and sends the quarantine again — once
+    /// what the engine declares is observed, so nothing of a table it no
+    /// longer mirrors is; answers the walk that files the inbox again, a
+    /// page at a time beside the passes, up to what it holds now.
     async fn retry(&self, lock: &mut Lock) -> Result<Refiling, Error> {
         let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
+        self.engine.observe(&mut tx).await?;
         let unparked = relay::unpark(&mut tx).await?;
         let retried = relay::retry_quarantine(&mut tx).await?;
         tx.commit().await?;

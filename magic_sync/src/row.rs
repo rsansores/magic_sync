@@ -17,6 +17,8 @@
 use crate::dialect::ident;
 use crate::{Conn, Db, Error};
 use sqlx::query_builder::Separated;
+#[cfg(feature = "sqlite")]
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Where a table lives, which decides who writes it and who holds a copy.
@@ -30,9 +32,6 @@ pub enum Mirror {
     /// Written on both, column by column (`mirror = "both"`): the columns the
     /// replicas own travel up, the others down.
     Both,
-    /// Only the server has it (`mirror = "server"`): a row the host writes
-    /// with this module's functions, and that never travels.
-    ServerOnly,
 }
 
 /// Which replicas hold which rows of a table the server sends down: the
@@ -151,9 +150,11 @@ pub trait Row:
     const QUALIFIED: &'static str;
     #[doc(hidden)]
     const ROUTE: Route;
-    /// The relation, as SQL, the rows replicas hold are read through on the
-    /// server: a view that leaves out the rows no replica should hold.
-    /// `None`: the table itself, every row of it.
+    /// The relation, as SQL, the rows the table's rule sends are read
+    /// through on the server: a view that leaves out the rows no replica is
+    /// sent for their own sake. A row it leaves out still travels while a
+    /// row a replica holds points at it. `None`: the table itself, every row
+    /// of it.
     #[doc(hidden)]
     const ACTIVE: Option<&'static str>;
     /// The column a replica sets on a row it lets go of but cannot delete,
@@ -548,6 +549,74 @@ pub(crate) async fn retire_by_keys<R: Row>(
     if keys.is_empty() && held.is_empty() {
         return Ok(retired);
     }
+    // A row of the server's keeps one only while it is retired: a live one
+    // is let go of before it, or refuses the delete.
+    let staying = |child: &str| match server.iter().find(|(t, _)| t.eq_ignore_ascii_case(child)) {
+        None => Some(String::new()),
+        Some((_, Some(column))) => Some(format!(" AND c.{} IS NOT NULL", ident(column))),
+        Some((_, None)) => None,
+    };
+    keep::<R>(exec, held, true, &mut retired).await?;
+    let (mut pinned, pointed) = pointed_at::<R>(exec, keys, staying).await?;
+    // What stays keeps what it points at: a row asked to stay by another
+    // table, or retired before and not let go of now, or kept so in turn.
+    let asked: HashSet<&Key> = keys.iter().collect();
+    pin(&mut pinned, &pointed, |(child, retired)| {
+        retired && !asked.contains(child)
+    });
+    let kept: Vec<Key> = keys
+        .iter()
+        .filter(|key| pinned.contains(*key))
+        .cloned()
+        .collect();
+    keep::<R>(exec, &kept, false, &mut retired).await?;
+    let going: Vec<Key> = keys
+        .iter()
+        .filter(|key| !pinned.contains(*key))
+        .cloned()
+        .collect();
+    delete_together::<R>(exec, going, "", &mut retired).await?;
+    Ok(retired)
+}
+
+/// Lets go of the retired rows of `keys` that nothing which stays points
+/// at — no row of any table, live or retired, but those of `keys`
+/// themselves, which go with them — together, as [`retire_by_keys`]
+/// deletes; the rest stay as they are, and so does a row of `keys` that is
+/// live. Answers how many went.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn collect_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<u64, Error> {
+    let (mut pinned, pointed) = pointed_at::<R>(exec, keys, |_| Some(String::new())).await?;
+    let asked: HashSet<&Key> = keys.iter().collect();
+    pin(&mut pinned, &pointed, |(child, _)| !asked.contains(child));
+    let going: Vec<Key> = keys
+        .iter()
+        .filter(|key| !pinned.contains(*key))
+        .cloned()
+        .collect();
+    let retired = R::RETIRED.map_or(" AND false".to_owned(), |column| {
+        format!(" AND {} IS NOT NULL", ident(column))
+    });
+    let mut gone = Retired::default();
+    delete_together::<R>(exec, going, &retired, &mut gone).await?;
+    Ok(gone.deleted)
+}
+
+/// A row of the table pointing at one of it: its key, whether it is
+/// retired, and the key of the row it points at.
+#[cfg(feature = "sqlite")]
+type Pointed = (Key, bool, Key);
+
+/// Of `keys`, the rows a row of another table points at — of a table
+/// `staying` names the filter of rows that keep one by, `None` for a table
+/// whose rows keep none — and every row of the table itself that points at
+/// one of them ([`Pointed`]).
+#[cfg(feature = "sqlite")]
+async fn pointed_at<R: Row>(
+    exec: &mut Conn,
+    keys: &[Key],
+    staying: impl Fn(&str) -> Option<String>,
+) -> Result<(HashSet<Key>, Vec<Pointed>), Error> {
     let mut pointers = Vec::new();
     // The table's own keys into itself, whose rows let go of together keep
     // one another only while one of them stays.
@@ -556,15 +625,13 @@ pub(crate) async fn retire_by_keys<R: Row>(
         child, from, to, ..
     } in crate::dialect::pointing(exec, R::TABLE, R::KEY).await?
     {
-        let stays = match server.iter().find(|(t, _)| t.eq_ignore_ascii_case(&child)) {
-            None => String::new(),
-            Some((_, Some(column))) => format!(" AND c.{} IS NOT NULL", ident(column)),
-            Some((_, None)) => continue,
-        };
         if child.eq_ignore_ascii_case(R::TABLE) {
             inward.push((from, to));
             continue;
         }
+        let Some(stays) = staying(&child) else {
+            continue;
+        };
         // The parent's column first: compared by its collation, as the key
         // compares, and through the child's index.
         let on: Vec<String> = from
@@ -578,10 +645,9 @@ pub(crate) async fn retire_by_keys<R: Row>(
             on.join(" AND ")
         ));
     }
-    keep::<R>(exec, held, true, &mut retired).await?;
     let kinds = key_kinds::<R>();
-    let mut pinned: std::collections::HashSet<Key> = std::collections::HashSet::new();
-    let mut pointed: Vec<(Key, bool, Key)> = Vec::new();
+    let mut pinned = HashSet::new();
+    let mut pointed = Vec::new();
     for chunk in keys.chunks(keys_per_statement::<R>()) {
         if !pointers.is_empty() {
             let mut qb =
@@ -627,34 +693,39 @@ pub(crate) async fn retire_by_keys<R: Row>(
             }
         }
     }
-    // What stays keeps what it points at: a row asked to stay by another
-    // table, or retired before and not let go of now, or kept so in turn.
-    let asked: std::collections::HashSet<&Key> = keys.iter().collect();
+    Ok((pinned, pointed))
+}
+
+/// Pins, in turn, what a pinned row points at, and what a row `stays` (its
+/// key, whether it is retired) points at.
+#[cfg(feature = "sqlite")]
+fn pin(pinned: &mut HashSet<Key>, pointed: &[Pointed], stays: impl Fn((&Key, bool)) -> bool) {
     loop {
         let more: Vec<Key> = pointed
             .iter()
             .filter(|(child, retired, parent)| {
-                !pinned.contains(parent)
-                    && (pinned.contains(child) || (*retired && !asked.contains(child)))
+                !pinned.contains(parent) && (pinned.contains(child) || stays((child, *retired)))
             })
             .map(|(_, _, parent)| parent.clone())
             .collect();
         if more.is_empty() {
-            break;
+            return;
         }
         pinned.extend(more);
     }
-    let kept: Vec<Key> = keys
-        .iter()
-        .filter(|key| pinned.contains(*key))
-        .cloned()
-        .collect();
-    keep::<R>(exec, &kept, false, &mut retired).await?;
-    let mut going: Vec<Key> = keys
-        .iter()
-        .filter(|key| !pinned.contains(*key))
-        .cloned()
-        .collect();
+}
+
+/// Deletes the rows of `going` the SQL condition `only` admits (empty:
+/// every one) together, so rows that point only at one another go; one the
+/// database refuses is tried again once those it waited for have gone, and
+/// answered in `retired` when that changes nothing.
+#[cfg(feature = "sqlite")]
+async fn delete_together<R: Row>(
+    exec: &mut Conn,
+    mut going: Vec<Key>,
+    only: &str,
+    retired: &mut Retired,
+) -> Result<(), Error> {
     loop {
         let before = retired.deleted;
         let mut refused = Vec::new();
@@ -662,13 +733,14 @@ pub(crate) async fn retire_by_keys<R: Row>(
             let delete = |keys: &[Key]| {
                 let mut qb = sqlx::QueryBuilder::new(format!("DELETE FROM {}", R::QUALIFIED));
                 key_filter::<R>(&mut qb, keys);
+                qb.push(only);
                 qb
             };
             refused.extend(one_by_one(exec, chunk, delete, &mut retired.deleted).await?);
         }
         if refused.is_empty() || retired.deleted == before {
             retired.refused.extend(refused);
-            return Ok(retired);
+            return Ok(());
         }
         going = refused.into_iter().map(|(key, _)| key).collect();
     }

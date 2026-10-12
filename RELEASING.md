@@ -13,8 +13,11 @@ same commit again and publishes it without building it (`cargo publish
 --no-verify`, in `scripts/publish-crate.sh`), so no build script or proc macro
 runs next to a token. The dashboard is packed by a job with no credentials, and the tarball is
 what a second job publishes. Every action is pinned to a commit
-(`.github/dependabot.yml` proposes the new ones), and CI's `workflows` job
-runs [zizmor](https://docs.zizmor.sh) over the workflows.
+(`.github/dependabot.yml` proposes the new ones, and those of the lockfiles,
+cargo's and npm's), CI's `workflows` job runs
+[zizmor](https://docs.zizmor.sh) over the workflows, and a scheduled workflow
+(`advisories.yml`) looks every day for an advisory published against what a
+lockfile holds.
 
 Once, in the repository's settings:
 

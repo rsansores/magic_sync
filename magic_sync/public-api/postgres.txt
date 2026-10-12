@@ -36,6 +36,7 @@ pub async fn magic_sync::plan::Engine::overview(&self, &mut magic_sync::Conn, ma
 pub async fn magic_sync::plan::Engine::progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>) -> core::result::Result<magic_sync::status::Progress, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::row_progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, &str, &str) -> core::result::Result<magic_sync::status::RowProgress, magic_sync::Error>
 impl magic_sync::plan::Engine
+pub async fn magic_sync::plan::Engine::indexes<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>], magic_sync::plan::Replicas) -> core::result::Result<alloc::string::String, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::triggers<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>], magic_sync::plan::Replicas) -> core::result::Result<alloc::string::String, magic_sync::Error>
 impl core::fmt::Debug for magic_sync::plan::Engine
 pub fn magic_sync::plan::Engine::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -64,7 +65,7 @@ impl core::marker::UnsafeUnpin for magic_sync::plan::Replicas
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::plan::Replicas
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::plan::Replicas
 pub fn magic_sync::plan::migration(i32) -> core::option::Option<alloc::string::String>
-pub async fn magic_sync::plan::note_resync(&mut magic_sync::Conn, core::option::Option<uuid::Uuid>, uuid::Uuid) -> core::result::Result<(), magic_sync::Error>
+pub async fn magic_sync::plan::note_resync(&mut magic_sync::Conn, uuid::Uuid, core::option::Option<uuid::Uuid>) -> core::result::Result<(), magic_sync::Error>
 pub mod magic_sync::row
 #[non_exhaustive] pub enum magic_sync::row::KeyKind
 pub magic_sync::row::KeyKind::Integer
@@ -116,7 +117,6 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::KeyPart
 pub magic_sync::row::Mirror::Both
 pub magic_sync::row::Mirror::Catalog
 pub magic_sync::row::Mirror::Record
-pub magic_sync::row::Mirror::ServerOnly
 impl core::clone::Clone for magic_sync::row::Mirror
 pub fn magic_sync::row::Mirror::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::row::Mirror
@@ -837,7 +837,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::wire::MapError
 pub type magic_sync::wire::Place<R, P> = fn(&mut R, uuid::Uuid, &P)
 #[non_exhaustive] pub enum magic_sync::Error
 pub magic_sync::Error::Database(sqlx_core::error::Error)
-pub magic_sync::Error::Host
+#[non_exhaustive] pub magic_sync::Error::Host
 pub magic_sync::Error::Host::reason: alloc::string::String
 pub magic_sync::Error::Host::transient: bool
 pub magic_sync::Error::Malformed
@@ -847,11 +847,13 @@ pub magic_sync::Error::Misuse(alloc::string::String)
 pub magic_sync::Error::Protocol
 pub magic_sync::Error::Protocol::ours: u32
 pub magic_sync::Error::Protocol::theirs: u32
-pub magic_sync::Error::Transport
+#[non_exhaustive] pub magic_sync::Error::Transport
 pub magic_sync::Error::Transport::reason: alloc::string::String
 pub magic_sync::Error::Transport::transient: bool
 impl magic_sync::Error
+pub fn magic_sync::Error::host(bool, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn magic_sync::Error::is_transient(&self) -> bool
+pub fn magic_sync::Error::transport(bool, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::convert::From<sqlx_core::error::Error> for magic_sync::Error
 pub fn magic_sync::Error::from(sqlx_core::error::Error) -> Self
 impl core::error::Error for magic_sync::Error

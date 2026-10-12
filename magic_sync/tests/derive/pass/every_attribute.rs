@@ -77,13 +77,6 @@ pub struct TaskNote {
     pub text: String,
 }
 
-/// The server's own.
-#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
-#[row(table = "audits", mirror = "server")]
-pub struct Audit {
-    pub id: i64,
-}
-
 fn main() {
     let _ = magic_sync::wire::Codec::<()>::new::<Product, ProductRow>(to, from, None);
 }

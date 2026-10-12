@@ -105,6 +105,9 @@ jobs:
   # newest: each test creates a database of its own.
   test-server:
     runs-on: ubuntu-latest
+    # About seven minutes, built: a suite slow on one PostgreSQL fails here
+    # rather than run on for hours.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

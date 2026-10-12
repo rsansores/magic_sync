@@ -24,8 +24,10 @@ pub const ENVELOPE_ROOM: usize = 4096;
 mod sync;
 
 pub(crate) use sync::to_replica::Body;
+#[cfg(any(feature = "sqlite", test))]
+pub(crate) use sync::TableBacklog;
 pub(crate) use sync::{
-    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, TableBacklog, ToReplica, Up,
+    Backlog, Digest, Down, EndSnapshot, Filed, Key, Rejected, Table, ToReplica, Up,
 };
 
 #[cfg(any(feature = "postgres", test))]
@@ -405,11 +407,23 @@ impl Packer {
             && (self.count >= self.limits.rows || self.bytes + added > self.limits.largest_row())
     }
 
+    /// The message being filled, ended early to free what it holds: whole
+    /// while no span is open in it, else up to the earliest span, unless
+    /// that span opens it — a span begun inside it ends inside it too.
+    /// Never inside a span: `None` when one opens it.
+    pub(crate) fn relieve(&mut self) -> Option<Down> {
+        match self.spans.first() {
+            None => self.finish(),
+            Some(span) if span.count > 0 => self.before_spans(),
+            Some(_) => None,
+        }
+    }
+
     /// The message being filled up to the earliest span that does not open
     /// it, which stays to go on in the next; the spans before it, split
     /// already, are spans no more. `None` when every span opens it, or there
     /// is none.
-    pub(crate) fn before_spans(&mut self) -> Option<Down> {
+    fn before_spans(&mut self) -> Option<Down> {
         let first = self.spans.iter().position(|s| s.count > 0)?;
         let mark = self.spans.remove(first);
         self.spans.drain(..first);
@@ -457,9 +471,10 @@ impl Packer {
 
 /// One replica's rows as messages within `limits`, as the relay gives them
 /// to a [`Packer`]: every table's upserts, in their order, then every
-/// table's deletes, in the reverse one.
+/// table's deletes, in the reverse one — `pressed`, the message being
+/// filled relieved after every row, as a pass short of memory does.
 #[cfg(all(test, feature = "postgres"))]
-pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Down> {
+pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits, pressed: bool) -> Vec<Down> {
     let dropping = tables
         .iter()
         .filter(|t| !t.deletes.is_empty())
@@ -471,12 +486,18 @@ pub(crate) fn pack(tables: Vec<Table>, snapshot: &str, limits: Limits) -> Vec<Do
     for table in tables {
         for (row, key) in table.upserts.into_iter().zip(table.keys) {
             out.extend(packer.push(&table.table, Some(row), key));
+            if pressed {
+                out.extend(packer.relieve());
+            }
         }
         deletes.push((table.table, table.deletes));
     }
     for (table, keys) in deletes.into_iter().rev() {
         for key in keys {
             out.extend(packer.push(&table, None, key));
+            if pressed {
+                out.extend(packer.relieve());
+            }
         }
     }
     out.extend(packer.finish());
@@ -569,6 +590,7 @@ mod tests {
             vec![rows("parents", &[4, 4]), rows("children", &[4, 1, 1, 1])],
             "",
             limits,
+            false,
         );
         let shape: Vec<Vec<(String, usize)>> = packed
             .iter()
@@ -599,6 +621,7 @@ mod tests {
                 rows: 2,
                 bytes: ENVELOPE_ROOM + 100,
             },
+            false,
         );
         let keys: Vec<Vec<String>> = packed
             .iter()
@@ -623,6 +646,7 @@ mod tests {
                 rows: 10,
                 bytes: ENVELOPE_ROOM + 30,
             },
+            false,
         );
         let sizes: Vec<usize> = packed.iter().map(|m| m.tables[0].upserts.len()).collect();
         assert_eq!(sizes, vec![1, 1, 1]);
@@ -664,7 +688,7 @@ mod tests {
                 .iter()
                 .map(|t| t.upserts.len() + t.deletes.len())
                 .sum();
-            let packed = pack(tables, &uuid::Uuid::now_v7().to_string(), limits);
+            let packed = pack(tables, &uuid::Uuid::now_v7().to_string(), limits, false);
             let mut carried = 0;
             for mut down in packed {
                 (down.sequence, down.previous) = (u64::MAX, u64::MAX);
@@ -691,13 +715,15 @@ mod tests {
 
     /// Whatever the rows and the limits, a table's deletes go in the message
     /// of its upserts whenever the rows from its first upsert to its last
-    /// delete fit one message on their own; and the rows go in the order
-    /// given, each once.
+    /// delete fit one message on their own — short of memory or not; and
+    /// the rows go in the order given, each once.
     #[cfg(feature = "postgres")]
     #[test]
     fn a_tables_deletes_go_with_its_upserts_whenever_they_fit_one_message() {
         let mut walk = crate::testkit::Walk(0x51A7);
-        for _ in 0..500 {
+        for round in 0..1000 {
+            // Every other round short of memory, relieved after every row.
+            let pressed = round % 2 == 1;
             let limits = Limits {
                 rows: 1 + walk.below(12),
                 bytes: ENVELOPE_ROOM + 20 + walk.below(300),
@@ -730,7 +756,7 @@ mod tests {
                 });
                 ups.chain(dels).collect()
             };
-            let packed = pack(tables.clone(), "", limits);
+            let packed = pack(tables.clone(), "", limits, pressed);
             let carried: Vec<(String, String, bool)> = packed
                 .iter()
                 .flat_map(|m| {

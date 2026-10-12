@@ -167,6 +167,10 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     /// Per lane, how many rows and rejections the next message passes over
     /// while it looks for one the transport takes: 0 when it is not looking.
     skips: Vec<AtomicUsize>,
+    /// How many times a message was applied again, with more care, since
+    /// this replica began: each a row at fault, or a cost of nothing.
+    #[cfg(test)]
+    pub(crate) again: AtomicUsize,
 }
 
 impl<P: 'static, I: Identity, U: Uplink> std::fmt::Debug for Replica<P, I, U> {
@@ -237,6 +241,8 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             skips: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
             wake: settings.lanes.iter().map(|_| Notify::new()).collect(),
             running: AtomicBool::new(false),
+            #[cfg(test)]
+            again: AtomicUsize::new(0),
             settings,
         })
     }
@@ -280,6 +286,8 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 Stop::Failed(e) if e.is_refusal() => care.heed(),
                 Stop::Failed(e) => return Err(e),
             };
+            #[cfg(test)]
+            self.again.fetch_add(1, Ordering::Relaxed);
             if !again {
                 // Refused with every row of it refused: nothing a message
                 // changes is at fault, and this one never applies.
@@ -288,6 +296,17 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 ));
             }
         };
+        if matches!(
+            received,
+            Received::Applied(_) | Received::SnapshotEnded | Received::Filed
+        ) {
+            // The message stands whatever this does.
+            if let Err(e) = replica::collect(&self.pool, &self.codecs).await {
+                tracing::warn!(
+                    "sync: retired rows nothing keeps stay, until the next message: {e}"
+                );
+            }
+        }
         if matches!(
             received,
             Received::Applied(_) | Received::SnapshotEnded | Received::Gap
@@ -433,7 +452,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         )
         .await?;
         tx.commit().await?;
+        let witnessed = &self.witnessed[lane];
         let Some(outgoing) = outgoing.filter(|o| skip == 0 || o.items() > 0) else {
+            // Nothing left of what was being narrowed down.
+            witnessed.store(false, Ordering::Relaxed);
             if skip > 0 {
                 self.skips[lane].store(0, Ordering::Relaxed);
                 self.caps[lane].store(0, Ordering::Relaxed);
@@ -442,10 +464,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                     "sync: the uplink refuses what this lane sends for good, and has no other \
                      row to try it with — nothing is set aside, and it goes again"
                 );
-                return Err(Error::Transport {
-                    reason: "the uplink refuses the only messages this lane has".to_owned(),
-                    transient: true,
-                });
+                return Err(Error::transport(
+                    true,
+                    "the uplink refuses the only messages this lane has".to_owned(),
+                ));
             }
             return Ok(Went::default());
         };
@@ -456,17 +478,16 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         )
         .await
         .unwrap_or_else(|_| {
-            Err(Error::Transport {
-                reason: format!("the uplink did not take the message within {timeout:?}"),
-                transient: true,
-            })
+            Err(Error::transport(
+                true,
+                format!("the uplink did not take the message within {timeout:?}"),
+            ))
         });
         let mut went = Went {
             message: true,
             digests: false,
         };
         let items = outgoing.items();
-        let witnessed = &self.witnessed[lane];
         match sent {
             Ok(()) => {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -510,11 +531,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 self.caps[lane].store(1, Ordering::Relaxed);
             }
             Err(e) => {
-                // The transport may be another by the time it takes again:
-                // what it took before witnesses nothing after.
-                if e.is_transient() {
-                    witnessed.store(false, Ordering::Relaxed);
-                } else {
+                // The transport may be another by the time it takes again,
+                // or refuses with no row to blame: what it took before
+                // witnesses nothing after.
+                witnessed.store(false, Ordering::Relaxed);
+                if !e.is_transient() {
                     tracing::error!(
                         lane = outgoing.lane,
                         items,

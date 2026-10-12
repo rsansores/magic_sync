@@ -52,10 +52,7 @@ impl Transport for Deliveries {
         if self.is_cut(register) {
             // A retry may get it through: the network's failure, not the
             // message's.
-            return Err(Error::Transport {
-                reason: "the line to it is cut".to_owned(),
-                transient: true,
-            });
+            return Err(Error::transport(true, "the line to it is cut".to_owned()));
         }
         // The same message sent twice is queued once: `id` names it.
         sqlx::query(

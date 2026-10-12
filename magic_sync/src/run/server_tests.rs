@@ -386,6 +386,63 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
     assert_eq!(quarantined().await, 0);
 }
 
+/// A deploy that stops mirroring a table with rows set aside lets go of
+/// them before it tries again what was set aside: its first pass leaves
+/// nothing of the table pending or parked, and the status reads.
+#[sqlx::test(migrations = false)]
+async fn a_table_no_longer_mirrored_leaves_nothing_set_aside_behind(pool: PgPool) {
+    let (partition, _) = world(&pool).await;
+    let wire = Wire::default();
+    let server = |codecs| {
+        Server::new(
+            pool.clone(),
+            codecs,
+            REPLICAS,
+            wire.clone(),
+            Anyone::new(pool.clone()),
+            settings(),
+        )
+    };
+    item(&pool, partition, "poison").await;
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let before = server(codecs()).await.unwrap();
+    until(&[&before], || async {
+        count("SELECT count(*) FROM sync.quarantine").await == 2
+    })
+    .await;
+    drop(before);
+
+    sqlx::raw_sql("DROP TABLE fixture.items CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut codecs = codecs();
+    codecs.remove(0);
+    let after = server(codecs).await.unwrap();
+    until(&[&after], || async {
+        count("SELECT count(*) FROM sync.quarantine").await == 0
+            && count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL AND relation = 'items'")
+                .await
+                == 0
+    })
+    .await;
+    let mut conn = pool.acquire().await.unwrap();
+    let overview = after
+        .engine
+        .overview(&mut conn, crate::status::Scope::All, 10)
+        .await
+        .unwrap();
+    assert_eq!(overview.health.parked.total, 0);
+}
+
 /// A relay whose lock's connection is gone cannot record what it sent: the
 /// record runs on that connection, so it dies with the lock, and the notes
 /// wait for whoever runs the relay next.
@@ -523,10 +580,7 @@ impl Senders for Broken {
 
     async fn known(&self, replica: Uuid) -> Result<Option<()>, Error> {
         if self.failing.lock().unwrap().contains(&replica) {
-            return Err(Error::Host {
-                reason: format!("{replica}: a bug in the host"),
-                transient: false,
-            });
+            return Err(Error::host(false, format!("{replica}: a bug in the host")));
         }
         Ok(Some(()))
     }
@@ -928,6 +982,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                     .collect(),
                 rejected: (0..walk.below(3))
                     .map(|_| Rejected {
+                        held_back: false,
                         table: pick(&mut walk, &tables),
                         key: (walk.below(4) > 0).then(|| key(&mut walk)),
                         reason: "refused\0".into(),
@@ -1081,7 +1136,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
         settings(),
     ));
     let mut conn = pool.acquire().await.unwrap();
-    spawnable(crate::plan::note_resync(&mut conn, None, Uuid::nil()));
+    spawnable(crate::plan::note_resync(&mut conn, Uuid::nil(), None));
 
     spawnable(Engine::triggers(&mut conn, &codecs(), REPLICAS));
     spawnable(crate::row::upsert::<Item>(&mut conn, Vec::new()));

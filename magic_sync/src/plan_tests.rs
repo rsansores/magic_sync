@@ -577,6 +577,11 @@ const RULES: Rules = Rules {
             .is_ok_and(|row| row.get("name").and_then(|n| n.as_str()) == Some(REFUSED))
     },
     parents,
+    unique: |table, bytes| {
+        let row: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let name = row.get("name")?.as_str()?;
+        (table == "t_products" && name.starts_with('u')).then(|| name.to_owned())
+    },
     ..Rules::ANY
 };
 
@@ -602,6 +607,7 @@ fn relay<'a>(
             bytes: 1 << 30,
         },
         concurrency: 4,
+        buffered: 1,
     }
 }
 
@@ -635,7 +641,9 @@ async fn world(pool: crate::DbPool) -> World {
         .expect("schema");
     // A write that waits on the long writer gives up, rather than wait on
     // a transaction this same thread is to commit.
-    sqlx::raw_sql("SET lock_timeout = '100ms'")
+    // Each statement planned as it runs, rather than as a plan cached
+    // before a pass refused sequential scans.
+    sqlx::raw_sql("SET lock_timeout = '100ms'; SET plan_cache_mode = force_custom_plan")
         .execute(&mut *conn)
         .await
         .expect("a lock timeout");
@@ -749,7 +757,39 @@ impl World {
                 .expect("held")
                 .into_iter()
                 .collect();
+        // Every lookup the planner makes on a host table is served by an
+        // index: refused a sequential scan, it makes one only where none
+        // serves it. (What the connection counted before is not reported
+        // until the transaction ends: what this one adds is the difference.)
+        // Before PostgreSQL 18 a refused scan still made costs 10^10 more,
+        // past every JIT threshold: without `jit = off` each statement of
+        // the pass would be compiled, a second at a time.
+        sqlx::raw_sql("SET LOCAL enable_seqscan = off; SET LOCAL jit = off")
+            .execute(&mut *tx)
+            .await
+            .expect("no sequential scans");
+        let scans = "SELECT relname::text, seq_scan FROM pg_stat_xact_user_tables \
+                      WHERE schemaname = 'fixture'";
+        let before: BTreeMap<String, i64> = sqlx::query_as(scans)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("scans")
+            .into_iter()
+            .collect();
         let outcome = relay.record(&mut tx).await.expect("recorded");
+        let scanned: Vec<String> = sqlx::query_as::<_, (String, i64)>(scans)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("scans")
+            .into_iter()
+            .filter(|(table, count)| before.get(table) != Some(count))
+            .map(|(table, _)| table)
+            .collect();
+        assert!(
+            scanned.is_empty(),
+            "the planner scanned host tables whole: {scanned:?}; last steps: {:#?}",
+            &self.history[self.history.len().saturating_sub(8)..]
+        );
         // Nothing here is a note no build can plan: a note parked is the
         // planner failing.
         assert!(
@@ -1708,7 +1748,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(109);
+    let choice = walk.below(111);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1872,9 +1912,19 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         104 => write!(conn, "UPDATE fixture.t_kind_notes SET kind_id = $2 WHERE id = $1", kind_note, kind),
         105 => write!(conn, &format!("UPDATE fixture.t_kind_notes SET {RETIRE} WHERE id = $1"), kind_note),
         106 => write!(conn, "DELETE FROM fixture.t_kind_notes WHERE id = $1", kind_note),
+        // A product's name its replicas hold unique, and that name moved to
+        // a new product while tallies come and go, at once: a pass short of
+        // memory ends no message between the products let go of and taken.
+        107 => write!(conn, "UPDATE fixture.t_products SET name = 'u' || $2 WHERE id = $1", product, number),
+        108 => {
+            write!(conn, "INSERT INTO fixture.t_tallies (id, partition_id, kind_id, name) VALUES ($1, $2, $3, 't')", walk.uuid(), partition, kind);
+            write!(conn, "DELETE FROM fixture.t_tallies WHERE id = $1", tally);
+            write!(conn, "INSERT INTO fixture.t_products (id, partition_id, kind_id, name) SELECT $1, partition_id, kind_id, name FROM fixture.t_products WHERE id = $2 AND name LIKE 'u%'", new, product)
+                && write!(conn, "DELETE FROM fixture.t_products WHERE id = $1", product)
+        }
         // Planning a row's changes fails, until a deploy: the relay parks
         // them.
-        107 => return Step::Park(i64::from(small)),
+        109 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -2164,9 +2214,43 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .execute(&mut *conn)
         .await
         .expect("a host's migration");
+    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let indexes = Engine::indexes(&mut conn, &codecs, REPLICAS)
+        .await
+        .expect("the indexes");
+    assert!(
+        why.contains(&indexes) && indexes.contains("t_list_members\" (\"customer_id\")"),
+        "refused naming the indexes it prints: {why}"
+    );
+    // One of the host's own serves, whatever its name, leading with the
+    // columns in another order.
+    sqlx::raw_sql(
+        "CREATE INDEX by_number ON fixture.t_account_members (number, region, partition_id)",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("an index of the host's");
+    let indexes = Engine::indexes(&mut conn, &codecs, REPLICAS)
+        .await
+        .expect("the indexes");
+    assert!(
+        !indexes.contains("t_account_members\" (\"region"),
+        "{indexes}"
+    );
+    sqlx::raw_sql(&indexes)
+        .execute(&mut *conn)
+        .await
+        .expect("a host's migration");
     Engine::new(&mut conn, &tables, REPLICAS)
         .await
-        .expect("the triggers it printed are the ones it needs");
+        .expect("the triggers and indexes it printed are the ones it needs");
+    assert_eq!(
+        Engine::indexes(&mut conn, &codecs, REPLICAS)
+            .await
+            .expect("the indexes"),
+        "",
+        "none missing"
+    );
 
     // Keyed as the primary key orders it, not as the row declares it: every
     // key it noted would be read the other way round.
@@ -2312,7 +2396,7 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
 /// is a step of its own.
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
-    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0x3931_5e62_776a_f26c];
+    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [0x404b_35fd_cc9a_ab37];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -2610,15 +2694,17 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
             ),
             // Named as the engine knows it, not by the partition it landed in.
             ("t_logs".into(), format!("{log}|{a}"), Some(a), None),
-            // A key that changed: the new one where it is now, the old one
-            // where it was, with what the row as it was pointed at.
-            ("t_counters".into(), log.to_string(), Some(b), None),
+            // A key that changed: the old one where it was, first, with
+            // what the row as it was pointed at — a batch that ends between
+            // the two takes the row back before it sends it again — then
+            // the new one where it is now.
             (
                 "t_counters".into(),
                 counter.to_string(),
                 Some(a),
                 pointed.clone()
             ),
+            ("t_counters".into(), log.to_string(), Some(b), None),
             ("t_counters".into(), log.to_string(), Some(b), None),
             // A row that moved: where it was, whose replicas let it go —
             // its first note, with what it pointed at — and where it is now.
@@ -3043,10 +3129,10 @@ async fn a_replica_is_provisioned_once_however_often_it_is_asked(pool: crate::Db
         .fetch_one(conn)
         .await
     }
-    note_resync(&mut world.conn, Some(partition), replica)
+    note_resync(&mut world.conn, replica, Some(partition))
         .await
         .expect("noted");
-    note_resync(&mut world.conn, Some(partition), replica)
+    note_resync(&mut world.conn, replica, Some(partition))
         .await
         .expect("noted again");
     assert!(
@@ -3214,7 +3300,7 @@ async fn a_row_written_last_by_the_older_transaction_goes_again(pool: crate::DbP
         .await
         .expect("the older transaction's id");
     let replica = live_in(&mut world.conn, partition).await[0];
-    note_resync(&mut world.conn, Some(partition), replica)
+    note_resync(&mut world.conn, replica, Some(partition))
         .await
         .expect("a provisioning");
     sqlx::query("UPDATE fixture.t_products SET name = 'newer' WHERE id = $1")
@@ -3308,7 +3394,9 @@ async fn a_database_moved_to_another_cluster_keeps_sending_what_changes(pool: cr
         .await
         .expect("the moved database");
     world.conn = world.pool.acquire().await.expect("a connection");
-    sqlx::raw_sql("SET lock_timeout = '100ms'")
+    // Each statement planned as it runs, rather than as a plan cached
+    // before a pass refused sequential scans.
+    sqlx::raw_sql("SET lock_timeout = '100ms'; SET plan_cache_mode = force_custom_plan")
         .execute(&mut *world.conn)
         .await
         .expect("a lock timeout");
@@ -3648,4 +3736,21 @@ async fn a_parent_held_for_an_older_version_brings_no_new_follower(pool: crate::
         .filter(|(t, _)| t == "t_emails")
         .count();
     assert_eq!(emails, 0);
+}
+
+/// Each index the planner needs has a name of its own, however its table's
+/// and its columns' names run together, and within what a name may hold.
+#[test]
+fn indexes_that_spell_alike_are_named_apart() {
+    let index = |table: &str, columns: &[&str]| Index {
+        on: Relation {
+            schema: "public".to_owned(),
+            name: table.to_owned(),
+        },
+        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    let (one, other) = (index("a_b", &["c"]), index("a", &["b", "c"]));
+    assert_ne!(one.name(), other.name());
+    let long = index(&"t".repeat(63), &["c"]);
+    assert!(long.name().len() <= 63, "{}", long.name());
 }

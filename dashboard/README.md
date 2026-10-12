@@ -146,12 +146,15 @@ always:
 ## Versions
 
 The dashboard reads the JSON of the engine of the same version: release and
-upgrade them together. A value the engine adds to a state (a replica's, a
-row's) is shown by this dashboard as unknown, with the word it came as, and
-counted; the contract number changes only when a word changes its meaning. Its types are generated from the engine's
-(`src/core/contract/types.ts`), and the engine's tests write what it answers
-into `src/core/contract/fixtures/`, which the dashboard's type-check holds
-field for field to those types and its tests read.
+upgrade them together. A field the engine adds is ignored; a word it adds
+to a state (a replica's, a row's, a note's) is shown by this dashboard as
+unknown, with the word it came as, and counted. The contract number (`status::CONTRACT`)
+changes when a field or a word is removed or renamed, or a word comes to mean
+something else, and the dashboard refuses an answer of a contract it does not
+read. Its types are generated from the engine's (`src/core/contract/types.ts`),
+and the engine's tests write what it answers into
+`src/core/contract/fixtures/`, which the dashboard's type-check holds field for
+field to those types and its tests read.
 
 ## License
 

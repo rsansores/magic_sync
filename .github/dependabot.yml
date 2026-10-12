@@ -1,8 +1,29 @@
-# The actions are pinned to commits; this moves the pins to the releases.
+# The actions are pinned to commits, and the lockfiles to versions; this moves
+# both to the releases.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  # The dependencies themselves: one workspace, and the example's programs and
+  # the book's snippets, each with a lockfile of its own.
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /examples/shop/server
+      - /examples/shop/register
+      - /book/snippets
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: npm
+    directories:
+      - /dashboard
+      - /examples/shop/web
     schedule:
       interval: weekly
     cooldown:

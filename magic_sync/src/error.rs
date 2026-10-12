@@ -22,7 +22,10 @@ pub enum Error {
     },
     /// The transport refused or could not take a message: what a host's
     /// transport or uplink answers.
+    ///
+    /// Build it with [`Error::transport`].
     #[error("{reason}")]
+    #[non_exhaustive]
     Transport {
         /// Why, as the transport says it.
         reason: String,
@@ -32,7 +35,10 @@ pub enum Error {
     },
     /// The host failed at something the engine asked of it: who a replica is,
     /// a transaction to file in.
+    ///
+    /// Build it with [`Error::host`].
     #[error("{reason}")]
+    #[non_exhaustive]
     Host {
         /// Why, as the host says it.
         reason: String,
@@ -51,6 +57,26 @@ pub enum Error {
 }
 
 impl Error {
+    /// A transport that refused or could not take a message, and whether a
+    /// retry may get it through.
+    #[must_use]
+    pub fn transport(transient: bool, reason: impl Into<String>) -> Self {
+        Error::Transport {
+            reason: reason.into(),
+            transient,
+        }
+    }
+
+    /// A host that failed at something the engine asked of it, and whether
+    /// the same question may be answered once the host is back.
+    #[must_use]
+    pub fn host(transient: bool, reason: impl Into<String>) -> Self {
+        Error::Host {
+            reason: reason.into(),
+            transient,
+        }
+    }
+
     /// Whether the infrastructure failed rather than the data or the code:
     /// the same work may succeed as it is once the database or the transport
     /// is back. Everything else is permanent — retrying it unchanged fails
@@ -176,11 +202,7 @@ mod tests {
     #[test]
     fn only_the_infrastructure_is_worth_retrying_as_it_is() {
         assert!(Error::Database(sqlx::Error::PoolTimedOut).is_transient());
-        assert!(Error::Transport {
-            reason: "no responders".into(),
-            transient: true
-        }
-        .is_transient());
+        assert!(Error::transport(true, "no responders").is_transient());
         assert!(!Error::Misuse("a key that does not parse".into()).is_transient());
         assert!(!Error::Database(sqlx::Error::RowNotFound).is_transient());
         // The server's own failures: an I/O error, a statement whose fate
@@ -211,10 +233,6 @@ mod tests {
             assert!(is_transient_code("267"));
             assert!(is_transient_code("26"));
         }
-        assert!(!Error::Transport {
-            reason: "message too large".into(),
-            transient: false
-        }
-        .is_transient());
+        assert!(!Error::transport(false, "message too large").is_transient());
     }
 }

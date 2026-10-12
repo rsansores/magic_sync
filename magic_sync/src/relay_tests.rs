@@ -106,10 +106,10 @@ impl Transport for Fake {
             });
         let failing = self.failing.lock().unwrap().get(&replica).copied();
         let result = match failing.or(next.then_some(true)) {
-            Some(transient) => Err(Error::Transport {
-                reason: format!("{replica} unreachable"),
+            Some(transient) => Err(Error::transport(
                 transient,
-            }),
+                format!("{replica} unreachable"),
+            )),
             None => {
                 self.sent.lock().unwrap().push((replica, message));
                 self.ids.lock().unwrap().push(id.to_owned());
@@ -253,6 +253,7 @@ impl World {
                 bytes: 1 << 30,
             },
             concurrency: 4,
+            buffered: BUFFERED,
         }
     }
 
@@ -356,8 +357,9 @@ impl std::ops::Deref for Passed {
 fn items_of(model: &Model) -> BTreeSet<String> {
     model
         .rows
-        .values()
-        .map(|bytes| ItemRow::decode(bytes.as_slice()).expect("an item").name)
+        .iter()
+        .filter(|((table, _), _)| table == "items")
+        .map(|(_, bytes)| ItemRow::decode(bytes.as_slice()).expect("an item").name)
         .collect()
 }
 
@@ -953,6 +955,7 @@ async fn a_row_a_replica_refuses_is_quarantined_and_sent_again_on_retry(pool: cr
         .unwrap();
     let last = world.last_sent(a).await;
     let rejection = |table: &str, key: &str, epoch: Uuid, sequence: u64| Rejected {
+        held_back: false,
         table: table.to_owned(),
         key: Some(WireKey {
             parts: vec![key.to_owned()],
@@ -1364,10 +1367,7 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
             if replica == self.replica {
                 let mut left = self.left.lock().unwrap();
                 if *left == 0 {
-                    return Err(Error::Transport {
-                        reason: "cut".into(),
-                        transient: true,
-                    });
+                    return Err(Error::transport(true, "cut"));
                 }
                 *left -= 1;
             }
@@ -2212,6 +2212,7 @@ async fn an_upload_kept_whole_keeps_only_its_rows(pool: crate::DbPool) {
     world.pass(&Fake::default()).await;
     let said = Up {
         rejected: vec![Rejected {
+            held_back: false,
             table: "items".to_owned(),
             key: Some(WireKey {
                 parts: vec![id.to_string()],
@@ -2383,6 +2384,7 @@ async fn digests_filed_while_a_pass_records_compare_with_what_they_were_read_at(
     let mut digests = model.digests(&["items"]);
     let refused = model.rejections.values().next().expect("its refusal");
     digests.rejected.push(envelope::Rejected {
+        held_back: false,
         table: "items".into(),
         key: Some(envelope::Key {
             parts: vec![x.to_string()],
@@ -2925,4 +2927,434 @@ async fn a_part_kept_again_while_the_inbox_is_filed_files_its_newest_edit(pool: 
     tx.commit().await.unwrap();
     assert_eq!(world.tallied(id).await, Some(("count".to_owned(), 2)));
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+}
+
+impl World {
+    /// A two-way row of `replica`'s own, titled `title`; answers its row as
+    /// a replica holds it.
+    async fn pad(&self, replica: Uuid, title: &str) -> (String, String) {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO fixture.pads (replica_id, id, partition_id, title, seen) \
+             VALUES ($1, $2, $3, $4, 0)",
+        )
+        .bind(replica)
+        .bind(id)
+        .bind(self.partition)
+        .bind(title)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        ("pads".to_owned(), format!("{replica}|{id}"))
+    }
+
+    /// `model` of `replica` deletes `pad`, and says so, with the last
+    /// message it applied; answers the server's answer, `Filed`, for the
+    /// model to receive when the transport brings it.
+    async fn delete_pad(
+        &self,
+        replica: Uuid,
+        model: &mut Model,
+        pad: &(String, String),
+    ) -> Vec<u8> {
+        model.rows.remove(pad);
+        model.deleted.insert(pad.clone(), None);
+        let applied = model.applied.as_ref().map_or(0, |(_, sequence)| *sequence);
+        let mut up = crate::testkit::confirmation(&self.pool, replica, applied).await;
+        up.tables = vec![envelope::Table {
+            table: pad.0.clone(),
+            deletes: vec![envelope::Key {
+                parts: pad.1.split('|').map(str::to_owned).collect(),
+            }],
+            ..envelope::Table::default()
+        }];
+        up.uploads = vec![u64::from(Uuid::now_v7().as_fields().0)];
+        model.carried(&up);
+        self.file(replica, &up).await;
+        Body::Filed(envelope::Filed {
+            uploads: up.uploads,
+        })
+        .encoded()
+    }
+
+    /// `replica`'s digests, as `model` holds, filed: answers how many
+    /// provisionings they left owed.
+    async fn digests_of(&self, replica: Uuid, model: &Model) -> i64 {
+        self.file(replica, &model.digests(&["items", "tallies", "pads"]))
+            .await;
+        self.count("SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL")
+            .await
+    }
+
+    /// The server refuses to delete a pad from now on.
+    async fn keep_pads(&self) {
+        sqlx::raw_sql(
+            "CREATE FUNCTION fixture.kept() RETURNS trigger LANGUAGE plpgsql AS \
+               $$BEGIN RAISE EXCEPTION 'kept'; END$$; \
+             CREATE TRIGGER kept BEFORE DELETE ON fixture.pads \
+               FOR EACH ROW EXECUTE FUNCTION fixture.kept();",
+        )
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// A replica deletes a two-way row of its own while a newer version of it,
+/// recorded before the delete came, is on its way, and hears the delete
+/// filed before that version comes: it takes the version, so the server
+/// still counts it held, and its own delete of the row reaches the replica
+/// after the version did.
+#[sqlx::test(migrations = false)]
+async fn a_replica_that_deletes_its_own_row_with_a_version_on_its_way_is_sent_the_delete(
+    pool: crate::DbPool,
+) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    assert!(models[&a].rows.contains_key(&pad));
+    sqlx::query("UPDATE fixture.pads SET title = 'theirs'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass(&wire).await;
+    let mut model = models.remove(&a).unwrap();
+    let filed = world.delete_pad(a, &mut model, &pad).await;
+    assert_eq!(world.count("SELECT count(*) FROM fixture.pads").await, 0);
+    model.receive(&filed, &REFUSING);
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    assert!(
+        model.rows.contains_key(&pad),
+        "the version on its way, taken"
+    );
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    assert!(!models[&a].rows.contains_key(&pad), "the delete reached it");
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+}
+
+/// The same, the version coming before the answer: the replica holds it
+/// back and says so, so the server counts it held no more — the digests it
+/// says once the answer came find nothing amiss before the server's own
+/// delete of the row is planned — and that delete leaves it as it is.
+#[sqlx::test(migrations = false)]
+async fn a_version_held_back_before_the_delete_is_filed_is_counted_held_no_more(
+    pool: crate::DbPool,
+) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    sqlx::query("UPDATE fixture.pads SET title = 'theirs'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass(&wire).await;
+    let mut model = models.remove(&a).unwrap();
+    let filed = world.delete_pad(a, &mut model, &pad).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    assert!(
+        !model.rows.contains_key(&pad),
+        "the version on its way, held back"
+    );
+    model.receive(&filed, &REFUSING);
+    world.say(a, &mut model).await;
+    assert_eq!(world.digests_of(a, &model).await, 0, "nothing differs");
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.quarantine WHERE cause = 'held_back'")
+            .await,
+        1
+    );
+    let overview = world.overview(Scope::Replicas(&[a])).await;
+    assert_eq!(overview.replicas.first[0].state, ReplicaState::CatchingUp);
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    assert!(!models[&a].rows.contains_key(&pad));
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+}
+
+/// A replica's delete of its own row the server refuses is a fact all the
+/// same: the replica no longer holds the row, the server records it so, and
+/// sends it the row again.
+#[sqlx::test(migrations = false)]
+async fn a_replica_delete_the_server_refuses_has_the_row_sent_again(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    world.keep_pads().await;
+    let mut model = models.remove(&a).unwrap();
+    let filed = world.delete_pad(a, &mut model, &pad).await;
+    assert_eq!(world.count("SELECT count(*) FROM fixture.pads").await, 1);
+    model.receive(&filed, &REFUSING);
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    assert!(models[&a].rows.contains_key(&pad), "sent again");
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+}
+
+/// A delete the server refuses, filed again and again from what it kept,
+/// notes the row to be sent again once while that note is pending.
+#[sqlx::test(migrations = false)]
+async fn a_refused_delete_filed_again_notes_one_retry(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    world.keep_pads().await;
+    let mut model = models.remove(&a).unwrap();
+    world.delete_pad(a, &mut model, &pad).await;
+    world.refile_all().await;
+    world.refile_all().await;
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE kind = 'retry' AND done_at IS NULL")
+            .await,
+        1
+    );
+}
+
+/// A delete the server refuses, of a row a version of which is on its way
+/// and comes before the answer: the replica holds that version back and
+/// says so, the server sets the row aside with no alarm — nothing is at
+/// fault — and the next retry sends it again.
+#[sqlx::test(migrations = false)]
+async fn a_refused_delete_of_a_row_held_back_has_it_sent_again_on_the_next_retry(
+    pool: crate::DbPool,
+) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let pad = world.pad(a, "mine").await;
+    world.settle(&wire, &mut models).await;
+    world.keep_pads().await;
+    sqlx::query("UPDATE fixture.pads SET title = 'theirs'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world.pass(&wire).await;
+    let mut model = models.remove(&a).unwrap();
+    let filed = world.delete_pad(a, &mut model, &pad).await;
+    world.deliver(&wire, a, &mut model, &REFUSING);
+    assert!(!model.rows.contains_key(&pad), "held back");
+    model.receive(&filed, &REFUSING);
+    models.insert(a, model);
+    world.settle(&wire, &mut models).await;
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+    let mut conn = world.pool.acquire().await.unwrap();
+    let health = world
+        .engine
+        .health(&mut conn, Scope::All, 10)
+        .await
+        .unwrap();
+    assert_eq!(health.quarantine.total, 0, "no alarm but the delete's");
+    crate::relay::retry_quarantine(&mut conn).await.unwrap();
+    drop(conn);
+    world.settle(&wire, &mut models).await;
+    assert!(models[&a].rows.contains_key(&pad), "sent again");
+    assert_eq!(world.digests_of(a, &models[&a]).await, 0, "nothing differs");
+    assert_eq!(world.count("SELECT count(*) FROM sync.quarantine").await, 0);
+}
+
+/// A pass that holds more than its bytes ends its messages early, never
+/// between a table's deletes and its upserts: a name one item lets go of
+/// is there for the item that takes it, on a replica whose names are
+/// unique.
+#[sqlx::test(migrations = false)]
+async fn a_pass_short_of_memory_keeps_a_unique_value_moving_in_one_message(pool: crate::DbPool) {
+    const UNIQUE: Rules = Rules {
+        unique: |_, bytes| ItemRow::decode(bytes).ok().map(|row| row.name),
+        ..Rules::ANY
+    };
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let x = world.item("taken").await;
+    world.settle(&wire, &mut models).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM fixture.items WHERE id = $1")
+        .bind(x)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO fixture.items (id, partition_id, name) VALUES ($1, $2, 'taken')")
+        .bind(Uuid::now_v7())
+        .bind(world.partition)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let relay = Relay {
+        buffered: 1,
+        ..world.relay()
+    };
+    world.pass_relay(&relay, &wire).await;
+    let mut model = models.remove(&a).unwrap();
+    world.deliver(&wire, a, &mut model, &UNIQUE);
+    assert!(model.rejections.is_empty(), "{:?}", model.rejections);
+    assert_eq!(items_of(&model), names(&["taken"]));
+}
+
+/// A pass short of memory keeps a unique value moving in one message when
+/// another table's rows come and go inside the move: the message ends
+/// neither between them nor between the items let go of and taken.
+#[sqlx::test(migrations = false)]
+async fn a_pass_short_of_memory_ends_no_message_inside_a_move_another_table_nests_in(
+    pool: crate::DbPool,
+) {
+    const UNIQUE: Rules = Rules {
+        unique: |table, bytes| {
+            ItemRow::decode(bytes)
+                .ok()
+                .filter(|_| table == "items")
+                .map(|row| row.name)
+        },
+        ..Rules::ANY
+    };
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let x = world.item("taken").await;
+    let gone = world.tally("gone").await;
+    world.settle(&wire, &mut models).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    for (sql, id) in [
+        (
+            "DELETE FROM fixture.items WHERE id = $1 AND $2::uuid IS NOT NULL",
+            x,
+        ),
+        (
+            "INSERT INTO fixture.items (id, partition_id, name) VALUES ($1, $2, 'taken')",
+            Uuid::now_v7(),
+        ),
+        (
+            "INSERT INTO fixture.tallies (id, partition_id, title, seen) VALUES ($1, $2, 'new', 0)",
+            Uuid::now_v7(),
+        ),
+        (
+            "DELETE FROM fixture.tallies WHERE id = $1 AND $2::uuid IS NOT NULL",
+            gone,
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(id)
+            .bind(world.partition)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let relay = Relay {
+        buffered: 1,
+        ..world.relay()
+    };
+    world.pass_relay(&relay, &wire).await;
+    let mut model = models.remove(&a).unwrap();
+    world.deliver(&wire, a, &mut model, &UNIQUE);
+    assert!(model.rejections.is_empty(), "{:?}", model.rejections);
+    assert_eq!(items_of(&model), names(&["taken"]));
+}
+
+/// A delete a replica refuses records the row held again as it was noted
+/// when it was taken back: what it points at there is read from the change
+/// that followed that version, not from the row's first.
+#[sqlx::test(migrations = false)]
+async fn a_refused_delete_holds_the_row_again_as_it_was_noted(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(15);
+    let mut models = world.models();
+    let x = world.item("one").await;
+    world.rename(x, "two").await;
+    world.settle(&wire, &mut models).await;
+    let noted = || async {
+        sqlx::query_as::<_, (i64, bool)>(
+            "SELECT noted, refused IS NOT NULL FROM sync.held \
+              WHERE replica_id = $1 AND row_key = $2",
+        )
+        .bind(a)
+        .bind(x.to_string())
+        .fetch_one(&world.pool)
+        .await
+        .unwrap()
+    };
+    let (kept, _) = noted().await;
+    assert!(kept > 0);
+    models
+        .get_mut(&a)
+        .unwrap()
+        .pinned
+        .insert(("items".to_owned(), x.to_string()));
+    world
+        .exec(
+            "DELETE FROM fixture.items WHERE id = $1 AND partition_id = $2 AND $3 <> ''",
+            x,
+            "x",
+        )
+        .await;
+    world.settle(&wire, &mut models).await;
+    assert_eq!(noted().await, (kept, true));
+}
+
+/// An engine that sends no table down — every table it declares a record
+/// the replicas send up — plans its notes to nothing, rather than failing
+/// on every pass: a replica provisioned is sent nothing, and the note is
+/// done.
+#[sqlx::test(migrations = false)]
+async fn an_engine_that_sends_nothing_down_plans_its_notes_to_nothing(pool: crate::DbPool) {
+    use crate::conformance::Reading;
+    let mut conn = pool.acquire().await.expect("a connection");
+    crate::plan::tests::install(&mut conn).await;
+    sqlx::raw_sql(&format!(
+        "{SCHEMA} CREATE TABLE fixture.readings (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         value BIGINT NOT NULL, at BIGINT NOT NULL, PRIMARY KEY (replica_id, id))"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("schema");
+    let (partition, replicas) = (Uuid::now_v7(), [Uuid::now_v7(), Uuid::now_v7()]);
+    for replica in replicas {
+        sqlx::raw_sql(&format!(
+            "INSERT INTO fixture.t_replicas VALUES ('{replica}', '{partition}', true); \
+             INSERT INTO sync.notes (kind, replica_id) VALUES ('resync', '{replica}')"
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("a replica");
+    }
+    let mut tx = conn.begin().await.expect("a transaction");
+    let engine = Engine::install(&mut tx, &[&Table::of::<Reading>()], REPLICAS)
+        .await
+        .expect("the engine");
+    tx.commit().await.expect("installed");
+    drop(conn);
+    let world = World {
+        pool,
+        engine,
+        codecs: vec![Codec::json::<Reading>(None)],
+        replicas,
+        partition,
+        provisioned: BTreeMap::new(),
+    };
+    world.pass(&Fake::default()).await;
+    assert_eq!(
+        world
+            .count("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
+            .await,
+        0
+    );
+    assert_eq!(world.count("SELECT count(*) FROM sync.outbox").await, 0);
 }

@@ -175,7 +175,6 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::row::KeyPart
 pub magic_sync::row::Mirror::Both
 pub magic_sync::row::Mirror::Catalog
 pub magic_sync::row::Mirror::Record
-pub magic_sync::row::Mirror::ServerOnly
 impl core::clone::Clone for magic_sync::row::Mirror
 pub fn magic_sync::row::Mirror::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::row::Mirror
@@ -346,7 +345,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::wire::MapError
 pub type magic_sync::wire::Place<R, P> = fn(&mut R, uuid::Uuid, &P)
 #[non_exhaustive] pub enum magic_sync::Error
 pub magic_sync::Error::Database(sqlx_core::error::Error)
-pub magic_sync::Error::Host
+#[non_exhaustive] pub magic_sync::Error::Host
 pub magic_sync::Error::Host::reason: alloc::string::String
 pub magic_sync::Error::Host::transient: bool
 pub magic_sync::Error::Malformed
@@ -356,11 +355,13 @@ pub magic_sync::Error::Misuse(alloc::string::String)
 pub magic_sync::Error::Protocol
 pub magic_sync::Error::Protocol::ours: u32
 pub magic_sync::Error::Protocol::theirs: u32
-pub magic_sync::Error::Transport
+#[non_exhaustive] pub magic_sync::Error::Transport
 pub magic_sync::Error::Transport::reason: alloc::string::String
 pub magic_sync::Error::Transport::transient: bool
 impl magic_sync::Error
+pub fn magic_sync::Error::host(bool, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn magic_sync::Error::is_transient(&self) -> bool
+pub fn magic_sync::Error::transport(bool, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::convert::From<sqlx_core::error::Error> for magic_sync::Error
 pub fn magic_sync::Error::from(sqlx_core::error::Error) -> Self
 impl core::error::Error for magic_sync::Error
