@@ -349,8 +349,11 @@ async fn analyze(conn: &mut Conn, tables: &str) -> Result<(), Error> {
 enum Set {
     Suspect,
     Blocked,
-    /// What replicas keep of a table beyond what its rules send them.
-    Kept(usize),
+    /// What replicas keep of a table beyond what its rules send them; for
+    /// a version of a row they hold that points there when `older`, which
+    /// holds up that row and keeps of its followers only those they hold:
+    /// what that version needs is the row, not what follows it since.
+    Kept(usize, bool),
 }
 
 /// What the replica `replica` holds of the row of the relation `relation`
@@ -475,7 +478,7 @@ CREATE TEMP TABLE IF NOT EXISTS sync_suspect (
     PRIMARY KEY (replica_id, rel, row_key)) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_kept (
     replica_id UUID, rel INTEGER, row_key TEXT, round INTEGER NOT NULL,
-    sends BOOLEAN NOT NULL, up BOOLEAN NOT NULL, down BOOLEAN NOT NULL,
+    sends BOOLEAN NOT NULL, up BOOLEAN NOT NULL, down BOOLEAN NOT NULL, older BOOLEAN NOT NULL,
     PRIMARY KEY (replica_id, rel, row_key)) ON COMMIT DELETE ROWS;
 CREATE TEMP TABLE IF NOT EXISTS sync_sends (
     rel INTEGER, row_key TEXT, replica_id UUID, lacks BOOLEAN) ON COMMIT DELETE ROWS;
@@ -1828,6 +1831,39 @@ impl Engine {
             );
             self.add(conn, Set::Suspect, &select, 0).await?;
         }
+        // The parent of a follower the batch changed, held by a replica
+        // that may hold it only for a version of a row that points there
+        // and changed since: whether it keeps it for more than that, and
+        // the new follower with it, is the plan's question.
+        for (f, column, p) in self
+            .followers()
+            .filter(|(f, _, _)| asked.changed.contains(f))
+        {
+            for c in self
+                .pointing()
+                .into_iter()
+                .filter(|(_, parent)| *parent == p)
+                .map(|(c, _)| c)
+            {
+                let select = format!(
+                    "SELECT DISTINCT h.replica_id, {p}, pp.row_key, NULL \
+                       FROM sync_changed x JOIN {} t ON {} \
+                       JOIN sync.pointed pp ON pp.relation = {} AND pp.row_key = t.{}::text \
+                       JOIN sync.notes n ON n.id = pp.note AND n.relation = {} \
+                                        AND n.id NOT IN (SELECT id FROM sync_batch) \
+                       JOIN sync.held h ON h.relation = n.relation AND h.row_key = n.row_key \
+                                       AND h.noted < n.id \
+                       JOIN sync_live l ON l.replica_id = h.replica_id AND NOT l.fresh \
+                      WHERE x.rel = {f}",
+                    self.plans[f].relation.sql(),
+                    self.row_is(f, "x.row_key"),
+                    literal(self.plans[p].table),
+                    ident(column),
+                    literal(self.plans[c].table),
+                );
+                self.add(conn, Set::Suspect, &select, 0).await?;
+            }
+        }
         let mut round = 0;
         loop {
             let from = self.frontier(conn, "sync_suspect", round).await?;
@@ -2050,15 +2086,20 @@ impl Engine {
                       WHERE k.rel = {c} AND k.round = $1 - 1 AND k.up AND NOT k.sends",
                     self.pointed_by_held(c, parent, "k"),
                 );
-                self.keep(conn, parent, round + 1, &source).await?;
+                self.keep_for_older(conn, parent, round + 1, &source)
+                    .await?;
             }
             for (f, column, p) in self.followers().filter(|(_, _, p)| from.contains(p)) {
                 let source = format!(
-                    "SELECT k.replica_id, {} FROM sync_kept k JOIN {} t ON {} \
-                      WHERE k.rel = {p} AND k.round = $1 - 1 AND k.down",
-                    self.key_of_row(f),
+                    "SELECT k.replica_id, {key} FROM sync_kept k JOIN {} t ON {} \
+                      WHERE k.rel = {p} AND k.round = $1 - 1 AND k.down \
+                        AND (NOT k.older OR EXISTS (SELECT 1 FROM sync.held h \
+                                                     WHERE h.replica_id = k.replica_id \
+                                                       AND h.relation = {} AND h.row_key = {key}))",
                     self.plans[f].active,
                     key_eq("t", &[column], &self.plans[p].key, "k.row_key"),
+                    literal(self.plans[f].table),
+                    key = self.key_of_row(f),
                 );
                 self.keep(conn, f, round + 1, &source).await?;
             }
@@ -2082,7 +2123,7 @@ impl Engine {
                                        AND x.rel = {c} AND x.row_key = h.row_key AND NOT x.sends))",
                 self.held_older(c, parent, "d.replica_id", "d.row_key"),
             );
-            kept += self.keep(conn, parent, round, &source).await?;
+            kept += self.keep_for_older(conn, parent, round, &source).await?;
         }
         Ok(kept > 0)
     }
@@ -2156,7 +2197,23 @@ impl Engine {
         let select = format!(
             "SELECT x.replica_id, {i}, x.row_key, NULL FROM ({source}) AS x(replica_id, row_key)"
         );
-        self.add(conn, Set::Kept(i), &select, round).await
+        self.add(conn, Set::Kept(i, false), &select, round).await
+    }
+
+    /// Keeps for `i`, at `round`, what `source` names as [`Engine::keep`]
+    /// does, for a version of a row its replica holds that points there:
+    /// the row is held up, and no follower it lacks goes with it.
+    async fn keep_for_older(
+        &self,
+        conn: &mut Conn,
+        i: usize,
+        round: i32,
+        source: &str,
+    ) -> Result<u64, Error> {
+        let select = format!(
+            "SELECT x.replica_id, {i}, x.row_key, NULL FROM ({source}) AS x(replica_id, row_key)"
+        );
+        self.add(conn, Set::Kept(i, true), &select, round).await
     }
 
     /// Adds to the plan's `set` the rows `select` answers —
@@ -2175,11 +2232,13 @@ impl Engine {
                  SELECT q.replica_id, q.rel, q.row_key, q.why, $1 FROM ({select}) AS q(replica_id, rel, row_key, why) \
                  ON CONFLICT DO NOTHING"
             ),
-            Set::Kept(i) => {
+            Set::Kept(i, older) => {
                 let plan = &self.plans[i];
                 format!(
-                    "INSERT INTO sync_kept (replica_id, rel, row_key, round, sends, up, down) \
-                     SELECT s.replica_id, s.rel, s.row_key, $1, s.sends, s.sends OR s.doubt, s.lacks OR s.doubt \
+                    "INSERT INTO sync_kept (replica_id, rel, row_key, round, sends, up, down, older) \
+                     SELECT DISTINCT ON (s.replica_id, s.rel, s.row_key) \
+                            s.replica_id, s.rel, s.row_key, $1, s.sends, s.sends OR s.doubt, \
+                            s.lacks OR s.doubt, {older} \
                        FROM (SELECT q.replica_id, q.rel, q.row_key, \
                                     h.replica_id IS NULL OR h.refused AS lacks, \
                                     (h.replica_id IS NULL OR h.refused OR {}) AND t.{} IS NOT NULL AS sends, \
@@ -2193,7 +2252,8 @@ impl Engine {
                               WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
                                                    AND b.rel = q.rel AND b.row_key = q.row_key) {}) AS s \
                       WHERE s.lacks OR s.sends OR s.doubt \
-                     ON CONFLICT DO NOTHING",
+                     ON CONFLICT (replica_id, rel, row_key) DO UPDATE SET older = false, round = $1 \
+                      WHERE sync_kept.older AND NOT EXCLUDED.older",
                     stale("c.noted"),
                     ident(plan.key[0].name),
                     holds("LEFT JOIN", "h", "q.replica_id", &literal(plan.table), "q.row_key"),
@@ -2212,6 +2272,8 @@ impl Engine {
                 )
             }
         };
+        // A row kept for an older version, and then for itself, spreads
+        // again, to every follower, from where it was found the second time.
         Ok(sqlx::query(&sql)
             .bind(round)
             .execute(&mut *conn)

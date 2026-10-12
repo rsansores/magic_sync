@@ -1,0 +1,50 @@
+name: Nightly
+
+# The planner's walks with seeds drawn for the night: each run of CI takes
+# the same eight, which find only what those paths reach. A walk that fails
+# names its seed; `MAGIC_SYNC_WALK_SEEDS=<seed>` takes it again anywhere, and
+# a seed worth keeping joins `SEEDS` in `plan_tests.rs`.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  walks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      MAGIC_SYNC_WALK_SEEDS: random
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: >-
+          cargo test --locked -p magic_sync --features postgres --
+          --nocapture plan_tests::every_replica plan_tests::whatever_fails
