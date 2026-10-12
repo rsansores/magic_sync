@@ -32,7 +32,9 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
   the replica since the wish was based on it. Wishes travel as rows of the
   engine's own two-way table `sync_wishes` (schema step 2 on each side), so
   every guarantee below holds for them; the server files a setting as its
-  replica last sent it, whatever its version.
+  replica last sent it, whatever its version, and a replica says its
+  settings and answers again whenever a snapshot begins — so once the system
+  settles, both sides show the same value, after a restore of either too.
 - **Codecs.** `Codec::json` (an object of the row's columns, 64-bit integers
   as text) and `Codec::new` (a protobuf message of your own).
 - **Runners.** `Server` and `Replica` run what a host builds; the host

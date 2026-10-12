@@ -504,7 +504,12 @@ For a table the replica writes and the server mirrors:
    only those edits go up: it **must** refuse an insert of one, an update
    of a column it does not own, and a delete of one but a row keyed by
    itself, in a table keyed by the replica. A record without a version is
-   history, written once. A setting is noted as a record with a version is.
+   history, written once. A setting is noted as a record with a version is;
+   and in the transaction that begins a snapshot (4.2) the replica **must**
+   note again every row of its settings, and every answer it gave to a wish
+   it holds (4.5): the server's record of them may be behind — it, or the
+   replica, restored from an older copy — and is set straight by what the
+   replica says it holds now (A.3).
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only
@@ -695,7 +700,9 @@ A replica implementation is complete when:
 - [ ] if it holds settings: it holds their wishes as a two-way table, takes
       no answer from the server, carries each out after the message that
       brought it is committed — superseded, unread or applied as 4.5 says —
-      and records the answer, with the row it wrote, in one transaction.
+      and records the answer, with the row it wrote, in one transaction;
+      and notes every setting and every answer again when a snapshot
+      begins (section 7).
 
 ---
 

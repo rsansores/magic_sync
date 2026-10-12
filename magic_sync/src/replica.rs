@@ -121,30 +121,8 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
     for codec in codecs {
         let table = codec.table.name;
         let on = ident(table);
-        let key_columns: Vec<&crate::row::Column> = codec
-            .table
-            .key
-            .iter()
-            .filter_map(|k| codec.table.columns.iter().find(|c| c.name == *k))
-            .collect();
-        let key = |row: &str| {
-            key_columns
-                .iter()
-                .map(|c| {
-                    let value = format!("{row}.{}", ident(c.name));
-                    if c.key == Some(KeyKind::Integer) {
-                        format!("CAST({value} AS TEXT)")
-                    } else {
-                        let hex = format!("hex({value})");
-                        format!(
-                            "lower(substr({hex}, 1, 8) || '-' || substr({hex}, 9, 4) || '-' || \
-                             substr({hex}, 13, 4) || '-' || substr({hex}, 17, 4) || '-' || substr({hex}, 21))"
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" || '|' || ")
-        };
+        let key_columns = key_columns(&codec.table);
+        let key = |row: &str| key_sql(&codec.table, row);
         let readable = key_columns
             .iter()
             .map(|c| {
@@ -258,6 +236,69 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
         }
     }
     out
+}
+
+/// The columns of `table`'s key, in key order.
+#[cfg(feature = "sqlite")]
+fn key_columns(table: &crate::row::Table) -> Vec<&crate::row::Column> {
+    table
+        .key
+        .iter()
+        .filter_map(|k| table.columns.iter().find(|c| c.name == *k))
+        .collect()
+}
+
+/// The key of the row `row` (an alias, `NEW` or `OLD`) of `table` as SQL
+/// writes it in the one form keys are compared in.
+#[cfg(feature = "sqlite")]
+fn key_sql(table: &crate::row::Table, row: &str) -> String {
+    key_columns(table)
+        .iter()
+        .map(|c| {
+            let value = format!("{row}.{}", ident(c.name));
+            if c.key == Some(KeyKind::Integer) {
+                format!("CAST({value} AS TEXT)")
+            } else {
+                let hex = format!("hex({value})");
+                format!(
+                    "lower(substr({hex}, 1, 8) || '-' || substr({hex}, 9, 4) || '-' || \
+                     substr({hex}, 13, 4) || '-' || substr({hex}, 17, 4) || '-' || substr({hex}, 21))"
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" || '|' || ")
+}
+
+/// Notes again every row of the replica's settings, and every answer it gave
+/// to a wish: what the server records of them may be behind — a server or a
+/// replica restored from an older copy — and a snapshot beginning is the
+/// moment the server sets out to find what this replica holds. A setting is
+/// filed as last sent, and an answer kept until the provisioning confirms.
+#[cfg(feature = "sqlite")]
+async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
+    for codec in codecs {
+        let table = &codec.table;
+        let only = match table.mirror {
+            // SQLite reads an upsert's ON after a SELECT with no WHERE as a
+            // join's.
+            crate::row::Mirror::Setting => " WHERE true",
+            _ if table.name == crate::wish::TABLE => {
+                " WHERE t.answered IS NOT NULL AND t.retired_at IS NULL"
+            }
+            _ => continue,
+        };
+        sqlx::query(&format!(
+            "INSERT INTO sync_notes (relation, row_key) SELECT {}, {} FROM {} t{only} \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, set_aside = NULL",
+            literal(table.name),
+            key_sql(table, "t"),
+            ident(table.name)
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// The triggers a replica database needs for `codecs`, as one SQL script: a
@@ -992,9 +1033,14 @@ async fn act<P: Sync + 'static>(
                 ends: false,
             };
             match chained(conn, place).await? {
-                Ok(by) => Ok(Received::Applied(
-                    apply(conn, codecs, &down, &by, care).await?,
-                )),
+                Ok(by) => {
+                    if down.previous == 0 {
+                        restate(conn, codecs).await?;
+                    }
+                    Ok(Received::Applied(
+                        apply(conn, codecs, &down, &by, care).await?,
+                    ))
+                }
                 Err(skipped) => Ok(skipped),
             }
         }
@@ -1010,6 +1056,9 @@ async fn act<P: Sync + 'static>(
             };
             match chained(conn, place).await? {
                 Ok(by) => {
+                    if end.previous == 0 {
+                        restate(conn, codecs).await?;
+                    }
                     end_snapshot(conn, codecs, &end, &by, care).await?;
                     Ok(Received::SnapshotEnded)
                 }

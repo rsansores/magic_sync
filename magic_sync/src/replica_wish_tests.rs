@@ -499,3 +499,61 @@ async fn a_running_replica_offers_the_wishes_a_message_brings(pool: SqlitePool) 
     stop.notify_one();
     running.await.unwrap();
 }
+
+/// A snapshot beginning — the server provisioning this replica again, after
+/// either side was restored from an older copy, say — has the replica say
+/// again what each setting is and how it answered each wish, all of it
+/// filed before: the server's record of them may be behind.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_beginning_has_the_replica_say_its_settings_and_answers_again(pool: SqlitePool) {
+    let hand = Hand::default();
+    let w = wish_world(pool, &hand).await;
+    w.set(40, 1).await;
+    w.receive(&down(
+        1,
+        "",
+        vec![wishes(vec![wished(&w.screen(70, 1), 5, false)])],
+    ))
+    .await;
+    w.offer().await;
+    let up = w.up(0, false).await.expect("the answer and the setting");
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads,
+        })
+        .encoded(),
+    )
+    .await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM sync_notes").await,
+        0,
+        "all filed"
+    );
+
+    let (key, row) = wished(&w.screen(70, 1), 5, false);
+    w.receive(&begin(2, "again", vec![wishes(vec![(key, row)])]))
+        .await;
+    let noted = w
+        .texts("SELECT relation FROM sync_notes ORDER BY relation")
+        .await;
+    assert_eq!(noted, ["screens", "sync_wishes"]);
+    w.receive(&end(3, "again", &["sync_wishes"])).await;
+    assert_eq!(w.offer().await, 0, "the wish it held, answered");
+    let up = w.up(0, false).await.expect("said again");
+    let said: BTreeMap<&str, usize> = up
+        .tables
+        .iter()
+        .map(|t| (t.table.as_str(), t.upserts.len()))
+        .collect();
+    assert_eq!(said, BTreeMap::from([("screens", 1), ("sync_wishes", 1)]));
+    let wish = WireWish::decode(
+        up.tables
+            .iter()
+            .find(|t| t.table == "sync_wishes")
+            .unwrap()
+            .upserts[0]
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!((wish.answered, wish.outcome.as_str()), (5, "applied"));
+}

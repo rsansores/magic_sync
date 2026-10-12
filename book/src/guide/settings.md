@@ -92,7 +92,9 @@ operator sees why. Either way the replica decides, once, and both sides then
 show what it decided.
 
 The server files a setting as the register last sent it, whatever its
-version: a register restored from an older copy holds what it holds.
+version, and a register that is provisioned again sends its settings and its
+answers again: so a register — or the server — restored from an older copy
+still ends showing the same value on both sides.
 
 ## Where a wish stands
 
