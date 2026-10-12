@@ -28,7 +28,7 @@ pub(super) async fn world(pool: crate::DbPool) -> World {
 impl World {
     pub(super) async fn desire(&self, wanted: Screen, note: Option<&str>) -> crate::wish::Wished {
         let mut tx = self.pool.begin().await.unwrap();
-        let wished = crate::wish::desire(&mut tx, &self.codecs, wanted, note)
+        let wished = crate::wish::desire(&mut tx, &self.engine, &self.codecs, wanted, note)
             .await
             .expect("wished");
         tx.commit().await.unwrap();
@@ -112,7 +112,6 @@ async fn a_wish_goes_to_the_replica_its_setting_belongs_to(pool: crate::DbPool) 
     assert_eq!(wishes.len(), 1, "{wishes:?}");
     let wish = &wishes[0];
     assert_eq!(wish.id, wished.id.to_string());
-    assert_eq!(wish.replica_id, a.to_string());
     assert_eq!(wish.table, "screens");
     assert_eq!(
         wish.key.as_ref().unwrap().parts,
@@ -121,12 +120,8 @@ async fn a_wish_goes_to_the_replica_its_setting_belongs_to(pool: crate::DbPool) 
     assert_eq!(wish.version, wished.version as u64);
     assert_eq!(wish.note, "ops@example.com");
     assert!(!wish.if_unchanged, "`always`, as declared");
-    let screens = world
-        .codecs
-        .iter()
-        .find(|c| c.table.name == "screens")
-        .unwrap();
-    let wanted: Screen = screens.decode_row(&wish.wanted).unwrap();
+    let wanted: Screen =
+        crate::wire::json_decode("screens", &Table::of::<Screen>().columns, &wish.wanted).unwrap();
     assert_eq!(wanted, screen(a, 70));
     assert_eq!(
         (
@@ -159,12 +154,16 @@ async fn a_wish_wished_again_is_replaced_and_one_withdrawn_is_taken_back(pool: c
     assert_eq!(held_wishes(&model)[0].version, again.version as u64);
     let key = screen(a, 0).key();
     let mut tx = world.pool.begin().await.unwrap();
-    assert!(crate::wish::withdraw::<Screen>(&mut tx, &key)
-        .await
-        .unwrap());
-    assert!(!crate::wish::withdraw::<Screen>(&mut tx, &key)
-        .await
-        .unwrap());
+    assert!(
+        crate::wish::withdraw::<Screen, ()>(&mut tx, &world.codecs, &key)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !crate::wish::withdraw::<Screen, ()>(&mut tx, &world.codecs, &key)
+            .await
+            .unwrap()
+    );
     tx.commit().await.unwrap();
     world.catch_up(a, &mut model).await;
     assert!(held_wishes(&model).is_empty());
@@ -261,7 +260,7 @@ async fn a_wish_stands_as_its_replica_answered_it(pool: crate::DbPool) {
     );
 
     let mut tx = world.pool.begin().await.unwrap();
-    crate::wish::withdraw::<Screen>(&mut tx, &key)
+    crate::wish::withdraw::<Screen, ()>(&mut tx, &world.codecs, &key)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -276,6 +275,101 @@ async fn a_wish_stands_as_its_replica_answered_it(pool: crate::DbPool) {
     .await;
     assert!(state().await.is_empty(), "the server's withdrawal wins");
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+}
+
+/// A final answer — applied, refused, superseded — stands against a later
+/// upload of another answer to the same wish, which the transport may have
+/// held back; one the replica re-states, as a snapshot begins, is what it
+/// holds now, and is taken.
+#[sqlx::test(migrations = false)]
+async fn a_final_answer_stands_against_a_late_one_unless_restated(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let mut model = world.follower(a);
+    let key = screen(a, 0).key();
+    world.desire(screen(a, 70), None).await;
+    world.catch_up(a, &mut model).await;
+    let wish = held_wishes(&model).remove(0);
+    let file = |up: Up| {
+        let world = &world;
+        async move { crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await }
+    };
+    let state = || async {
+        let wishes = world.wishes(std::slice::from_ref(&key)).await;
+        wishes.into_iter().map(|w| w.state).collect::<Vec<_>>()
+    };
+    file(answer(&wish, "applied", "")).await;
+    file(answer(&wish, "waiting", "away")).await;
+    assert_eq!(state().await, [WishState::Applied], "a waiting from before");
+    let mut restated = answer(&wish, "waiting", "away");
+    restated.tables[0].restated = true;
+    file(restated).await;
+    assert_eq!(state().await, [WishState::Waiting], "what it holds now");
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+}
+
+/// A replica's settings and answers are compared as the server holds them:
+/// one that differs — a server restored from a copy older than what the
+/// replica uploaded since — is provisioned again, and the server lets go of
+/// what it holds of the setting that differs, for the replica to state
+/// again as its snapshot begins.
+#[sqlx::test(migrations = false)]
+async fn a_replica_whose_settings_or_answers_differ_is_provisioned_again(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let mut model = world.follower(a);
+    let mut holder = crate::model::Holder::default();
+    let row = ("screens".to_owned(), format!("{a}|{}", Uuid::from_u128(1)));
+    holder.write(&row, 40);
+    world.desire(screen(a, 70), None).await;
+    world.catch_up(a, &mut model).await;
+    holder.carry(&model, read_setting, |_| crate::model::Handled::Applied);
+    let up = holder.up(write_setting).unwrap();
+    crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+    holder.filed(&up.uploads);
+    let held = || async {
+        sqlx::query_as::<_, (i64, i64)>("SELECT level, revision FROM fixture.screens")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(held().await, [(70, 2)]);
+
+    let resyncs = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
+    let compare = |held: &crate::model::Holder| {
+        let mut up = model.digests(&[]);
+        up.digests = held.digests(&model, &["screens", TABLE]);
+        let world = &world;
+        async move {
+            sqlx::raw_sql(
+                "UPDATE sync.replicas SET compared_at = NULL, drifted_at = NULL; \
+                 UPDATE sync.notes SET done_at = now() WHERE kind = 'resync'",
+            )
+            .execute(&world.pool)
+            .await
+            .unwrap();
+            crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+            world.count(resyncs).await
+        }
+    };
+    assert_eq!(
+        compare(&holder).await,
+        0,
+        "it holds what the server records"
+    );
+
+    let mut before = holder.clone();
+    before.answers.clear();
+    assert_eq!(compare(&before).await, 1, "answers it does not hold");
+    assert_eq!(held().await, [(70, 2)], "a setting that agrees is kept");
+
+    let mut older = holder.clone();
+    older.settings.insert(row.clone(), (40, 1));
+    assert_eq!(compare(&older).await, 1, "a setting of another version");
+    assert!(
+        held().await.is_empty(),
+        "the server lets go of the setting that differs"
+    );
 }
 
 /// A wish that does not decode as the row it says — another build's
@@ -304,17 +398,17 @@ async fn an_answer_that_does_not_read_is_kept_for_a_fix(pool: crate::DbPool) {
     assert_eq!(stored[0].outcome, None);
 }
 
-/// A host table cannot take the name of the engine's own.
+/// A host table cannot take a name the engine keeps for its own.
 #[test]
-fn a_table_named_as_the_engines_wishes_is_refused() {
+fn a_table_named_as_the_engines_is_refused() {
     #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
-    #[row(table = "sync_wishes", mirror = "catalog", sync = "broadcast")]
+    #[row(table = "sync_mine", mirror = "catalog", sync = "broadcast")]
     struct Mine {
         id: Uuid,
     }
     let refused = crate::wish::with_wishes(vec![Codec::<()>::json::<Mine>(None)]);
     assert!(
-        matches!(&refused, Err(Error::Misuse(why)) if why.contains("engine's table of wishes")),
+        matches!(&refused, Err(Error::Misuse(why)) if why.contains("is the engine's")),
         "{refused:?}"
     );
     let none = crate::wish::with_wishes(vec![Codec::<()>::json::<Mine2>(None)]).unwrap();
@@ -326,12 +420,12 @@ fn a_table_named_as_the_engines_wishes_is_refused() {
     }
 }
 
-/// A replica with a wish it has not carried out is catching up, whatever
-/// else it holds; one refused or superseded is not. Each replica counts
+/// A replica with a wish it has not answered is catching up, whatever
+/// else it holds; one that answered, even waiting, is not. Each replica counts
 /// its wishes by where they stand, and the listing puts those that need
 /// attention first.
 #[sqlx::test(migrations = false)]
-async fn a_replica_with_a_wish_to_carry_out_is_catching_up(pool: crate::DbPool) {
+async fn a_replica_with_a_wish_unanswered_is_catching_up(pool: crate::DbPool) {
     use crate::status::{Page, ReplicaState, WishCounts};
     let world = world(pool).await;
     let [a, b] = world.replicas;
@@ -388,7 +482,7 @@ async fn a_replica_with_a_wish_to_carry_out_is_catching_up(pool: crate::DbPool) 
     assert_eq!(
         state_of(&overview, a),
         (
-            ReplicaState::CatchingUp,
+            ReplicaState::Synced,
             WishCounts {
                 waiting: 1,
                 refused: 1,
@@ -396,38 +490,8 @@ async fn a_replica_with_a_wish_to_carry_out_is_catching_up(pool: crate::DbPool) 
                 ..WishCounts::default()
             }
         ),
-        "a wish waiting is one not carried out yet"
+        "every wish answered — one waiting for its host, which the replica tries again"
     );
-    let waiting = noted("module");
-    crate::testkit::file(
-        &world.pool,
-        &world.codecs,
-        &answer(waiting, "applied", ""),
-        a,
-        &(),
-    )
-    .await;
-    assert_eq!(
-        world
-            .overview(Scope::All)
-            .await
-            .replicas
-            .first
-            .iter()
-            .find(|r| r.replica == a)
-            .unwrap()
-            .state,
-        ReplicaState::Synced,
-        "refused and superseded are answers"
-    );
-    crate::testkit::file(
-        &world.pool,
-        &world.codecs,
-        &answer(waiting, "waiting", "module away"),
-        a,
-        &(),
-    )
-    .await;
     assert_eq!(state_of(&overview, b).0, ReplicaState::CatchingUp);
 
     let mut conn = world.pool.acquire().await.unwrap();
@@ -475,7 +539,7 @@ async fn a_replica_with_a_wish_to_carry_out_is_catching_up(pool: crate::DbPool) 
     let json =
         serde_json::to_string_pretty(&stable.of(serde_json::to_value(&listing).unwrap())).unwrap();
     let text = format!(
-        "// Generated by magic_sync's `a_replica_with_a_wish_to_carry_out_is_catching_up`: \
+        "// Generated by magic_sync's `a_replica_with_a_wish_unanswered_is_catching_up`: \
          UPDATE_CONTRACT=1 rewrites it.\n\
          import type {{ WishListing }} from '../types.js'\n\n\
          export default {json} satisfies WishListing\n"
@@ -547,11 +611,18 @@ impl World {
     /// Passes, deliveries and uploads until nothing moves: each replica
     /// says what it applied and sends what it wrote, the server files it and
     /// answers; a snapshot beginning has a replica say its settings again.
-    async fn settle_wishes(&self, wire: &Wire, replicas: &mut BTreeMap<Uuid, Walked>) {
+    async fn settle_wishes(
+        &self,
+        wire: &Wire,
+        replicas: &mut BTreeMap<Uuid, Walked>,
+        walk: &mut crate::testkit::Walk,
+    ) {
         // Time enough passes for every wait to be over: a replica that
-        // asks to be provisioned again too soon is, then.
+        // asks to be provisioned again too soon is, then, and digests are
+        // compared, and acted on, again.
         sqlx::raw_sql(
-            "UPDATE sync.replicas SET retry_after = NULL, asked_at = NULL; \
+            "UPDATE sync.replicas SET retry_after = NULL, asked_at = NULL, compared_at = NULL, \
+                    drifted_at = NULL; \
              UPDATE sync.notes SET noted_at = now() WHERE noted_at > now()",
         )
         .execute(&self.pool)
@@ -583,16 +654,26 @@ impl World {
                     wire.acknowledge(*replica);
                     moved = true;
                 }
-                if let Some(up) = walked.model.up() {
-                    crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &()).await;
-                    walked.model.delivered(&up);
-                    moved = true;
-                }
-                if let Some(up) = walked.holder.up(write_setting) {
-                    crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &()).await;
-                    walked.holder.filed(&up.uploads);
-                    walked.holder.forget(&walked.model);
-                    moved = true;
+                // What it applied and what it wrote, in either order — its
+                // writes now and then before its confirmation — and the
+                // answer to an upload now and then lost: it goes again.
+                let first = walk.below(2) == 0;
+                for confirming in [first, !first] {
+                    if confirming {
+                        if let Some(up) = walked.model.up() {
+                            crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &())
+                                .await;
+                            walked.model.delivered(&up);
+                            moved = true;
+                        }
+                    } else if let Some(up) = walked.holder.up(write_setting) {
+                        crate::testkit::file(&self.pool, &self.codecs, &up, *replica, &()).await;
+                        if walk.below(5) > 0 {
+                            walked.holder.filed(&up.uploads);
+                            walked.holder.forget(&walked.model);
+                        }
+                        moved = true;
+                    }
                 }
             }
             if !moved {
@@ -694,7 +775,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
         ["screens", "dials"]
             .into_iter()
             .flat_map(|table| {
-                (1..=2_u128).map(move |id| {
+                (1..=3_u128).map(move |id| {
                     (
                         table.to_owned(),
                         format!("{replica}|{}", Uuid::from_u128(id)),
@@ -704,11 +785,14 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
             .collect()
     };
     for (replica, w) in &mut walked {
-        for row in rows(*replica) {
+        for row in rows(*replica)
+            .into_iter()
+            .filter(|(_, key)| !key.ends_with('3'))
+        {
             w.holder.write(&row, 0);
         }
     }
-    world.settle_wishes(&wire, &mut walked).await;
+    world.settle_wishes(&wire, &mut walked, &mut walk).await;
     // Per replica, each wish it answered for good since its database was
     // last restored: its handler is never handed one of them again.
     let mut answered: BTreeMap<Uuid, BTreeSet<(String, u64)>> = BTreeMap::new();
@@ -716,7 +800,8 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
     // What the walk did, so that a seed that misses a case says so.
     let mut did: BTreeSet<&str> = BTreeSet::new();
     let mut backed_up = false;
-    for _ in 0..160 {
+    let mut uploaded = false;
+    for _ in 0..240 {
         let replica = walk.pick(&world.replicas).unwrap();
         let all = rows(replica);
         let row = all[walk.below(all.len())].clone();
@@ -739,7 +824,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                         level,
                         revision: based,
                     };
-                    crate::wish::desire(&mut tx, &world.codecs, wanted, None)
+                    crate::wish::desire(&mut tx, &world.engine, &world.codecs, wanted, None)
                         .await
                         .unwrap();
                 } else {
@@ -749,7 +834,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                         level,
                         revision: based,
                     };
-                    crate::wish::desire(&mut tx, &world.codecs, wanted, None)
+                    crate::wish::desire(&mut tx, &world.engine, &world.codecs, wanted, None)
                         .await
                         .unwrap();
                 }
@@ -762,24 +847,47 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                 ];
                 let mut tx = world.pool.begin().await.unwrap();
                 if table == "screens" {
-                    crate::wish::withdraw::<Screen>(&mut tx, &key)
+                    crate::wish::withdraw::<Screen, ()>(&mut tx, &world.codecs, &key)
                         .await
                         .unwrap();
                 } else {
-                    crate::wish::withdraw::<Dial>(&mut tx, &key).await.unwrap();
+                    crate::wish::withdraw::<Dial, ()>(&mut tx, &world.codecs, &key)
+                        .await
+                        .unwrap();
                 }
                 tx.commit().await.unwrap();
             }
-            38..53 => {
+            38..47 => {
                 let level = walk.below(100) as i64 + 1;
                 walked.get_mut(&replica).unwrap().holder.write(&row, level);
+            }
+            47..50 => walked.get_mut(&replica).unwrap().holder.delete(&row),
+            50..52 => {
+                // Its writes go up, and nothing comes down: a server
+                // restored right after has forgotten them, and only a
+                // digest says so.
+                let w = walked.get_mut(&replica).unwrap();
+                if let Some(up) = w.holder.up(write_setting) {
+                    crate::testkit::file(&world.pool, &world.codecs, &up, replica, &()).await;
+                    w.holder.filed(&up.uploads);
+                    w.holder.forget(&w.model);
+                    uploaded |= backed_up;
+                }
+            }
+            52..53 => {
+                let w = &walked[&replica];
+                let mut up = w.model.digests(&[]);
+                up.digests = w
+                    .holder
+                    .digests(&w.model, &["screens", "dials", crate::wish::TABLE]);
+                crate::testkit::file(&world.pool, &world.codecs, &up, replica, &()).await;
             }
             53..73 => {
                 let w = walked.get_mut(&replica).unwrap();
                 let choice = walk.below(100);
                 let handled = w.holder.carry(&w.model, read_setting, |_| match choice {
-                    0..60 => Handled::Applied,
-                    60..75 => Handled::Refused,
+                    0..55 => Handled::Applied,
+                    55..80 => Handled::Refused,
                     _ => Handled::Later,
                 });
                 let done = answered.entry(replica).or_default();
@@ -799,7 +907,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                     }
                 }
             }
-            73..90 => world.settle_wishes(&wire, &mut walked).await,
+            73..90 => world.settle_wishes(&wire, &mut walked, &mut walk).await,
             90..93 => {
                 copies.insert(replica, walked[&replica].clone());
             }
@@ -812,16 +920,28 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                     did.insert("a replica restored");
                 }
             }
-            96..98 => {
-                crate::testkit::back_up(
-                    &mut world.pool.acquire().await.unwrap(),
-                    &["fixture", "sync"],
-                )
-                .await;
-                backed_up = true;
-            }
             _ => {
-                if std::mem::take(&mut backed_up) {
+                if !backed_up {
+                    crate::testkit::back_up(
+                        &mut world.pool.acquire().await.unwrap(),
+                        &["fixture", "sync"],
+                    )
+                    .await;
+                    backed_up = true;
+                } else {
+                    backed_up = false;
+                    if walk.below(2) == 0 {
+                        let w = walked.get_mut(&replica).unwrap();
+                        w.holder.write(&row, walk.below(100) as i64 + 1);
+                        let up = w.holder.up(write_setting).unwrap();
+                        crate::testkit::file(&world.pool, &world.codecs, &up, replica, &()).await;
+                        w.holder.filed(&up.uploads);
+                        w.holder.forget(&w.model);
+                        uploaded = true;
+                    }
+                    if std::mem::take(&mut uploaded) {
+                        did.insert("uploads only, then the server restored");
+                    }
                     // A server restored from an older copy wishes again
                     // what it wished then: a wish answered since may be
                     // carried out again.
@@ -841,13 +961,17 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
     // replica says what it holds, which finds a server restored from an
     // older copy.
     for _ in 0..10 {
-        world.settle_wishes(&wire, &mut walked).await;
+        world.settle_wishes(&wire, &mut walked, &mut walk).await;
         let mut moved = false;
         for (replica, w) in &mut walked {
-            let up = w.model.digests(&["sync_wishes"]);
+            let mut up = w.model.digests(&[]);
+            up.digests = w
+                .holder
+                .digests(&w.model, &["screens", "dials", crate::wish::TABLE]);
             crate::testkit::file(&world.pool, &world.codecs, &up, *replica, &()).await;
             let handled = w.holder.carry(&w.model, read_setting, |wish| {
                 if wish.version % 3 == 0 {
+                    did.insert("refused");
                     Handled::Refused
                 } else {
                     Handled::Applied
@@ -855,7 +979,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
             });
             moved |= !handled.is_empty();
         }
-        world.settle_wishes(&wire, &mut walked).await;
+        world.settle_wishes(&wire, &mut walked, &mut walk).await;
         if !moved && walked.values().all(|w| w.holder.noted().is_empty()) {
             break;
         }
@@ -865,6 +989,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
         BTreeSet::from([
             "a replica restored",
             "the server restored",
+            "uploads only, then the server restored",
             "applied",
             "refused",
             "superseded"

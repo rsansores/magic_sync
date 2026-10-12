@@ -140,7 +140,7 @@ impl<P: Sync + 'static> Codec<P> {
     {
         Self::typed(
             std::any::type_name::<M>(),
-            Box::new(move |row: R| {
+            std::sync::Arc::new(move |row: R| {
                 to(row)
                     .map(|m| m.encode_to_vec())
                     .map_err(|e| Error::Misuse(format!("`{}` does not encode: {e}", R::TABLE)))
@@ -174,10 +174,45 @@ impl<P: Sync + 'static> Codec<P> {
         let columns_back = columns.clone();
         Self::typed(
             "json",
-            Box::new(move |row: R| json_encode(R::TABLE, &columns, &row)),
+            std::sync::Arc::new(move |row: R| json_encode(R::TABLE, &columns, &row)),
             Box::new(move |bytes: &[u8]| json_decode(R::TABLE, &columns_back, bytes)),
             place,
         )
+    }
+
+    /// A codec of the engine's own, whose `ops` are its own.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn custom(table: Table, ops: Box<dyn Ops<P>>) -> Self {
+        Self { table, ops }
+    }
+
+    /// What builds a row of this table, as a wish of it wants it, to send:
+    /// `None` but for a setting.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn builder(&self) -> Option<std::sync::Arc<dyn Build>> {
+        self.ops.builder()
+    }
+
+    /// Every row — of the replica `of`, when given — as the `key \t version`
+    /// lines a digest of a setting fingerprints.
+    pub(crate) fn versions<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        of: Option<Uuid>,
+    ) -> Fut<'a, Vec<String>> {
+        self.ops.versions(conn, of)
+    }
+
+    /// Lets go of every row of `replica`, by the table's origin.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64> {
+        self.ops.delete_of(conn, replica)
+    }
+
+    /// Its table, and what it does with rows.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn into_parts(self) -> (Table, Box<dyn Ops<P>>) {
+        (self.table, self.ops)
     }
 
     /// The codec of `R`, encoded and decoded so.
@@ -252,33 +287,8 @@ impl<P: Sync + 'static> Codec<P> {
             .collect()
     }
 
-    /// `row`, encoded as this table's: refused when `R` is not the table's
-    /// row.
-    #[cfg(feature = "postgres")]
-    pub(crate) fn encode_row<R: Row>(&self, row: R) -> Result<Vec<u8>, Error> {
-        self.ops.encode_any(Box::new(row))
-    }
-
-    /// `bytes`, decoded as this table's row: refused when `R` is not the
-    /// table's row, or the bytes do not decode ([`Error::Malformed`]).
-    #[cfg(feature = "postgres")]
-    pub(crate) fn decode_row<R: Row>(&self, bytes: &[u8]) -> Result<R, Error> {
-        self.decode_any(bytes)?
-            .downcast::<R>()
-            .map(|row| *row)
-            .map_err(|_| self.not_its_row::<R>())
-    }
-
-    #[cfg(feature = "postgres")]
-    fn not_its_row<R: Row>(&self) -> Error {
-        Error::Misuse(format!(
-            "`{}` is not the row of the table `{}`",
-            std::any::type_name::<R>(),
-            self.table.name
-        ))
-    }
-
     /// `bytes`, decoded as this table's row, its type erased.
+    #[cfg(feature = "sqlite")]
     pub(crate) fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
         self.ops.decode_any(bytes)
     }
@@ -307,7 +317,8 @@ impl<P: Sync + 'static> Codec<P> {
     }
 
     /// The server writing what a replica sent: a record first-delivery-wins
-    /// (or newest-wins when it carries a version), a two-way table only the
+    /// (or newest-wins when it carries a version), a setting newest-wins — or
+    /// whatever its version, when `restated` — a two-way table only the
     /// columns the replica owns, of a row the server has and records `sender`
     /// holding; a catalog is refused. `sender` is the replica
     /// the message came from; `known` is the server's knowledge of it. Answers
@@ -321,8 +332,9 @@ impl<P: Sync + 'static> Codec<P> {
         rows: Vec<Vec<u8>>,
         sender: Uuid,
         known: &'a P,
+        restated: bool,
     ) -> Fut<'a, Taken> {
-        self.ops.apply_up(conn, rows, sender, known)
+        self.ops.apply_up(conn, rows, sender, known, restated)
     }
 
     /// A replica letting rows go together: deleted, or retired where a row
@@ -467,6 +479,63 @@ impl<P: Sync + 'static> Codec<P> {
     }
 }
 
+/// Builds the row a wish of a setting wants, to send it: the row as the
+/// server holds it — or as the wish was written, when it holds none — with
+/// the wish's desired columns and version laid over it, encoded as the
+/// table's codec encodes it now.
+#[cfg(feature = "postgres")]
+pub(crate) trait Build: Send + Sync {
+    /// The row of `key` (as its text) as `whole` — the row the host wished,
+    /// as [`row::as_json`] wrote it — wants it, encoded.
+    fn wanted<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        key: &'a str,
+        whole: &'a serde_json::Value,
+    ) -> Fut<'a, Vec<u8>>;
+}
+
+#[cfg(feature = "postgres")]
+struct Builder<R> {
+    encode: Encode<R>,
+}
+
+#[cfg(feature = "postgres")]
+impl<R: Row + Clone + Send + Sync> Build for Builder<R> {
+    fn wanted<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        key: &'a str,
+        whole: &'a serde_json::Value,
+    ) -> Fut<'a, Vec<u8>> {
+        Box::pin(async move {
+            let table = Table::of::<R>();
+            let key_columns: Vec<row::Column> = table
+                .key
+                .iter()
+                .filter_map(|k| table.columns.iter().find(|c| c.name == *k).copied())
+                .collect();
+            let key = crate::plan::parse_key(&key_columns, key)?;
+            let laid: serde_json::Map<String, serde_json::Value> = whole
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(name, _)| {
+                    table.columns.iter().any(|c| {
+                        c.name == name.as_str()
+                            && (c.desired || c.key.is_some() || c.version.is_some())
+                    })
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let row = row::laid_over::<R>(conn, &key, whole, &serde_json::Value::Object(laid))
+                .await?
+                .ok_or_else(|| Error::Misuse(format!("`{}`: no row to send", R::TABLE)))?;
+            (self.encode)(row)
+        })
+    }
+}
+
 /// Things by their place in a message's rows.
 type Placed<T> = Vec<(usize, T)>;
 
@@ -497,10 +566,9 @@ pub(crate) struct Encoded {
     pub(crate) failed: Vec<(Key, Error)>,
 }
 
-trait Ops<P>: Send + Sync {
+pub(crate) trait Ops<P>: Send + Sync {
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded>;
-    #[cfg(feature = "postgres")]
-    fn encode_any(&self, row: Box<dyn std::any::Any + Send>) -> Result<Vec<u8>, Error>;
+    #[cfg(feature = "sqlite")]
     fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error>;
     #[cfg(feature = "sqlite")]
     fn apply_down<'a>(
@@ -515,7 +583,18 @@ trait Ops<P>: Send + Sync {
         rows: Vec<Vec<u8>>,
         sender: Uuid,
         known: &'a P,
+        restated: bool,
     ) -> Fut<'a, Taken>;
+    /// What builds a row of the table as a wish of it wants it: `None` but
+    /// for a setting.
+    #[cfg(feature = "postgres")]
+    fn builder(&self) -> Option<std::sync::Arc<dyn Build>>;
+    /// Every row — of the replica `of`, when given — as `key \t version`
+    /// lines.
+    fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>>;
+    /// Lets go of every row of `replica`.
+    #[cfg(feature = "postgres")]
+    fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64>;
     #[cfg(feature = "sqlite")]
     fn retire<'a>(
         &'a self,
@@ -560,9 +639,9 @@ enum How {
     /// The server taking state a replica reports: newest wins.
     #[cfg(feature = "postgres")]
     Newest,
-    /// The server taking a setting: what the replica sent last wins,
-    /// whatever its version — a replica restored from an older copy holds
-    /// an older version, and that is what the setting is.
+    /// The server taking a setting the replica re-states: what it says it
+    /// holds wins, whatever its version — a replica restored from an older
+    /// copy holds an older version, and that is what the setting is.
     #[cfg(feature = "postgres")]
     Latest,
     /// The server taking history a replica records: first delivery wins.
@@ -570,7 +649,7 @@ enum How {
     First,
 }
 
-type Encode<R> = Box<dyn Fn(R) -> Result<Vec<u8>, Error> + Send + Sync>;
+type Encode<R> = std::sync::Arc<dyn Fn(R) -> Result<Vec<u8>, Error> + Send + Sync>;
 type Decode<R> = Box<dyn Fn(&[u8]) -> Result<R, Error> + Send + Sync>;
 
 struct Typed<R, P> {
@@ -832,17 +911,7 @@ where
         })
     }
 
-    #[cfg(feature = "postgres")]
-    fn encode_any(&self, row: Box<dyn std::any::Any + Send>) -> Result<Vec<u8>, Error> {
-        let row = row.downcast::<R>().map_err(|_| {
-            Error::Misuse(format!(
-                "a row that is not `{}`'s, to encode as one",
-                R::TABLE
-            ))
-        })?;
-        (self.encode)(*row)
-    }
-
+    #[cfg(feature = "sqlite")]
     fn decode_any(&self, bytes: &[u8]) -> Result<Box<dyn std::any::Any + Send>, Error> {
         Ok(Box::new((self.decode)(bytes)?))
     }
@@ -886,12 +955,13 @@ where
         rows: Vec<Vec<u8>>,
         sender: Uuid,
         known: &'a P,
+        restated: bool,
     ) -> Fut<'a, Taken> {
         Box::pin(async move {
             let how = match R::MIRROR {
                 Mirror::Both => How::OnlyOwned(sender),
-                Mirror::Record if R::VERSION.is_some() => How::Newest,
-                Mirror::Setting => How::Latest,
+                Mirror::Setting if restated => How::Latest,
+                Mirror::Record | Mirror::Setting if R::VERSION.is_some() => How::Newest,
                 Mirror::Record => How::First,
                 _ => {
                     return Err(Error::Misuse(format!(
@@ -960,6 +1030,24 @@ where
     #[cfg(feature = "postgres")]
     fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
         Box::pin(row::delete_by_keys::<R>(conn, keys))
+    }
+
+    fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>> {
+        Box::pin(row::versions::<R>(conn, of))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64> {
+        Box::pin(row::delete_of::<R>(conn, replica))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn builder(&self) -> Option<std::sync::Arc<dyn Build>> {
+        (R::MIRROR == Mirror::Setting).then(|| {
+            std::sync::Arc::new(Builder {
+                encode: std::sync::Arc::clone(&self.encode),
+            }) as std::sync::Arc<dyn Build>
+        })
     }
 
     #[cfg(feature = "sqlite")]

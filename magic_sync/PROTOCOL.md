@@ -521,13 +521,18 @@ For a table the replica writes and the server mirrors:
    note again every row of its settings, and every answer it gave to a wish
    it holds (4.5): the server's record of them may be behind — it, or the
    replica, restored from an older copy — and is set straight by what the
-   replica says it holds now (A.3).
+   replica says it holds now (A.3). Such a note is **re-stated** until the
+   upload that carries it is filed, a later write of the row
+   notwithstanding: its row goes up in a part of its own, `restated` set.
 2. **Upload** noted rows, as they are **at upload time**, in an `Up`:
    - each row in `tables[].upserts`, encoded as its table's message;
    - a row that is gone by now, as its key in `tables[].deletes`, but only
      for a table keyed by the replica that wrote it: history a replica pruned
      is not the server's to delete;
    - one key per row in `tables[].keys`;
+   - `tables[].restated` set on a part of re-stated rows only: a table's
+     rows go in two parts when some are re-stated and some are not, and a
+     delete always goes in a part without it;
    - upserts parents first, in the order the tables point at one another,
      then deletes children first;
    - in `uploads`, the number of this upload: a **fresh** one on every send,
@@ -595,6 +600,17 @@ for each key, sorted:
 
 Test vectors: no keys → `0xcbf29ce484222325`; the single key `a` →
 `0x089bdc07b544e7b2`.
+
+It **should** report its settings and its answers as well, which the server
+records as the replica uploads them: a server restored from an older copy
+records what the replica said before, and no message it sends shows it. Their
+lines are fingerprinted the same way, and say more than the key:
+
+- a setting: each row it holds, as its key, a tab (`\t`), and its version as
+  text (4.5);
+- `sync_wishes`: each wish it holds, left out as above, as its key, a tab,
+  the version it answered, a tab, and the outcome — each empty for a wish it
+  has not answered.
 
 A replica **must** leave out of its digests every table of which it wrote
 rows the server has not filed yet (section 7): what the server records of
@@ -716,8 +732,9 @@ A replica implementation is complete when:
       no answer from the server, carries each out after the message that
       brought it is committed — superseded, unread or applied as 4.5 says —
       and records the answer, with the row it wrote, in one transaction;
-      and notes every setting and every answer again when a snapshot
-      begins (section 7).
+      notes every setting and every answer again when a snapshot begins,
+      and sends them re-stated until filed (section 7); its digests, if it
+      reports them, include its settings and its answers (section 8).
 
 ---
 
@@ -822,12 +839,12 @@ delete filed later, from what the server kept, leaves the row held the same
 way: a delete of a row a replica does not hold changes nothing there. The server
 keeps, of each row, the newest upload of it: a later upload of the row replaces
 what it kept, or drops it once filed, so what is filed later never rolls the row
-back. A record with a version is filed only over an older version of it; a
-**setting** — a value the replica holds and acts on — is filed as the replica
-last sent it, whatever its version: one replica writes it, its uploads arrive in
-order, and each carries the row as it is, so the last is the replica's present,
-even when a replica restored from an older copy sends an older version. So it keeps a row only with its key in `keys`: one without is malformed,
-and left out. What the upload says of the replica — rejections, the last applied
+back. A record with a version is filed only over an older version of it, and so is
+a **setting** — a value the replica holds and acts on — but one in a part
+`restated` (section 7), which is filed whatever its version: it is what the
+replica holds now, even when a replica restored from an older copy says an older
+version. So it keeps a row only with its key in `keys`: one without is
+malformed, and left out. What the upload says of the replica — rejections, the last applied
 message, a gap, digests, the backlog — is filed apart from its rows, so neither
 holds back the other. Deletes of a table not keyed by the replica, and keys that
 are not the table's, are malformed and left out. An upload beyond the server's
@@ -865,12 +882,16 @@ repairs the row by hand.
 The server compares a digest only when the replica has applied every message
 recorded for it (the same epoch and last sequence, sealed by the server), and
 against what it recorded as of that message: when it has sent the replica
-more meanwhile, it waits for the next digests. If they differ, it
-provisions the replica again from scratch (4.2). Digests that differ again
+more meanwhile, it waits for the next digests. It compares a setting's
+against the rows of it it holds of that replica, and those of `sync_wishes`
+against the answers it keeps. If they differ, it provisions the replica again
+from scratch (4.2), having let go first of every row it holds of the replica's
+settings that differ: the replica re-states them as the snapshot begins
+(section 7). Digests that differ again
 within a day of the provisioning they caused are a bug no provisioning cures:
 the server logs them and does not act on them. A digest of a table the server
-does not send the replica — a later build's, or one it no longer sends — is
-skipped. Two digests of one table are malformed: none of that `Up`'s digests
+neither sends the replica nor holds as a setting — the replica's records, a
+later build's table, one it no longer mirrors — is skipped. Two digests of one table are malformed: none of that `Up`'s digests
 is compared. The server compares a replica's digests at most once every ten
 minutes: those that come sooner are not compared. A replica that skips
 digests loses only this safety net.
@@ -885,4 +906,11 @@ withdrawn is deleted, and taken back as a row is. It never sends an answer
 down. It files an answer as the edit of a two-way row it is (A.3): only while
 it records the replica holding the wish — so an answer to a wish withdrawn is
 left out — and keeps it beside the wish; a wish stands as its answer says
-only while that answer is of its version: `pending` until then.
+only while that answer is of its version: `pending` until then. A final answer
+— `applied`, `refused`, `superseded` — stands against a later upload of
+another answer to the same version, which the transport may have kept back,
+but for one re-stated (section 7). It keeps the row wished apart from any
+encoding, and encodes it as it sends the wish: the setting row it holds, or
+the one wished when it holds none, with the wished columns and the version the
+wish is based on laid over it. Table names beginning `sync_` are the
+engine's: no host table may take one.

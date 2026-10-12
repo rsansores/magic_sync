@@ -255,11 +255,13 @@ const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [
 /// script that also records the version it brings it to — `None` for a
 /// version no build of the engine has had yet. [`Server::install`] runs every
 /// step a database lacks, in order; a host with migrations runs each, in one
-/// of its own: the first before the migration that writes
-/// [`Engine::triggers`]' script, and each later one when a release brings it
-/// (its changelog says). A step is never edited once released.
+/// of its own: every step up to [`SERVER_SCHEMA_VERSION`], in order, before
+/// the migration that writes [`Engine::triggers`]' script, and each later one
+/// when a release brings it (its changelog says). A step is never edited once
+/// released.
 ///
 /// [`Server::install`]: crate::run::server::Server::install
+/// [`SERVER_SCHEMA_VERSION`]: crate::SERVER_SCHEMA_VERSION
 #[must_use]
 pub fn migration(version: i32) -> Option<String> {
     let step = MIGRATIONS.get(usize::try_from(version.checked_sub(1)?).ok()?)?;
@@ -915,9 +917,8 @@ impl Engine {
     /// For a host that has no migrations of its own. Run it before anything
     /// writes a mirrored table — a write before its trigger is never noted —
     /// on a connection that may create triggers. A host with migrations runs
-    /// [`migration`]`(1)` in one and writes each
-    /// table's triggers in the migration that creates it, as it does its
-    /// indexes; [`Engine::new`] refuses to start while one is missing.
+    /// every [`migration`] step in one and writes each table's triggers in
+    /// the migration that creates it, as it does its indexes; [`Engine::new`] refuses to start while one is missing.
     pub(crate) async fn install(
         conn: &mut Conn,
         tables: &[&Table],
@@ -979,7 +980,7 @@ impl Engine {
     /// The statements that create every trigger the server needs for
     /// `codecs`, one per line, read off the database `conn` is on: what a
     /// host with migrations writes in the migration that creates the tables —
-    /// after the engine's first step ([`migration`]) — and what
+    /// after every step of the engine's schema ([`migration`]) — and what
     /// [`Server::install`](crate::run::server::Server::install) runs. A mirrored table
     /// notes every write that changes a column it does not leave to the
     /// replicas, and refuses a truncate; a group table notes every write.
@@ -1015,8 +1016,7 @@ impl Engine {
         codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        crate::wish::unclaimed(codecs)?;
-        let wishes = crate::wish::wishes_for(codecs);
+        let wishes = crate::wish::engines(codecs)?;
         let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
         let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine
@@ -1047,8 +1047,7 @@ impl Engine {
         codecs: &[Codec<P>],
         replicas: Replicas,
     ) -> Result<String, Error> {
-        crate::wish::unclaimed(codecs)?;
-        let wishes = crate::wish::wishes_for(codecs);
+        let wishes = crate::wish::engines(codecs)?;
         let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
         let engine = Self::read(conn, &tables, replicas).await?;
         Ok(engine

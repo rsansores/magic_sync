@@ -91,7 +91,9 @@ the product:
 
 A replica's line says how many wishes of its settings it has not carried
 out, is waiting to, refused, or found changed there first ([Settings and
-wishes](settings.md)); a replica with one not carried out is catching up.
+wishes](settings.md)); a replica with one it has not answered is catching
+up. One waiting is answered — the replica tries it again by itself, and its
+reason says what it waits for — so it does not keep the replica from synced.
 `Engine::wishes` lists them — those that need attention first — for
 `WishList` to show, each with its replica's answer and why.
 

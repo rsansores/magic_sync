@@ -203,6 +203,7 @@ fn upserts(table: &str, rows: Vec<(WireKey, Vec<u8>)>) -> Table {
         upserts,
         deletes: Vec::new(),
         keys,
+        restated: false,
     }
 }
 
@@ -4882,7 +4883,7 @@ async fn live_triggers(conn: &mut sqlx::SqliteConnection) -> Vec<(String, String
 async fn the_triggers_script_runs_again_over_what_it_wrote(pool: SqlitePool) {
     let w = world(pool).await;
     let mut conn = w.pool.acquire().await.unwrap();
-    let script = triggers(&codecs());
+    let script = triggers(&codecs()).unwrap();
     let before = live_triggers(&mut conn).await;
 
     sqlx::raw_sql(&script)
@@ -4915,7 +4916,7 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
     let w = world(pool).await;
     let mut conn = w.pool.acquire().await.unwrap();
     check(&mut conn, &codecs()).await.expect("as installed");
-    let script = triggers(&codecs());
+    let script = triggers(&codecs()).unwrap();
     assert!(script.contains("sync_note_readings_update"));
 
     let cases = [
@@ -5004,7 +5005,7 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
     let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] =
-        [0xe5dd_b8ea_c465_953a, 0x0981_b07e_c108_212d];
+        [0xe5dd_b8ea_c465_953a, 0x3663_5d6b_eb53_4f77];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)

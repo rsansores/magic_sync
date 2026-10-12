@@ -364,7 +364,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         wanted: R,
         note: Option<&str>,
     ) -> Result<Wished, Error> {
-        crate::wish::desire(conn, &self.codecs, wanted, note).await
+        crate::wish::desire(conn, &self.engine, &self.codecs, wanted, note).await
     }
 
     /// Withdraws the wish of the setting row `key`, answered or not, in the
@@ -375,7 +375,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     ///
     /// [`Error::Database`] when the database fails.
     pub async fn withdraw<R: Setting>(&self, conn: &mut Conn, key: &Key) -> Result<bool, Error> {
-        crate::wish::withdraw::<R>(conn, key).await
+        crate::wish::withdraw::<R, _>(conn, &self.codecs, key).await
     }
 
     /// The wishes of the setting rows `keys` — those that have one — with

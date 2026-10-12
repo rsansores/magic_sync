@@ -13,9 +13,11 @@ CREATE TABLE sync.sync_wishes (
     replica_id   UUID NOT NULL,
     relation     TEXT NOT NULL,
     row_key      TEXT NOT NULL,
-    -- The row as wished, in the setting's own encoding: the replica takes its
-    -- desired columns, and, when `if_unchanged`, compares its version.
-    wanted       BYTEA NOT NULL,
+    -- The row as wished, as the setting's table writes it as JSON. What a
+    -- replica is sent is built from it when it is sent: the setting's row as
+    -- the server holds it then, the wish's desired columns and version laid
+    -- over it, encoded with the codec of the day.
+    wanted       JSONB NOT NULL,
     -- Drawn at random for every wish, never 0: only whether an answer is of
     -- this wish matters, and a server restored from an older copy draws
     -- others.
@@ -31,4 +33,4 @@ CREATE TABLE sync.sync_wishes (
 );
 
 CREATE INDEX sync_wishes_replica ON sync.sync_wishes (replica_id);
-CREATE INDEX sync_wishes_row ON sync.sync_wishes (relation, row_key);
+CREATE UNIQUE INDEX sync_wishes_row ON sync.sync_wishes (relation, row_key);

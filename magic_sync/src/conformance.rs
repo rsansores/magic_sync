@@ -647,7 +647,7 @@ mod server {
              VALUES ('0192f6a0-0000-7000-8000-00000000f001', '0192f6a0-0000-7000-8000-0000000000aa',
                      'screens',
                      '0192f6a0-0000-7000-8000-0000000000aa|0192f6a0-0000-7000-8000-00000000f002',
-                     convert_to('{\"replica_id\":\"0192f6a0-0000-7000-8000-0000000000aa\",\"id\":\"0192f6a0-0000-7000-8000-00000000f002\",\"level\":\"70\",\"revision\":\"3\"}', 'UTF8'),
+                     '{\"replica_id\":\"0192f6a0-0000-7000-8000-0000000000aa\",\"id\":\"0192f6a0-0000-7000-8000-00000000f002\",\"level\":70,\"revision\":3}',
                      7, false, 'ops');",
             None,
         ),
@@ -1106,8 +1106,10 @@ mod server {
                ('{REPLICA}', '0192f6a0-0000-7000-8000-000000000e01', 7, 1);
              INSERT INTO sync.sync_wishes (id, replica_id, relation, row_key, wanted, version,
                                            if_unchanged)
-             VALUES ('{WISHED}', '{REPLICA}', 'screens', '{REPLICA}|{SCREEN}', '\\x7b7d', 7, false),
-                    ('{WITHDRAWN}', '{REPLICA}', 'screens', '{REPLICA}|{OTHER_SCREEN}', '\\x7b7d',
+             VALUES ('{WISHED}', '{REPLICA}', 'screens', '{REPLICA}|{SCREEN}',
+                     '{{\"replica_id\":\"{REPLICA}\",\"id\":\"{SCREEN}\",\"level\":70,\"revision\":1}}', 7, false),
+                    ('{WITHDRAWN}', '{REPLICA}', 'screens', '{REPLICA}|{OTHER_SCREEN}',
+                     '{{\"replica_id\":\"{REPLICA}\",\"id\":\"{OTHER_SCREEN}\",\"level\":70,\"revision\":1}}',
                      8, false);"
         ))
         .execute(&mut *conn)
@@ -1193,6 +1195,7 @@ mod server {
                 .unwrap()],
                 keys: vec![key(&["0192f6a0-0000-7000-8000-000000000d01"])],
                 deletes: Vec::new(),
+                restated: false,
             }],
             ..up(0x0192_f6a0_0000_7002)
         };
@@ -1239,29 +1242,30 @@ mod server {
         };
         // Its answer to a wish, as it sends one up: the wish as it holds
         // it, and its own columns.
-        let answer = |id: &str, screen: &str, version: u64, number: u64| Up {
+        let answer = |id: &str, screen: &str, version: u64, outcome: &str, number: u64| Up {
             tables: vec![Table {
                 table: "sync_wishes".to_owned(),
                 upserts: vec![crate::envelope::Wish {
                     id: id.to_owned(),
-                    replica_id: REPLICA.to_owned(),
                     table: "screens".to_owned(),
                     key: Some(key(&[REPLICA, screen])),
                     wanted: b"{}".to_vec(),
                     version,
                     answered: version,
-                    outcome: "applied".to_owned(),
+                    outcome: outcome.to_owned(),
                     answered_at: "2027-01-15T08:00:02.000000Z".to_owned(),
                     ..crate::envelope::Wish::default()
                 }
                 .encode_to_vec()],
                 keys: vec![key(&[id])],
                 deletes: Vec::new(),
+                restated: false,
             }],
             ..up(number)
         };
-        // A setting of its own, as it is.
-        let setting = |level: i64, revision: i64, number: u64| Up {
+        // A setting of its own, as it is: re-stated, as a snapshot begins,
+        // or not.
+        let setting = |level: i64, revision: i64, restated: bool, number: u64| Up {
             tables: vec![Table {
                 table: "screens".to_owned(),
                 upserts: vec![crate::wire::json_encode(
@@ -1277,6 +1281,7 @@ mod server {
                 .unwrap()],
                 keys: vec![key(&[REPLICA, SCREEN])],
                 deletes: Vec::new(),
+                restated,
             }],
             ..up(number)
         };
@@ -1287,22 +1292,34 @@ mod server {
             (
                 "answer",
                 "filed,answered",
-                answer(WISHED, SCREEN, 7, 0x0192_f6a0_0000_7004),
+                answer(WISHED, SCREEN, 7, "applied", 0x0192_f6a0_0000_7004),
+            ),
+            // An answer of the same wish held back by the transport: the
+            // final one stands.
+            (
+                "answer_late",
+                "filed,answered",
+                answer(WISHED, SCREEN, 7, "waiting", 0x0192_f6a0_0000_7008),
             ),
             (
                 "answer_withdrawn",
                 "filed,unheld",
-                answer(WITHDRAWN, OTHER_SCREEN, 8, 0x0192_f6a0_0000_7005),
+                answer(WITHDRAWN, OTHER_SCREEN, 8, "applied", 0x0192_f6a0_0000_7005),
             ),
             (
                 "setting",
                 "filed,set",
-                setting(40, 9, 0x0192_f6a0_0000_7006),
+                setting(40, 9, false, 0x0192_f6a0_0000_7006),
             ),
             (
                 "setting_older",
+                "filed,kept",
+                setting(20, 3, false, 0x0192_f6a0_0000_7007),
+            ),
+            (
+                "setting_restated",
                 "filed,set",
-                setting(20, 3, 0x0192_f6a0_0000_7007),
+                setting(20, 3, true, 0x0192_f6a0_0000_7009),
             ),
             ("edit", "filed,edited", edit),
             ("delete", "filed,gone", delete),
@@ -1328,7 +1345,8 @@ mod server {
                       # quarantined: the row it refused set aside; held_back: the row of its\n\
                       # own it held back set aside, with no alarm; answered: its answer to a\n\
                       # wish kept beside it; unheld: its answer to a wish withdrawn left out;\n\
-                      # set: its setting written, older version or not; provisioned: provisioned\n\
+                      # set: its setting written; kept: an older version of its setting, not\n\
+                      # re-stated, left out; provisioned: provisioned\n\
                       # again; restored: a new epoch, every replica provisioned again. Each\n\
                       # after a provisioning, a change and a take-back the replica applied.\n\
                       # Generated and filed by conformance::server.\n";
@@ -1407,21 +1425,22 @@ mod server {
                             && scalar("SELECT count(*) FROM sync.inbox WHERE $1 IS NOT NULL").await
                                 == 0
                     }
-                    "set" => {
+                    "set" | "kept" => {
                         let screen = crate::wire::json_decode::<Screen>(
                             "screens",
                             &crate::row::Table::of::<Screen>().columns,
                             &up.tables[0].upserts[0],
                         )
                         .unwrap();
-                        sqlx::query_as::<_, (i64, i64)>(
+                        (sqlx::query_as::<_, (i64, i64)>(
                             "SELECT level, revision FROM fixture.screens WHERE replica_id = $1",
                         )
                         .bind(replica)
                         .fetch_one(&pool)
                         .await
                         .unwrap()
-                            == (screen.level, screen.revision)
+                            == (screen.level, screen.revision))
+                            == (*outcome == "set")
                     }
                     "provisioned" => scalar(resyncs).await == 1,
                     "restored" => {

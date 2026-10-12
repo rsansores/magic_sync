@@ -139,18 +139,26 @@ export function percent(share: number): number {
   return Math.floor(share * 100)
 }
 
+/** The engine's name for a table of its own, which no host labels: its
+ * wishes travel as the rows of `sync_wishes`. */
+export function engineTableLabel(table: string, t: Translate): string | undefined {
+  return table === 'sync_wishes' ? t('table.sync_wishes') : undefined
+}
+
 /** A replica's state in a word; an unknown one is named as it came. */
 export function describeState(state: string, t: Translate): string {
   return knowsReplicaState(state) ? t(`state.${state}`) : t('state.unknown', { state })
 }
 
-/** What a row is to a replica: its mood, and the word for it. An unknown
- * state is named as it came, neither settled nor a problem. */
+/** Where a wish stands: its mood, and the word for it. An unknown state is
+ * named as it came, neither settled nor a problem. */
 export function describeWish(state: string, t: Translate): { mood: PlaceMood; label: string } {
   const mood = wishMoodOf(state)
   return { mood, label: mood === 'unknown' ? t('wish.unknown', { state }) : t(`wish.${state}`) }
 }
 
+/** What a row is to a replica: its mood, and the word for it. An unknown
+ * state is named as it came, neither settled nor a problem. */
 export function describePlace(state: string, t: Translate): { mood: PlaceMood; label: string } {
   const mood = placeMoodOf(state)
   return { mood, label: mood === 'unknown' ? t('row.unknown', { state }) : t(`row.${state}`) }

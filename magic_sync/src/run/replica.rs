@@ -9,7 +9,8 @@ use crate::envelope::Limits;
 use crate::replica::{self, Care, Lane, Outbox, Received, Stop};
 use crate::run::Backoff;
 use crate::wire::Codec;
-use crate::wish::{Offered, Run, Wishes};
+pub use crate::wish::{CarryOut, Direct, Outcome, Wish, Wishes};
+use crate::wish::{Offered, Run};
 use crate::{Conn, Error};
 use sqlx::SqlitePool;
 use std::future::Future;
@@ -349,7 +350,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
 
     /// Offers every wish not carried out yet to its handler now, rather than
     /// at the next message or `wishes_every`: for a host whose handler said
-    /// [`Later`](crate::wish::Outcome::Later) and can now — a module came
+    /// [`Later`](Outcome::Later) and can now — a module came
     /// back. Wishes are offered while [`Replica::run`] runs.
     pub fn offer_wishes(&self) {
         self.offer.notify_one();

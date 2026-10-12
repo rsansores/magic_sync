@@ -7,6 +7,7 @@ import {
   describeState,
   describeTable,
   describeWish,
+  engineTableLabel,
   mismatchOf,
   type Speech,
 } from './describe.js'
@@ -130,5 +131,11 @@ describe('wishes', () => {
     expect(describeWish('applied', t)).toEqual({ mood: 'holds', label: 'Applied' })
     expect(describeWish('waiting', t).mood).toBe('moving')
     expect(describeWish('postponed', t)).toEqual({ mood: 'unknown', label: 'Unknown (postponed)' })
+  })
+
+  it("labels the engine's table of wishes, and no table of the host's", () => {
+    expect(engineTableLabel('sync_wishes', translator('en'))).toBe('Wishes')
+    expect(engineTableLabel('sync_wishes', translator('es'))).toBe('Ajustes pedidos')
+    expect(engineTableLabel('receipts', translator('en'))).toBeUndefined()
   })
 })

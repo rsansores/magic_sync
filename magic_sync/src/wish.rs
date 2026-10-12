@@ -16,7 +16,9 @@
 //! every row is, and a replica that predates wishes rejects it as a table it
 //! does not know, which shows as a row set aside for it.
 
-use crate::envelope::{self, Key as WireKey};
+#[cfg(feature = "sqlite")]
+use crate::envelope;
+use crate::envelope::Key as WireKey;
 use crate::wire::{Codec, MapError};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -24,22 +26,32 @@ use uuid::Uuid;
 /// The engine's table of wishes, as both sides hold it.
 pub(crate) const TABLE: &str = "sync_wishes";
 
-/// A row of `sync_wishes`.
+/// The prefix of every table the engine keeps, on either side: no host
+/// table may begin so.
+pub(crate) const RESERVED: &str = "sync_";
+
+/// A row of `sync_wishes`. The server keeps the row a wish wants as the
+/// setting's table writes it as JSON, and builds the bytes that carry it
+/// when it sends it, with the codec of the day; a replica keeps those bytes.
 #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
 #[row(
     crate = "crate",
     table = "sync_wishes",
     schema = "sync",
     mirror = "both",
-    sync = "assigned(replica_id)",
     retired = "retired_at",
     unmirrored = "wished_at"
 )]
+#[cfg_attr(feature = "postgres", row(sync = "assigned(replica_id)"))]
 pub(crate) struct WishRow {
     pub(crate) id: Uuid,
+    #[cfg(feature = "postgres")]
     pub(crate) replica_id: Uuid,
     pub(crate) relation: String,
     pub(crate) row_key: String,
+    #[cfg(feature = "postgres")]
+    pub(crate) wanted: serde_json::Value,
+    #[cfg(feature = "sqlite")]
     pub(crate) wanted: Vec<u8>,
     pub(crate) version: i64,
     pub(crate) if_unchanged: bool,
@@ -54,42 +66,6 @@ pub(crate) struct WishRow {
     pub(crate) answered_at: Option<DateTime<Utc>>,
 }
 
-/// The answers a replica gives, as they are written.
-#[cfg(feature = "postgres")]
-pub(crate) const OUTCOMES: [&str; 4] = ["applied", "refused", "superseded", "waiting"];
-
-fn to_wire(row: WishRow) -> Result<envelope::Wish, MapError> {
-    // The answer is the replica's: the server never sends one down, so a
-    // replica that takes a wish it did not hold carries it out.
-    #[cfg(feature = "postgres")]
-    let (answered, outcome, reason, answered_at) = (0, String::new(), String::new(), String::new());
-    #[cfg(feature = "sqlite")]
-    let (answered, outcome, reason, answered_at) = (
-        row.answered.map(u64::try_from).transpose()?.unwrap_or(0),
-        row.outcome.unwrap_or_default(),
-        row.reason.unwrap_or_default(),
-        row.answered_at
-            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-            .unwrap_or_default(),
-    );
-    Ok(envelope::Wish {
-        id: row.id.to_string(),
-        replica_id: row.replica_id.to_string(),
-        table: row.relation,
-        key: Some(WireKey {
-            parts: row.row_key.split('|').map(str::to_owned).collect(),
-        }),
-        wanted: row.wanted,
-        version: u64::try_from(row.version)?,
-        if_unchanged: row.if_unchanged,
-        note: row.note.unwrap_or_default(),
-        answered,
-        outcome,
-        reason,
-        answered_at,
-    })
-}
-
 /// A number of the wire's that is 1 to 2^63 - 1, or none.
 fn positive(number: u64, what: &str) -> Result<Option<i64>, MapError> {
     match number {
@@ -100,74 +76,11 @@ fn positive(number: u64, what: &str) -> Result<Option<i64>, MapError> {
     }
 }
 
-/// A replica's answer, as the server reads it off a wish it sent up.
-#[cfg(feature = "postgres")]
-type Answer = (
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-    Option<DateTime<Utc>>,
-);
-
-#[cfg(feature = "postgres")]
-fn answer_of(wish: &envelope::Wish) -> Result<Answer, MapError> {
-    let outcome = (!wish.outcome.is_empty()).then(|| wish.outcome.clone());
-    if let Some(outcome) = outcome.as_deref() {
-        if !OUTCOMES.contains(&outcome) {
-            return Err(MapError::new(format!(
-                "an answer this build does not know: `{outcome}`"
-            )));
-        }
+/// The parts a wish's key travels as, from its text.
+fn parts_of(row_key: &str) -> WireKey {
+    WireKey {
+        parts: row_key.split('|').map(str::to_owned).collect(),
     }
-    let answered_at = match wish.answered_at.as_str() {
-        "" => None,
-        at => Some(DateTime::parse_from_rfc3339(at)?.with_timezone(&Utc)),
-    };
-    Ok((
-        positive(wish.answered, "an answer to version")?,
-        outcome,
-        (!wish.reason.is_empty()).then(|| wish.reason.clone()),
-        answered_at,
-    ))
-}
-
-fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
-    let parts = wish
-        .key
-        .as_ref()
-        .map(|k| k.parts.clone())
-        .unwrap_or_default();
-    if parts.is_empty() {
-        return Err(MapError::new("a wish of no row"));
-    }
-    let version =
-        positive(wish.version, "a version")?.ok_or_else(|| MapError::new("a wish of version 0"))?;
-    // A replica takes no answer from the server: its own are the only ones,
-    // and a wish it did not hold is one it has not answered.
-    #[cfg(feature = "postgres")]
-    let (answered, outcome, reason, answered_at) = answer_of(&wish)?;
-    #[cfg(feature = "sqlite")]
-    let (answered, outcome, reason, answered_at) = (None, None, None, None);
-    Ok(WishRow {
-        id: wish.id.parse()?,
-        replica_id: wish.replica_id.parse()?,
-        relation: wish.table,
-        row_key: parts.join("|"),
-        wanted: wish.wanted,
-        version,
-        if_unchanged: wish.if_unchanged,
-        note: (!wish.note.is_empty()).then_some(wish.note),
-        answered,
-        outcome,
-        reason,
-        answered_at,
-    })
-}
-
-/// The codec of `sync_wishes`, which the engine adds to a host's tables
-/// whenever one of them is a setting.
-fn codec<P: Sync + 'static>() -> Codec<P> {
-    Codec::new::<WishRow, envelope::Wish>(to_wire, from_wire, None)
 }
 
 /// `codecs`, with the engine's table of wishes after them when one of them
@@ -175,27 +88,150 @@ fn codec<P: Sync + 'static>() -> Codec<P> {
 ///
 /// # Errors
 ///
-/// [`crate::Error::Misuse`] for a host table named as the engine's.
+/// [`crate::Error::Misuse`] for a host table named as the engine's are.
 pub(crate) fn with_wishes<P: Sync + 'static>(
-    mut codecs: Vec<Codec<P>>,
+    codecs: Vec<Codec<P>>,
 ) -> Result<Vec<Codec<P>>, crate::Error> {
-    unclaimed(&codecs)?;
-    codecs.extend(wishes_for(&codecs));
+    let wishes = engines(&codecs)?;
+    let mut codecs = codecs;
+    codecs.extend(wishes);
     Ok(codecs)
 }
 
-/// Refuses a host table named as the engine's table of wishes.
+/// Refuses a host table named as the engine's are: `sync_…`.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Misuse`] for one.
 pub(crate) fn unclaimed<P>(codecs: &[Codec<P>]) -> Result<(), crate::Error> {
-    if codecs.iter().any(|c| c.table.name == TABLE) {
-        return Err(crate::Error::Misuse(format!(
-            "`{TABLE}` is the engine's table of wishes: a table of the host's needs another name"
-        )));
+    match codecs.iter().find(|c| c.table.name.starts_with(RESERVED)) {
+        Some(codec) => Err(crate::Error::Misuse(format!(
+            "`{}`: a table named `{RESERVED}…` is the engine's — a table of the host's needs \
+             another name",
+            codec.table.name
+        ))),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The engine's own tables for a host's `codecs`: the table of wishes,
+/// when one of them is a setting. A host table named as the engine's are is
+/// refused.
+///
+/// # Errors
+///
+/// [`crate::Error::Misuse`] for one.
+pub(crate) fn engines<P: Sync + 'static>(
+    codecs: &[Codec<P>],
+) -> Result<Option<Codec<P>>, crate::Error> {
+    unclaimed(codecs)?;
+    Ok(wishes_for(codecs))
+}
+
+#[cfg(feature = "sqlite")]
+fn to_wire(row: WishRow) -> Result<envelope::Wish, MapError> {
+    Ok(envelope::Wish {
+        id: row.id.to_string(),
+        table: row.relation,
+        key: Some(parts_of(&row.row_key)),
+        wanted: row.wanted,
+        version: u64::try_from(row.version)?,
+        if_unchanged: row.if_unchanged,
+        note: row.note.unwrap_or_default(),
+        answered: row.answered.map(u64::try_from).transpose()?.unwrap_or(0),
+        outcome: row.outcome.unwrap_or_default(),
+        reason: row.reason.unwrap_or_default(),
+        answered_at: row
+            .answered_at
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+            .unwrap_or_default(),
+    })
+}
+
+#[cfg(feature = "sqlite")]
+fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
+    let parts = wish.key.map(|k| k.parts).unwrap_or_default();
+    if parts.is_empty() {
+        return Err(MapError::new("a wish of no row"));
+    }
+    // A replica takes no answer from the server: its own are the only ones,
+    // and a wish it did not hold is one it has not answered.
+    Ok(WishRow {
+        id: wish.id.parse()?,
+        relation: wish.table,
+        row_key: parts.join("|"),
+        wanted: wish.wanted,
+        version: positive(wish.version, "a version")?
+            .ok_or_else(|| MapError::new("a wish of version 0"))?,
+        if_unchanged: wish.if_unchanged,
+        note: (!wish.note.is_empty()).then_some(wish.note),
+        answered: None,
+        outcome: None,
+        reason: None,
+        answered_at: None,
+    })
+}
+
+/// The codec of `sync_wishes` on a replica.
+#[cfg(feature = "sqlite")]
+fn codec<P: Sync + 'static>(_: &[Codec<P>]) -> Codec<P> {
+    Codec::new::<WishRow, envelope::Wish>(to_wire, from_wire, None)
+}
+
+/// What a digest of `sync_wishes` fingerprints: each wish of `keys` (their
+/// text) with the answer to it held here, `key \t answered \t outcome`,
+/// either empty with no answer — the answers, not only the wishes, are
+/// compared.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn answers(
+    conn: &mut crate::Conn,
+    keys: Vec<String>,
+) -> Result<Vec<String>, crate::Error> {
+    let answered: std::collections::HashMap<String, (Option<i64>, Option<String>)> =
+        sqlx::query_as::<_, (Uuid, Option<i64>, Option<String>)>(&format!(
+            "SELECT id, answered, outcome FROM {TABLE}"
+        ))
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|(id, answered, outcome)| (id.to_string(), (answered, outcome)))
+        .collect();
+    Ok(keys
+        .into_iter()
+        .map(|key| {
+            let (answered, outcome) = answered.get(&key).cloned().unwrap_or_default();
+            answer_line(&key, answered, outcome.as_deref())
+        })
+        .collect())
+}
+
+/// What the server compares a digest of `sync_wishes` with: each wish of
+/// `keys` it records the replica holding, with the answer it filed.
+#[cfg(feature = "postgres")]
+pub(crate) async fn answers(
+    conn: &mut crate::Conn,
+    keys: Vec<String>,
+) -> Result<Vec<String>, crate::Error> {
+    let answered: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT k, w.answered, w.outcome FROM unnest($1::text[]) AS k \
+           LEFT JOIN sync.{TABLE} w ON w.id::text = k"
+    ))
+    .bind(&keys)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(answered
+        .into_iter()
+        .map(|(key, answered, outcome)| answer_line(&key, answered, outcome.as_deref()))
+        .collect())
+}
+
+/// One wish's line in a digest of `sync_wishes`.
+fn answer_line(key: &str, answered: Option<i64>, outcome: Option<&str>) -> String {
+    format!(
+        "{key}\t{}\t{}",
+        answered.map(|a| a.to_string()).unwrap_or_default(),
+        outcome.unwrap_or_default()
+    )
 }
 
 /// The engine's table of wishes, when a host's `codecs` hold a setting.
@@ -203,21 +239,31 @@ pub(crate) fn wishes_for<P: Sync + 'static>(codecs: &[Codec<P>]) -> Option<Codec
     codecs
         .iter()
         .any(|c| c.table.mirror == crate::row::Mirror::Setting)
-        .then(codec)
+        .then(|| codec(codecs))
 }
 
 #[cfg(feature = "postgres")]
-pub use server::*;
+pub(crate) use server::{codec, desire, wishes, withdraw, STATE};
+#[cfg(feature = "postgres")]
+pub use server::{WishOf, Wished};
 
 #[cfg(feature = "postgres")]
 mod server {
-    use super::TABLE;
+    use super::{parts_of, positive, WishRow, TABLE};
+    use crate::envelope;
+    use crate::plan::Engine;
     use crate::row::{key_text, Key, Setting};
     use crate::status::WishState;
-    use crate::wire::Codec;
+    use crate::wire::{Build, Codec, Encoded, MapError, Ops, Taken};
     use crate::{Conn, Error};
     use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
     use uuid::Uuid;
+
+    type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
     /// A wish [`Server::desire`](crate::run::server::Server::desire) wrote.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +283,8 @@ mod server {
         pub key: Key,
         /// The row as wished: its desired columns are the wish.
         pub wanted: R,
+        /// This wish of the row: the one [`Wished::version`] names.
+        pub version: i64,
         /// Where the wish stands.
         pub state: WishState,
         /// Why, for an answer that says: refused, superseded or waiting.
@@ -269,13 +317,187 @@ mod server {
         "CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN coalesce(w.outcome, 'pending') \
               ELSE 'pending' END";
 
-    pub(crate) fn state_of(text: &str) -> WishState {
-        match text {
-            "applied" => WishState::Applied,
-            "refused" => WishState::Refused,
-            "superseded" => WishState::Superseded,
-            "waiting" => WishState::Waiting,
-            _ => WishState::Pending,
+    /// A replica's answer, as the server reads it off a wish it sent up.
+    fn from_wire(wish: envelope::Wish) -> Result<WishRow, MapError> {
+        let outcome = (!wish.outcome.is_empty()).then_some(wish.outcome);
+        if let Some(outcome) = outcome.as_deref() {
+            if WishState::of(outcome).is_none() || outcome == "pending" {
+                return Err(MapError::new(format!(
+                    "an answer this build does not know: `{outcome}`"
+                )));
+            }
+        }
+        let answered_at = match wish.answered_at.as_str() {
+            "" => None,
+            at => Some(DateTime::parse_from_rfc3339(at)?.with_timezone(&Utc)),
+        };
+        let parts = wish.key.map(|k| k.parts).unwrap_or_default();
+        Ok(WishRow {
+            id: wish.id.parse()?,
+            replica_id: Uuid::nil(),
+            relation: wish.table,
+            row_key: parts.join("|"),
+            wanted: serde_json::Value::Null,
+            version: positive(wish.version, "a version")?
+                .ok_or_else(|| MapError::new("a wish of version 0"))?,
+            if_unchanged: wish.if_unchanged,
+            note: (!wish.note.is_empty()).then_some(wish.note),
+            answered: positive(wish.answered, "an answer to version")?,
+            outcome,
+            reason: (!wish.reason.is_empty()).then_some(wish.reason),
+            answered_at,
+        })
+    }
+
+    /// A wish is built when it is sent, never from a row alone.
+    fn unbuilt(_: WishRow) -> Result<envelope::Wish, MapError> {
+        Err(MapError::new("a wish is built when it is sent"))
+    }
+
+    /// The codec of `sync_wishes` on the server, which builds each wish's
+    /// row from the setting's when it is sent.
+    pub(crate) fn codec<P: Sync + 'static>(codecs: &[Codec<P>]) -> Codec<P> {
+        let inner = Codec::new::<WishRow, envelope::Wish>(unbuilt, from_wire, None);
+        let builders = codecs
+            .iter()
+            .filter_map(|c| c.builder().map(|b| (c.table.name, b)))
+            .collect();
+        let (table, inner) = inner.into_parts();
+        Codec::custom(table, Box::new(Wishes { inner, builders }))
+    }
+
+    /// The wishes' operations: those of the table as any other, but that a
+    /// wish's row is built when it is sent, and that an answer to a wish is
+    /// final.
+    struct Wishes<P> {
+        inner: Box<dyn Ops<P>>,
+        builders: HashMap<&'static str, Arc<dyn Build>>,
+    }
+
+    impl<P: Sync> Wishes<P> {
+        async fn load(&self, conn: &mut Conn, keys: &[Key]) -> Result<Encoded, Error> {
+            let mut encoded = Encoded::default();
+            for row in crate::row::get_by_keys::<WishRow>(conn, keys).await? {
+                let key = row.key_of();
+                let built = match self.builders.get(row.relation.as_str()) {
+                    Some(builder) => builder.wanted(conn, &row.row_key, &row.wanted).await,
+                    None => Err(Error::Misuse(format!(
+                        "a wish of `{}`, which this build sends no setting of",
+                        row.relation
+                    ))),
+                };
+                match built {
+                    Ok(wanted) => {
+                        use prost::Message as _;
+                        let wish = envelope::Wish {
+                            id: row.id.to_string(),
+                            key: Some(parts_of(&row.row_key)),
+                            table: row.relation,
+                            wanted,
+                            version: u64::try_from(row.version).unwrap_or_default(),
+                            if_unchanged: row.if_unchanged,
+                            note: row.note.unwrap_or_default(),
+                            ..envelope::Wish::default()
+                        };
+                        encoded.rows.push((key, wish.encode_to_vec()));
+                    }
+                    Err(e) => encoded.failed.push((key, e)),
+                }
+            }
+            Ok(encoded)
+        }
+
+        /// The places of `rows` that, unless re-stated, would take a final
+        /// answer of a version back to another answer of it: an older
+        /// upload, filed late.
+        async fn stale(&self, conn: &mut Conn, rows: &[Vec<u8>]) -> Result<Vec<usize>, Error> {
+            use prost::Message as _;
+            let said: Vec<(usize, Uuid, i64, String)> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(at, bytes)| {
+                    let wish = envelope::Wish::decode(bytes.as_slice()).ok()?;
+                    let id = wish.id.parse().ok()?;
+                    let answered = i64::try_from(wish.answered).ok()?;
+                    Some((at, id, answered, wish.outcome))
+                })
+                .collect();
+            let finals: Vec<(Uuid, i64, String)> = sqlx::query_as(&format!(
+                "SELECT id, answered, outcome FROM sync.{TABLE} \
+                  WHERE id = ANY($1) AND outcome IN ('applied', 'refused', 'superseded')"
+            ))
+            .bind(said.iter().map(|(_, id, _, _)| *id).collect::<Vec<_>>())
+            .fetch_all(&mut *conn)
+            .await?;
+            Ok(said
+                .into_iter()
+                .filter(|(_, id, answered, outcome)| {
+                    finals.iter().any(|(fid, fanswered, foutcome)| {
+                        fid == id && fanswered == answered && foutcome != outcome
+                    })
+                })
+                .map(|(at, _, _, _)| at)
+                .collect())
+        }
+    }
+
+    impl<P: Sync + 'static> Ops<P> for Wishes<P> {
+        fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded> {
+            Box::pin(Wishes::load(self, conn, keys))
+        }
+
+        fn apply_up<'a>(
+            &'a self,
+            conn: &'a mut Conn,
+            rows: Vec<Vec<u8>>,
+            sender: Uuid,
+            known: &'a P,
+            restated: bool,
+        ) -> Fut<'a, Taken> {
+            Box::pin(async move {
+                let stale = if restated {
+                    Vec::new()
+                } else {
+                    self.stale(conn, &rows).await?
+                };
+                let kept: Vec<usize> = (0..rows.len()).filter(|at| !stale.contains(at)).collect();
+                let rows = rows
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(at, _)| !stale.contains(at))
+                    .map(|(_, row)| row)
+                    .collect();
+                let mut taken = self
+                    .inner
+                    .apply_up(conn, rows, sender, known, restated)
+                    .await?;
+                for refused in &mut taken.rejected {
+                    refused.at = kept[refused.at];
+                }
+                Ok(taken)
+            })
+        }
+
+        fn delete<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, u64> {
+            self.inner.delete(conn, keys)
+        }
+
+        fn builder(&self) -> Option<Arc<dyn Build>> {
+            None
+        }
+
+        fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>> {
+            self.inner.versions(conn, of)
+        }
+
+        fn delete_of<'a>(&'a self, conn: &'a mut Conn, replica: Uuid) -> Fut<'a, u64> {
+            self.inner.delete_of(conn, replica)
+        }
+    }
+
+    impl WishRow {
+        fn key_of(&self) -> Key {
+            vec![crate::row::KeyPart::Uuid(self.id)]
         }
     }
 
@@ -292,34 +514,38 @@ mod server {
     }
 
     /// The replica a setting row belongs to: its origin.
-    fn replica_of<R: Setting>(key: &Key) -> Result<Uuid, Error> {
+    fn replica_of<R: Setting>(key: &Key) -> Uuid {
         let origin = R::ORIGIN.expect("a setting has an origin");
         let at = R::KEY
             .iter()
             .position(|k| *k == origin)
             .expect("a setting's origin is a key column");
         match key.get(at) {
-            Some(crate::row::KeyPart::Uuid(replica)) => Ok(*replica),
-            _ => Err(Error::Misuse(format!(
-                "`{}`'s origin `{origin}` is not a uuid",
-                R::TABLE
-            ))),
+            Some(crate::row::KeyPart::Uuid(replica)) => *replica,
+            _ => unreachable!("the derive holds a setting's origin to a uuid"),
         }
     }
 
     pub(crate) async fn desire<R: Setting, P: Sync + 'static>(
         conn: &mut Conn,
+        engine: &Engine,
         codecs: &[Codec<P>],
         wanted: R,
         note: Option<&str>,
     ) -> Result<Wished, Error> {
-        let codec = codec_of::<R, P>(codecs)?;
+        codec_of::<R, P>(codecs)?;
         let key = wanted.key();
-        let replica = replica_of::<R>(&key)?;
+        let replica = replica_of::<R>(&key);
+        if !engine.is_replica(conn, replica).await? {
+            return Err(Error::Misuse(format!(
+                "a wish of a row of `{}` whose origin, {replica}, is no replica",
+                R::TABLE
+            )));
+        }
         let row_key = key_text(&key);
         let id = id_of(R::TABLE, &row_key);
         let version = i64::try_from(crate::envelope::nonce()).expect("a nonce is below 2^63");
-        let bytes = codec.encode_row(wanted)?;
+        let whole = crate::row::as_json(conn, wanted).await?;
         sqlx::query(&format!(
             "INSERT INTO sync.{TABLE} AS w \
                     (id, replica_id, relation, row_key, wanted, version, if_unchanged, note) \
@@ -331,7 +557,7 @@ mod server {
         .bind(replica)
         .bind(R::TABLE)
         .bind(&row_key)
-        .bind(bytes)
+        .bind(whole)
         .bind(version)
         .bind(R::APPLY == crate::row::Apply::IfUnchanged)
         .bind(note)
@@ -340,7 +566,12 @@ mod server {
         Ok(Wished { id, version })
     }
 
-    pub(crate) async fn withdraw<R: Setting>(conn: &mut Conn, key: &Key) -> Result<bool, Error> {
+    pub(crate) async fn withdraw<R: Setting, P: Sync + 'static>(
+        conn: &mut Conn,
+        codecs: &[Codec<P>],
+        key: &Key,
+    ) -> Result<bool, Error> {
+        codec_of::<R, P>(codecs)?;
         let id = id_of(R::TABLE, &key_text(key));
         let gone = sqlx::query(&format!("DELETE FROM sync.{TABLE} WHERE id = $1"))
             .bind(id)
@@ -350,9 +581,10 @@ mod server {
         Ok(gone > 0)
     }
 
-    /// One stored wish, before its row is decoded.
+    /// One stored wish, before its row is read.
     type Stored = (
-        Vec<u8>,
+        serde_json::Value,
+        i64,
         String,
         Option<String>,
         Option<String>,
@@ -365,10 +597,10 @@ mod server {
         codecs: &[Codec<P>],
         keys: &[Key],
     ) -> Result<Vec<WishOf<R>>, Error> {
-        let codec = codec_of::<R, P>(codecs)?;
+        codec_of::<R, P>(codecs)?;
         let texts: Vec<String> = keys.iter().map(key_text).collect();
         let stored: Vec<Stored> = sqlx::query_as(&format!(
-            "SELECT w.wanted, {STATE}, \
+            "SELECT w.wanted, w.version, {STATE}, \
                     CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN w.reason END, \
                     w.note, w.wished_at, \
                     CASE WHEN w.answered IS NOT DISTINCT FROM w.version THEN w.answered_at END \
@@ -381,12 +613,13 @@ mod server {
         .fetch_all(&mut *conn)
         .await?;
         let mut out = Vec::with_capacity(stored.len());
-        for (bytes, state, reason, note, wished_at, answered_at) in stored {
-            let wanted: R = codec.decode_row(&bytes)?;
+        for (whole, version, state, reason, note, wished_at, answered_at) in stored {
+            let wanted: R = crate::row::from_json(conn, &whole).await?;
             out.push(WishOf {
                 key: wanted.key(),
                 wanted,
-                state: state_of(&state),
+                version,
+                state: WishState::of(&state).unwrap_or(WishState::Pending),
                 reason,
                 note,
                 wished_at,
@@ -544,7 +777,7 @@ mod replica {
     /// [`Replica::new`](crate::run::replica::Replica::new) checks.
     ///
     /// ```
-    /// use magic_sync::wish::{CarryOut, Direct, Outcome, Wish, Wishes};
+    /// use magic_sync::run::replica::{CarryOut, Direct, Outcome, Wish, Wishes};
     /// # #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
     /// # #[row(table = "screens", mirror = "setting", key = "replica_id, id", origin = "replica_id")]
     /// # pub struct Screen {
@@ -685,8 +918,8 @@ mod replica {
             let mut after = (String::new(), String::new());
             loop {
                 let next: Option<WishRow> = sqlx::query_as(&format!(
-                    "SELECT id, replica_id, relation, row_key, wanted, version, if_unchanged, \
-                            note, answered, outcome, reason, answered_at \
+                    "SELECT id, relation, row_key, wanted, version, if_unchanged, note, \
+                            answered, outcome, reason, answered_at \
                        FROM {TABLE} \
                       WHERE retired_at IS NULL \
                         AND (answered IS NOT version OR outcome = 'waiting') \
@@ -861,7 +1094,8 @@ mod replica {
                     row.take_desired(wanted);
                     row.raise_version();
                     if row.version_text() == was {
-                        let why = format!("its version cannot move past {was}");
+                        let why =
+                            format!("its version cannot move past {}", was.unwrap_or_default());
                         let wrote = answer(&mut tx, wish, "refused", Some(&why)).await?;
                         tx.commit().await?;
                         return Ok(Offered {
@@ -942,8 +1176,9 @@ mod replica {
             let based = wanted.version_text();
             if wish.if_unchanged && held.version_text() != based {
                 let why = format!(
-                    "this replica holds version {} of it, and the wish is based on {based}",
-                    held.version_text()
+                    "this replica holds version {} of it, and the wish is based on {}",
+                    held.version_text().unwrap_or_default(),
+                    based.unwrap_or_default()
                 );
                 return answer_alone(&run.pool, &wish, "superseded", Some(&why)).await;
             }

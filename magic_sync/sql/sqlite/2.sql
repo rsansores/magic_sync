@@ -5,7 +5,6 @@
 -- `answered` = `version` is carried out once its table's handler is offered it.
 CREATE TABLE sync_wishes (
     id           BLOB PRIMARY KEY NOT NULL,
-    replica_id   BLOB NOT NULL,
     relation     TEXT NOT NULL,
     row_key      TEXT NOT NULL,
     wanted       BLOB NOT NULL,
@@ -18,3 +17,8 @@ CREATE TABLE sync_wishes (
     answered_at  TEXT,
     retired_at   TEXT
 );
+
+-- A note of a row re-stated when a snapshot began (a setting, or an answer to
+-- a wish), until the server files it: the server takes it whatever its
+-- version, as what the replica holds.
+ALTER TABLE sync_notes ADD COLUMN restated INTEGER NOT NULL DEFAULT 0;

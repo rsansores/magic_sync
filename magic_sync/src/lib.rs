@@ -75,7 +75,7 @@ pub mod status;
 #[cfg(test)]
 mod testkit;
 pub mod wire;
-pub mod wish;
+mod wish;
 
 pub use error::Error;
 pub use row::{Columns, Row};
@@ -132,7 +132,7 @@ pub use row::{Columns, Row};
 ///
 /// | flag | means |
 /// |---|---|
-/// | `#[row(version)]` | the column whose value only moves forward: an older report of a replica's record never overwrites a newer one on the server. An integer or a `chrono` instant ([`row::Version`]), never NULL. Only a `record` or a `setting` has one — a setting must, a field of its own: what a wish is based on. The server files a setting as its replica last sent it, whatever its version: a replica restored from an older copy holds what it holds. A replica takes what the server sends whatever its version |
+/// | `#[row(version)]` | the column whose value only moves forward: an older report of a replica's record never overwrites a newer one on the server. An integer or a `chrono` instant ([`row::Version`]), never NULL. Only a `record` or a `setting` has one — a setting must, a field of its own: what a wish is based on. The server files a setting as a record, the newer version winning, but one its replica re-states as a snapshot begins whatever its version: a replica restored from an older copy holds what it holds. A replica takes what the server sends whatever its version |
 /// | `#[row(desired)]` | in a `setting`, a column the server may wish other values ([`row::Setting`]); at least one, a field of the row itself, never its key or version |
 /// | `#[row(created)]` | written once, when the row is created; never by an update |
 /// | `#[row(replica_owned)]` | in a `both` table, a column only replicas write: it goes up, the rest come down |

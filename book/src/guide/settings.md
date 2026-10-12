@@ -32,7 +32,8 @@ A setting goes up as a record does, with three things more:
 The tables are yours, as for any row; the wishes live in a table of the
 engine's, `sync_wishes`, which its schema's second step creates on each side
 and its triggers cover — print them again (`Engine::triggers`,
-`replica::triggers`) once you add a setting.
+`replica::triggers`) once you add a setting. A name beginning `sync_` is the
+engine's on either side: no table of yours may take one.
 
 ## Wishing, on the server
 
@@ -106,10 +107,13 @@ register still holds the version the operator saw; otherwise it is
 operator sees why. Either way the replica decides, once, and both sides then
 show what it decided.
 
-The server files a setting as the register last sent it, whatever its
-version, and a register that is provisioned again sends its settings and its
-answers again: so a register — or the server — restored from an older copy
-still ends showing the same value on both sides.
+The server files a setting as it does a record, the newer version winning.
+A register that is provisioned again sends its settings and its answers again,
+and those the server takes whatever their version — they are what the register
+holds now. A register's digests fingerprint its settings and its answers too,
+so one the server finds apart from what it records — the server restored from
+an older copy, say — is provisioned again: either side restored from an older
+copy, both still end showing the same value.
 
 ## Where a wish stands
 

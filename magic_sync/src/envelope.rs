@@ -527,6 +527,7 @@ mod tests {
             table: table.to_owned(),
             upserts: sizes.iter().map(|n| vec![0; *n]).collect(),
             deletes: Vec::new(),
+            restated: false,
             keys: (0..sizes.len())
                 .map(|n| Key {
                     parts: vec![n.to_string()],
@@ -681,6 +682,7 @@ mod tests {
                         upserts: (0..n).map(|_| vec![7; next(400)]).collect(),
                         keys: (0..n).map(key).collect(),
                         deletes: (0..next(20)).map(key).collect(),
+                        restated: false,
                     }
                 })
                 .collect();
@@ -739,6 +741,7 @@ mod tests {
                         upserts: (0..n).map(|_| vec![7; walk.below(60)]).collect(),
                         keys: (0..n).map(key).collect(),
                         deletes: (n..n + walk.below(4)).map(key).collect(),
+                        restated: false,
                     }
                 })
                 .collect();

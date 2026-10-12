@@ -70,9 +70,12 @@ const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [
 /// script that also records the version it brings them to — `None` for a
 /// version no build of the engine has had yet. [`install`] runs every step a
 /// database lacks, in order; a host with migrations runs each, in one of its
-/// own: the first in the migration that creates its tables, before
-/// [`triggers`]' script, and each later one when a release brings it (its
-/// changelog says). A step is never edited once released.
+/// own: every step up to [`REPLICA_SCHEMA_VERSION`], in order, in the
+/// migration that creates its tables, before [`triggers`]' script, and each
+/// later one when a release brings it (its changelog says). A step is never
+/// edited once released.
+///
+/// [`REPLICA_SCHEMA_VERSION`]: crate::REPLICA_SCHEMA_VERSION
 #[cfg(feature = "sqlite")]
 #[must_use]
 pub fn migration(version: i32) -> Option<String> {
@@ -289,8 +292,8 @@ async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Res
             _ => continue,
         };
         sqlx::query(&format!(
-            "INSERT INTO sync_notes (relation, row_key) SELECT {}, {} FROM {} t{only} \
-             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1",
+            "INSERT INTO sync_notes (relation, row_key, restated) SELECT {}, {}, 1 FROM {} t{only} \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, restated = 1",
             literal(table.name),
             key_sql(table, "t"),
             ident(table.name)
@@ -303,18 +306,26 @@ async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Res
 
 /// The triggers a replica database needs for `codecs`, as one SQL script: a
 /// host with migrations puts it in the one that creates the tables, after
-/// the engine's first step ([`migration`]), and again whenever a table is
-/// added or changes how it travels, or a release writes them otherwise: each
-/// trigger is dropped if it exists before it is created, so the script runs
-/// again over what an earlier run wrote. [`check`] refuses a database whose triggers are not these.
+/// every step of the engine's schema up to [`REPLICA_SCHEMA_VERSION`]
+/// ([`migration`]), and again whenever a table is added or changes how it
+/// travels, or a release writes them otherwise: each trigger is dropped if it
+/// exists before it is created, so the script runs again over what an
+/// earlier run wrote. [`check`] refuses a database whose triggers are not
+/// these.
+///
+/// # Errors
+///
+/// [`Error::Misuse`] for a table of `codecs` whose name the engine keeps
+/// for its own (`sync_…`).
+///
+/// [`REPLICA_SCHEMA_VERSION`]: crate::REPLICA_SCHEMA_VERSION
 #[cfg(feature = "sqlite")]
-#[must_use]
-pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> String {
-    let wishes = crate::wish::wishes_for(codecs);
-    generated(&codecs.iter().chain(&wishes).collect::<Vec<_>>())
+pub fn triggers<P: Sync + 'static>(codecs: &[Codec<P>]) -> Result<String, Error> {
+    let wishes = crate::wish::engines(codecs)?;
+    Ok(generated(&codecs.iter().chain(&wishes).collect::<Vec<_>>())
         .into_iter()
         .map(|t| format!("DROP TRIGGER IF EXISTS {};\n{};\n", ident(&t.name), t.sql))
-        .collect()
+        .collect())
 }
 
 /// Records which replica this is, for the triggers to know its rows by.
@@ -372,8 +383,7 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
-    crate::wish::unclaimed(codecs)?;
-    let wishes = crate::wish::wishes_for(codecs);
+    let wishes = crate::wish::engines(codecs)?;
     checked(conn, &codecs.iter().chain(&wishes).collect::<Vec<_>>()).await
 }
 
@@ -596,8 +606,7 @@ pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
 /// are at a later version than this build's, or [`check`] refuses what results.
 #[cfg(feature = "sqlite")]
 pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Result<(), Error> {
-    crate::wish::unclaimed(codecs)?;
-    let wishes = crate::wish::wishes_for(codecs);
+    let wishes = crate::wish::engines(codecs)?;
     let all: &[&Codec<P>] = &codecs.iter().chain(&wishes).collect::<Vec<_>>();
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
     let version = schema_version(&mut tx).await?;
@@ -2572,6 +2581,8 @@ struct Note {
     id: i64,
     relation: String,
     row_key: String,
+    /// Re-stated when a snapshot began, and not filed since (section 7).
+    restated: bool,
 }
 
 /// Up to a message's rows of notes, and `most`, to send on `lane`, oldest
@@ -2613,7 +2624,7 @@ async fn unsent(
     };
     let now = crate::dialect::NOW;
     Ok(sqlx::query_as(&format!(
-        "SELECT id, relation, row_key FROM sync_notes \
+        "SELECT id, relation, row_key, restated FROM sync_notes \
           WHERE set_aside IS NULL \
             AND (sent_at IS NULL OR writes > sent \
                  OR sent_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{:.3} seconds') \
@@ -2657,8 +2668,9 @@ async fn gather<P: Sync + 'static>(
 ) -> Result<Gathered, Error> {
     let mut aside: Vec<(i64, String)> = Vec::new();
     let mut done: Vec<i64> = Vec::new();
-    // Per table, each key with its note, in the order first noted.
-    let mut keyed: HashMap<&str, Keyed> = HashMap::new();
+    // Per table, and whether re-stated, each key with its note, in the
+    // order first noted.
+    let mut keyed: HashMap<(&str, bool), Keyed> = HashMap::new();
     for note in &notes {
         let Some(codec) = codec_of(codecs, &note.relation).filter(|c| c.goes_up()) else {
             aside.push((note.id, "a table this build does not send up".to_owned()));
@@ -2673,7 +2685,7 @@ async fn gather<P: Sync + 'static>(
             }
         };
         keyed
-            .entry(codec.table.name)
+            .entry((codec.table.name, note.restated))
             .or_default()
             .push((key, note.id));
     }
@@ -2681,17 +2693,21 @@ async fn gather<P: Sync + 'static>(
     let mut tables = Vec::new();
     let mut gone: Vec<(&Codec<P>, Keyed)> = Vec::new();
     let mut full = false;
-    for codec in codecs {
-        let Some(keys) = keyed.remove(codec.table.name) else {
+    for (codec, restated) in codecs
+        .iter()
+        .flat_map(|codec| [(codec, true), (codec, false)])
+    {
+        let Some(keys) = keyed.remove(&(codec.table.name, restated)) else {
             continue;
         };
         let wanted: Vec<Key> = keys.iter().map(|(k, _)| k.clone()).collect();
         let encoded = codec.load(conn, &wanted).await?;
         let mut part = Table {
             table: codec.table.name.to_owned(),
+            restated,
             ..Table::default()
         };
-        let mut len = framed(part.table.len());
+        let mut len = framed(part.table.len()) + usize::from(restated) * 2;
         let mut missing = Vec::new();
         for (key, id) in keys {
             if let Some((_, e)) = encoded.failed.iter().find(|(k, _)| *k == key) {
@@ -2727,7 +2743,10 @@ async fn gather<P: Sync + 'static>(
             tables.push(part);
         }
         if codec.takes_deletes() {
-            gone.push((codec, missing));
+            match gone.last_mut() {
+                Some((last, keys)) if std::ptr::eq(*last, codec) => keys.extend(missing),
+                _ => gone.push((codec, missing)),
+            }
         } else {
             done.extend(missing.into_iter().map(|(_, id)| id));
         }
@@ -2999,7 +3018,8 @@ pub(crate) async fn held<P: Sync + 'static>(
         .fetch_optional(&mut *conn)
         .await?;
     let mut digests = Vec::new();
-    for codec in codecs.iter().filter(|c| c.sent_down()) {
+    let setting = |c: &Codec<P>| c.table.mirror == crate::row::Mirror::Setting;
+    for codec in codecs.iter().filter(|c| c.sent_down() || setting(c)) {
         // What the replica wrote of it and the server has not filed is
         // about to change what the server records: compared now, the two
         // would differ for nothing.
@@ -3018,13 +3038,18 @@ pub(crate) async fn held<P: Sync + 'static>(
                 .await?
                 .into_iter()
                 .collect();
-        let keys: Vec<String> = codec
+        let mut keys: Vec<String> = codec
             .live_keys(conn)
             .await?
             .iter()
             .map(key_text)
             .filter(|k| !rejected.contains(k))
             .collect();
+        if setting(codec) {
+            keys = codec.versions(conn, None).await?;
+        } else if codec.table.name == crate::wish::TABLE {
+            keys = crate::wish::answers(conn, keys).await?;
+        }
         digests.push(envelope::Digest {
             table: codec.table.name.to_owned(),
             count: keys.len() as u64,

@@ -8,7 +8,7 @@
 
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
 import type { Listing, Overview, Progress, ReplicaState } from '../core/contract/types.js'
-import { bannerOf, mismatchOf, type Speech } from '../core/describe.js'
+import { bannerOf, engineTableLabel, mismatchOf, type Speech } from '../core/describe.js'
 import { pageOf, progressOf, readsContract, summarize } from '../core/derive.js'
 import type { Messages } from '../core/i18n.js'
 import { useServerClock } from './clock.js'
@@ -65,7 +65,7 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
       ? null
       : {
           name: (replica: string) => lookup(toValue(options.names), replica),
-          label: (table: string) => lookup(toValue(options.labels), table),
+          label: (table: string) => lookup(toValue(options.labels), table) ?? engineTableLabel(table, t),
           now: now.value,
           silentAfter: toValue(options.silentAfter),
           stuckAfter: toValue(options.stuckAfter),

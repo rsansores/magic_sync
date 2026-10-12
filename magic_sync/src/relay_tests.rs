@@ -2212,11 +2212,12 @@ async fn an_uploaded_row_of_another_replica_is_left_out(pool: crate::DbPool) {
     assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
 }
 
-/// A setting is what its replica last said it is: an upload of an older
-/// version — a replica restored from an older copy says what it holds — is
-/// filed over a newer one, as a record's would not be.
+/// A setting's upload of an older version is refused as a record's would
+/// be — two uploads may arrive out of order — but one the replica re-states,
+/// as a snapshot begins, is filed whatever its version: a replica restored
+/// from an older copy says what it holds.
 #[sqlx::test(migrations = false)]
-async fn a_setting_is_filed_as_last_uploaded_whatever_its_version(pool: crate::DbPool) {
+async fn a_setting_is_filed_newest_unless_restated(pool: crate::DbPool) {
     use crate::envelope::{Key as WireKey, Table as WireTable, Up};
     #[derive(
         sqlx::FromRow, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::Row,
@@ -2247,7 +2248,7 @@ async fn a_setting_is_filed_as_last_uploaded_whatever_its_version(pool: crate::D
     .unwrap();
     let codecs = vec![Codec::<()>::json::<Brightness>(None)];
     let id = Uuid::now_v7();
-    let upload = |level: i64, revision: i64| {
+    let upload = |level: i64, revision: i64, restated: bool| {
         let row = Brightness {
             replica_id: a,
             id,
@@ -2262,6 +2263,7 @@ async fn a_setting_is_filed_as_last_uploaded_whatever_its_version(pool: crate::D
                 keys: vec![WireKey {
                     parts: vec![a.to_string(), id.to_string()],
                 }],
+                restated,
                 ..WireTable::default()
             }],
             protocol: envelope::PROTOCOL,
@@ -2274,14 +2276,12 @@ async fn a_setting_is_filed_as_last_uploaded_whatever_its_version(pool: crate::D
             .await
             .unwrap()
     };
-    crate::testkit::file(&world.pool, &codecs, &upload(70, 9), a, &()).await;
+    crate::testkit::file(&world.pool, &codecs, &upload(70, 9, false), a, &()).await;
     assert_eq!(filed().await, [(70, 9)]);
-    crate::testkit::file(&world.pool, &codecs, &upload(40, 3), a, &()).await;
-    assert_eq!(
-        filed().await,
-        [(40, 3)],
-        "the replica's present, older or not"
-    );
+    crate::testkit::file(&world.pool, &codecs, &upload(40, 3, false), a, &()).await;
+    assert_eq!(filed().await, [(70, 9)], "an older upload, arrived late");
+    crate::testkit::file(&world.pool, &codecs, &upload(40, 3, true), a, &()).await;
+    assert_eq!(filed().await, [(40, 3)], "the replica's present, re-stated");
 }
 
 /// What an upload said of its moment — what the replica refused, applied,
@@ -2566,6 +2566,7 @@ fn edit(partition: Uuid, id: Uuid, title: &str, seen: i32) -> envelope::Up {
                 parts: vec![id.to_string()],
             }],
             deletes: Vec::new(),
+            restated: false,
         }],
         protocol: envelope::PROTOCOL,
         ..envelope::Up::default()

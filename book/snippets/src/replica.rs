@@ -2,13 +2,13 @@
 
 use crate::rows::RegisterSetting;
 use magic_sync::replica::Lane;
-use magic_sync::run::replica::Settings;
-use magic_sync::wish::{CarryOut, Outcome, Wish, Wishes};
+use magic_sync::run::replica::{CarryOut, Outcome, Settings, Wish, Wishes};
 use shop_rows::codecs;
 
 // ANCHOR: triggers
-pub fn print_triggers() {
-    println!("{}", magic_sync::replica::triggers(&codecs()));
+pub fn print_triggers() -> Result<(), magic_sync::Error> {
+    println!("{}", magic_sync::replica::triggers(&codecs())?);
+    Ok(())
 }
 // ANCHOR_END: triggers
 

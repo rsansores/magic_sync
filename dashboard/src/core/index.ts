@@ -34,6 +34,7 @@ export {
   describeState,
   describePlace,
   describeWish,
+  engineTableLabel,
   tableMood,
   percent,
 } from './describe.js'

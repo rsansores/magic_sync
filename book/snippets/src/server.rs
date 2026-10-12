@@ -213,3 +213,43 @@ pub async fn where_the_wishes_stand<S: Senders, T: Transport>(
     Ok(())
 }
 // ANCHOR_END: wishes
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The triggers the book shows a host's migrations writing for the shop
+    /// (`book/src/guide/shop-triggers.sql`) are the ones the engine prints
+    /// for the shop's codecs. `MAGIC_SYNC_BLESS=1` writes them anew.
+    #[sqlx::test(migrations = false)]
+    async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: PgPool) {
+        let mut conn = pool.acquire().await.expect("a connection");
+        for version in 1..=magic_sync::SERVER_SCHEMA_VERSION {
+            let step = magic_sync::plan::migration(version).expect("a step");
+            sqlx::raw_sql(&step)
+                .execute(&mut *conn)
+                .await
+                .expect("the engine's step");
+        }
+        let root = env!("CARGO_MANIFEST_DIR");
+        let shop = std::fs::read_to_string(format!("{root}/../../examples/shop/server/schema.sql"))
+            .expect("the shop's schema");
+        sqlx::raw_sql(&shop)
+            .execute(&mut *conn)
+            .await
+            .expect("the shop's tables");
+        let printed = Engine::triggers(&mut conn, &codecs(), REGISTERS)
+            .await
+            .expect("the triggers");
+        let path = format!("{root}/../src/guide/shop-triggers.sql");
+        if std::env::var_os("MAGIC_SYNC_BLESS").is_some() {
+            std::fs::write(&path, format!("{printed}\n")).expect("write the book's triggers");
+        }
+        let shown = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            shown == format!("{printed}\n"),
+            "book/src/guide/shop-triggers.sql is not what the engine prints for the shop: \
+             run this test with MAGIC_SYNC_BLESS=1 and commit the result"
+        );
+    }
+}

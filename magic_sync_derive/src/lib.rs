@@ -448,6 +448,7 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
         };
         let generated = flags.generated.is_some();
         let replica_owned = flags.replica_owned.is_some();
+        let desired = flags.desired.is_some();
         push.push(quote! {
             out.push(#private::Column {
                 name: #name,
@@ -455,6 +456,7 @@ fn declared(input: &DeriveInput, krate: &syn::Path, key: &[String]) -> syn::Resu
                 nullable: #nullable,
                 generated: #generated,
                 replica_owned: #replica_owned,
+                desired: #desired,
                 key: #key,
                 version: #version,
                 int64: #private::is_int64::<#ty>(),
@@ -794,6 +796,12 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
     let origin = option(args.origin.as_ref().map(LitStr::value));
     let variant = mirror.variant();
     let (quoted_schema, quoted_table) = (quoted(&schema), quoted(&table));
+    let version_text = match direct.iter().find(|d| d.flags.version.is_some()) {
+        Some(Direct { ident, ty, .. }) => quote_spanned! {ty.span()=>
+            ::core::option::Option::Some(<#ty as #krate::row::Version>::text(&self.#ident))
+        },
+        None => quote!(::core::option::Option::None),
+    };
     let key_parts = key_columns.iter().map(|c| {
         let (ident, ty) = (&c.ident, &c.ty);
         quote_spanned! {ty.span()=>
@@ -818,6 +826,10 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
 
             fn key(&self) -> #krate::row::Key {
                 ::std::vec![#(#key_parts),*]
+            }
+
+            fn version_text(&self) -> ::core::option::Option<::std::string::String> {
+                #version_text
             }
         }
 
@@ -872,20 +884,14 @@ fn setting(
             }
         },
     };
-    let names = desired.iter().map(|d| &d.name);
     let fields = desired.iter().map(|d| &d.ident);
     let (version_ident, version_ty) = (&version.ident, &version.ty);
     Ok(quote! {
         impl #krate::row::Setting for #ident {
-            const DESIRED: &'static [&'static ::core::primitive::str] = &[#(#names),*];
             const APPLY: #krate::row::Apply = #krate::row::Apply::#apply;
 
             fn take_desired(&mut self, from: Self) {
                 #(self.#fields = from.#fields;)*
-            }
-
-            fn version_text(&self) -> ::std::string::String {
-                <#version_ty as #krate::row::Version>::text(&self.#version_ident)
             }
 
             fn raise_version(&mut self) {

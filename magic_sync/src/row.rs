@@ -61,7 +61,9 @@ pub enum Apply {
     Always,
     /// Only while the replica still holds the version the wish is based on
     /// (`apply = "if_unchanged"`): one based on a version it no longer holds
-    /// is superseded, and the replica's value stands.
+    /// is superseded, and the replica's value stands. The version is compared
+    /// as the handler is handed the wish: a write the replica makes of the row
+    /// while the handler runs is overwritten by the wished columns.
     IfUnchanged,
 }
 
@@ -70,9 +72,6 @@ pub enum Apply {
 /// values. Implemented by [`#[derive(Row)]`](crate::Row) for such a row,
 /// and only by it.
 pub trait Setting: Row + Clone + Sync {
-    /// The columns a wish sets.
-    #[doc(hidden)]
-    const DESIRED: &'static [&'static str];
     /// Which wish a replica carries out.
     #[doc(hidden)]
     const APPLY: Apply;
@@ -80,10 +79,6 @@ pub trait Setting: Row + Clone + Sync {
     /// Takes the desired columns of `from`, leaving the rest.
     #[doc(hidden)]
     fn take_desired(&mut self, from: Self);
-
-    /// The version, as [`Version::text`] writes it.
-    #[doc(hidden)]
-    fn version_text(&self) -> String;
 
     /// Moves the version past what it is ([`Version::raised`]).
     #[doc(hidden)]
@@ -124,6 +119,8 @@ pub struct Column {
     pub generated: bool,
     /// Written only by a replica, in a table that syncs both ways.
     pub replica_owned: bool,
+    /// A column a wish of a setting sets.
+    pub desired: bool,
     /// A key column's kind, read off its type.
     pub key: Option<KeyKind>,
     /// The version column's kind, read off its type.
@@ -229,6 +226,11 @@ pub trait Row:
     /// The row's key values, in [`Row::KEY`] order.
     fn key(&self) -> Key;
 
+    /// Its `#[row(version)]` field's value, as [`Version::text`] writes it:
+    /// `None` for a row with no version field of its own.
+    #[doc(hidden)]
+    fn version_text(&self) -> Option<String>;
+
     /// The row's key as the engine writes it where a key is text — the `key`
     /// of `plan::Engine::row_progress`, a key in the engine's tables and in a
     /// log: its parts joined by `|`, a uuid lowercase and hyphenated, an
@@ -317,8 +319,9 @@ pub enum VersionKind {
     Instant,
 }
 
-/// A type a `#[row(version)]` column can have: an integer or an instant. A
-/// host's newtype around one implements it the way its inner type does.
+/// A type a `#[row(version)]` column can have: an integer or an instant — a
+/// `NaiveDateTime` is read as UTC. A host's newtype around one implements it
+/// the way its inner type does.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be a #[row(version)] column",
     label = "a version is an integer or a `chrono` instant",
@@ -334,9 +337,10 @@ pub trait Version: Sized {
     /// server and came back compares equal to the one it was.
     fn text(&self) -> String;
 
-    /// A version past this one, for a write the engine makes: an integer
-    /// one more; an instant now, or a microsecond past this one when the
-    /// clock is behind it.
+    /// The version after this one, for a write the engine makes: an integer
+    /// one more, or itself at its type's maximum — a version that cannot
+    /// move, so the replica refuses a wish then; an instant now, or a
+    /// microsecond past this one when the clock is behind it.
     #[must_use]
     fn raised(&self) -> Self;
 }
@@ -1359,6 +1363,131 @@ pub(crate) async fn upsert<R: Row>(exec: &mut Conn, rows: Vec<R>) -> Result<Vec<
     write_keys(exec, rows, &newest::<R>(update_clause_where::<R>(|_| true))).await
 }
 
+/// `row` as PostgreSQL writes it as JSON (`to_jsonb`): its written columns
+/// by name, each value as its column's type writes it — the row in the
+/// table's own shape, which [`laid_over`] reads back.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails or refuses a value.
+#[cfg(feature = "postgres")]
+pub(crate) async fn as_json<R: Row>(exec: &mut Conn, row: R) -> Result<serde_json::Value, Error> {
+    let names = written_names::<R>();
+    let mut qb = sqlx::QueryBuilder::new("SELECT to_jsonb(v) FROM (VALUES (");
+    let mut sep = qb.separated(", ");
+    row.push_binds(&mut sep);
+    qb.push(format!(")) AS v({})", listed(&names)));
+    Ok(qb.build_query_scalar().fetch_one(&mut *exec).await?)
+}
+
+/// The row of `key` as the table holds it now — or, when it holds none, as
+/// `whole` (from [`as_json`]) is — with the columns of `laid` laid over it:
+/// whatever columns the table has gained since `whole` was written come from
+/// its own row. `None` when neither gives a row of `R`.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or the row does not decode
+/// as `R`.
+#[cfg(feature = "postgres")]
+pub(crate) async fn laid_over<R: Row>(
+    exec: &mut Conn,
+    key: &Key,
+    whole: &serde_json::Value,
+    laid: &serde_json::Value,
+) -> Result<Option<R>, Error> {
+    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
+    let mut qb = sqlx::QueryBuilder::new(format!(
+        "SELECT {} FROM (SELECT (jsonb_populate_record(coalesce(\
+           (SELECT t FROM {} t",
+        listed(&names),
+        R::QUALIFIED
+    ));
+    key_filter::<R>(&mut qb, std::slice::from_ref(key));
+    qb.push(format!("), jsonb_populate_record(NULL::{}, ", R::QUALIFIED));
+    qb.push_bind(whole.clone());
+    qb.push(")), ");
+    qb.push_bind(laid.clone());
+    qb.push(")).*) w");
+    Ok(qb.build_query_as::<R>().fetch_optional(&mut *exec).await?)
+}
+
+/// Every row of the table — of the replica `of`, by the table's origin,
+/// when given — as `key \t version` lines: what a digest of a setting
+/// fingerprints.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or a row does not decode.
+pub(crate) async fn versions<R: Row>(
+    exec: &mut Conn,
+    of: Option<Uuid>,
+) -> Result<Vec<String>, Error> {
+    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
+    let mut qb =
+        sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(&names), R::QUALIFIED));
+    if let (Some(replica), Some(origin)) = (of, R::ORIGIN) {
+        qb.push(format!(" WHERE {} = ", ident(origin)));
+        qb.push_bind(replica);
+    }
+    Ok(qb
+        .build_query_as::<R>()
+        .fetch_all(&mut *exec)
+        .await?
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}",
+                row.key_text(),
+                row.version_text().unwrap_or_default()
+            )
+        })
+        .collect())
+}
+
+/// Lets go of every row of the replica `replica`, by the table's origin.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails or refuses.
+#[cfg(feature = "postgres")]
+pub(crate) async fn delete_of<R: Row>(exec: &mut Conn, replica: Uuid) -> Result<u64, Error> {
+    let Some(origin) = R::ORIGIN else {
+        return Ok(0);
+    };
+    Ok(sqlx::query(&format!(
+        "DELETE FROM {} WHERE {} = $1",
+        R::QUALIFIED,
+        ident(origin)
+    ))
+    .bind(replica)
+    .execute(&mut *exec)
+    .await?
+    .rows_affected())
+}
+
+/// `row` (from [`as_json`]) read back as a row of `R`.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or the row does not decode
+/// as `R` — one a column the table gained since it was written is NULL in.
+#[cfg(feature = "postgres")]
+pub(crate) async fn from_json<R: Row>(
+    exec: &mut Conn,
+    row: &serde_json::Value,
+) -> Result<R, Error> {
+    let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
+    Ok(sqlx::query_as::<_, R>(&format!(
+        "SELECT {} FROM jsonb_populate_record(NULL::{}, $1)",
+        listed(&names),
+        R::QUALIFIED
+    ))
+    .bind(row.clone())
+    .fetch_one(&mut *exec)
+    .await?)
+}
+
 /// Inserts every row, or overwrites the one the table holds, whatever its
 /// version. Answers the keys it wrote.
 ///
@@ -1720,7 +1849,15 @@ mod tests {
             level: 70,
             at: at - chrono::Duration::days(1),
         };
-        assert_eq!(Screen::DESIRED, ["level"]);
+        assert_eq!(
+            Table::of::<Screen>()
+                .columns
+                .iter()
+                .filter(|c| c.desired)
+                .map(|c| c.name)
+                .collect::<Vec<_>>(),
+            ["level"]
+        );
         assert_eq!(Screen::APPLY, Apply::IfUnchanged);
         let mut row = held.clone();
         row.take_desired(wanted);
@@ -1731,7 +1868,10 @@ mod tests {
                 ..held.clone()
             }
         );
-        assert_eq!(row.version_text(), "2023-11-14T22:13:20.000001Z");
+        assert_eq!(
+            row.version_text().as_deref(),
+            Some("2023-11-14T22:13:20.000001Z")
+        );
         row.raise_version();
         assert!(row.at > at, "moved past what it was");
         assert_eq!(

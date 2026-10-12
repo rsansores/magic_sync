@@ -978,6 +978,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         upserts: (0..walk.below(3)).map(|_| row(&mut walk)).collect(),
                         deletes: (0..walk.below(3)).map(|_| key(&mut walk)).collect(),
                         keys: (0..walk.below(3)).map(|_| key(&mut walk)).collect(),
+                        restated: walk.below(2) == 0,
                     })
                     .collect(),
                 rejected: (0..walk.below(3))
@@ -1148,6 +1149,18 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
     spawnable(engine.health(&mut conn, scope, 1));
     spawnable(engine.progress(&mut conn, scope));
     spawnable(engine.row_progress(&mut conn, scope, "items", ""));
+    spawnable(engine.wishes(&mut conn, scope, None, crate::status::Page::new(0, 1)));
+    use crate::conformance::Screen;
+    let screen = Screen {
+        replica_id: Uuid::nil(),
+        id: Uuid::nil(),
+        level: 0,
+        revision: 0,
+    };
+    let key = crate::row::Row::key(&screen);
+    spawnable(server.desire(&mut conn, screen, None));
+    spawnable(server.withdraw::<Screen>(&mut conn, &key));
+    spawnable(server.wishes::<Screen>(&mut conn, &[key]));
 }
 
 /// Settings a server cannot run with are refused when it is built: a wait

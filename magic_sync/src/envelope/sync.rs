@@ -43,6 +43,11 @@ pub struct Table {
     /// cannot read a row can still say which one it was.
     #[prost(message, repeated, tag = "4")]
     pub keys: ::prost::alloc::vec::Vec<Key>,
+    /// Up only: the replica re-states these rows, of a setting or answers to
+    /// wishes, as it holds them now (PROTOCOL.md section 7) — the server takes
+    /// them whatever their version.
+    #[prost(bool, tag = "5")]
+    pub restated: bool,
 }
 /// Server to replica: rows to hold and rows to let go, in the order given —
 /// parents' upserts first, children's deletes first — applied in one
@@ -227,9 +232,6 @@ pub struct Wish {
     /// A uuid: the row's key.
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
-    /// The replica the setting belongs to: this one.
-    #[prost(string, tag = "2")]
-    pub replica_id: ::prost::alloc::string::String,
     /// The setting's table, and its row's key.
     #[prost(string, tag = "3")]
     pub table: ::prost::alloc::string::String,

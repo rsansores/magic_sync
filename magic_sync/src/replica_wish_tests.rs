@@ -69,7 +69,6 @@ fn wished(screen: &Screen, version: u64, if_unchanged: bool) -> (WireKey, Vec<u8
     let id = Uuid::from_u128(0xa_0000 + screen.id.as_u128());
     let wish = WireWish {
         id: id.to_string(),
-        replica_id: screen.replica_id.to_string(),
         table: "screens".to_owned(),
         key: Some(key(&[
             &screen.replica_id.to_string(),
@@ -747,6 +746,16 @@ async fn walk_wishes(pool: SqlitePool, seed: u64) {
                 model.receive(&ended, &crate::model::Rules::ANY);
                 holder.forget(&model);
             }
+            // The host deletes a screen of its own.
+            4 if walk.below(4) == 0 => {
+                holder.delete(&row);
+                sqlx::query("DELETE FROM screens WHERE replica_id = $1 AND id = $2")
+                    .bind(w.me)
+                    .bind(Uuid::from_u128(id))
+                    .execute(&w.pool)
+                    .await
+                    .unwrap();
+            }
             // The host writes a screen of its own.
             4 => {
                 holder.write(&row, walk.below(100) as i64);
@@ -773,15 +782,41 @@ async fn walk_wishes(pool: SqlitePool, seed: u64) {
             }
             // What it wrote goes up, and is filed.
             _ => {
-                let real = w.up(0, false).await;
+                // Now and then with its digests, which fingerprint its
+                // settings and its answers as the model says.
+                let digests = walk.below(2) == 0;
+                let real = w.up(0, digests).await;
+                if digests {
+                    let mut said: Vec<_> = real
+                        .as_ref()
+                        .map(|up| up.digests.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|d| d.table == "screens" || d.table == "sync_wishes")
+                        .collect();
+                    said.sort_by(|a, b| a.table.cmp(&b.table));
+                    assert_eq!(
+                        said,
+                        holder.digests(&model, &["screens", "sync_wishes"]),
+                        "{at}: its digests"
+                    );
+                }
                 let modelled = holder.up(write_screen);
-                let said = |up: Option<&Up>| -> BTreeSet<(String, String)> {
+                // Each row it states or deletes, and whether it re-states.
+                let said = |up: Option<&Up>| -> BTreeSet<(String, String, bool, bool)> {
                     up.map(|up| {
                         up.tables
                             .iter()
                             .filter(|t| t.table == "screens" || t.table == "sync_wishes")
                             .flat_map(|t| {
-                                t.keys.iter().map(|k| (t.table.clone(), k.parts.join("|")))
+                                let row = |k: &crate::envelope::Key, deleted| {
+                                    (t.table.clone(), k.parts.join("|"), deleted, t.restated)
+                                };
+                                t.keys
+                                    .iter()
+                                    .map(move |k| row(k, false))
+                                    .chain(t.deletes.iter().map(move |k| row(k, true)))
+                                    .collect::<Vec<_>>()
                             })
                             .collect()
                     })

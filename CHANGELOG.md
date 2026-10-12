@@ -27,16 +27,18 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 - **Settings and wishes.** A `setting` is a row a replica owns and acts on;
   the server may wish its `#[row(desired)]` columns other values
   (`Server::desire`, `withdraw`, `wishes`). The replica carries each wish out
-  once through the host's handler (`wish::CarryOut`, `Settings::wishes`) —
+  once through the host's handler (`run::replica::CarryOut`, `Settings::wishes`) —
   outside any transaction, so it may reach hardware — and answers `applied`
   (the engine writes the row and the answer together), `refused`, `waiting`,
   or `superseded` when `apply = "if_unchanged"` and the setting changed on
   the replica since the wish was based on it. Wishes travel as rows of the
   engine's own two-way table `sync_wishes` (schema step 2 on each side), so
-  every guarantee below holds for them; the server files a setting as its
-  replica last sent it, whatever its version, and a replica says its
-  settings and answers again whenever a snapshot begins — so once the system
-  settles, both sides show the same value, after a restore of either too.
+  every guarantee below holds for them. The server files a setting as a
+  record, the newer version winning; a replica says its settings and answers
+  again whenever a snapshot begins, which the server takes whatever their
+  version, and its digests fingerprint them — so once the system settles,
+  both sides show the same value, after a restore of either too. Table
+  names beginning `sync_` are the engine's.
 - **Codecs.** `Codec::json` (an object of the row's columns, 64-bit integers
   as text) and `Codec::new` (a protobuf message of your own).
 - **Runners.** `Server` and `Replica` run what a host builds; the host
@@ -50,8 +52,8 @@ contract 1. PostgreSQL 14 or later on the server; Rust 1.85 or later.
 - **Status.** `status` answers for a dashboard, over a scope, in one
   snapshot: the overview, a paged listing, health, progress, where one row
   is, and the wishes of the replicas' settings (`Engine::wishes`; each
-  replica counts its own, and one with a wish not carried out is catching
-  up). Every answer serializes as JSON of a versioned contract.
+  replica counts its own, and one with a wish it has not answered is
+  catching up). Every answer serializes as JSON of a versioned contract.
 - **The replica protocol** (`PROTOCOL.md`, `proto/sync.proto`) is written for
   a replica in any language, with test vectors (`tests/golden`) that the
   engine's own replica is held to.

@@ -166,7 +166,7 @@ pub enum RowState {
 
 /// Where a wish stands: what its replica answered to it, or that it has
 /// not yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -242,6 +242,35 @@ pub struct WishListing {
     pub offset: u32,
     /// The page.
     pub wishes: Listed<WishEntry>,
+}
+
+impl WishState {
+    /// The word it is written as, in the engine's tables and in JSON.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WishState::Pending => "pending",
+            WishState::Waiting => "waiting",
+            WishState::Applied => "applied",
+            WishState::Refused => "refused",
+            WishState::Superseded => "superseded",
+        }
+    }
+
+    /// The state `word` writes; `None` for a word of no state this build
+    /// knows.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Self> {
+        [
+            WishState::Pending,
+            WishState::Waiting,
+            WishState::Applied,
+            WishState::Refused,
+            WishState::Superseded,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == word)
+    }
 }
 
 /// Where a replica stands, in one word: the first of these that applies.
@@ -612,7 +641,7 @@ mod stored {
                 replica: self.replica,
                 table: self.table,
                 key: self.key,
-                state: crate::wish::state_of(&self.state),
+                state: super::WishState::of(&self.state).unwrap_or(super::WishState::Pending),
                 reason: self.reason,
                 note: self.note,
                 wished_at: self.wished_at,
@@ -1138,12 +1167,7 @@ impl Engine {
         let mut tx = snapshot(conn).await?;
         let now = Self::now(&mut tx).await?;
         let scoped = self.scoped(&mut tx, scope).await?;
-        let wanted = state.map(|s| {
-            serde_json::to_value(s)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_default()
-        });
+        let wanted = state.map(WishState::as_str);
         let state_sql = crate::wish::STATE;
         let rows: Vec<stored::Wished> = sqlx::query_as(&format!(
             "WITH w AS ( \
@@ -1161,7 +1185,7 @@ impl Engine {
               OFFSET $3 LIMIT $4"
         ))
         .bind(scoped.ids())
-        .bind(&wanted)
+        .bind(wanted)
         .bind(i64::from(offset))
         .bind(i64::from(limit))
         .fetch_all(&mut *tx)
@@ -1174,7 +1198,7 @@ impl Engine {
                       WHERE w.replica_id = ANY($1) AND ($2::text IS NULL OR {state_sql} = $2)"
                 ))
                 .bind(scoped.ids())
-                .bind(&wanted)
+                .bind(wanted)
                 .fetch_one(&mut *tx)
                 .await?
             }
@@ -1441,7 +1465,6 @@ impl Engine {
                     || behind
                     || r.quarantined > 0
                     || r.wishes_pending > 0
-                    || r.wishes_waiting > 0
                 {
                     ReplicaState::CatchingUp
                 } else {
