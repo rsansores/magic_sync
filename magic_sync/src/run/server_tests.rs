@@ -1310,3 +1310,28 @@ async fn the_inbox_is_bounded_per_replica_filed_a_page_at_a_time_and_pruned_of_s
 fn a_servers_default_limits_are_the_replicas() {
     assert_eq!(Settings::default().limits, Limits::default());
 }
+
+/// Through a pooler in transaction mode a relay's transaction can run on a
+/// server process that does not hold its lock: it is refused, rather than
+/// recording beside the process that does.
+#[sqlx::test(migrations = false)]
+async fn a_transaction_on_a_connection_without_the_lock_is_refused(pool: PgPool) {
+    world(&pool).await;
+    let held = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
+    let mut elsewhere = Lock {
+        conn: pool.acquire().await.unwrap().detach(),
+    };
+    let refused = elsewhere
+        .fenced("BEGIN", None)
+        .await
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|why| why.contains("session pooling")),
+        "{refused:?}"
+    );
+    assert!(!elsewhere.still_held().await, "nor counts as held");
+    held.release(LOCK_KEY).await;
+}

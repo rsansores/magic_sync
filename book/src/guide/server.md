@@ -91,7 +91,10 @@ is planned and sent again by the next relay, as after a crash:
 >
 > - It takes a PostgreSQL advisory lock. Run as many server processes as you
 >   like: one of them runs the relay, the others stand by and take over if it
->   goes away.
+>   goes away. The lock is a session's, so the pool you hand it reaches
+>   PostgreSQL directly or through a pooler in session mode: through one in
+>   transaction mode (PgBouncer's default) a pass would run on a server
+>   process that does not hold the lock, and the relay refuses to.
 > - While it holds the lock, it reads the noted changes, plans what each
 >   replica should hold against what it holds, and — in one transaction on the
 >   lock's own connection, so a process that lost the lock cannot record over

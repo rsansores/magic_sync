@@ -804,6 +804,13 @@ struct Refiling {
 
 /// Proof that this process runs the relay: a connection holding the
 /// advisory lock. Drop it, or lose the connection, and the lock is free.
+/// Whether the server process the statement runs on holds the advisory lock
+/// `$1`: a connection through a pooler in transaction mode may run each
+/// transaction on another, which does not.
+const HELD_HERE: &str = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+       AND pid = pg_backend_pid() AND granted AND objsubid = 1 \
+       AND classid = ($1::bigint >> 32)::oid AND objid = ($1::bigint & 4294967295)::oid)";
+
 struct Lock {
     conn: PgConnection,
 }
@@ -832,10 +839,11 @@ impl Lock {
 
     /// A connection that still answers still holds its session's lock.
     async fn still_held(&mut self) -> bool {
-        sqlx::query("SELECT 1")
-            .execute(&mut self.conn)
+        sqlx::query_scalar::<_, bool>(HELD_HERE)
+            .bind(LOCK_KEY)
+            .fetch_one(&mut self.conn)
             .await
-            .is_ok()
+            .unwrap_or(false)
     }
 
     /// A transaction on the lock's own connection: it commits only while this
@@ -847,6 +855,18 @@ impl Lock {
         role: Option<&str>,
     ) -> Result<Transaction<'_, Postgres>, Error> {
         let mut tx = self.conn.begin_with(statement).await?;
+        let here: bool = sqlx::query_scalar(HELD_HERE)
+            .bind(LOCK_KEY)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !here {
+            return Err(Error::Misuse(
+                "the relay's lock is not held by the server process its transaction runs on: \
+                 a pooler in transaction mode hands each transaction to any server process. \
+                 The relay needs session pooling, or a direct connection"
+                    .to_owned(),
+            ));
+        }
         assume(&mut tx, role).await?;
         Ok(tx)
     }
