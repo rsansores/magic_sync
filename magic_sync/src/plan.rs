@@ -1490,6 +1490,17 @@ impl Engine {
             .fetch_one(&mut *conn)
             .await?;
         if !made {
+            // The sets a large plan keeps outgrow the default temp_buffers,
+            // and then every row a round adds is read back from disk. The
+            // setting takes only before a session's first temporary table:
+            // on a connection that had one, the default stays.
+            sqlx::Executor::execute(&mut *conn, "SAVEPOINT sync_temp_buffers").await?;
+            let end = match sqlx::Executor::execute(&mut *conn, "SET temp_buffers = '128MB'").await
+            {
+                Ok(_) => "RELEASE SAVEPOINT sync_temp_buffers",
+                Err(_) => "ROLLBACK TO SAVEPOINT sync_temp_buffers",
+            };
+            sqlx::Executor::execute(&mut *conn, end).await?;
             sqlx::Executor::execute(&mut *conn, PLAN_TABLES).await?;
         }
         sqlx::Executor::execute(&mut *conn, PLAN_RESET).await?;
@@ -1795,17 +1806,29 @@ impl Engine {
                 break;
             }
             for (c, reference) in self.references().filter(|(c, _)| from.contains(c)) {
+                let p = reference.parent;
+                // A parent its own rules send the replica stays whatever
+                // points at it: its place is in no question, nor what it
+                // holds up.
+                let ruled = self
+                    .wanted_sql(
+                        p,
+                        &self.key_among(p, "SELECT replica_id, row_key FROM g", true),
+                    )
+                    .map_or(String::new(), |w| {
+                        format!(" EXCEPT SELECT w.replica_id, w.key FROM ({w}) w")
+                    });
                 let select = format!(
                     "WITH f AS MATERIALIZED ( \
                          SELECT d.replica_id, {} AS row_key FROM sync_suspect d JOIN {} t ON {} \
-                          WHERE d.rel = {c} AND d.round = $1 - 1 AND {}) \
-                     SELECT f.replica_id, {}, f.row_key, NULL FROM f {}",
+                          WHERE d.rel = {c} AND d.round = $1 - 1 AND {}), \
+                          g AS MATERIALIZED (SELECT DISTINCT f.replica_id, f.row_key FROM f {}) \
+                     SELECT q.replica_id, {p}, q.row_key, NULL FROM (TABLE g{ruled}) AS q",
                     key_sql("t", &reference.columns),
                     self.plans[c].relation.sql(),
                     self.row_is(c, "d.row_key"),
                     not_null("t", &reference.columns),
-                    reference.parent,
-                    held_by("f", self.plans[reference.parent].table),
+                    held_by("f", self.plans[p].table),
                 );
                 self.add(conn, Set::Suspect, &select, round + 1).await?;
             }
@@ -2023,8 +2046,10 @@ impl Engine {
     }
 
     /// Keeps for `i`, at `round` — `$1` to `source` — the rows `source`
-    /// names, `(replica_id, row_key)`, but those that cannot go and those
-    /// kept already. Each is sent where its replica lacks it, refused it, or
+    /// names, `(replica_id, row_key)`, but those that cannot go, those kept
+    /// already, those its rules send a replica provisioned, and those its
+    /// replica holds as they are and that are in no question: those stay
+    /// as recorded, and what they need with them. Each is sent where its replica lacks it, refused it, or
     /// holds a version from before a change of the batch — while the row
     /// is there to send: one a change not planned yet keeps may be gone. It
     /// spreads to its parents when sent or in question, and to its
@@ -2075,13 +2100,24 @@ impl Engine {
                                                        AND d.row_key = q.row_key \
                                LEFT JOIN {} t ON {} \
                               WHERE NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
-                                                   AND b.rel = q.rel AND b.row_key = q.row_key)) AS s \
+                                                   AND b.rel = q.rel AND b.row_key = q.row_key) {}) AS s \
+                      WHERE s.lacks OR s.sends OR s.doubt \
                      ON CONFLICT DO NOTHING",
                     stale("c.noted"),
                     ident(plan.key[0].name),
                     holds("LEFT JOIN", "h", "q.replica_id", &literal(plan.table), "q.row_key"),
                     plan.relation.sql(),
                     self.row_is(i, "q.row_key"),
+                    // What its rules send a replica provisioned goes with
+                    // everything it needs already.
+                    self.wanted_sql(
+                        i,
+                        &format!("s.id = q.replica_id AND {}", self.row_is(i, "q.row_key"))
+                    )
+                    .map_or(String::new(), |whole| format!(
+                        "AND NOT (q.replica_id IN (SELECT replica_id FROM sync_live WHERE fresh) \
+                                  AND EXISTS ({whole}))"
+                    )),
                 )
             }
         };
