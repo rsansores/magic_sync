@@ -57,6 +57,10 @@ CREATE TABLE fixture.t_kinds (
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+-- Follows a table with no rule of its own: it goes where its kind goes.
+CREATE TABLE fixture.t_kind_notes (
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID NOT NULL REFERENCES fixture.t_kinds (id),
+    text TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
 CREATE TABLE fixture.t_customers (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
     rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
@@ -141,6 +145,7 @@ CREATE VIEW t_kinds AS SELECT * FROM fixture.t_kinds WHERE retired_at IS NULL;
 CREATE VIEW t_products AS SELECT * FROM fixture.t_products WHERE retired_at IS NULL;
 CREATE VIEW t_customers AS SELECT * FROM fixture.t_customers WHERE retired_at IS NULL;
 CREATE VIEW t_emails AS SELECT * FROM fixture.t_emails WHERE retired_at IS NULL;
+CREATE VIEW t_kind_notes AS SELECT * FROM fixture.t_kind_notes WHERE retired_at IS NULL;
 CREATE VIEW t_calls AS SELECT * FROM fixture.t_calls WHERE retired_at IS NULL;
 CREATE VIEW t_orders AS SELECT * FROM fixture.t_orders WHERE retired_at IS NULL;
 CREATE VIEW t_phones AS SELECT * FROM fixture.t_phones WHERE retired_at IS NULL;
@@ -150,7 +155,7 @@ CREATE VIEW t_accounts AS SELECT * FROM fixture.t_accounts WHERE retired_at IS N
 CREATE VIEW t_tasks AS SELECT * FROM fixture.t_tasks WHERE retired_at IS NULL;
 CREATE VIEW t_task_lines AS SELECT * FROM fixture.t_task_lines WHERE retired_at IS NULL;
 DO $$ DECLARE t TEXT; BEGIN
-  FOREACH t IN ARRAY ARRAY['t_families', 't_kinds', 't_products', 't_customers', 't_emails',
+  FOREACH t IN ARRAY ARRAY['t_families', 't_kinds', 't_kind_notes', 't_products', 't_customers', 't_emails',
       't_phones', 't_calls', 't_orders', 't_sizes', 't_bins', 't_accounts', 't_tasks', 't_task_lines'] LOOP
     EXECUTE format('CREATE TRIGGER bump BEFORE UPDATE ON fixture.%I FOR EACH ROW EXECUTE FUNCTION fixture.bump()', t);
   END LOOP;
@@ -198,6 +203,24 @@ struct Kind {
     #[serde(serialize_with = "poisoned")]
     name: String,
     family_id: Option<Uuid>,
+    rev: i64,
+    retired_at: Option<DateTime<Utc>>,
+}
+
+/// A follower of a table with no rule of its own.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "t_kind_notes",
+    schema = "fixture",
+    mirror = "catalog",
+    sync = "follows(kind_id)"
+)]
+#[row(active = "t_kind_notes", retired = "retired_at")]
+struct KindNote {
+    id: Uuid,
+    partition_id: Uuid,
+    kind_id: Uuid,
+    text: String,
     rev: i64,
     retired_at: Option<DateTime<Utc>>,
 }
@@ -428,6 +451,7 @@ pub(super) fn codecs() -> Vec<Codec<()>> {
         Codec::json::<Customer>(None),
         Codec::json::<Product>(None),
         Codec::json::<Tally>(None),
+        Codec::json::<KindNote>(None),
         Codec::json::<Kind>(None),
         Codec::json::<Family>(None),
         Codec::json::<TaskLine>(None),
@@ -455,6 +479,7 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
     ("t_phones", &["kind_id"], "t_kinds"),
     ("t_calls", &["customer_id", "number"], "t_phones"),
     ("t_emails", &["customer_id"], "t_customers"),
+    ("t_kind_notes", &["kind_id"], "t_kinds"),
     ("t_orders", &["customer_id"], "t_customers"),
     ("t_orders", &["referrer_id"], "t_customers"),
     ("t_bins", &["size_code"], "t_sizes"),
@@ -468,6 +493,7 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
 /// The tables that follow another: the follower, its column, the parent.
 const FOLLOWS: &[(&str, &str, &str)] = &[
     ("t_emails", "customer_id", "t_customers"),
+    ("t_kind_notes", "kind_id", "t_kinds"),
     ("t_phones", "customer_id", "t_customers"),
     ("t_task_lines", "task_id", "t_tasks"),
 ];
@@ -480,6 +506,7 @@ const KEYS: &[(&str, &[&str])] = &[
     ("t_tallies", &["id"]),
     ("t_customers", &["id"]),
     ("t_emails", &["id"]),
+    ("t_kind_notes", &["id"]),
     ("t_phones", &["customer_id", "number"]),
     ("t_calls", &["id"]),
     ("t_orders", &["id"]),
@@ -846,8 +873,11 @@ impl World {
                 let rejected = model.rejections.clone();
                 if model.receive(&bytes, &RULES) == Received::Applied {
                     for ((row, bytes), held) in carried.iter().zip(held) {
+                        // One it would not let go of the server counts as
+                        // lacking, and sends whole when it wants it again.
+                        let kept = rejected.get(row).is_some_and(|r| r.reason == "pointed at");
                         assert!(
-                            held.as_ref() != Some(bytes),
+                            kept || held.as_ref() != Some(bytes),
                             "{replica} was sent {row:?} again at the version it holds; last steps: {:#?}",
                             &self.history[self.history.len().saturating_sub(8)..]
                         );
@@ -1633,6 +1663,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
     let customers = uuids(conn, "t_customers", partition).await;
     let lists = uuids(conn, "t_lists", partition).await;
     let emails = uuids(conn, "t_emails", partition).await;
+    let kind_notes = uuids(conn, "t_kind_notes", partition).await;
     let orders = uuids(conn, "t_orders", partition).await;
     let calls = uuids(conn, "t_calls", partition).await;
     let tallies = uuids(conn, "t_tallies", partition).await;
@@ -1677,7 +1708,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(105);
+    let choice = walk.below(109);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1696,11 +1727,12 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         walk.pick(&tasks),
         walk.pick(&lines),
     );
-    let (call, tally, other_list, other_customer) = (
+    let (call, tally, other_list, other_customer, kind_note) = (
         walk.pick(&calls),
         walk.pick(&tallies),
         walk.pick(&lists),
         walk.pick(&customers),
+        walk.pick(&kind_notes),
     );
     let small = i32::try_from(walk.below(4)).expect("small");
     let other = partitions[walk.below(partitions.len())];
@@ -1835,9 +1867,14 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         101 => write!(conn, "UPDATE fixture.t_tasks SET name = $2 WHERE id = $1", task, &big),
         // A parent deleted before what points at it points elsewhere.
         102 => write!(conn, "SELECT fixture.replace_family($1, $2) WHERE $1 IS NOT NULL", family, walk.pick(&families)),
+        // A follower of a table with no rule: it goes where its kind goes.
+        103 => write!(conn, "INSERT INTO fixture.t_kind_notes (id, partition_id, kind_id, text) VALUES ($1, $2, $3, 'n')", new, partition, kind),
+        104 => write!(conn, "UPDATE fixture.t_kind_notes SET kind_id = $2 WHERE id = $1", kind_note, kind),
+        105 => write!(conn, &format!("UPDATE fixture.t_kind_notes SET {RETIRE} WHERE id = $1"), kind_note),
+        106 => write!(conn, "DELETE FROM fixture.t_kind_notes WHERE id = $1", kind_note),
         // Planning a row's changes fails, until a deploy: the relay parks
         // them.
-        103 => return Step::Park(i64::from(small)),
+        107 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -2545,7 +2582,12 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
             // A key that changed: the new one where it is now, the old one
             // where it was, with what the row as it was pointed at.
             ("t_counters".into(), log.to_string(), Some(b), None),
-            ("t_counters".into(), counter.to_string(), Some(a), pointed.clone()),
+            (
+                "t_counters".into(),
+                counter.to_string(),
+                Some(a),
+                pointed.clone()
+            ),
             ("t_counters".into(), log.to_string(), Some(b), None),
             // A row that moved: where it was, whose replicas let it go —
             // its first note, with what it pointed at — and where it is now.
