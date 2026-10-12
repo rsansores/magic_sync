@@ -7,6 +7,7 @@ use crate::conformance::{codecs, settled, Uplinked};
 use crate::envelope::{self, Body, Down, Key as WireKey, Table};
 use crate::testkit::ItemRow;
 use prost::Message as _;
+use tokio::time::Instant;
 
 const TABLES: &str = "
 CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL, retired_at TEXT);
@@ -384,6 +385,45 @@ async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
         (first.sequence, first.digests.len()),
         (1, 0),
         "confirmed at once, without them"
+    );
+}
+
+/// When digests are due is the database's, not the process's: a replica
+/// that restarts more often than `digests_first` still sends them, once
+/// they are due since it first started.
+#[sqlx::test(migrations = false)]
+async fn digests_are_due_across_restarts(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    let uplink = Uplinked::default();
+    let settings = || Settings {
+        digests_first: Duration::from_millis(400),
+        digests_every: Duration::from_secs(3600),
+        ..settings()
+    };
+    let digested = || {
+        uplink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, up)| !up.digests.is_empty())
+            .count()
+    };
+    let me = Uuid::now_v7();
+    for run in 0..3 {
+        let replica = Replica::new(pool.clone(), codecs(), me, uplink.clone(), settings())
+            .await
+            .unwrap();
+        if run == 0 {
+            replica.receive(&rows(1, 0, "one")).await.unwrap();
+        }
+        let started = Instant::now();
+        until(&replica, || started.elapsed() > Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        digested(),
+        1,
+        "due once since it first started, then not for an hour"
     );
 }
 

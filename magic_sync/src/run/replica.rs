@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
-use tokio::time::Instant;
+
 use uuid::Uuid;
 
 /// Which replica this is: a `Uuid` the replica knows from the start, or the
@@ -84,7 +84,9 @@ pub struct Settings {
     /// failed, for a while: a send that hangs holds back only its lane, and
     /// only so long.
     pub send_timeout: Duration,
-    /// When the first digests go, after the replica starts: once it settled.
+    /// When the first digests go, after the replica first starts on its
+    /// database: once it settled. When they are due is kept in the
+    /// database, so a replica that restarts often says them all the same.
     pub digests_first: Duration,
     /// How often digests go after that.
     pub digests_every: Duration,
@@ -322,16 +324,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     async fn lane(&self, lane: usize, mut stopped: watch::Receiver<bool>) {
         let first = self.settings.backoff.first;
         let mut backoff = first;
-        let mut digests_at = Instant::now() + self.settings.digests_first;
         while !*stopped.borrow() {
-            let now = Instant::now();
-            let digests = lane == 0 && now >= digests_at;
-            let (wait, failed) = match self.send_lane(lane, digests).await {
+            let (wait, failed) = match self.turn(lane).await {
                 Ok(went) => {
                     backoff = first;
-                    if went.digests {
-                        digests_at = now + self.settings.digests_every;
-                    }
                     if went.message {
                         continue;
                     }
@@ -354,6 +350,20 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 () = tokio::time::sleep(wait) => {}
             }
         }
+    }
+
+    /// One turn of `lane`: a message, with the digests when they are due
+    /// on the main lane.
+    async fn turn(&self, lane: usize) -> Result<Went, Error> {
+        let settings = &self.settings;
+        let digests = lane == 0
+            && replica::digests_due(
+                &mut *self.pool.acquire().await?,
+                settings.digests_first,
+                settings.digests_every,
+            )
+            .await?;
+        self.send_lane(lane, digests).await
     }
 
     /// One message on `lane`, when it has something to say: read and
@@ -430,8 +440,11 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             Ok(()) => {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 replica::delivered(&mut tx, &outgoing).await?;
-                tx.commit().await?;
                 went.digests = !outgoing.up.digests.is_empty();
+                if went.digests {
+                    replica::digested(&mut tx, self.settings.digests_every).await?;
+                }
+                tx.commit().await?;
                 witnessed.store(cap > 0, Ordering::Relaxed);
                 self.skips[lane].store(0, Ordering::Relaxed);
                 self.caps[lane].store(0, Ordering::Relaxed);

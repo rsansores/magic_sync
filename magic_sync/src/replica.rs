@@ -2351,6 +2351,38 @@ pub(crate) async fn retry_set_aside(conn: &mut Conn) -> Result<u64, Error> {
     )
 }
 
+/// Whether the digests are due, `now`: when they were last said, or — the
+/// first time this database is asked — `first` after now; a clock set back
+/// past it counts as due.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn digests_due(
+    conn: &mut Conn,
+    first: std::time::Duration,
+    every: std::time::Duration,
+) -> Result<bool, Error> {
+    let millis = |d: std::time::Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
+    let now = chrono::Utc::now().timestamp_millis();
+    sqlx::query("INSERT OR IGNORE INTO sync_digests (id, due) VALUES (1, $1)")
+        .bind(now.saturating_add(millis(first)))
+        .execute(&mut *conn)
+        .await?;
+    let due: i64 = sqlx::query_scalar("SELECT due FROM sync_digests WHERE id = 1")
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(now >= due || due > now.saturating_add(millis(first.max(every))))
+}
+
+/// The digests went: due again `every` from now.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn digested(conn: &mut Conn, every: std::time::Duration) -> Result<(), Error> {
+    let every = i64::try_from(every.as_millis()).unwrap_or(i64::MAX);
+    sqlx::query("INSERT INTO sync_digests (id, due) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET due = EXCLUDED.due")
+        .bind(chrono::Utc::now().timestamp_millis().saturating_add(every))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// What this replica holds of each table the server sends down, for the
 /// server to compare with what it records — rows it retired, or rejected,
 /// left out — and the last message it applied, which they are read against.
