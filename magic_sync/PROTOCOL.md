@@ -472,6 +472,11 @@ For a table the replica writes and the server mirrors:
 The server files an upload under **the replica it came from** (the transport
 says which), whatever the rows themselves claim: a row of a table keyed by
 its replica that names another replica there is malformed, and left out. A
+row of a table written on both sides is an edit of the columns the replica
+owns, filed only as an update of a row the server has and records the
+replica holding: one of a row it is taking back, or of one it does not
+record the replica holding while it provisions it again, is kept and filed
+later; one of a row it never sent the replica is malformed, and left out. A
 row the server cannot file, or a delete its database refuses, is kept on the
 server, not lost, and filed later; so are an upload's rows whose filing fails
 as a whole for a reason a resend cannot cure. Either still counts as filed

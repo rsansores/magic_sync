@@ -1079,20 +1079,73 @@ pub(crate) async fn overwrite_except<R: Row>(
     write_keys(exec, rows, &conflict).await
 }
 
-/// Every row, a known key taking only `columns` — the ones this side owns.
-/// Answers the keys it wrote.
+/// `columns` — the ones replicas own — of every row the table has and
+/// `sender` is recorded holding, taken from `rows`; nothing else. A row
+/// written on both sides begins on the server: an edit of one it does not
+/// have is never a row, and one `sender` is not recorded holding is no edit
+/// of its own yet. Answers the keys it wrote.
 #[cfg(feature = "postgres")]
-pub(crate) async fn update_only<R: Row>(
+pub(crate) async fn update_held<R: Row>(
     exec: &mut Conn,
     rows: Vec<R>,
     columns: &[&str],
+    sender: Uuid,
 ) -> Result<Vec<Key>, Error> {
-    write_keys(
-        exec,
-        rows,
-        &update_clause_where::<R>(|c| columns.contains(&c)),
-    )
-    .await
+    let names = written_names::<R>();
+    let set: Vec<String> = names
+        .iter()
+        .filter(|c| columns.contains(c) && !R::KEY.contains(c))
+        .map(|c| format!("{0} = v.{0}", ident(c)))
+        .collect();
+    if rows.is_empty() || set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<R> = rows
+        .into_iter()
+        .rev()
+        .filter(|row| seen.insert(row.key()))
+        .collect();
+    unique.reverse();
+    let matched: Vec<String> = R::KEY
+        .iter()
+        .map(|k| format!("t.{0} = v.{0}", ident(k)))
+        .collect();
+    let key_text: Vec<String> = R::KEY
+        .iter()
+        .map(|k| format!("t.{}::text", ident(k)))
+        .collect();
+    let returned: Vec<String> = R::KEY.iter().map(|k| format!("t.{}", ident(k))).collect();
+    // Every row's columns, and the sender.
+    let per_statement = ((crate::dialect::MAX_BINDS - 1) / names.len().max(1)).max(1);
+    let kinds = key_kinds::<R>();
+    let mut written = Vec::new();
+    let mut rest = unique.into_iter().peekable();
+    while rest.peek().is_some() {
+        let chunk: Vec<R> = rest.by_ref().take(per_statement).collect();
+        let mut qb = sqlx::QueryBuilder::new(format!(
+            "UPDATE {} AS t SET {} FROM (",
+            R::QUALIFIED,
+            set.join(", ")
+        ));
+        qb.push_values(chunk, |mut sep, row| row.push_binds(&mut sep));
+        qb.push(format!(
+            ") AS v ({}) WHERE {} AND EXISTS (SELECT 1 FROM sync.held h WHERE h.replica_id = ",
+            listed(&names),
+            matched.join(" AND ")
+        ));
+        qb.push_bind(sender);
+        qb.push(format!(
+            " AND h.relation = {} AND h.row_key = concat_ws('|', {})) RETURNING {}",
+            crate::dialect::literal(R::TABLE),
+            key_text.join(", "),
+            returned.join(", ")
+        ));
+        for row in &qb.build().fetch_all(&mut *exec).await? {
+            written.push(key_of_row(row, &kinds)?);
+        }
+    }
+    Ok(written)
 }
 
 /// Writes every column of every row, the incoming value winning on a key the

@@ -263,7 +263,8 @@ impl<P: Sync + 'static> Codec<P> {
 
     /// The server writing what a replica sent: a record first-delivery-wins
     /// (or newest-wins when it carries a version), a two-way table only the
-    /// columns the replica owns; a catalog is refused. `sender` is the replica
+    /// columns the replica owns, of a row the server has and records `sender`
+    /// holding; a catalog is refused. `sender` is the replica
     /// the message came from; `known` is the server's knowledge of it. Answers
     /// the keys written, and the rows it could not take — that do not
     /// decode, or that the database refuses for their data — by their place in
@@ -473,9 +474,10 @@ enum How {
     /// A replica taking the server's: every column but its own, newest wins.
     #[cfg(feature = "sqlite")]
     AllButOwned,
-    /// The server taking a two-way table's: only the columns the replica owns.
+    /// The server taking a two-way table's: only the columns the replica
+    /// owns, of a row the replica named is recorded holding.
     #[cfg(feature = "postgres")]
-    OnlyOwned,
+    OnlyOwned(Uuid),
     /// The server taking state a replica reports: newest wins.
     #[cfg(feature = "postgres")]
     Newest,
@@ -599,7 +601,7 @@ where
             #[cfg(feature = "sqlite")]
             How::AllButOwned => row::overwrite_except(conn, rows, &self.owned).await,
             #[cfg(feature = "postgres")]
-            How::OnlyOwned => row::update_only(conn, rows, &self.owned).await,
+            How::OnlyOwned(sender) => row::update_held(conn, rows, &self.owned, sender).await,
             #[cfg(feature = "postgres")]
             How::Newest => row::upsert(conn, rows).await,
             #[cfg(feature = "postgres")]
@@ -656,6 +658,59 @@ where
         let result = self.write(conn, rows, how).await;
         row::released(conn, result).await
     }
+}
+
+/// What becomes of the edits of a two-way table's rows `sender` uploaded
+/// that the server did not write. One of a row `sender` was sent waits in
+/// the inbox, answered by its place in the upload: the server forgot what
+/// it holds until its provisioning is recorded, or deleted the row and is
+/// taking it back — the delete wins, and the edit leaves the inbox once
+/// `sender` let go of the row. One of a row never sent it breaks the
+/// protocol, and is left out.
+#[cfg(feature = "postgres")]
+async fn unheld<R: Row>(
+    conn: &mut Conn,
+    unwritten: Vec<(usize, Key)>,
+    sender: Uuid,
+) -> Result<Vec<Refused>, Error> {
+    if unwritten.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<Key> = unwritten.iter().map(|(_, key)| key.clone()).collect();
+    let there: std::collections::HashSet<Key> = row::get_by_keys::<R>(conn, &keys)
+        .await?
+        .iter()
+        .map(Row::key)
+        .collect();
+    let texts: Vec<String> = keys.iter().map(row::key_text).collect();
+    let sent: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT row_key FROM sync.held WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3) \
+         UNION SELECT row_key FROM sync.gone WHERE replica_id = $1 AND relation = $2 AND row_key = ANY($3)",
+    )
+    .bind(sender)
+    .bind(R::TABLE)
+    .bind(&texts)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .collect();
+    let mut kept = Vec::new();
+    for (at, key) in unwritten {
+        let text = row::key_text(&key);
+        let reason = match (there.contains(&key), sent.contains(&text)) {
+            (true, _) => "an edit of a row the server does not record the replica holding",
+            (false, true) => "an edit of a row the server deleted, and is taking back",
+            (false, false) => {
+                tracing::error!(%sender, table = R::TABLE, key = text, "upload: an edit of a two-way row never sent it — malformed, left out");
+                continue;
+            }
+        };
+        kept.push(Refused {
+            at,
+            reason: reason.to_owned(),
+        });
+    }
+    Ok(kept)
 }
 
 impl<R, P: Sync> Ops<P> for Typed<R, P>
@@ -733,7 +788,7 @@ where
     ) -> Fut<'a, Taken> {
         Box::pin(async move {
             let how = match R::MIRROR {
-                Mirror::Both => How::OnlyOwned,
+                Mirror::Both => How::OnlyOwned(sender),
                 Mirror::Record if R::VERSION.is_some() => How::Newest,
                 Mirror::Record => How::First,
                 _ => {
@@ -764,8 +819,19 @@ where
                     own
                 });
             }
+            let offered: Vec<(usize, Key)> =
+                rows.iter().map(|(at, row)| (*at, row.key())).collect();
             let (written, refused) = self.guarded(conn, rows, how).await?;
             rejected.extend(refused);
+            if let How::OnlyOwned(_) = how {
+                let unwritten: Vec<(usize, Key)> = offered
+                    .into_iter()
+                    .filter(|(at, key)| {
+                        !written.contains(key) && !rejected.iter().any(|r| r.at == *at)
+                    })
+                    .collect();
+                rejected.extend(unheld::<R>(conn, unwritten, sender).await?);
+            }
             Ok(Taken {
                 held: written,
                 rejected,
