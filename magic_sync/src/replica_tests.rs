@@ -4748,8 +4748,12 @@ async fn only_the_engines_own_triggers_pass_the_check(pool: SqlitePool) {
             "the trigger `sync_note_events_delete` is missing",
         ),
         (
-            "CREATE TRIGGER sync_note_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
-            "the trigger `sync_note_gone_insert` is not one of the engine's",
+            "CREATE TRIGGER sync_refuse_gone_insert AFTER INSERT ON receipts BEGIN SELECT 1; END",
+            "the trigger `sync_refuse_gone_insert` is not one of the engine's",
+        ),
+        (
+            "CREATE TRIGGER sync_note_items_insert AFTER INSERT ON items BEGIN SELECT 1; END",
+            "the trigger `sync_note_items_insert` is not one of the engine's",
         ),
     ];
     for (case, why) in cases {

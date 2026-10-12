@@ -58,7 +58,11 @@ provision the replicas yourself ([Provisioning](provisioning.md)).
 On a replica, what it wrote of a table its build does not send up — one
 that no longer goes up, or not yet, after a rollback — stays, set aside and
 counted in the backlog, and goes up once a build that sends it runs: rolling
-a replica back and forward again loses none of its writes.
+a replica back and forward again loses none of its writes. An earlier build
+keeps the note triggers a later one wrote for a table it does not know, so
+what the host writes there while it runs is noted too. A table that no
+longer travels for good keeps them as well: drop its `sync_note_…` triggers
+in a migration of yours.
 
 ## The protocol
 

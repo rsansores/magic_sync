@@ -314,7 +314,8 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// ones; triggers that
 /// are not the ones [`triggers`] writes — one missing, one that differs, or
 /// one left from a table that no longer travels, the engine's being those
-/// named `sync_note_…` and `sync_refuse_…`; or a connection the engine
+/// named `sync_note_…` and `sync_refuse_…` — but the note triggers of a
+/// table this build does not know, which a later build wrote; or a connection the engine
 /// cannot keep its word on — `synchronous` below `FULL`, `journal_mode`
 /// `OFF` or `MEMORY` (of a database with a file), `recursive_triggers` off — which the pool's options
 /// set. [`Replica::new`] runs it; a host with migrations also runs it in a
@@ -365,12 +366,15 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
             }
         }
     }
-    let live: HashMap<String, String> =
-        sqlx::query_as("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
             .fetch_all(&mut *conn)
-            .await?
-            .into_iter()
-            .collect();
+            .await?;
+    let live: HashMap<String, String> = rows
+        .into_iter()
+        .filter(|(name, table, _)| !unknown(codecs, name, table))
+        .map(|(name, _, sql)| (name, sql))
+        .collect();
     let normal = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
     let wanted = generated(codecs);
     for trigger in &wanted {
@@ -408,6 +412,21 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
 #[cfg(feature = "sqlite")]
 fn engines(name: &str) -> bool {
     name.starts_with("sync_note_") || name.starts_with("sync_refuse_")
+}
+
+/// Whether `name` is the engine's note trigger of a table this build does
+/// not know: one a later build wrote, which an earlier one keeps — what
+/// the host writes while it runs is noted, and set aside until the later
+/// build runs again ([`Replica::new`]). A table that no longer travels for
+/// good is the host's to drop the trigger of.
+///
+/// [`Replica::new`]: crate::run::replica::Replica::new
+#[cfg(feature = "sqlite")]
+fn unknown<P: Sync + 'static>(codecs: &[Codec<P>], name: &str, table: &str) -> bool {
+    name.starts_with("sync_note_")
+        && !codecs
+            .iter()
+            .any(|c| c.table.name.eq_ignore_ascii_case(table))
 }
 
 /// Refuses a connection the engine cannot keep its word on, each setting of
@@ -453,7 +472,9 @@ pub(crate) async fn settled(conn: &mut Conn) -> Result<(), Error> {
 /// Brings a replica database to what this build runs against, in one
 /// transaction (`BEGIN IMMEDIATE`, so no write slips in half-way): the
 /// engine's tables migrated from whatever version they are at, and every
-/// trigger [`triggers`] writes, in place of the engine's own it had. Then
+/// trigger [`triggers`] writes, in place of the engine's own it had — but
+/// the note triggers of a table this build does not know, which it keeps:
+/// a later build wrote them, and runs again. Then
 /// [`check`]s it. For a host with no migrations of its own; run it before
 /// anything writes, on a connection with no transaction open. Idempotent.
 ///
@@ -476,11 +497,14 @@ pub async fn install<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) ->
         let script = migration(step).expect("a step of this build");
         sqlx::Executor::execute(&mut *tx, script.as_str()).await?;
     }
-    let live: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    let live: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'")
             .fetch_all(&mut *tx)
             .await?;
-    for name in live.into_iter().filter(|name| engines(name)) {
+    let ours = live
+        .into_iter()
+        .filter(|(name, table)| engines(name) && !unknown(codecs, name, table));
+    for (name, _) in ours {
         sqlx::query(&format!("DROP TRIGGER {}", ident(&name)))
             .execute(&mut *tx)
             .await?;
