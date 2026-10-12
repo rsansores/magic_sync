@@ -357,8 +357,9 @@ impl std::ops::Deref for Passed {
 fn items_of(model: &Model) -> BTreeSet<String> {
     model
         .rows
-        .values()
-        .map(|bytes| ItemRow::decode(bytes.as_slice()).expect("an item").name)
+        .iter()
+        .filter(|((table, _), _)| table == "items")
+        .map(|(_, bytes)| ItemRow::decode(bytes.as_slice()).expect("an item").name)
         .collect()
 }
 
@@ -3064,6 +3065,67 @@ async fn a_pass_short_of_memory_keeps_a_unique_value_moving_in_one_message(pool:
         .execute(&mut *tx)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
+    let relay = Relay {
+        buffered: 1,
+        ..world.relay()
+    };
+    world.pass_relay(&relay, &wire).await;
+    let mut model = models.remove(&a).unwrap();
+    world.deliver(&wire, a, &mut model, &UNIQUE);
+    assert!(model.rejections.is_empty(), "{:?}", model.rejections);
+    assert_eq!(items_of(&model), names(&["taken"]));
+}
+
+/// A pass short of memory keeps a unique value moving in one message when
+/// another table's rows come and go inside the move: the message ends
+/// neither between them nor between the items let go of and taken.
+#[sqlx::test(migrations = false)]
+async fn a_pass_short_of_memory_ends_no_message_inside_a_move_another_table_nests_in(
+    pool: crate::DbPool,
+) {
+    const UNIQUE: Rules = Rules {
+        unique: |table, bytes| {
+            ItemRow::decode(bytes)
+                .ok()
+                .filter(|_| table == "items")
+                .map(|row| row.name)
+        },
+        ..Rules::ANY
+    };
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let wire = Wire::new(0);
+    let mut models = world.models();
+    let x = world.item("taken").await;
+    let gone = world.tally("gone").await;
+    world.settle(&wire, &mut models).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    for (sql, id) in [
+        (
+            "DELETE FROM fixture.items WHERE id = $1 AND $2::uuid IS NOT NULL",
+            x,
+        ),
+        (
+            "INSERT INTO fixture.items (id, partition_id, name) VALUES ($1, $2, 'taken')",
+            Uuid::now_v7(),
+        ),
+        (
+            "INSERT INTO fixture.tallies (id, partition_id, title, seen) VALUES ($1, $2, 'new', 0)",
+            Uuid::now_v7(),
+        ),
+        (
+            "DELETE FROM fixture.tallies WHERE id = $1 AND $2::uuid IS NOT NULL",
+            gone,
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(id)
+            .bind(world.partition)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
     tx.commit().await.unwrap();
     let relay = Relay {
         buffered: 1,

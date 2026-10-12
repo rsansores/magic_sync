@@ -577,6 +577,11 @@ const RULES: Rules = Rules {
             .is_ok_and(|row| row.get("name").and_then(|n| n.as_str()) == Some(REFUSED))
     },
     parents,
+    unique: |table, bytes| {
+        let row: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let name = row.get("name")?.as_str()?;
+        (table == "t_products" && name.starts_with('u')).then(|| name.to_owned())
+    },
     ..Rules::ANY
 };
 
@@ -1740,7 +1745,7 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(109);
+    let choice = walk.below(111);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1904,9 +1909,19 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         104 => write!(conn, "UPDATE fixture.t_kind_notes SET kind_id = $2 WHERE id = $1", kind_note, kind),
         105 => write!(conn, &format!("UPDATE fixture.t_kind_notes SET {RETIRE} WHERE id = $1"), kind_note),
         106 => write!(conn, "DELETE FROM fixture.t_kind_notes WHERE id = $1", kind_note),
+        // A product's name its replicas hold unique, and that name moved to
+        // a new product while tallies come and go, at once: a pass short of
+        // memory ends no message between the products let go of and taken.
+        107 => write!(conn, "UPDATE fixture.t_products SET name = 'u' || $2 WHERE id = $1", product, number),
+        108 => {
+            write!(conn, "INSERT INTO fixture.t_tallies (id, partition_id, kind_id, name) VALUES ($1, $2, $3, 't')", walk.uuid(), partition, kind);
+            write!(conn, "DELETE FROM fixture.t_tallies WHERE id = $1", tally);
+            write!(conn, "INSERT INTO fixture.t_products (id, partition_id, kind_id, name) SELECT $1, partition_id, kind_id, name FROM fixture.t_products WHERE id = $2 AND name LIKE 'u%'", new, product)
+                && write!(conn, "DELETE FROM fixture.t_products WHERE id = $1", product)
+        }
         // Planning a row's changes fails, until a deploy: the relay parks
         // them.
-        107 => return Step::Park(i64::from(small)),
+        109 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
