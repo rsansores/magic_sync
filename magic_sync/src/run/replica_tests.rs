@@ -388,6 +388,37 @@ async fn digests_go_once_the_replica_settled(pool_: SqlitePool) {
     );
 }
 
+/// What a replica wrote of a table that no longer goes up — its triggers
+/// dropped, as `check` requires — never will: its notes are dropped when
+/// the replica starts, rather than counted in the backlog for ever.
+#[sqlx::test(migrations = false)]
+async fn notes_of_a_table_that_no_longer_goes_up_are_dropped(pool_: SqlitePool) {
+    let pool = pool(pool_).await;
+    sqlx::query(
+        "INSERT INTO sync_notes (relation, row_key) VALUES ('retired_table', 'a'), ('events', 'b'); \
+         INSERT INTO sync_leaving (relation, row_key) VALUES ('retired_table', 'a')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    Replica::new(
+        pool.clone(),
+        codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        settings(),
+    )
+    .await
+    .unwrap();
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT relation FROM sync_notes UNION ALL SELECT relation FROM sync_leaving",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, ["events"]);
+}
+
 /// When digests are due is the database's, not the process's: a replica
 /// that restarts more often than `digests_first` still sends them, once
 /// they are due since it first started.
