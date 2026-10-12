@@ -504,9 +504,7 @@ From time to time (hourly is reasonable), a replica **should** report what it
 holds of every table the server sends it, in `Up.digests`, together with the
 `(epoch, sequence, nonce, mac)` of the last message it applied (5.2). It
 **must** leave out a table it wrote rows of that the server has not filed
-(`Filed`, 4.4): the server records a row the replica deleted as held until
-it files the delete — in the transaction that files it, it records the row
-held no more.
+(`Filed`, 4.4); the reason is given at the end of this section.
 
 - `table`: the table;
 - `count`: how many rows it holds, **leaving out** rows it retired (4.3) and
@@ -528,9 +526,12 @@ Test vectors: no keys → `0xcbf29ce484222325`; the single key `a` →
 A replica **must** leave out of its digests every table of which it wrote
 rows the server has not filed yet (section 7): what the server records of
 it is about to change, and a comparison now would find them apart for
-nothing. That holds from when it reads them to when it sends them: a table
-written in between — a write that may go up in the very message — goes
-without its digest too.
+nothing: the server records a row the replica deleted as held until it
+files the delete, and then records it held no more only where the replica had
+applied every message that carries the row (Appendix A.3).
+That holds from when it reads them to when it sends them: a table written in
+between — a write that may go up in the very message — goes without its
+digest too.
 
 ---
 
