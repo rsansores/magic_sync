@@ -81,8 +81,8 @@ delete = holds − should hold
 ```
 
 A change is never "an event that must be delivered" — it is a reason to
-compare two sets again. So a row that could not be sent is simply not
-recorded as held, and the next comparison sends it, as it is *then*. A
+compare two sets again. So a row a replica did not take is simply not
+counted as held, and the next comparison sends it, as it is *then*. A
 replica that missed a week catches up from the current state. Provisioning a
 new replica is a comparison against an empty set.
 
