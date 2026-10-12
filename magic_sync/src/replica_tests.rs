@@ -4513,6 +4513,22 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
     assert!(told.up.backlog.is_some());
 }
 
+/// What the replica stored of the backlog it last told, it reads in a shape
+/// of its own: one it cannot read — another build's — it never told, and
+/// tells now, rather than fail every message up.
+#[sqlx::test(migrations = false)]
+async fn a_backlog_told_in_a_shape_it_cannot_read_is_told_again(pool: SqlitePool) {
+    let w = world(pool).await;
+    events(&w, &["x"]).await;
+    w.up(0, false).await.expect("sent");
+    w.exec("UPDATE sync_backlog SET backlog = '[{\"table\":\"events\",\"later\":true}]'")
+        .await
+        .unwrap();
+    events(&w, &["y"]).await;
+    let up = w.up(0, false).await.expect("sent");
+    assert_eq!(up.backlog.expect("told").tables[0].unsent, 1);
+}
+
 /// A clock set back makes nothing wait for it to come round again: an upload
 /// sent "in the future" goes again.
 #[sqlx::test(migrations = false)]

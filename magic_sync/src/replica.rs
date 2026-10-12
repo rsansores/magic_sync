@@ -1994,15 +1994,16 @@ pub struct UpProgress {
     pub set_aside: i64,
 }
 
-impl From<&envelope::TableBacklog> for UpProgress {
-    fn from(table: &envelope::TableBacklog) -> Self {
-        UpProgress {
-            table: table.table.clone(),
-            unsent: i64::try_from(table.unsent).unwrap_or(i64::MAX),
-            unfiled: i64::try_from(table.unfiled).unwrap_or(i64::MAX),
-            set_aside: i64::try_from(table.set_aside).unwrap_or(i64::MAX),
-        }
-    }
+/// A table's backlog as the replica stores what it last told the server
+/// — its own shape, apart from [`UpProgress`]'s, which a host reads and a
+/// later release may change.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Told {
+    table: String,
+    unsent: u64,
+    unfiled: u64,
+    set_aside: u64,
 }
 
 /// [`UpProgress`] for every table with something on its way.
@@ -2044,26 +2045,43 @@ async fn backlog_due(
     settings: &Outbox,
     sending: bool,
 ) -> Result<Option<envelope::Backlog>, Error> {
-    let told: Option<(sqlx::types::Json<Vec<UpProgress>>, i64)> =
+    let stored: Option<(String, i64)> =
         sqlx::query_as("SELECT backlog, reported_at FROM sync_backlog WHERE id = 1")
             .fetch_optional(&mut *conn)
             .await?;
-    let (before, at) = match told {
-        Some((backlog, at)) => (Some(backlog.0), at),
+    // What it cannot read of what it told — stored by another build — it
+    // never told.
+    let (before, at) = match stored {
+        Some((backlog, at)) => match serde_json::from_str::<Vec<Told>>(&backlog) {
+            Ok(before) => (Some(before), at),
+            Err(_) => (None, 0),
+        },
         None => (None, 0),
     };
+    let now = backlog_of(now);
     let every = i64::try_from(settings.backlog_every.as_millis()).unwrap_or(i64::MAX);
     let clock = chrono::Utc::now().timestamp_millis();
     let stale = clock < at || clock - at >= every;
-    let due = if before.as_ref() == Some(&now) {
+    let unchanged = before.as_ref() == Some(&now.tables.iter().map(told).collect());
+    let due = if unchanged {
         // Unchanged: said again now and then while not empty, should the
         // server have lost it.
-        !now.is_empty() && stale
+        !now.tables.is_empty() && stale
     } else {
-        let edge = now.is_empty() || before.as_ref().is_none_or(Vec::is_empty);
+        let edge = now.tables.is_empty() || before.as_ref().is_none_or(Vec::is_empty);
         sending || edge || stale
     };
-    Ok(due.then(|| backlog_of(now)))
+    Ok(due.then_some(now))
+}
+
+#[cfg(feature = "sqlite")]
+fn told(table: &envelope::TableBacklog) -> Told {
+    Told {
+        table: table.table.clone(),
+        unsent: table.unsent,
+        unfiled: table.unfiled,
+        set_aside: table.set_aside,
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -2720,7 +2738,7 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
         .await?;
     }
     if let Some(backlog) = &outgoing.up.backlog {
-        let tables: Vec<UpProgress> = backlog.tables.iter().map(UpProgress::from).collect();
+        let tables: Vec<Told> = backlog.tables.iter().map(told).collect();
         sqlx::query(
             "INSERT INTO sync_backlog (id, backlog, reported_at) VALUES (1, $1, $2) \
              ON CONFLICT (id) DO UPDATE SET backlog = EXCLUDED.backlog, reported_at = EXCLUDED.reported_at",
