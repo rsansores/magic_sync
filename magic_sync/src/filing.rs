@@ -1175,8 +1175,9 @@ pub(crate) async fn newest(conn: &mut Conn) -> Result<i64, Error> {
 /// age. Only the rows it carried are filed: what it said of its moment —
 /// what it refused, applied, missed, held, had not sent — is out of date by
 /// now, and was filed when it came. One filing of a replica runs at a time,
-/// its uploads and its inbox alike: a part an upload of its row superseded
-/// meanwhile is gone, and files nothing.
+/// its uploads and its inbox alike, and what files is the part as the inbox
+/// holds it then: an upload of its row since replaced it, or dropped it,
+/// and `kept` as it was read is never filed over it.
 pub(crate) async fn refile<P: Sync + 'static>(
     conn: &mut Conn,
     codecs: &[Codec<P>],
@@ -1184,6 +1185,17 @@ pub(crate) async fn refile<P: Sync + 'static>(
     known: &P,
 ) -> Result<bool, Error> {
     use prost::Message as _;
+    one_at_a_time(conn, kept.replica_id).await?;
+    let Some(kept): Option<Kept> = sqlx::query_as(
+        "DELETE FROM sync.inbox WHERE id = $1 \
+         RETURNING id, replica_id, upload, first_at, attempts",
+    )
+    .bind(kept.id)
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(true);
+    };
     let up = Up::decode(kept.upload.as_slice()).map_err(|e| Error::Malformed {
         table: "sync.inbox".to_owned(),
         reason: e.to_string(),
@@ -1194,16 +1206,8 @@ pub(crate) async fn refile<P: Sync + 'static>(
             ours: envelope::PROTOCOL,
         });
     }
-    one_at_a_time(conn, kept.replica_id).await?;
-    let taken = sqlx::query("DELETE FROM sync.inbox WHERE id = $1")
-        .bind(kept.id)
-        .execute(&mut *conn)
-        .await?;
-    if taken.rows_affected() == 0 {
-        return Ok(true);
-    }
     let (_, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known).await?;
-    keep(conn, kept.replica_id, &unfiled, &mut Keeping::Again(kept)).await?;
+    keep(conn, kept.replica_id, &unfiled, &mut Keeping::Again(&kept)).await?;
     Ok(unfiled.is_empty())
 }
 

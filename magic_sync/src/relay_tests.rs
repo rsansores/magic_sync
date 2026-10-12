@@ -2866,3 +2866,44 @@ async fn a_replica_that_deletes_its_own_two_way_row_holds_what_is_recorded(pool:
     world.pass(&wire).await;
     assert_eq!(held(b).await, 0, "taken back from the others");
 }
+
+/// An upload of a row kept in the inbox, kept whole while the inbox is
+/// being filed again, is what files: the part read before it came files
+/// the newest edit, never the one it read.
+#[sqlx::test(migrations = false)]
+async fn a_part_kept_again_while_the_inbox_is_filed_files_its_newest_edit(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    let id = world.tally("count").await;
+    world.pass(&Fake::default()).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    collapse(&mut tx, a, "a test").await.unwrap();
+    tx.commit().await.unwrap();
+    world.file(a, &edit(world.partition, id, "count", 1)).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    let newest = crate::filing::newest(&mut tx).await.unwrap();
+    let read = crate::filing::inbox(&mut tx, 0, newest, 10).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(read.len(), 1);
+
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::keep_whole(
+        &mut tx,
+        &world.codecs,
+        a,
+        &edit(world.partition, id, "count", 2),
+        "a test",
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    world.pass(&Fake::default()).await;
+    let mut tx = world.pool.begin().await.unwrap();
+    assert!(crate::filing::refile(&mut tx, &world.codecs, &read[0], &())
+        .await
+        .unwrap());
+    tx.commit().await.unwrap();
+    assert_eq!(world.tallied(id).await, Some(("count".to_owned(), 2)));
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+}
