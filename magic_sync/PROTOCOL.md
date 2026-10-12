@@ -246,9 +246,9 @@ their deletes ignored.
    A key both let go of and upserted in one part is held: its upsert comes
    after. A key upserted twice in one part is the last row beside it.
 
-**A row the database refuses is tried again once the whole message is in**
-— every part of it, the deletes of later parts included — and again while
-that takes one more: it may point at a row after it, or take a unique value
+**A row the database refuses is tried again once the rest of its part is
+in, and once the whole message is** — every part of it, the deletes of
+later parts included — each while that takes one more: it may point at a row after it, or take a unique value
 a row after it, or a delete after it, gives up. One that a later part lets
 go of is not tried again: the server let go of it. What is still refused
 then is rejected (section 6). Two rows that swap a unique value cannot be

@@ -629,14 +629,13 @@ pub(crate) struct Culprit {
 }
 
 /// Where a row is in a message: the upsert at `at` of its `entry`th table,
-/// a key it lets go of (a delete, a sweep, a let-go once filed), or a
-/// retired row let go of once nothing keeps it.
+/// or a key it lets go of (a delete, a sweep, a let-go once filed, a retired
+/// row nothing keeps).
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Spot {
     Upsert { entry: usize, at: usize },
     LetGo(String),
-    Collect(String),
 }
 
 /// How a message is applied: all at once; or — once a refusal rolled a
@@ -818,9 +817,14 @@ async fn carefully<P: Sync + 'static>(
     let why = "rows here point at what it changes, through a key checked at commit";
     for (codec, pointing) in &before {
         let table = codec.table.name;
-        for key in codec.broken(conn, pointing).await? {
-            let row = upserts
-                .remove(&(table, key.clone()))
+        let broken = codec.broken(conn, pointing).await?;
+        // One still held was changed by its upsert; one gone, let go of.
+        let held: HashSet<Key> = codec.present(conn, &broken).await?.into_iter().collect();
+        for key in broken {
+            let row = held
+                .contains(&key)
+                .then(|| upserts.remove(&(table, key.clone())))
+                .flatten()
                 .unwrap_or_else(|| Spot::LetGo(key_text(&key)));
             culprits.push(Culprit {
                 table: table.to_owned(),
@@ -829,6 +833,11 @@ async fn carefully<P: Sync + 'static>(
             });
         }
         crate::row::forget(conn, pointing).await?;
+        // A row of the message pointing at one it let go of is the let-go's
+        // to answer for, found first.
+        if !culprits.is_empty() {
+            continue;
+        }
         let mine: Vec<Key> = upserts
             .keys()
             .filter(|(t, _)| *t == table)
@@ -1133,10 +1142,11 @@ fn json<T: serde::Serialize>(keys: &[T]) -> String {
 /// refuses to delete, or that a row of the replica's own points at in a table
 /// with nothing to retire it by — is left as it was and noted as rejected,
 /// for [`outbox`] to report, rather than holding back the queue behind it; a
-/// storage failure is the error. A row refused is tried again once the whole
-/// message is in, while that takes one more: the value it takes may be given
-/// up later in the message. A row the replica takes or lets go of is no
-/// longer one to report.
+/// storage failure is the error. A row refused is tried again once the rest
+/// of its part is in, and once the whole message is, while that takes one
+/// more: what it points at, or the value it takes, may come later in the
+/// message. A row the replica takes or lets go of is no longer one to
+/// report.
 #[cfg(feature = "sqlite")]
 async fn apply<P: Sync + 'static>(
     conn: &mut Conn,
@@ -1217,18 +1227,13 @@ async fn apply<P: Sync + 'static>(
             refused: Vec::new(),
         };
         part.attempt(conn, &pending, naming, care).await?;
+        while part.again(conn, naming, care).await? {}
         parts.push(part);
     }
     loop {
         let mut took = false;
         for part in &mut parts {
-            let again: Vec<usize> = std::mem::take(&mut part.refused)
-                .into_iter()
-                .map(|(at, _)| at)
-                .collect();
-            let held = part.held.len();
-            part.attempt(conn, &again, naming, care).await?;
-            took |= part.held.len() > held;
+            took |= part.again(conn, naming, care).await?;
         }
         if !took {
             break;
@@ -1294,6 +1299,17 @@ struct Part<'m, P: 'static> {
 
 #[cfg(feature = "sqlite")]
 impl<P: Sync + 'static> Part<'_, P> {
+    /// The rows refused so far tried again: answers whether it took any.
+    async fn again(&mut self, conn: &mut Conn, naming: bool, care: &Care) -> Result<bool, Stop> {
+        let refused: Vec<usize> = std::mem::take(&mut self.refused)
+            .into_iter()
+            .map(|(at, _)| at)
+            .collect();
+        let held = self.held.len();
+        self.attempt(conn, &refused, naming, care).await?;
+        Ok(self.held.len() > held)
+    }
+
     /// The rows at `positions` tried: all at once, or — careful — each in a
     /// savepoint of its own, so that one whose refusal takes the whole
     /// transaction with it stops the message, named.
@@ -1663,7 +1679,7 @@ async fn collect<P: Sync + 'static>(
         // rows that keep only one another go one after the other.
         let mut pending: Vec<Key> = retired
             .into_iter()
-            .filter(|key| care.culprit(table, &Spot::Collect(key_text(key))).is_none())
+            .filter(|key| care.culprit(table, &Spot::LetGo(key_text(key))).is_none())
             .collect();
         loop {
             let mut kept = Vec::new();
@@ -1674,7 +1690,7 @@ async fn collect<P: Sync + 'static>(
                     .retire(conn, one, &[], &server)
                     .await
                     .map_err(Stop::from);
-                let spot = Spot::Collect(key_text(&key));
+                let spot = Spot::LetGo(key_text(&key));
                 if !row_done(conn, gone, table, spot)
                     .await?
                     .is_ok_and(|r| r.deleted > 0)

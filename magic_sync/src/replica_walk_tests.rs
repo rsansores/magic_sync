@@ -1,32 +1,64 @@
 //! A replica walked at random against a model of it: a server sends what a
-//! server sends — rows of a tree that points at itself, under a unique
-//! name, deletes, snapshots, new epochs — and now and then what none sends:
-//! a row beside another's key, one that does not decode, a key twice, rows
-//! of a table the replica does not hold from it; through a transport that
-//! loses, and redelivers, of this epoch or an earlier one; the host writes, rewrites and deletes its own
-//! rows; the uplink fails for a while and for good; and the power goes, in
-//! the middle of a message, of an upload, of a write, after a send. After
-//! every step the replica holds what the protocol's model of it holds,
-//! confirms nothing it has not told every refusal of, keeps what it stores
-//! bounded, and has lost no write: each is either still noted or filed with
-//! its latest content. At the end, with the faults gone, everything it wrote
-//! is filed, once, as it is.
+//! server sends — rows of a tree that points at itself, under names unique
+//! among the live ones and given again once let go of; prices of items and
+//! shelves labelled in either case, through keys checked at commit; deletes,
+//! snapshots, new epochs, each pass packed as a server packs it, a table's
+//! rows that come together in one part, a few rows a message — and now and
+//! then what none sends: a row beside another's key, one that does not
+//! decode, a key twice, rows of a table the replica does not hold from it,
+//! more rows than a message carries, a row of twenty thousand bytes, a table
+//! named past what is kept; through a transport that loses, and redelivers,
+//! of this epoch or an earlier one; the host writes, rewrites and deletes its
+//! own rows — receipts, quotes and tags pointing at the server's, readings
+//! written while a message is applied; the uplink fails for a while and for
+//! good; and the power goes, in the middle of a message, of an upload, of a
+//! write, after a send. After every step the replica holds what the
+//! protocol's model of it holds — retired rows let go of once nothing keeps
+//! them, its edits held for as long as the host's writes say they are not
+//! filed — digests what the model holds, confirms nothing it has not told
+//! every refusal of, keeps what it stores bounded, and has lost no write:
+//! each is either still noted or filed with its latest content. At the end,
+//! with the faults gone, everything it wrote is filed, once, as it is.
 
 use super::*;
 use crate::model::{self, Model, Rules};
 use crate::testkit::Walk;
 use std::collections::{BTreeMap, VecDeque};
 
-/// Rows the walk's server names: few, so the same rows come back.
+/// Rows the walk's server names: few, so the same rows come back. A price
+/// is of the item of its id.
 const ITEMS: u128 = 6;
+const SHELVES: usize = 3;
 const PRICES: u128 = 3;
 const READINGS: u128 = 4;
 const TASKS: u128 = 3;
 
 /// The walk's tables: the suite's, its items a tree — each under a parent,
-/// the root under itself — named uniquely among the live ones.
+/// the root under itself — named uniquely among the live ones; a price of
+/// an item, checked at commit; shelves labelled uniquely whatever the case,
+/// and the replica's own tags of a shelf's label, checked at commit.
 fn tables() -> String {
-    tree_tables() + "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;"
+    tree_tables()
+        .replace(
+            "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL,",
+            "CREATE TABLE prices (id BLOB PRIMARY KEY NOT NULL \
+             REFERENCES items (id) DEFERRABLE INITIALLY DEFERRED,",
+        )
+        .replace(
+            "label TEXT NOT NULL,",
+            "label TEXT NOT NULL UNIQUE COLLATE NOCASE,",
+        )
+        + "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;
+           CREATE TABLE tags (id INTEGER PRIMARY KEY, \
+             label TEXT NOT NULL REFERENCES shelves (label) DEFERRABLE INITIALLY DEFERRED);"
+}
+
+/// The aisle of the walk's shelves.
+const AISLE: Uuid = Uuid::from_u128(0xa151e);
+
+fn label_of(bytes: &[u8]) -> String {
+    let value: serde_json::Value = serde_json::from_slice(bytes).expect("a shelf");
+    value["label"].as_str().expect("a label").to_owned()
 }
 
 /// What the replica's database refuses: an item named `bad…` (with `ABORT`)
@@ -85,8 +117,16 @@ const RULES: Rules = Rules {
             && item_of(bytes)
                 .is_some_and(|row| row.name.starts_with("keep") || row.name.starts_with("gone"))
     },
-    parents: |table, bytes| match item_of(bytes) {
-        Some(row) if table == "items" => vec![("items".to_owned(), row.partition_id)],
+    parents: |table, bytes| match table {
+        "items" => item_of(bytes)
+            .map(|row| ("items".to_owned(), row.partition_id))
+            .into_iter()
+            .collect(),
+        "prices" => {
+            let value: serde_json::Value = serde_json::from_slice(bytes).expect("a price");
+            let id = value["id"].as_str().expect("an id").to_owned();
+            vec![("items".to_owned(), id)]
+        }
         _ => Vec::new(),
     },
     retires: |table| matches!(table, "items" | "tasks"),
@@ -97,13 +137,11 @@ const RULES: Rules = Rules {
             None
         }
     },
-    holds: |table| matches!(table, "items" | "prices" | "tasks"),
-    unique: |table, bytes| {
-        if table == "items" {
-            item_of(bytes).map(|row| row.name)
-        } else {
-            None
-        }
+    holds: |table| matches!(table, "items" | "shelves" | "prices" | "tasks"),
+    unique: |table, bytes| match table {
+        "items" => item_of(bytes).map(|row| row.name),
+        "shelves" => Some(label_of(bytes).to_lowercase()),
+        _ => None,
     },
     checked: true,
 };
@@ -122,6 +160,10 @@ struct Server {
     began: u64,
     /// Items: their name and parent.
     items: BTreeMap<Uuid, (String, Uuid)>,
+    /// The names of items it let go of, to give a new one.
+    gone_names: Vec<String>,
+    /// Shelves, by slot: their label.
+    shelves: BTreeMap<i64, String>,
     prices: BTreeMap<Uuid, (i64, i64)>,
     /// Tasks, written on both sides: their title and version, here.
     tasks: BTreeMap<Uuid, (String, i64)>,
@@ -180,6 +222,16 @@ impl Server {
         .encoded()
     }
 
+    fn shelf(slot: i64, label: &str) -> (WireKey, Vec<u8>) {
+        let shelf = Shelf {
+            aisle: AISLE,
+            slot,
+            label: label.to_owned(),
+            revision: 1,
+        };
+        (key(&[&AISLE.to_string(), &slot.to_string()]), json(&shelf))
+    }
+
     fn price(id: Uuid, cents: i64, version: i64) -> (WireKey, Vec<u8>) {
         let price = Price {
             id,
@@ -199,7 +251,9 @@ impl Server {
         (key(&[&id.to_string()]), json(&task))
     }
 
-    /// A message of changes, as a pass would send them — and now and then
+    /// The messages of a pass's changes, as a server packs them — upserts
+    /// parents first, then deletes children first, a table's rows that
+    /// come together in one part, a few rows a message — and now and then
     /// what no server sends.
     fn changes(&mut self, walk: &mut Walk) {
         let mut items = Vec::new();
@@ -212,21 +266,47 @@ impl Server {
                 continue;
             }
             let name = ["fine", "fine", "fine", "bad", "doom", "keep", "gone"][walk.below(7)];
-            let name = format!("{name}{}", walk.below(100));
+            let mut name = format!("{name}{}", walk.below(100));
+            // Now and then the name of an item let go of: a retired one may
+            // still hold it here.
+            if walk.below(3) == 0 {
+                if let Some(old) = walk.pick(&(0..self.gone_names.len()).collect::<Vec<_>>()) {
+                    name = self.gone_names[old].clone();
+                }
+            }
             // Under an item named before it, or itself: a tree.
             let parent = Uuid::from_u128(1 + walk.below(n) as u128);
             items.push((id, name, parent));
         }
-        // Its deletes in the part of its rows — so before them — or after
-        // every table, children first.
-        let together = walk.below(2) == 0;
+        // A key let go of and sent again in one part is held — a pass of
+        // items alone, whose deletes then join the part of its rows;
+        // otherwise a pass sends a row or lets it go, never both.
+        let held_again = walk.below(4) == 0;
+        if !held_again {
+            items.retain(|(id, _, _)| !gone.iter().any(|g| g.parts[0] == id.to_string()));
+        }
+        // Its own keys hold: an item with a price goes with it, but in a
+        // pass of items alone, which keeps it.
+        let mut unpriced = Vec::new();
+        gone.retain(|g| {
+            let id: Uuid = g.parts[0].parse().unwrap();
+            if !self.prices.contains_key(&id) {
+                return true;
+            }
+            if held_again {
+                return false;
+            }
+            self.prices.remove(&id);
+            unpriced.push(key(&[&id.to_string()]));
+            true
+        });
         for key in &gone {
-            self.items.remove(&key.parts[0].parse().unwrap());
+            if let Some((name, _)) = self.items.remove(&key.parts[0].parse().unwrap()) {
+                self.gone_names.push(name);
+            }
         }
         for (id, name, parent) in &items {
-            if together || !gone.iter().any(|g| g.parts[0] == id.to_string()) {
-                self.items.insert(*id, (name.clone(), *parent));
-            }
+            self.items.insert(*id, (name.clone(), *parent));
         }
         let mut items: Vec<(WireKey, Vec<u8>)> = items
             .iter()
@@ -248,6 +328,8 @@ impl Server {
                 |walk: &mut Walk| key(&[&Uuid::from_u128(500 + walk.below(3) as u128).to_string()]);
             let mut part = upserts("ghosts", vec![(ghost(walk), vec![1, 2, 3])]);
             part.deletes = vec![ghost(walk)];
+            strays.push(part.clone());
+            // A table named again, further on: logged once.
             strays.push(part);
         }
         if walk.below(8) == 0 {
@@ -258,13 +340,32 @@ impl Server {
             );
             strays.push(upserts("readings", vec![reading]));
         }
-        let mut prices = Vec::new();
-        let mut unpriced = Vec::new();
-        if walk.below(2) == 0 {
-            let id = Uuid::from_u128(100 + walk.below(PRICES as usize) as u128);
+        let mut shelves = Vec::new();
+        let mut unshelved = Vec::new();
+        if !held_again && walk.below(2) == 0 {
+            let slot = walk.below(SHELVES);
+            let at = i64::try_from(slot).unwrap();
             if walk.below(4) == 0 {
-                self.prices.remove(&id);
-                unpriced.push(key(&[&id.to_string()]));
+                self.shelves.remove(&at);
+                unshelved.push(key(&[&AISLE.to_string(), &at.to_string()]));
+            } else {
+                // Each slot's labels its own, in either case, or another.
+                let label = [format!("s{slot}"), format!("S{slot}"), format!("t{slot}")]
+                    [walk.below(3)]
+                .clone();
+                self.shelves.insert(at, label.clone());
+                shelves.push(Self::shelf(at, &label));
+            }
+        }
+        let mut prices = Vec::new();
+        if !held_again && walk.below(2) == 0 {
+            let id = Uuid::from_u128(1 + walk.below(PRICES as usize) as u128);
+            if !self.items.contains_key(&id) {
+                // Of no item it holds.
+            } else if walk.below(4) == 0 {
+                if self.prices.remove(&id).is_some() {
+                    unpriced.push(key(&[&id.to_string()]));
+                }
             } else {
                 // Newer, whatever was let go of meanwhile; now and then
                 // older, as a server restored from a copy, or whose clock
@@ -281,7 +382,7 @@ impl Server {
         }
         let mut tasks = Vec::new();
         let mut untasked = Vec::new();
-        if walk.below(3) == 0 {
+        if !held_again && walk.below(3) == 0 {
             let id = Uuid::from_u128(300 + walk.below(TASKS as usize) as u128);
             if walk.below(4) == 0 {
                 self.tasks.remove(&id);
@@ -293,21 +394,77 @@ impl Server {
                 tasks.push(Self::task(id, &title, version));
             }
         }
-        let mut part = upserts("items", items);
-        let mut tables = vec![part.clone()];
-        if together {
-            part.deletes = gone;
-            tables = vec![part];
-            gone = Vec::new();
+        // The rows in the order a pass lists them.
+        let row =
+            |table: &str, (key, bytes): (WireKey, Vec<u8>)| (table.to_owned(), Some(bytes), key);
+        let gone_row = |table: &str, key: WireKey| (table.to_owned(), None, key);
+        let mut rows: Vec<(String, Option<Vec<u8>>, WireKey)> = Vec::new();
+        if held_again {
+            rows.extend(gone.drain(..).map(|k| gone_row("items", k)));
         }
-        tables.extend([
-            upserts("prices", prices),
-            upserts("tasks", tasks),
-            deletes("tasks", untasked),
-            deletes("prices", unpriced),
-            deletes("items", gone),
-        ]);
-        tables.extend(strays);
+        rows.extend(items.into_iter().map(|r| row("items", r)));
+        rows.extend(shelves.into_iter().map(|r| row("shelves", r)));
+        rows.extend(prices.into_iter().map(|r| row("prices", r)));
+        rows.extend(tasks.into_iter().map(|r| row("tasks", r)));
+        rows.extend(untasked.into_iter().map(|k| gone_row("tasks", k)));
+        rows.extend(unpriced.into_iter().map(|k| gone_row("prices", k)));
+        rows.extend(unshelved.into_iter().map(|k| gone_row("shelves", k)));
+        rows.extend(gone.into_iter().map(|k| gone_row("items", k)));
+        // A few rows a message — or, when a key is let go of and sent again,
+        // all in one — each table's rows that come together in one part.
+        let most = if held_again {
+            usize::MAX
+        } else {
+            1 + walk.below(6)
+        };
+        let mut messages: Vec<Vec<Table>> = vec![Vec::new()];
+        let mut count = 0;
+        for (table, bytes, key) in rows {
+            if count == most {
+                messages.push(Vec::new());
+                count = 0;
+            }
+            count += 1;
+            let message = messages.last_mut().expect("one at least");
+            if message.last().is_none_or(|part| part.table != table) {
+                message.push(Table {
+                    table,
+                    ..Table::default()
+                });
+            }
+            let part = message.last_mut().expect("just pushed");
+            match bytes {
+                Some(bytes) => {
+                    part.upserts.push(bytes);
+                    part.keys.push(key);
+                }
+                None => part.deletes.push(key),
+            }
+        }
+        messages.last_mut().expect("one at least").extend(strays);
+        for tables in messages {
+            let bytes = self.numbered("", tables, false);
+            self.queue.push_back(bytes);
+        }
+    }
+
+    /// What no server sends, and the replica must survive: a message of
+    /// more rows than it takes, a row larger than most, a table named longer
+    /// than it keeps.
+    fn hostile(&mut self, walk: &mut Walk) {
+        let tables = match walk.below(3) {
+            0 => vec![deletes("ghosts", vec![key(&["g"]); 501])],
+            1 => {
+                let id = Uuid::from_u128(1 + walk.below(ITEMS as usize) as u128);
+                let name = format!("fine{}", "x".repeat(20_000 + walk.below(1000)));
+                self.items.insert(id, (name.clone(), id));
+                vec![upserts("items", vec![node(id, id, &name)])]
+            }
+            _ => {
+                let long = "g".repeat(600);
+                vec![upserts(&long, vec![(key(&[&long]), vec![1])])]
+            }
+        };
         let bytes = self.numbered("", tables, false);
         self.queue.push_back(bytes);
     }
@@ -317,10 +474,15 @@ impl Server {
     /// it was about to send.
     fn snapshot(&mut self, walk: &mut Walk) {
         let id = walk.uuid().to_string();
-        let mut rows: Vec<Table> = self
+        let rows: Vec<Table> = self
             .items
             .iter()
             .map(|(id, (name, parent))| upserts("items", vec![node(*id, *parent, name)]))
+            .chain(
+                self.shelves
+                    .iter()
+                    .map(|(slot, label)| upserts("shelves", vec![Self::shelf(*slot, label)])),
+            )
             .chain(
                 self.prices
                     .iter()
@@ -332,9 +494,6 @@ impl Server {
                     .map(|(id, (t, v))| upserts("tasks", vec![Self::task(*id, t, *v)])),
             )
             .collect();
-        // Prices before items, as a server lists its tables: here either
-        // order holds, nothing points between them.
-        rows.rotate_left(self.items.len());
         let mut begins = true;
         for chunk in rows.chunks(2) {
             let bytes = self.numbered(&id, chunk.to_vec(), begins);
@@ -344,7 +503,8 @@ impl Server {
         let (sequence, nonce, previous, previous_nonce) = self.next(begins);
         let end = Body::EndSnapshot(EndSnapshot {
             snapshot_id: id.clone(),
-            tables: ["prices", "items", "tasks", "ghosts"][..3 + usize::from(walk.below(4) == 0)]
+            tables: ["items", "shelves", "prices", "tasks", "ghosts"]
+                [..4 + usize::from(walk.below(4) == 0)]
                 .iter()
                 .map(|t| (*t).to_owned())
                 .collect(),
@@ -483,6 +643,21 @@ impl Edits {
     }
 }
 
+/// Writes a reading of `me`, as the host does.
+async fn write_reading(pool: &SqlitePool, me: Uuid, id: Uuid, value: i64, clock: i64) {
+    sqlx::query(
+        "INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (replica_id, id) DO UPDATE SET value = excluded.value, at = excluded.at",
+    )
+    .bind(me)
+    .bind(id)
+    .bind(value)
+    .bind(clock)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// What the host wrote: each reading's latest value and version, or `None`
 /// once deleted, and every version it ever had; every event.
 #[derive(Default)]
@@ -495,6 +670,17 @@ struct Host {
     /// What of that is not filed yet.
     edits: Edits,
     clock: i64,
+}
+
+impl Host {
+    /// The reading `key` was written `value`, now.
+    fn read(&mut self, key: String, value: i64) {
+        self.readings.insert(key.clone(), Some((value, self.clock)));
+        self.versions
+            .entry(key)
+            .or_default()
+            .insert((value, self.clock));
+    }
 }
 
 /// A replica as a host runs it, over a pool it may lose at any moment.
@@ -550,8 +736,9 @@ fn same(model: &Model, made: &model::Received, real: &Received) -> bool {
 }
 
 /// The rows the replica's own keep, as the model is told: a price a quote
-/// points at, which it cannot let go; and what it retires — an item a
-/// receipt points at, a task whose edit the server has not filed.
+/// points at, a shelf a tag names, which it cannot let go — nor the shelf's
+/// label change; and what it retires — an item a receipt points at, a task
+/// whose edit the server has not filed.
 async fn pins(pool: &SqlitePool, edits: &Edits, model: &mut Model) {
     let ids = |sql: &'static str| async move {
         sqlx::query_scalar::<_, Uuid>(sql)
@@ -562,11 +749,24 @@ async fn pins(pool: &SqlitePool, edits: &Edits, model: &mut Model) {
             .map(|id| id.to_string())
             .collect::<BTreeSet<String>>()
     };
+    // The shelf's label first: compared as the key compares, whatever the
+    // case.
+    let tagged: BTreeSet<model::Row> = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT aisle, slot FROM shelves s WHERE EXISTS (SELECT 1 FROM tags t WHERE s.label = t.label)",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(aisle, slot)| ("shelves".to_owned(), format!("{aisle}|{slot}")))
+    .collect();
     model.pinned = ids("SELECT price_id FROM quotes")
         .await
         .into_iter()
         .map(|id| ("prices".to_owned(), id))
+        .chain(tagged.iter().cloned())
         .collect();
+    model.anchored = tagged;
     model.retiring = ids("SELECT item_id FROM receipts")
         .await
         .into_iter()
@@ -648,7 +848,42 @@ async fn held_rows(pool: &SqlitePool, retired: bool) -> BTreeMap<model::Row, Str
                 .map(|(id, content)| ((table.to_owned(), id.to_string()), content)),
         );
     }
+    if !retired {
+        let shelves: Vec<(Uuid, i64, String)> =
+            sqlx::query_as("SELECT aisle, slot, label FROM shelves")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        held.extend(shelves.into_iter().map(|(aisle, slot, label)| {
+            (("shelves".to_owned(), format!("{aisle}|{slot}")), label)
+        }));
+    }
     held
+}
+
+/// The digests `up` carries are what the model holds — but of a table with
+/// writes the server has not filed, which go without one (PROTOCOL.md
+/// section 8).
+fn digests_are_the_models(model: &Model, edits: &Edits, up: &Up, at: &str) {
+    if up.digests.is_empty() {
+        return;
+    }
+    let tables: Vec<&str> = ["items", "shelves", "prices", "tasks"]
+        .into_iter()
+        .filter(|table| *table != "tasks" || edits.0.is_empty())
+        .collect();
+    let modelled = model.digests(&tables);
+    assert_eq!(
+        (up.epoch.as_str(), up.sequence),
+        (modelled.epoch.as_str(), modelled.sequence),
+        "{at}: digests read against"
+    );
+    let digest = |d: &crate::envelope::Digest| (d.table.clone(), d.count, d.fingerprint);
+    let mut sent: Vec<_> = up.digests.iter().map(digest).collect();
+    let mut expected: Vec<_> = modelled.digests.iter().map(digest).collect();
+    sent.sort();
+    expected.sort();
+    assert_eq!(sent, expected, "{at}: the digests");
 }
 
 /// What the replica holds of the server's rows, its rejections, and where
@@ -662,6 +897,7 @@ async fn holds_what_the_model_holds(pool: &SqlitePool, model: &Model, at: &str) 
                 let content = match row.0.as_str() {
                     "items" => name_of(bytes),
                     "prices" => cents_of(bytes).to_string(),
+                    "shelves" => label_of(bytes),
                     _ => title_of(bytes),
                 };
                 (row.clone(), content)
@@ -705,7 +941,7 @@ async fn keeps_its_word(pool: &SqlitePool, host: &Host, model: &Model, at: &str)
     assert!(rejections <= i64::try_from(model.rejections.len()).unwrap());
     let named = count(pool, "SELECT count(*) FROM sync_snapshot_keys").await;
     assert!(
-        named <= i64::try_from(ITEMS + PRICES + TASKS).unwrap(),
+        named <= i64::try_from(ITEMS + PRICES + TASKS).unwrap() + i64::try_from(SHELVES).unwrap(),
         "{at}: {named} named"
     );
     let leaving = count(pool, "SELECT count(*) FROM sync_leaving").await;
@@ -799,6 +1035,8 @@ async fn walk(pool: SqlitePool, seed: u64) {
         salt: 0,
         began: BASE,
         items: BTreeMap::new(),
+        gone_names: Vec::new(),
+        shelves: BTreeMap::new(),
         prices: BTreeMap::new(),
         tasks: BTreeMap::new(),
         queue: VecDeque::new(),
@@ -835,7 +1073,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
         let action = if quiet {
             20 + walk.below(4)
         } else {
-            walk.below(30)
+            walk.below(32)
         };
         if matches!(action, 6..=9 | 24) {
             copy = None;
@@ -901,22 +1139,8 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     }
                 } else {
                     let value = i64::try_from(walk.below(1000)).unwrap();
-                    sqlx::query(
-                        "INSERT INTO readings (replica_id, id, value, at) VALUES ($1, $2, $3, $4) \
-                         ON CONFLICT (replica_id, id) DO UPDATE SET value = excluded.value, at = excluded.at",
-                    )
-                    .bind(me)
-                    .bind(id)
-                    .bind(value)
-                    .bind(host.clock)
-                    .execute(&node.pool)
-                    .await
-                    .unwrap();
-                    host.readings.insert(key.clone(), Some((value, host.clock)));
-                    host.versions
-                        .entry(key)
-                        .or_default()
-                        .insert((value, host.clock));
+                    write_reading(&node.pool, me, id, value, host.clock).await;
+                    host.read(key, value);
                 }
             }
             9 => {
@@ -1024,6 +1248,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 let went = node.replica.send_lane(lane, walk.below(5) == 0).await;
                 for up in uplink.offered.lock().unwrap().drain(..) {
                     host.edits.carried(&up);
+                    digests_are_the_models(&model, &host.edits, &up, &at);
                 }
                 assert!(
                     // Refused for good with nothing else to try it beside,
@@ -1138,6 +1363,37 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     );
                 }
             }
+            // A tag of the replica's own names a shelf's label, in any case;
+            // or goes.
+            30 => {
+                let labels: Vec<String> = sqlx::query_scalar("SELECT label FROM shelves")
+                    .fetch_all(&node.pool)
+                    .await
+                    .unwrap();
+                match walk.pick(&(0..labels.len()).collect::<Vec<_>>()) {
+                    Some(at) if walk.below(2) == 0 => {
+                        let label = if walk.below(2) == 0 {
+                            labels[at].to_uppercase()
+                        } else {
+                            labels[at].to_lowercase()
+                        };
+                        sqlx::query("INSERT INTO tags (label) VALUES ($1)")
+                            .bind(label)
+                            .execute(&node.pool)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        sqlx::query("DELETE FROM tags WHERE id = (SELECT min(id) FROM tags)")
+                            .execute(&node.pool)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            // The server sends what none sends: too many rows, a row of
+            // twenty thousand bytes, a table named past what is kept.
+            31 => server.hostile(&mut walk),
             // The transport loses the first message of a snapshot.
             27 => {
                 let begins = |bytes: &Vec<u8>| match ToReplica::decode(bytes.as_slice()) {
@@ -1168,8 +1424,23 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     }
                 }
                 if let Some(bytes) = server.queue.pop_front() {
-                    let (expected, received) =
-                        deliver(&node, &mut host.edits, &mut model, &bytes).await;
+                    // The host writes a reading meanwhile, now and then.
+                    let during = (walk.below(4) == 0).then(|| {
+                        host.clock += 1;
+                        let id = Uuid::from_u128(200 + walk.below(READINGS as usize) as u128);
+                        (id, i64::try_from(walk.below(1000)).unwrap(), host.clock)
+                    });
+                    let writing = async {
+                        if let Some((id, value, clock)) = during {
+                            write_reading(&node.pool, me, id, value, clock).await;
+                        }
+                    };
+                    let ((expected, received), ()) =
+                        tokio::join!(deliver(&node, &mut host.edits, &mut model, &bytes), writing);
+                    if let Some((id, value, _)) = during {
+                        host.read(format!("{me}|{id}"), value);
+                        copy = None;
+                    }
                     assert!(
                         same(&model, &expected, &received),
                         "{at}: {expected:?} of {:?}, and the replica {received:?}",
@@ -1195,6 +1466,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
             said |= node.replica.send_lane(lane, digests).await.unwrap().message;
             for up in uplink.offered.lock().unwrap().drain(..) {
                 host.edits.carried(&up);
+                digests_are_the_models(&model, &host.edits, &up, "the end");
             }
         }
         for (_, up) in uplink.taken() {

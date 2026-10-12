@@ -4,19 +4,13 @@
 //! engine's replica (the other build): where the two disagree, one of them
 //! breaks the protocol, and the conformance suite says which.
 
-use crate::envelope::{Body, ToReplica};
+use crate::envelope::{Body, ToReplica, Up};
 use prost::Message as _;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "postgres")]
 use {
-    crate::envelope::{Rejected, Up},
-    crate::relay::Transport,
-    crate::testkit::Walk,
-    crate::Error,
-    std::collections::VecDeque,
-    std::future::Future,
-    std::sync::Mutex,
-    uuid::Uuid,
+    crate::envelope::Rejected, crate::relay::Transport, crate::testkit::Walk, crate::Error,
+    std::collections::VecDeque, std::future::Future, std::sync::Mutex, uuid::Uuid,
 };
 
 /// A row, by its table and its key's text.
@@ -132,6 +126,9 @@ pub(crate) struct Model {
     /// Rows a row of its own points at, in a table with nothing to retire
     /// them by: it cannot let them go.
     pub(crate) pinned: BTreeSet<Row>,
+    /// Rows a row of its own points at by their unique value: one that
+    /// changes it is refused.
+    pub(crate) anchored: BTreeSet<Row>,
     /// Rows a row of its own points at, in a table it retires by: let go
     /// of, they are retired — kept, and out of what it holds.
     pub(crate) retiring: BTreeSet<Row>,
@@ -310,6 +307,11 @@ impl Model {
                         }
                         let beside =
                             (rules.key)(&table.table, bytes).is_some_and(|own| own != row.1);
+                        // Of a table it does not know, named or keyed longer
+                        // than it keeps: logged, not kept (6).
+                        if !holds && (row.0.len() > 512 || row.1.len() > 512) {
+                            continue;
+                        }
                         if !holds || beside || (rules.refuses)(&table.table, bytes) {
                             self.reject(row, "refused", sequence);
                         } else {
@@ -318,12 +320,14 @@ impl Model {
                     }
                     if holds {
                         self.taken.push((table.table, Vec::new()));
-                        self.take(self.taken.len() - 1, &mut rows, rules);
-                        pending.push((self.taken.len() - 1, rows));
+                        let entry = self.taken.len() - 1;
+                        while self.take(entry, &mut rows, rules) {}
+                        pending.push((entry, rows));
                     }
                 }
-                // One refused for what the replica holds is tried again
-                // once the whole message is in, while that takes one more.
+                // One refused for what the replica holds is tried again —
+                // once the rest of its part is in, and once the whole
+                // message is — while that takes one more.
                 while pending.iter_mut().fold(false, |took, (entry, rows)| {
                     self.take(*entry, rows, rules) || took
                 }) {}
@@ -387,6 +391,13 @@ impl Model {
         let present =
             |p: &Row| p == row || self.rows.contains_key(p) || self.retired.contains_key(p);
         if rules.checked && !(rules.parents)(&row.0, bytes).iter().all(present) {
+            return false;
+        }
+        let held = self.rows.get(row).or_else(|| self.retired.get(row));
+        if self.anchored.contains(row)
+            && held
+                .is_some_and(|held| (rules.unique)(&row.0, held) != (rules.unique)(&row.0, bytes))
+        {
             return false;
         }
         let Some(value) = (rules.unique)(&row.0, bytes) else {
@@ -473,10 +484,13 @@ impl Model {
             })
             .cloned()
             .collect();
+        // What stays — live, or retired — refuses to let go what it points
+        // at.
         loop {
             let refused: BTreeSet<Row> = self
                 .rows
                 .iter()
+                .chain(&self.retired)
                 .filter(|(row, _)| !going.contains(*row) && !retiring.contains(*row))
                 .flat_map(|(row, bytes)| (rules.parents)(&row.0, bytes))
                 .filter(|parent| going.contains(parent))
@@ -557,7 +571,6 @@ impl Model {
     }
 
     /// The last message it applied, as it gives it back to the server.
-    #[cfg(feature = "postgres")]
     fn confirm(&self, up: &mut Up) {
         if let Some((epoch, sequence)) = &self.applied {
             (up.epoch, up.sequence) = (epoch.clone(), *sequence);
@@ -567,8 +580,7 @@ impl Model {
 
     /// What it holds of each of `tables`, with the last message it applied:
     /// the digests a replica reports now and then (PROTOCOL.md section 8),
-    /// leaving out the rows it rejected.
-    #[cfg(feature = "postgres")]
+    /// leaving out the rows it retired or rejected.
     pub(crate) fn digests(&self, tables: &[&str]) -> Up {
         let mut up = Up {
             protocol: crate::envelope::PROTOCOL,
