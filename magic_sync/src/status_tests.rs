@@ -473,13 +473,14 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
     .execute(&world.pool)
     .await
     .unwrap();
-    // Changes the planner set aside, one of each kind: about `refusing`, or
-    // of a partition no replica in the scope belongs to — the one above too.
+    // Changes the planner set aside, one of each kind as its trigger notes
+    // it: about `refusing`, or of a partition no replica in the scope
+    // belongs to — the one above too.
     sqlx::query(
-        "INSERT INTO sync.notes (kind, relation, replica_id, partition_id, parked_at, attempts, last_error) \
-         VALUES ('members', 'list_members', NULL, $3, now(), 1, 'a bug'), \
-                ('assigned', 'replica_lists', $2, $1, now(), 1, 'a bug'), \
-                ('resync', NULL, $2, $1, now(), 1, 'a bug')",
+        "INSERT INTO sync.notes (kind, relation, replica_id, partition_id, parked_at, attempts, last_error, previous) \
+         VALUES ('members', 'list_members', NULL, $3, now(), 1, 'a bug', '{}'), \
+                ('assigned', 'replica_lists', $2, $1, now(), 1, 'a bug', NULL), \
+                ('resync', NULL, $2, $1, now(), 1, 'a bug', NULL)",
     )
     .bind(world.partition)
     .bind(refusing)
@@ -952,6 +953,28 @@ async fn a_retry_set_aside_is_listed_as_a_change_of_its_row(pool: crate::DbPool)
 
     let parked = world.overview(Scope::All).await.health.parked;
     assert_eq!(parked.total, 1);
+    assert_eq!(parked.first[0].kind, crate::status::NoteKind::Row);
+}
+
+/// Parked notes of a kind only a later build reads are counted, and never
+/// take the places of the ones this build lists.
+#[sqlx::test(migrations = false)]
+async fn parked_notes_of_a_later_build_leave_the_listing_to_this_ones(pool: crate::DbPool) {
+    let world = world(pool).await;
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE sync.notes DROP CONSTRAINT notes_kind_check; \
+         INSERT INTO sync.notes (kind, partition_id, parked_at, attempts) \
+           SELECT 'later', '{0}', now(), 1 FROM generate_series(1, 20); \
+         INSERT INTO sync.notes (kind, relation, row_key, partition_id, parked_at, attempts) \
+           VALUES ('retry', 'items', 'not-a-key', '{0}', now(), 1)",
+        world.partition
+    ))
+    .execute(&world.pool)
+    .await
+    .unwrap();
+
+    let parked = world.overview(Scope::All).await.health.parked;
+    assert_eq!(parked.first.len(), 1);
     assert_eq!(parked.first[0].kind, crate::status::NoteKind::Row);
 }
 

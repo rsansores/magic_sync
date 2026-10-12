@@ -169,6 +169,7 @@ pub struct Replica<P: 'static, I: Identity, U: Uplink> {
     skips: Vec<AtomicUsize>,
     /// How many times a message was applied again, with more care, since
     /// this replica began: each a row at fault, or a cost of nothing.
+    #[cfg(test)]
     pub(crate) again: AtomicUsize,
 }
 
@@ -240,6 +241,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             skips: settings.lanes.iter().map(|_| AtomicUsize::new(0)).collect(),
             wake: settings.lanes.iter().map(|_| Notify::new()).collect(),
             running: AtomicBool::new(false),
+            #[cfg(test)]
             again: AtomicUsize::new(0),
             settings,
         })
@@ -284,6 +286,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
                 Stop::Failed(e) if e.is_refusal() => care.heed(),
                 Stop::Failed(e) => return Err(e),
             };
+            #[cfg(test)]
             self.again.fetch_add(1, Ordering::Relaxed);
             if !again {
                 // Refused with every row of it refused: nothing a message

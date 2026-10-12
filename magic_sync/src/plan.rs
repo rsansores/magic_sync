@@ -3289,7 +3289,7 @@ impl Noted {
 
 /// The notes this build reads: one it cannot, from a later build, is left
 /// where a later build finds it, and holds back none behind it.
-const READABLE: &str =
+pub(crate) const READABLE: &str =
     "((kind IN ('row', 'retry') AND relation IS NOT NULL AND row_key IS NOT NULL) \
      OR (kind = 'members' AND relation IS NOT NULL AND previous IS NOT NULL) \
      OR (kind = 'assigned' AND relation IS NOT NULL AND replica_id IS NOT NULL) \

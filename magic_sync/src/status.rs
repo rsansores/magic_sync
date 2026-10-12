@@ -460,7 +460,10 @@ mod stored {
     use sqlx::Row as _;
 
     /// A note of a kind this build does not know, a later build's, is
-    /// `None`: counted, and left out of the listing.
+    /// `None`: the listing reads none — it asks for what [`READABLE`]
+    /// admits — and the count counts it.
+    ///
+    /// [`READABLE`]: crate::plan::READABLE
     pub(super) fn parked(row: PgRow) -> sqlx::Result<Option<Parked>> {
         let kind = match row.try_get::<String, _>("kind")?.as_str() {
             "row" | "retry" => NoteKind::Row,
@@ -1095,7 +1098,9 @@ impl Engine {
                 "SELECT n.id, n.kind, n.relation AS table, n.row_key AS key, \
                         n.replica_id AS replica, n.attempts, n.last_error, n.parked_at \
                    FROM sync.notes n WHERE {NOTES_IN_SCOPE} AND n.parked_at IS NOT NULL \
-                  ORDER BY n.id LIMIT $4"
+                    AND {} \
+                  ORDER BY n.id LIMIT $4",
+                crate::plan::READABLE
             ))
             .bind(scoped.all)
             .bind(&scoped.partitions)
