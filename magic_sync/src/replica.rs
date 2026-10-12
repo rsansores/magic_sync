@@ -284,7 +284,10 @@ async fn schema_version(conn: &mut Conn) -> Result<i32, Error> {
 /// Refuses a replica database the engine cannot run against: another
 /// version of its tables; a table that is not its row, column for column —
 /// one missing or extra, nullable on one side only, of a type its field does
-/// not decode, keyed otherwise — with every difference named; triggers that
+/// not decode, keyed otherwise — with every difference named; a unique index
+/// of a table with a retired column that is not partial on `<retired> IS
+/// NULL`, which would hold a retired row's values against the server's live
+/// ones; triggers that
 /// are not the ones [`triggers`] writes — one missing, one that differs, or
 /// one left from a table that no longer travels, the engine's being those
 /// named `sync_note_…` and `sync_refuse_…`; or a connection the engine
@@ -317,6 +320,27 @@ pub async fn check<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> R
     }
     let tables: Vec<&crate::row::Table> = codecs.iter().map(|c| &c.table).collect();
     crate::row::parity(conn, &tables).await?;
+    for table in &tables {
+        let Some(retired) = table.retired else {
+            continue;
+        };
+        let live = format!("{retired} is null");
+        for (index, sql) in crate::dialect::unique_indexes(conn, table.name).await? {
+            let only = |sql: String| {
+                let sql = sql.to_lowercase().replace(['"', '`', '[', ']'], "");
+                let (_, filter) = sql.rsplit_once(" where ")?;
+                Some(filter.split_whitespace().collect::<Vec<_>>().join(" "))
+            };
+            if sql.and_then(only).as_deref() != Some(live.as_str()) {
+                return Err(Error::Misuse(format!(
+                    "`{}`: the unique index `{index}` holds its retired rows' values too, which \
+                     would refuse every row the server sends with one of them while the retired \
+                     row stays — make it partial: `WHERE {retired} IS NULL`",
+                    table.name
+                )));
+            }
+        }
+    }
     let live: HashMap<String, String> =
         sqlx::query_as("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
             .fetch_all(&mut *conn)
@@ -532,6 +556,12 @@ pub(crate) async fn receive<P: Sync + 'static>(
     } else {
         act(conn, codecs, body, care).await
     };
+    let received = match received {
+        Ok(r @ (Received::Applied(_) | Received::SnapshotEnded | Received::Filed)) => {
+            collect(conn, codecs, care).await.map(|()| r)
+        }
+        other => other,
+    };
     let quiet = sqlx::query("DELETE FROM sync_applying")
         .execute(&mut *conn)
         .await;
@@ -576,12 +606,14 @@ pub(crate) struct Culprit {
 }
 
 /// Where a row is in a message: the upsert at `at` of its `entry`th table,
-/// or a key it lets go of (a delete, a sweep, a let-go once filed).
+/// a key it lets go of (a delete, a sweep, a let-go once filed), or a
+/// retired row let go of once nothing keeps it.
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Spot {
     Upsert { entry: usize, at: usize },
     LetGo(String),
+    Collect(String),
 }
 
 /// How a message is applied: all at once, or — once a refusal rolled a
@@ -1493,6 +1525,74 @@ async fn cleared(conn: &mut Conn, table: &str, keys: &[String]) -> Result<(), Er
     .bind(json(keys))
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
+
+/// Lets go of the rows of the server's tables the replica retired that
+/// nothing keeps any more — no row that stays points at them, no edit of
+/// them is on its way — as a delete would, in the transaction of every
+/// message applied: a retired row stays only for what needs it. One the
+/// database refuses to let go stays retired, and nobody is told: the server
+/// let go of it already.
+#[cfg(feature = "sqlite")]
+async fn collect<P: Sync + 'static>(
+    conn: &mut Conn,
+    codecs: &[Codec<P>],
+    care: &Care,
+) -> Result<(), Stop> {
+    let server: Vec<(&str, Option<&str>)> = codecs
+        .iter()
+        .filter(|c| c.sent_down())
+        .map(|c| (c.table.name, c.table.retired))
+        .collect();
+    for codec in codecs.iter().filter(|c| c.sent_down()) {
+        let table = codec.table.name;
+        let noted: HashSet<String> =
+            sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = $1")
+                .bind(table)
+                .fetch_all(&mut *conn)
+                .await?
+                .into_iter()
+                .collect();
+        let retired: Vec<Key> = codec
+            .retired_keys(conn)
+            .await?
+            .into_iter()
+            .filter(|key| !noted.contains(&key_text(key)))
+            .collect();
+        if !care.careful {
+            codec.retire(conn, &retired, &[], &server).await?;
+            continue;
+        }
+        // One by one, each in a savepoint, while that lets one more go:
+        // rows that keep only one another go one after the other.
+        let mut pending: Vec<Key> = retired
+            .into_iter()
+            .filter(|key| care.culprit(table, &Spot::Collect(key_text(key))).is_none())
+            .collect();
+        loop {
+            let mut kept = Vec::new();
+            for key in pending.iter().cloned() {
+                row_begun(conn).await?;
+                let one = std::slice::from_ref(&key);
+                let gone = codec
+                    .retire(conn, one, &[], &server)
+                    .await
+                    .map_err(Stop::from);
+                let spot = Spot::Collect(key_text(&key));
+                if !row_done(conn, gone, table, spot)
+                    .await?
+                    .is_ok_and(|r| r.deleted > 0)
+                {
+                    kept.push(key);
+                }
+            }
+            if kept.is_empty() || kept.len() == pending.len() {
+                break;
+            }
+            pending = kept;
+        }
+    }
     Ok(())
 }
 

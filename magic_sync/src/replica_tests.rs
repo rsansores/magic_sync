@@ -1897,6 +1897,110 @@ async fn a_unique_value_given_up_later_in_the_message_is_taken(pool: SqlitePool)
     assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
 }
 
+/// Items whose names are unique among the live ones: a retired item keeps
+/// its name only for what still points at it.
+fn uniquely_named_items() -> String {
+    format!("{TABLES}CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;")
+}
+
+/// A row retired for what pointed at it is let go of once nothing does —
+/// in the next message the replica applies, whatever it carries — and
+/// while it stays, its unique values are no live row's: the server's next
+/// row with them is taken.
+#[sqlx::test(migrations = false)]
+async fn a_retired_row_goes_once_nothing_points_at_it(pool: SqlitePool) {
+    let w = world_over(pool, &uniquely_named_items(), Settings::default()).await;
+    let [first, second] = ids();
+    w.receive(&down(
+        1,
+        "",
+        vec![upserts("items", vec![item(first, "sku")])],
+    ))
+    .await;
+    w.exec(&format!(
+        "INSERT INTO receipts (item_id) VALUES (x'{}')",
+        first.simple()
+    ))
+    .await
+    .unwrap();
+    let mut part = upserts("items", vec![item(second, "sku")]);
+    part.deletes = vec![key(&[&first.to_string()])];
+    w.receive(&down(2, "", vec![part])).await;
+    assert_eq!(w.items().await, ["sku"]);
+    assert!(w.rejected().await.is_empty());
+    let retired = "SELECT count(*) FROM items WHERE retired_at IS NOT NULL";
+    assert_eq!(w.count(retired).await, 1, "kept for its receipt");
+
+    w.exec("DELETE FROM receipts").await.unwrap();
+    w.receive(&down(3, "", vec![upserts("prices", Vec::new())]))
+        .await;
+    assert_eq!(w.count(retired).await, 0, "nothing points at it any more");
+    assert_eq!(w.items().await, ["sku"]);
+    assert!(w.rejected().await.is_empty());
+}
+
+/// A unique index over a table with a retired column must leave the
+/// retired rows out: one that does not would keep a retired row's value
+/// from every row the server sends after it.
+#[sqlx::test(migrations = false)]
+async fn a_unique_index_over_retired_rows_is_refused(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    let column = "DROP TABLE items; \
+                  CREATE TABLE items (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, \
+                    name TEXT NOT NULL UNIQUE, retired_at TEXT)";
+    for (unique, refused) in [
+        (column, true),
+        ("CREATE UNIQUE INDEX items_name ON items (name)", true),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE name <> ''",
+            true,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL",
+            false,
+        ),
+        (
+            "CREATE UNIQUE INDEX items_name ON items (name) WHERE \"retired_at\" IS NULL",
+            false,
+        ),
+        (
+            "CREATE UNIQUE INDEX shelves_label ON shelves (label)",
+            false,
+        ),
+    ] {
+        sqlx::raw_sql(&format!("{TABLES}{unique};"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let installed = install(&mut conn, &codecs()).await;
+        match installed {
+            Err(Error::Misuse(why)) if refused => {
+                assert!(
+                    why.contains("`items`") && why.contains("retired_at IS NULL"),
+                    "{why}"
+                );
+            }
+            Ok(()) if !refused => {}
+            other => panic!("{unique}: {other:?}"),
+        }
+        drop(conn);
+        let mut tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        tables.sort();
+        for table in tables {
+            sqlx::raw_sql(&format!("DROP TABLE \"{table}\""))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+}
+
 /// A row the replica's own rows point at through a key that would cascade
 /// or set them null is kept, retired, like one a key would refuse to let
 /// go: letting it go would change rows of the replica's that the server

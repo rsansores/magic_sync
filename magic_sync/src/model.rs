@@ -174,7 +174,10 @@ impl Model {
             return Received::Malformed;
         };
         let (place, ends) = match &body {
-            Body::Filed(_) => return Received::Filed,
+            Body::Filed(_) => {
+                self.collect(rules);
+                return Received::Filed;
+            }
             Body::Down(d) => {
                 if d.tables.iter().any(|t| t.keys.len() != t.upserts.len()) {
                     return Received::Malformed;
@@ -311,6 +314,7 @@ impl Model {
                 for (row, _) in pending.into_iter().flat_map(|(_, rows)| rows) {
                     self.reject(row, "refused", sequence);
                 }
+                self.collect(rules);
                 Received::Applied
             }
             Body::EndSnapshot(end) => {
@@ -335,6 +339,7 @@ impl Model {
                 let epoch = self.applied.as_ref().map(|(e, _)| e.clone());
                 self.rejections
                     .retain(|(t, _), r| (rules.holds)(t) || Some(&r.epoch) == epoch.as_ref());
+                self.collect(rules);
                 Received::Ended
             }
         }
@@ -358,8 +363,9 @@ impl Model {
         took
     }
 
-    /// Whether the database takes `row` as it stands: no other row holds
-    /// its unique value, and — where it checks them — it holds what the row
+    /// Whether the database takes `row` as it stands: no other live row
+    /// holds its unique value — a retired one keeps it only for what points
+    /// at it — and — where it checks them — it holds what the row
     /// points at, or the row points at itself.
     fn fits(&self, row: &Row, bytes: &[u8], rules: &Rules) -> bool {
         let present =
@@ -370,7 +376,7 @@ impl Model {
         let Some(value) = (rules.unique)(&row.0, bytes) else {
             return true;
         };
-        !self.rows.iter().chain(&self.retired).any(|(other, b)| {
+        !self.rows.iter().any(|(other, b)| {
             other.0 == row.0 && other != row && (rules.unique)(&other.0, b).as_ref() == Some(&value)
         })
     }
@@ -382,6 +388,24 @@ impl Model {
     /// the database refuses — kept by a trigger, or pointed at by a row of
     /// the server's that stays — which is kept, rejected.
     fn let_go(&mut self, rows: Vec<Row>, sequence: u64, rules: &Rules) {
+        for row in self.letting_go(rows, rules) {
+            self.reject(row, "pointed at", sequence);
+        }
+    }
+
+    /// Lets go of the rows it retired that nothing keeps any more, as it
+    /// would let go of them on a delete (4.3) — after every message it
+    /// applies — and says nothing of one it cannot.
+    fn collect(&mut self, rules: &Rules) {
+        let retired: Vec<Row> = self.retired.keys().cloned().collect();
+        let rejected = self.rejections.clone();
+        self.letting_go(retired, rules);
+        self.rejections = rejected;
+    }
+
+    /// What [`Model::let_go`] does but reject: answers the rows it could
+    /// not let go of.
+    fn letting_go(&mut self, rows: Vec<Row>, rules: &Rules) -> Vec<Row> {
         let asked: BTreeSet<Row> = rows.into_iter().collect();
         let held: BTreeSet<Row> = asked
             .iter()
@@ -446,6 +470,7 @@ impl Model {
             }
             going.retain(|row| !refused.contains(row));
         }
+        let mut refused = Vec::new();
         for row in held {
             if retiring.contains(&row) {
                 if let Some(bytes) = self.rows.remove(&row) {
@@ -457,9 +482,10 @@ impl Model {
                 self.retired.remove(&row);
                 self.rejections.remove(&row);
             } else {
-                self.reject(row, "pointed at", sequence);
+                refused.push(row);
             }
         }
+        refused
     }
 
     fn reject(&mut self, row: Row, reason: &str, sequence: u64) {

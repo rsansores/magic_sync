@@ -97,7 +97,22 @@ declaration changes.
 > **What happens:** when the head office deletes a product a receipt here
 > points at, the register cannot delete it without breaking the receipt. It
 > sets `retired_at` instead: the product stays for the receipt, and your
-> screens leave retired rows out. Offered again, it is live again.
+> screens leave retired rows out. Offered again, it is live again. Once
+> nothing points at it any more, it goes, with the next message the register
+> applies.
+
+A retired row keeps its values only for what points at it: a unique index on
+such a table leaves the retired rows out, or a product deleted and made again
+with the same code would be refused here while the old one stays. `check`
+refuses one that does not:
+
+```sql
+CREATE UNIQUE INDEX products_code ON products (code) WHERE retired_at IS NULL;
+```
+
+Every message applied looks for the retired rows that nothing keeps any
+more: on a table of many rows, an index on its retired column keeps that
+cheap.
 
 Same two ways for the engine's part: your migrations run the engine's
 first step, [`magic_sync::replica::migration`]`(1)`, and the script

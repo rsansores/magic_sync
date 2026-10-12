@@ -1037,6 +1037,16 @@ pub(crate) async fn keys<R: Row>(exec: &mut Conn) -> Result<Vec<Key>, Error> {
     keys_where::<R>(exec, "").await
 }
 
+/// Every key the table holds retired: none where it has nothing to retire
+/// rows by.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn retired_keys<R: Row>(exec: &mut Conn) -> Result<Vec<Key>, Error> {
+    let Some(retired) = R::RETIRED else {
+        return Ok(Vec::new());
+    };
+    keys_where::<R>(exec, &format!(" WHERE {} IS NOT NULL", ident(retired))).await
+}
+
 /// The keys of the rows `filter` admits. A key stored in a form the engine
 /// does not read — a uuid as text, written by something other than the
 /// engine — is logged and left out: that row is not one the engine holds.

@@ -198,6 +198,22 @@ mod imp {
         Ok(out)
     }
 
+    /// The unique indexes of `table` other than its primary key, each with
+    /// the SQL that made it — none for one a constraint declared.
+    pub(crate) async fn unique_indexes(
+        conn: &mut Conn,
+        table: &str,
+    ) -> Result<Vec<(String, Option<String>)>, Error> {
+        Ok(sqlx::query_as(
+            r#"SELECT i.name, m.sql FROM pragma_index_list(?1) i
+                 LEFT JOIN sqlite_master m ON m.type = 'index' AND m.name = i.name
+                WHERE i."unique" = 1 AND i.origin <> 'pk' ORDER BY i.name"#,
+        )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
     /// Binds one statement may carry (`SQLITE_MAX_VARIABLE_NUMBER`).
     pub(crate) const MAX_BINDS: usize = 32_766;
 

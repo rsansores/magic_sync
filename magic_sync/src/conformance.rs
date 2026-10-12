@@ -171,6 +171,8 @@ pub struct Uplinked {
     pub hanging: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     /// Every send it was asked to make.
     pub attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Every message it was handed, taken or not, since last asked.
+    pub offered: std::sync::Arc<std::sync::Mutex<Vec<crate::envelope::Up>>>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -184,6 +186,8 @@ impl crate::run::replica::Uplink for Uplinked {
         use prost::Message as _;
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let up = crate::envelope::Up::decode(message.as_slice()).expect("an upload");
+        self.offered.lock().unwrap().push(up.clone());
         if self.hanging.lock().unwrap().contains(&lane) {
             std::future::pending::<()>().await;
         }
@@ -196,7 +200,6 @@ impl crate::run::replica::Uplink for Uplinked {
                 });
             }
         }
-        let up = crate::envelope::Up::decode(message.as_slice()).expect("an upload");
         if self
             .cannot_take
             .lock()

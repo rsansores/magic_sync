@@ -343,6 +343,12 @@ impl<P: Sync + 'static> Codec<P> {
         self.ops.live_keys(conn)
     }
 
+    /// Every key this side holds retired.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn retired_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
+        self.ops.retired_keys(conn)
+    }
+
     /// Whether the server sends this table's rows down.
     pub(crate) fn sent_down(&self) -> bool {
         matches!(self.table.mirror, Mirror::Catalog | Mirror::Both)
@@ -466,6 +472,8 @@ trait Ops<P>: Send + Sync {
     fn keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
     #[cfg(feature = "sqlite")]
     fn live_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
+    #[cfg(feature = "sqlite")]
+    fn retired_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>>;
 }
 
 /// How a side writes rows of the other's.
@@ -858,6 +866,11 @@ where
     #[cfg(feature = "sqlite")]
     fn live_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
         Box::pin(row::live_keys::<R>(conn))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn retired_keys<'a>(&'a self, conn: &'a mut Conn) -> Fut<'a, Vec<Key>> {
+        Box::pin(row::retired_keys::<R>(conn))
     }
 
     #[cfg(feature = "sqlite")]

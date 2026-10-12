@@ -24,12 +24,9 @@ const READINGS: u128 = 4;
 const TASKS: u128 = 3;
 
 /// The walk's tables: the suite's, its items a tree — each under a parent,
-/// the root under itself — named uniquely.
+/// the root under itself — named uniquely among the live ones.
 fn tables() -> String {
-    tree_tables().replace(
-        "name TEXT NOT NULL, retired_at",
-        "name TEXT NOT NULL UNIQUE, retired_at",
-    )
+    tree_tables() + "CREATE UNIQUE INDEX items_name ON items (name) WHERE retired_at IS NULL;"
 }
 
 /// What the replica's database refuses: an item named `bad…` (with `ABORT`)
@@ -452,6 +449,40 @@ impl Server {
     }
 }
 
+/// What the host wrote of each task's own column that the server has not
+/// filed, as PROTOCOL.md section 7 says a replica keeps it: per task, how
+/// many writes, and the upload that last carried it with how many it
+/// carried — filed once the server answers that upload, unless written
+/// since.
+#[derive(Clone, Default)]
+struct Edits(BTreeMap<Uuid, (u64, Option<(u64, u64)>)>);
+
+impl Edits {
+    fn wrote(&mut self, task: Uuid) {
+        self.0.entry(task).or_insert((0, None)).0 += 1;
+    }
+
+    /// `up` was made: what it carries of the tasks goes under its number.
+    fn carried(&mut self, up: &Up) {
+        let Some(number) = up.uploads.first() else {
+            return;
+        };
+        for part in up.tables.iter().filter(|t| t.table == "tasks") {
+            for key in &part.keys {
+                if let Some((writes, sent)) = self.0.get_mut(&key.parts[0].parse().unwrap()) {
+                    *sent = Some((*number, *writes));
+                }
+            }
+        }
+    }
+
+    fn filed(&mut self, numbers: &[u64]) {
+        self.0.retain(|_, (writes, sent)| {
+            !sent.is_some_and(|(number, carried)| numbers.contains(&number) && carried == *writes)
+        });
+    }
+}
+
 /// What the host wrote: each reading's latest value and version, or `None`
 /// once deleted, and every version it ever had; every event.
 #[derive(Default)]
@@ -461,6 +492,8 @@ struct Host {
     events: BTreeSet<String>,
     /// The latest the host set each task's own column to.
     done: BTreeMap<Uuid, bool>,
+    /// What of that is not filed yet.
+    edits: Edits,
     clock: i64,
 }
 
@@ -518,8 +551,8 @@ fn same(model: &Model, made: &model::Received, real: &Received) -> bool {
 
 /// The rows the replica's own keep, as the model is told: a price a quote
 /// points at, which it cannot let go; and what it retires — an item a
-/// receipt points at, a task whose edit has not reached the server.
-async fn pins(pool: &SqlitePool, model: &mut Model) {
+/// receipt points at, a task whose edit the server has not filed.
+async fn pins(pool: &SqlitePool, edits: &Edits, model: &mut Model) {
     let ids = |sql: &'static str| async move {
         sqlx::query_scalar::<_, Uuid>(sql)
             .fetch_all(pool)
@@ -539,39 +572,32 @@ async fn pins(pool: &SqlitePool, model: &mut Model) {
         .into_iter()
         .map(|id| ("items".to_owned(), id))
         .chain(
-            noted_tasks(pool)
-                .await
-                .into_iter()
-                .map(|id| ("tasks".to_owned(), id)),
+            edits
+                .0
+                .keys()
+                .map(|id| ("tasks".to_owned(), id.to_string())),
         )
         .collect();
 }
 
-/// The tasks whose edits have not reached the server: let go of, they are
-/// retired until it files them (4.3).
-async fn noted_tasks(pool: &SqlitePool) -> BTreeSet<String> {
-    sqlx::query_scalar("SELECT row_key FROM sync_notes WHERE relation = 'tasks'")
-        .fetch_all(pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect()
-}
-
 /// `bytes` delivered to the replica and to the model, the model told what
-/// the replica's own rows keep: what each made of it. Once the server
-/// filed what the replica wrote, a task retired for its edits goes when no
-/// edit of it is left to file (4.4).
-async fn deliver(node: &Node, model: &mut Model, bytes: &[u8]) -> (model::Received, Received) {
-    pins(&node.pool, model).await;
+/// the replica's own rows keep: what each made of it.
+async fn deliver(
+    node: &Node,
+    edits: &mut Edits,
+    model: &mut Model,
+    bytes: &[u8],
+) -> (model::Received, Received) {
+    if let Ok(ToReplica {
+        body: Some(Body::Filed(filed)),
+        ..
+    }) = ToReplica::decode(bytes)
+    {
+        edits.filed(&filed.uploads);
+    }
+    pins(&node.pool, edits, model).await;
     let expected = model.receive(bytes, &RULES);
     let received = node.replica.receive(bytes).await.expect("applied");
-    if expected == model::Received::Filed {
-        let noted = noted_tasks(&node.pool).await;
-        model
-            .retired
-            .retain(|(table, key), _| table != "tasks" || noted.contains(key));
-    }
     (expected, received)
 }
 
@@ -736,6 +762,11 @@ async fn loses_no_write(pool: &SqlitePool, host: &Host, server: &Server, at: &st
             .unwrap()
             .into_iter()
             .collect();
+    let unfiled: BTreeSet<String> = host.edits.0.keys().map(Uuid::to_string).collect();
+    assert_eq!(
+        noted_tasks, unfiled,
+        "{at}: the tasks whose edits are not filed"
+    );
     for (id, done) in &host.done {
         assert!(
             noted_tasks.contains(&id.to_string()) || server.done.get(id) == Some(done),
@@ -787,7 +818,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
     // host restores it now and then — never over writes of its own made
     // since, which a restore would lose for good.
     let copy_path = file.get_filename().with_extension("copy");
-    let mut copy: Option<Model> = None;
+    let mut copy: Option<(Model, Edits)> = None;
     // A copy of the server's database: what it sends, and what it recorded
     // sending — never what it filed, which a restore would lose for good.
     let mut server_copy: Option<Server> = None;
@@ -828,7 +859,8 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 };
                 if let Some(old) = walk.pick(&(0..from.len()).collect::<Vec<_>>()) {
                     let bytes = from[old].clone();
-                    let (expected, received) = deliver(&node, &mut model, &bytes).await;
+                    let (expected, received) =
+                        deliver(&node, &mut host.edits, &mut model, &bytes).await;
                     assert!(
                         same(&model, &expected, &received),
                         "{at}: again, {expected:?} of {:?}, and the replica {received:?}",
@@ -956,6 +988,9 @@ async fn walk(pool: SqlitePool, seed: u64) {
                 .await
                 .unwrap();
                 tx.commit().await.unwrap();
+                if let Some(outgoing) = &outgoing {
+                    host.edits.carried(&outgoing.up);
+                }
                 if let (Some(outgoing), 0) = (outgoing, walk.below(2)) {
                     answers.extend(server.file(&outgoing.up, me));
                 }
@@ -986,6 +1021,9 @@ async fn walk(pool: SqlitePool, seed: u64) {
             17 | 20 | 21 => {
                 let lane = walk.below(2);
                 let went = node.replica.send_lane(lane, walk.below(5) == 0).await;
+                for up in uplink.offered.lock().unwrap().drain(..) {
+                    host.edits.carried(&up);
+                }
                 assert!(
                     // Refused for good with nothing else to try it beside,
                     // a row is not blamed: the lane goes again later.
@@ -1017,6 +1055,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                         .await
                         .unwrap();
                     host.done.insert(id, done);
+                    host.edits.wrote(id);
                 }
             }
             // A receipt of the replica's own points at an item, or goes.
@@ -1044,7 +1083,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
             // The host copies the replica's database, or restores the copy
             // over it: the replica holds, and applied, what it did then.
             26 => match copy.take() {
-                Some(copied) if walk.below(2) == 0 => {
+                Some((copied, edits)) if walk.below(2) == 0 => {
                     node.pool.close().await;
                     let path = file.get_filename();
                     for suffix in ["-wal", "-shm"] {
@@ -1053,6 +1092,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     std::fs::copy(&copy_path, path).unwrap();
                     node = boot(&file, me, &uplink).await;
                     model = copied;
+                    host.edits = edits;
                 }
                 _ => {
                     let _ = std::fs::remove_file(&copy_path);
@@ -1061,7 +1101,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                         .execute(&node.pool)
                         .await
                         .unwrap();
-                    copy = Some(model.clone());
+                    copy = Some((model.clone(), host.edits.clone()));
                 }
             },
             // The server's database is copied, or restored from the copy:
@@ -1088,7 +1128,7 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     let mut later = ToReplica::decode(bytes.as_slice()).unwrap();
                     later.protocol += 1;
                     let later = later.encode_to_vec();
-                    pins(&node.pool, &mut model).await;
+                    pins(&node.pool, &host.edits, &mut model).await;
                     assert_eq!(model.receive(&later, &RULES), model::Received::Waits);
                     let waits = node.replica.receive(&later).await;
                     assert!(
@@ -1127,7 +1167,8 @@ async fn walk(pool: SqlitePool, seed: u64) {
                     }
                 }
                 if let Some(bytes) = server.queue.pop_front() {
-                    let (expected, received) = deliver(&node, &mut model, &bytes).await;
+                    let (expected, received) =
+                        deliver(&node, &mut host.edits, &mut model, &bytes).await;
                     assert!(
                         same(&model, &expected, &received),
                         "{at}: {expected:?} of {:?}, and the replica {received:?}",
@@ -1144,13 +1185,16 @@ async fn walk(pool: SqlitePool, seed: u64) {
     // Quiet: everything goes, and is answered, until nothing is left.
     for round in 0..200 {
         while let Some(bytes) = server.queue.pop_front() {
-            deliver(&node, &mut model, &bytes).await;
+            deliver(&node, &mut host.edits, &mut model, &bytes).await;
         }
         let mut said = false;
         for lane in 0..2 {
             // Digests now and then, as a replica says them hourly.
             let digests = round % 10 == 5;
             said |= node.replica.send_lane(lane, digests).await.unwrap().message;
+            for up in uplink.offered.lock().unwrap().drain(..) {
+                host.edits.carried(&up);
+            }
         }
         for (_, up) in uplink.taken() {
             forgets_what_it_told(&mut model, &up);
