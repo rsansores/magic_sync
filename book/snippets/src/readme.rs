@@ -17,7 +17,6 @@ pub mod rows {
         pub id: Uuid,
         pub name: String,
         pub price_cents: i64,
-        #[row(version)]
         pub updated_at: DateTime<Utc>,
     }
 }

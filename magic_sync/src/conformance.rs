@@ -26,7 +26,6 @@ pub struct Shelf {
     pub aisle: Uuid,
     pub slot: i64,
     pub label: String,
-    #[row(version)]
     pub revision: i64,
 }
 
@@ -42,7 +41,6 @@ pub struct Shelf {
 pub struct Price {
     pub id: Uuid,
     pub cents: i64,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -62,7 +60,6 @@ pub struct Task {
     pub title: String,
     #[row(replica_owned)]
     pub done: bool,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 

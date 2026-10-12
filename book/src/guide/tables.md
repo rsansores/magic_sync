@@ -18,17 +18,11 @@ And the same tables, minus `registers`, on every register's SQLite.
 {{#include ../../../examples/shop/server/schema.sql:tables}}
 ```
 
-`products.updated_at` is the row's **version**: a register never overwrites a
-newer copy with an older one. Stamp it with the clock *at the write*, and never
-behind the value it replaces:
-
-```sql
-UPDATE shop.products SET name = $2, updated_at = clock_timestamp() WHERE id = $1;
-```
-
-Not `now()`: that is when the transaction *began*, and a transaction that
-began first and committed last would stamp an older version than the row it
-replaces.
+`products.updated_at` is a column like any other: a register takes what the
+head office sends, whatever its version, because the order of the messages —
+not a column — says which is the latest. A column that orders versions
+(`#[row(version)]`) belongs to a table a register edits and the head office
+files, such as a record a register corrects.
 
 ### The engine's part: installed for you, or in your migrations
 

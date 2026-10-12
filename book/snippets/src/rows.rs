@@ -66,7 +66,6 @@ pub struct RegisterState {
     pub label: String,
     #[row(replica_owned)]
     pub battery: Option<i32>,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 // ANCHOR_END: both
@@ -85,7 +84,6 @@ pub struct RegisterState {
 pub struct LiveProduct {
     pub id: Uuid,
     pub name: String,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 // ANCHOR_END: active

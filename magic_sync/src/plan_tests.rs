@@ -2249,7 +2249,6 @@ async fn the_book_shows_the_triggers_the_engine_prints_for_the_shop(pool: crate:
         id: Uuid,
         name: String,
         price_cents: i64,
-        #[row(version)]
         updated_at: DateTime<Utc>,
     }
 

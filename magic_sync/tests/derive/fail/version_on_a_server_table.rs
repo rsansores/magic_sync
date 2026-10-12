@@ -1,8 +1,8 @@
 #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
-#[row(table = "things", mirror = "both")]
+#[row(table = "things", mirror = "server")]
 pub struct Thing {
     pub id: uuid::Uuid,
-    #[row(version, replica_owned)]
+    #[row(version)]
     pub at: i64,
 }
 

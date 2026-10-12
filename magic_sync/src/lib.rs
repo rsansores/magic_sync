@@ -87,7 +87,6 @@ pub use row::{Columns, Row};
 ///     pub id: Uuid,
 ///     pub name: String,
 ///     pub price_cents: i64,
-///     #[row(version)]
 ///     pub updated_at: DateTime<Utc>,
 /// }
 ///
@@ -124,7 +123,7 @@ pub use row::{Columns, Row};
 ///
 /// | flag | means |
 /// |---|---|
-/// | `#[row(version)]` | the column whose value only moves forward: an older report of a replica's record never overwrites a newer one on the server (what the server sends, the replica takes as it comes). An integer or a `chrono` instant ([`row::Version`]), never NULL, and in a `both` table the server's |
+/// | `#[row(version)]` | the column whose value only moves forward: an older report of a replica's record never overwrites a newer one on the server. An integer or a `chrono` instant ([`row::Version`]), never NULL. Only a `record` has one: a replica takes what the server sends whatever its version |
 /// | `#[row(created)]` | written once, when the row is created; never by an update |
 /// | `#[row(replica_owned)]` | in a `both` table, a column only replicas write: it goes up, the rest come down |
 /// | `#[row(generated)]` | computed by the database: read, never written |

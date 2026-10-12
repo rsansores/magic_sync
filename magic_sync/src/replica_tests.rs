@@ -2622,7 +2622,6 @@ struct Cart {
     id: Uuid,
     #[row(replica_owned)]
     note: String,
-    #[row(version)]
     at: i64,
 }
 

@@ -28,7 +28,6 @@ pub struct Product {
     pub search: Option<String>,
     #[sqlx(skip)]
     pub cached: bool,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -67,7 +66,6 @@ pub struct Task {
     pub title: String,
     #[row(replica_owned)]
     pub done: bool,
-    #[row(version)]
     pub updated_at: DateTime<Utc>,
 }
 

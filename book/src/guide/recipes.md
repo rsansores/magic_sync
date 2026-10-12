@@ -55,8 +55,8 @@ only the register's columns is not sent back down:
 {{#include ../../snippets/src/rows.rs:both}}
 ```
 
-The row begins on the server, and its version is the server's: a register
-edits only its own columns of a row it holds.
+The row begins on the server: a register edits only its own columns of a row
+it holds.
 
 ## Archived rows replicas should not hold
 

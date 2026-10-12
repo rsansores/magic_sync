@@ -13,7 +13,7 @@
 //! names no column, so a column added to the struct is written and read
 //! without touching them:
 //!
-//! - [`upsert`] — every column, newest wins when the row has a version.
+//! - [`upsert`] — every column, newest wins when the record has a version.
 //! - [`insert_ignore`] — history: the first delivery wins.
 //! - [`get`] / [`get_many`] — rows as the replicas see them, by key.
 //! - [`get_by_keys`] — rows by key, every one the table holds.
@@ -131,7 +131,6 @@ pub trait Columns: crate::__private::Sealed {
 /// pub struct Product {
 ///     pub id: Uuid,
 ///     pub name: String,
-///     #[row(version)]
 ///     pub updated_at: DateTime<Utc>,
 /// }
 ///
@@ -1452,13 +1451,30 @@ mod tests {
         #[sqlx(rename = "Total Due")]
         total: Cents,
         note: Option<Cents>,
-        #[row(version)]
         at: chrono::DateTime<chrono::Utc>,
     }
 
     #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Columns)]
     struct Label {
         label: String,
+    }
+
+    /// A record whose reports are ordered by an instant.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(table = "reports", mirror = "record")]
+    struct Report {
+        id: Uuid,
+        #[row(version)]
+        at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[test]
+    fn a_records_version_column_is_read_off_its_type() {
+        let table = Table::of::<Report>();
+        let column = |name: &str| *table.columns.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(column("at").version, Some(VersionKind::Instant));
+        assert_eq!(column("id").version, None);
+        assert_eq!(Report::VERSION, Some("at"));
     }
 
     /// Two parts that bring in the same column, and one that brings in a
@@ -1536,8 +1552,6 @@ mod tests {
         assert!(column("Total Due").int64, "an alias of i64 is an i64");
         assert!(column("note").int64 && column("note").nullable);
         assert!(!column("line").int64);
-        assert_eq!(column("at").version, Some(VersionKind::Instant));
-        assert_eq!(Order::VERSION, Some("at"));
         assert_eq!(table.retired, Some("retired at"));
     }
 

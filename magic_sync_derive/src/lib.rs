@@ -301,11 +301,6 @@ fn row_field(field: &Field) -> syn::Result<RowField> {
             out.created,
             "a #[row(version)] column moves with every write; a #[row(created)] one never moves",
         )?;
-        refuse(
-            out.replica_owned,
-            "the version of a table written on both sides is the server's: \
-             a #[row(version)] column cannot be #[row(replica_owned)]",
-        )?;
     }
     Ok(out)
 }
@@ -625,6 +620,15 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             ));
         }
     }
+    if mirror != Mirror::Record {
+        if let Some(at) = direct.iter().find_map(|d| d.flags.version) {
+            return Err(syn::Error::new(
+                at,
+                "#[row(version)] orders the reports of a replica's table: only a `record` has one, \
+                 and a replica takes what the server sends whatever its version",
+            ));
+        }
+    }
     let (route, mut checks) = route(args.sync.as_ref(), mirror, &direct, &krate)?;
     only_sent_down(args.active.as_ref(), mirror, "an `active` relation")?;
     only_sent_down(args.retired.as_ref(), mirror, "a `retired` column")?;
@@ -719,6 +723,15 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         }
         None => None,
     };
+    if mirror != Mirror::Record {
+        let refusal = "#[row(version)] in a part flattened in orders the reports of a replica's \
+                       table: only a `record` has one";
+        checks.extend(flattened.iter().map(|part| {
+            quote_spanned! {part.span()=>
+                const _: () = ::core::assert!(<#part as #private::Columns>::VERSION.is_none(), #refusal);
+            }
+        }));
+    }
     if mirror != Mirror::Both {
         let refusal = "#[row(replica_owned)] in a part flattened in splits a table written on \
                        both sides: the row needs `mirror = \"both\"`";

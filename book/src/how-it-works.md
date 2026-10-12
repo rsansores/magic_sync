@@ -101,7 +101,7 @@ catalogue, so this needs no declaration: the schema already says it.
 | Declaration | What it is for |
 |---|---|
 | `table`, `schema`, `key` | where the table lives and its primary key (one or more uuid or integer columns) |
-| `#[row(version)]` | a column whose value only moves forward (an `updated_at`): the server never files a replica's older report over a newer one |
+| `#[row(version)]` | for a record a register edits, a column whose value only moves forward (an `updated_at`): the server never files a replica's older report over a newer one. A table the server sends down has none: a replica takes what the server sends, whatever its version |
 | `#[row(created)]` | a column written once, never by an update |
 | `retired` | the column a replica sets on a row it lets go of but cannot delete, because a row of its own points at it |
 | `origin` | for a record: the key column naming the replica that wrote it, so a replica may delete only its own rows on the server |
@@ -523,8 +523,9 @@ The engine guarantees that:
 2. **A replica converges to what it should hold.** At-least-once delivery,
    idempotent application, and the digest backstop.
 3. **A replica never holds a row without the rows it points at.**
-4. **A replica never goes back in time.** Numbered messages, and the `VERSION`
-   guard on every row.
+4. **A replica never goes back in time.** The messages of an epoch are
+   chained: the replica applies each once, in order, so the one applied last
+   is the server's latest.
 5. **One failure holds back only what it is about.**
 
 They rest on:
@@ -537,9 +538,9 @@ They rest on:
   lost until the safety net of section 6 catches it.
 - **Transactions.** `record` and `file` run in a transaction (they use
   savepoints); `apply` runs in one so a message applies whole or not at all.
-- **A monotonic version column**, if tables have one: the server must stamp it
-  with the clock at the write, never behind the value it replaces (not
-  `now()`, which is when the transaction began).
+- **A monotonic version column**, on a record a replica edits: the replica
+  must stamp it with a clock that never goes behind the value it replaces,
+  or its newer report is filed as older and dropped.
 
 ---
 
@@ -565,7 +566,7 @@ runners.
 
 | Module | What it holds |
 |---|---|
-| [`row`] | a table's declaration (`Row`, `Mirror`, the key and version types), the check of a table against its row, and the writes both sides make: upsert with the version guard, insert-first-wins, retire |
+| [`row`] | a table's declaration (`Row`, `Mirror`, the key and version types), the check of a table against its row, and the writes both sides make: upsert (a record with a version: newest wins), insert-first-wins, retire |
 | [`wire`] | the codec: a table's rows encoded as its own message, and applied by the rules its row declares |
 | [`envelope`] | the messages between server and replica, their limits, the packer, the fingerprint (the wire is `proto/sync.proto`, and [the protocol](protocol.md) says what a replica in any language must do) |
 | [`plan`] | the planner and the notes (server) |
