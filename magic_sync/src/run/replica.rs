@@ -170,8 +170,9 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// is; `uplink` how a message reaches the server. Refused, too, when the
     /// settings cannot send up: no lane, a table on two lanes or on none.
     /// What an earlier run set aside, because it could not go up as it was,
-    /// is offered again: this build may send it; what it wrote of a table
-    /// that no longer goes up is dropped, for it never will.
+    /// is offered again: this build may send it. What the replica wrote of
+    /// a table this build does not send up stays, set aside and counted in
+    /// the backlog, for a build that does.
     ///
     /// # Errors
     ///
@@ -201,13 +202,6 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         }
         let mut conn = pool.acquire().await?;
         replica::check(&mut conn, &codecs).await?;
-        let dropped = replica::forsake(&mut conn, &codecs).await?;
-        if dropped > 0 {
-            tracing::warn!(
-                dropped,
-                "sync: writes of tables that no longer go up, which never will — dropped"
-            );
-        }
         let offered = replica::retry_set_aside(&mut conn).await?;
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");

@@ -2435,41 +2435,9 @@ pub(crate) async fn refused(conn: &mut Conn, outgoing: &Outgoing, why: &str) -> 
     Ok(())
 }
 
-/// Drops what the replica kept for tables that no longer travel as they
-/// did — their triggers gone, as [`check`] requires: the notes of one that
-/// no longer goes up, which never will, and the rows of one no longer
-/// written on both sides that it kept retired for edits on their way.
-/// Answers how many.
-#[cfg(feature = "sqlite")]
-pub(crate) async fn forsake<P: Sync + 'static>(
-    conn: &mut Conn,
-    codecs: &[Codec<P>],
-) -> Result<u64, Error> {
-    let up: Vec<&str> = codecs
-        .iter()
-        .filter(|c| c.goes_up())
-        .map(|c| c.table.name)
-        .collect();
-    let both: Vec<&str> = codecs
-        .iter()
-        .filter(|c| matches!(c.table.mirror, crate::row::Mirror::Both))
-        .map(|c| c.table.name)
-        .collect();
-    let mut dropped = 0;
-    for (table, kept) in [("sync_notes", up), ("sync_leaving", both)] {
-        dropped += sqlx::query(&format!(
-            "DELETE FROM {table} WHERE relation NOT IN (SELECT value FROM json_each($1))"
-        ))
-        .bind(json(&kept))
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
-    }
-    Ok(dropped)
-}
-
-/// Offers every write set aside to go up again: what this build could not
-/// send, a new one may.
+/// Offers every write set aside to go up again: what an earlier build could
+/// not send — of a table it did not send up, a row it could not encode —
+/// this one may; what it cannot either, it sets aside again.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn retry_set_aside(conn: &mut Conn) -> Result<u64, Error> {
     Ok(
