@@ -695,21 +695,20 @@ impl Index {
         )
     }
 
-    /// Its name: its table's and its columns', and a digest of them where
-    /// that is longer than a name may be.
+    /// Its name: its table's and its columns', as far as a name holds them,
+    /// and a digest of them apart — the same names joined otherwise, a
+    /// table `a_b` on `c` and a table `a` on `b, c`, are other indexes.
     fn name(&self) -> String {
-        let name = format!("{}_{}_sync", self.on.name, self.columns.join("_"));
-        if name.len() <= 63 {
-            return name;
-        }
-        let digest = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        let name = format!("{}_{}", self.on.name, self.columns.join("_"));
+        let apart = format!("{}\0{}", self.on.name, self.columns.join("\0"));
+        let digest = apart.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        let mut cut = 46;
+        let mut cut = name.len().min(41);
         while !name.is_char_boundary(cut) {
             cut -= 1;
         }
-        format!("{}_{digest:016x}", &name[..cut])
+        format!("{}_sync_{digest:016x}", &name[..cut])
     }
 
     /// Whether one of `live` serves it: a valid b-tree index, of every row,

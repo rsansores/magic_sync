@@ -3734,3 +3734,20 @@ async fn a_parent_held_for_an_older_version_brings_no_new_follower(pool: crate::
         .count();
     assert_eq!(emails, 0);
 }
+
+/// Each index the planner needs has a name of its own, however its table's
+/// and its columns' names run together, and within what a name may hold.
+#[test]
+fn indexes_that_spell_alike_are_named_apart() {
+    let index = |table: &str, columns: &[&str]| Index {
+        on: Relation {
+            schema: "public".to_owned(),
+            name: table.to_owned(),
+        },
+        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    let (one, other) = (index("a_b", &["c"]), index("a", &["b", "c"]));
+    assert_ne!(one.name(), other.name());
+    let long = index(&"t".repeat(63), &["c"]);
+    assert!(long.name().len() <= 63, "{}", long.name());
+}

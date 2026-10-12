@@ -90,6 +90,12 @@ database does not have — write them in the migration beside the triggers.
 > it, and creates every index it needs that no index serves. Run it before anything writes a mirrored table: a write before its
 > trigger exists is never noted.
 
+> **Mind:** `Server::install` creates an index with a plain `CREATE INDEX`,
+> which holds writes to the table until it is built — on a large table, a
+> long time. Print them with [`Engine::indexes`] and create them yourself
+> first, `CREATE INDEX CONCURRENTLY` (outside a transaction): an index that
+> serves is left as it is.
+
 ## On a register
 
 > **You write** the same tables, with one more column on each table that comes
