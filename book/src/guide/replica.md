@@ -16,14 +16,19 @@ that arrives, and run its upward loop in a task of its own.
 implement [`Identity`] instead, answering `None` until it does: nothing goes
 up until then.
 
-> **What happens:** until the replica first sends or applies a message with
-> its id, its database refuses none of your writes — it is setting itself
-> up: a placeholder of its own row, say, renamed once it learns its id, and
-> the rows of its own that point at it. What it wrote there is the server's to set straight, and its
-> provisioning does: the rows the server sends overwrite the ones of the same
-> key, and the ones it does not send go. From then on, the server's tables
-> are the server's. `run` sends up until the future it is given resolves,
-finishing what it is sending.
+> **What happens:** until the replica first runs knowing its id — built
+> with it, or sending or applying a message once `Identity` answers — its
+> database refuses none of your writes: you are setting it up. A
+> placeholder of its own row, say, renamed once it learns its id, with the
+> rows of its own that point at it. What you wrote to the server's tables
+> is not noted, and the provisioning sets it straight: the rows the server
+> sends overwrite the ones of the same key, and the ones it does not send
+> go. What you wrote to the replica's own tables is noted by the key it has
+> by then, and goes up once the replica knows which it is. From then on,
+> the server's tables are the server's.
+
+`run` sends up until the future it is given resolves, finishing what it is
+sending.
 
 `Replica::new` refuses a connection the engine cannot keep its word on, and
 so does every message it applies, on whichever connection of the pool:

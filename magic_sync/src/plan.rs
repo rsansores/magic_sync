@@ -89,7 +89,9 @@ impl Replicas {
     /// In a foreign key, the columns that are `column` on both sides say the
     /// two rows share a partition, not which parent it is: `(company_id,
     /// region_id)` into `regions (company_id, id)` points at a region by
-    /// `region_id`, and a key of `company_id` alone points at no parent.
+    /// `region_id`, and a key of `company_id` alone points at no parent —
+    /// unless the parent's primary key holds `column`, when the key points
+    /// at it by every column, as at any other.
     #[must_use]
     pub const fn partitioned_by(self, column: &'static str) -> Self {
         Replicas {
@@ -238,8 +240,16 @@ pub(crate) struct Unsent {
 type ForeignKey = (Relation, Relation, Vec<String>, Vec<String>);
 
 /// A [`ForeignKey`] as the catalogue query answers it, each relation as its
-/// schema and name.
-type CatalogForeignKey = (String, String, String, String, Vec<String>, Vec<String>);
+/// schema and name, then the columns of the parent's primary key.
+type CatalogForeignKey = (
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
 
 /// Rows a pass loads, encodes and records at a time: what it holds in
 /// memory however much it sends.
@@ -1254,7 +1264,11 @@ impl Engine {
                               ORDER BY k.o),
                         ARRAY(SELECT a.attname::text FROM unnest(c.confkey) WITH ORDINALITY AS k(n, o)
                               JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.n
-                              ORDER BY k.o)
+                              ORDER BY k.o),
+                        ARRAY(SELECT a.attname::text FROM pg_index i
+                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+                              WHERE i.indrelid = c.confrelid AND i.indisprimary
+                              ORDER BY a.attname)
                    FROM pg_constraint c
                    JOIN pg_class child ON child.oid = c.conrelid
                    JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
@@ -1265,20 +1279,23 @@ impl Engine {
             )
             .fetch_all(&mut *conn)
             .await?;
-        let foreign_keys: Vec<ForeignKey> = foreign_keys
+        let foreign_keys: Vec<(ForeignKey, Vec<String>)> = foreign_keys
             .into_iter()
-            .map(|(cs, c, ps, p, cc, pc)| {
+            .map(|(cs, c, ps, p, cc, pc, parent_key)| {
                 (
-                    Relation {
-                        schema: cs,
-                        name: c,
-                    },
-                    Relation {
-                        schema: ps,
-                        name: p,
-                    },
-                    cc,
-                    pc,
+                    (
+                        Relation {
+                            schema: cs,
+                            name: c,
+                        },
+                        Relation {
+                            schema: ps,
+                            name: p,
+                        },
+                        cc,
+                        pc,
+                    ),
+                    parent_key,
                 )
             })
             .collect();
@@ -3570,26 +3587,40 @@ fn topological(plans: &[Plan]) -> Result<Vec<usize>, Error> {
     Ok(order)
 }
 
-/// Each foreign key as the engine reads it: the columns that are the
-/// partition on both sides say the two rows share a partition, which no row
-/// crosses anyway, not which parent it is. A key such as `(company_id,
-/// region_id)` into `regions (company_id, id)` — how PostgreSQL keeps a row
-/// from pointing into another company — points at a region by `region_id`;
-/// one made only of the partition column points at no parent.
-fn within_partition(foreign_keys: Vec<ForeignKey>, partition: Option<&str>) -> Vec<ForeignKey> {
-    let Some(partition) = partition else {
-        return foreign_keys;
-    };
+/// Each foreign key as the engine reads it, beside its parent's primary
+/// key: the columns that are the partition on both sides say the two rows
+/// share a partition, which no row crosses anyway, not which parent it is —
+/// unless the parent is keyed by the partition too. A key such as
+/// `(company_id, region_id)` into `regions (company_id, id)` — how
+/// PostgreSQL keeps a row from pointing into another company — points at a
+/// region by `region_id`; one made only of the partition column points at no
+/// parent; and one into a table keyed by `(id, company_id)`, as a table
+/// partitioned by `company_id` is, points at it by both.
+fn within_partition(
+    foreign_keys: Vec<(ForeignKey, Vec<String>)>,
+    partition: Option<&str>,
+) -> Vec<ForeignKey> {
     foreign_keys
         .into_iter()
-        .filter_map(|(child, parent, child_columns, parent_columns)| {
-            let (child_columns, parent_columns): (Vec<String>, Vec<String>) = child_columns
-                .into_iter()
-                .zip(parent_columns)
-                .filter(|(c, p)| !(c == partition && p == partition))
-                .unzip();
-            (!child_columns.is_empty()).then_some((child, parent, child_columns, parent_columns))
-        })
+        .filter_map(
+            |((child, parent, child_columns, parent_columns), parent_key)| {
+                let Some(partition) = partition.filter(|p| !parent_key.iter().any(|k| k == p))
+                else {
+                    return Some((child, parent, child_columns, parent_columns));
+                };
+                let (child_columns, parent_columns): (Vec<String>, Vec<String>) = child_columns
+                    .into_iter()
+                    .zip(parent_columns)
+                    .filter(|(c, p)| !(c == partition && p == partition))
+                    .unzip();
+                (!child_columns.is_empty()).then_some((
+                    child,
+                    parent,
+                    child_columns,
+                    parent_columns,
+                ))
+            },
+        )
         .collect()
 }
 

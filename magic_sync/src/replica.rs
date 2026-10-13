@@ -111,16 +111,20 @@ struct Trigger {
 ///   and such a delete, go up.
 ///
 /// A write the engine makes while it applies what the server sent is noted
-/// by none and refused by none. Nor is any write refused before the replica
-/// knows which it is ([`identified`]): it is setting itself up, nothing it
-/// wrote has gone up, and the server's provisioning sets the server's rows
-/// straight.
+/// by none and refused by none. Before the replica first runs knowing which
+/// it is ([`identified`]), the host is setting it up: nothing is refused, and
+/// a write to a table the server sends is not noted either — nothing has gone
+/// up yet, and the server's provisioning sets those rows straight. A write
+/// to the replica's own tables is noted then too, and goes up once it knows.
 #[cfg(feature = "sqlite")]
 fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
     use crate::row::Mirror;
-    const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
-    // A replica that does not know which it is yet sets itself up: it writes
-    // what it needs, and the server's provisioning sets those rows straight.
+    // Until the replica knows which it is, the host sets it up: it writes
+    // what it needs, and the server's provisioning sets its rows straight.
+    const SETTING_UP: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_replica)";
+    const IDENTIFIED: &str = " WHEN EXISTS (SELECT 1 FROM sync_replica)";
+    // Neither the engine applying what the server sent, nor the host setting
+    // the replica up.
     const GUARDED: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying) \
                            AND EXISTS (SELECT 1 FROM sync_replica)";
     // A row noted again is one note, written once more: a hot row goes up
@@ -196,7 +200,18 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     let why = format!(
                         "`{table}` is history: a row of it is written once (a version column makes it editable)"
                     );
-                    out.push(refuse("UPDATE", GUARDED, why));
+                    out.push(refuse("UPDATE", IDENTIFIED, why));
+                    // Nothing went up while it was set up: a key renamed then
+                    // leaves no note of the old one behind.
+                    let renamed = format!(
+                        "DELETE FROM sync_notes WHERE relation = {} AND row_key = {} AND {} IS NOT {}; ",
+                        literal(table),
+                        key("OLD"),
+                        key("OLD"),
+                        key("NEW")
+                    );
+                    let body = format!("{guard}{renamed}{}", note("NEW"));
+                    out.push(noting("UPDATE", "", SETTING_UP, body));
                 }
                 out.push(noting("DELETE", "", "", note("OLD")));
             }
@@ -223,7 +238,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     format!(" OF {}", owned.join(", "))
                 };
                 let body = format!("{guard}{}{gone}", note("NEW"));
-                out.push(noting("UPDATE", &of, QUIET, body));
+                out.push(noting("UPDATE", &of, GUARDED, body));
                 if let Some(origin) = codec.table.origin.filter(|_| codec.takes_deletes()) {
                     let why = format!(
                         "a row of `{table}` is let go of by the server: a replica deletes only \
@@ -234,7 +249,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                         ident(origin)
                     );
                     out.push(refuse("DELETE", &others, why));
-                    out.push(noting("DELETE", "", QUIET, note("OLD")));
+                    out.push(noting("DELETE", "", GUARDED, note("OLD")));
                 } else {
                     let why = format!(
                         "a row of `{table}` is let go of by the server: a replica deletes one \

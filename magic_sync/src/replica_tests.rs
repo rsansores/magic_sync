@@ -2915,65 +2915,97 @@ struct Cart {
     at: i64,
 }
 
-/// A replica that does not know which it is yet sets itself up: its
-/// database takes any write of the host's — a placeholder of the server's
-/// rows, renamed; history, edited — and once it applies a message under its
-/// id, the provisioning sets the server's rows straight and every refusal
-/// holds.
+/// Which replica this is, once the host learns it.
+#[derive(Clone, Default)]
+struct Later(std::sync::Arc<std::sync::OnceLock<Uuid>>);
+
+impl crate::run::replica::Identity for Later {
+    async fn id(&self, _conn: &mut Conn) -> Result<Option<Uuid>, Error> {
+        Ok(self.0.get().copied())
+    }
+}
+
+/// A replica that does not know which it is yet is set up by its host: its
+/// database takes any write — a placeholder of the server's rows, renamed;
+/// history, renamed and edited — and notes only the replica's own rows, by
+/// the keys they have by then. Once it runs knowing which it is, the
+/// provisioning sets the server's rows straight and every refusal holds.
 #[sqlx::test(migrations = false)]
 async fn a_replica_sets_itself_up_until_it_knows_which_it_is(pool: SqlitePool) {
     let pool = settled(pool).await;
-    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
-    install(&mut pool.acquire().await.unwrap(), &codecs())
+    sqlx::raw_sql(&format!(
+        "{TABLES}CREATE TABLE carts (replica_id BLOB NOT NULL, id BLOB NOT NULL, \
+           note TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (replica_id, id));"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    install(&mut pool.acquire().await.unwrap(), &with_carts())
         .await
         .unwrap();
+    let identity = Later::default();
     let replica = Replica::new(
         pool.clone(),
-        codecs(),
-        Uuid::now_v7(),
+        with_carts(),
+        identity.clone(),
         Uplinked::default(),
         Settings::default(),
     )
     .await
     .unwrap();
     let [placeholder, named] = ids();
+    let [event, renamed] = ids();
     let write = |sql: String| sqlx::raw_sql(Box::leak(sql.into_boxed_str())).execute(&pool);
-    write(format!(
-        "INSERT INTO items (id, partition_id, name) VALUES (x'{}', x'{}', 'mine')",
-        placeholder.simple(),
-        placeholder.simple()
-    ))
-    .await
-    .expect("a placeholder");
-    write(format!(
-        "UPDATE items SET id = x'{}' WHERE id = x'{}'",
-        named.simple(),
-        placeholder.simple()
-    ))
-    .await
-    .expect("renamed");
-    write(format!(
-        "INSERT INTO events (id, what) VALUES (x'{}', 'switched on')",
-        placeholder.simple()
-    ))
-    .await
-    .expect("history of its own");
-    write("UPDATE events SET what = 'switched on, before it was set up'".to_owned())
+    for setting_up in [
+        format!(
+            "INSERT INTO items (id, partition_id, name) VALUES (x'{0}', x'{0}', 'mine')",
+            placeholder.simple()
+        ),
+        format!(
+            "UPDATE items SET id = x'{}' WHERE id = x'{}'",
+            named.simple(),
+            placeholder.simple()
+        ),
+        format!(
+            "INSERT INTO carts (replica_id, id, note, at) VALUES (x'{0}', x'{0}', '', 1)",
+            placeholder.simple()
+        ),
+        "UPDATE carts SET note = 'mine'".to_owned(),
+        format!(
+            "INSERT INTO events (id, what) VALUES (x'{}', 'switched on')",
+            event.simple()
+        ),
+        format!(
+            "UPDATE events SET id = x'{}', what = 'switched on, before it was set up'",
+            renamed.simple()
+        ),
+    ] {
+        write(setting_up.clone()).await.expect(&setting_up);
+    }
+    let noted: Vec<String> = sqlx::query_scalar("SELECT row_key FROM sync_notes")
+        .fetch_all(&pool)
         .await
-        .expect("edited while it sets itself up");
+        .unwrap();
+    assert_eq!(
+        noted,
+        [renamed.to_string()],
+        "the replica's own, as renamed"
+    );
 
+    identity.0.set(named).unwrap();
     replica
-        .receive(&ending(BASE, 0, "provisioned", &["items"]))
+        .receive(&ending(BASE, 0, "provisioned", &["items", "carts"]))
         .await
         .unwrap();
-    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM items")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left, 0, "what the server does not send goes");
+    for table in ["items", "carts"] {
+        let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "what the server does not send of `{table}` goes");
+    }
     write(format!(
-        "INSERT INTO items (id, partition_id, name) VALUES (x'{}', x'{}', 'mine')",
-        named.simple(),
+        "INSERT INTO items (id, partition_id, name) VALUES (x'{0}', x'{0}', 'mine')",
         named.simple()
     ))
     .await
@@ -2981,6 +3013,33 @@ async fn a_replica_sets_itself_up_until_it_knows_which_it_is(pool: SqlitePool) {
     write("UPDATE events SET what = 'edited'".to_owned())
         .await
         .expect_err("history, once it knows which it is");
+}
+
+/// A replica that knows which it is from the start is never set up: its
+/// triggers refuse from the moment it is built, before it sends or applies
+/// anything.
+#[sqlx::test(migrations = false)]
+async fn a_replica_that_knows_which_it_is_refuses_from_the_start(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    install(&mut pool.acquire().await.unwrap(), &codecs())
+        .await
+        .unwrap();
+    let me = Uuid::now_v7();
+    Replica::new(
+        pool.clone(),
+        codecs(),
+        me,
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO items (id, partition_id, name) VALUES ($1, $1, 'mine')")
+        .bind(me)
+        .execute(&pool)
+        .await
+        .expect_err("the server's");
 }
 
 /// A replica deletes, of a table written on both sides and keyed by its

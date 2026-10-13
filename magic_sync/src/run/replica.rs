@@ -204,7 +204,8 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// A replica over a database the engine can run against
     /// ([`replica::check`]): `codecs` are the tables that travel, parents
     /// first, as the server lists them; `identity` says which replica this
-    /// is; `uplink` how a message reaches the server. Refused, too, when the
+    /// is — one that already knows is set up, and its triggers refuse from
+    /// here on; `uplink` how a message reaches the server. Refused, too, when the
     /// settings cannot send up: no lane, a table on two lanes or on none.
     /// What an earlier run set aside, because it could not go up as it was,
     /// is offered again: this build may send it. What the replica wrote of
@@ -246,6 +247,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let offered = replica::retry_set_aside(&mut conn).await?;
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");
+        }
+        // One that knows which it is is set up: its triggers refuse from now.
+        if let Some(id) = identity.id(&mut conn).await? {
+            replica::identified(&mut conn, id).await?;
         }
         drop(conn);
         Ok(Replica {

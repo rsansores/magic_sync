@@ -113,6 +113,8 @@ CREATE TABLE shop.stores (
 > foreign key as "the same company", which no row crosses anyway: a store
 > points at its region by `region_id`, so `sync = "follows(region_id)"` works,
 > and a region goes wherever a store that points at it goes. A key made only
-> of `company_id` — into a table of companies, say — points at no parent.
+> of `company_id` — into a table of companies, say — points at no parent. A
+> parent whose primary key holds `company_id` — a table partitioned by it —
+> is pointed at by every column of the key, `company_id` too.
 
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers
