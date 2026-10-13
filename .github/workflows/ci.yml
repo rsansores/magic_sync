@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The release runs it on the tag, and publishes only once it is green.
+  # The release runs it on the commit it releases, and publishes only once it
+  # is green.
   workflow_call:
 
 permissions:

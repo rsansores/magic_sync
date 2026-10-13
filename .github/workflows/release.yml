@@ -1,16 +1,28 @@
 name: Release
 
-# A tag `v<version>` on a commit of main releases it: CI runs on the tag, and
-# only once it is green, and the tag is the version everywhere, is anything
-# published — the derive, then the engine, then the dashboard, then the book.
-# Each publication is a job of its own that skips what the registry already
-# has, so a release that stopped half-way is finished by running its failed
-# jobs again. No job that builds holds a token: the tarballs CI verified are
-# what is published. The credentials live in the `release` environment, which
-# may ask a maintainer to approve before a job of it starts.
+# A click releases: Actions → Release → Run workflow on main, with the
+# version. It sets that version everywhere and dates the changelog, runs CI,
+# and — once a maintainer approves the `release` environment — publishes the
+# derive, then the engine, then the dashboard; only once every registry took
+# the release does it commit the version, tag it and push both, then publish
+# the book. `dry_run` does everything but publish, commit and tag.
+#
+# A publication skips what its registry already has, so a release that
+# stopped half-way is finished by running its failed jobs again. No job that
+# builds holds a token: the crates are packed and verified, and the
+# dashboard packed, by jobs with no credentials; the publishing job compiles
+# nothing.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to release (semver, e.g. 0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: set the version, build, pack and verify — publish, commit and tag nothing"
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -20,136 +32,199 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  VERSION: ${{ inputs.version }}
 
 jobs:
+  # The version and its date, set in the working tree; the change, as a patch
+  # every later job applies; and both sides' crates packed and verified at it.
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      date: ${{ steps.date.outputs.date }}
+    steps:
+      - name: A release of main, at a version not released yet
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "::error::a release runs on main, not $GITHUB_REF"; exit 1; }
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || { echo "::error::'$VERSION' is not a semver version"; exit 1; }
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Not tagged already
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION is tagged already"
+            exit 1
+          fi
+      - id: date
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: scripts/set-version.sh "$VERSION" "$DATE"
+        env:
+          DATE: ${{ steps.date.outputs.date }}
+      - run: git diff > "$RUNNER_TEMP/release.patch"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}/release.patch
+          if-no-files-found: error
+      - run: cargo package --locked --allow-dirty --workspace --features magic_sync/postgres
+      - run: cargo package --locked --allow-dirty --workspace --features magic_sync/sqlite
+
+  # Every check a pull request passes, on the commit released.
   ci:
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
 
-  versions:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - run: scripts/check-versions.sh "${GITHUB_REF_NAME#v}"
-      - name: The tag is on main
-        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-
-  # crates.io: the engine pins the derive at its own version, so the derive
-  # goes first. `cargo publish` waits until a crate is in the index before it
-  # returns. The token is the short-lived one crates.io gives this workflow
-  # when the crate trusts it (Trusted Publishing); the first release of a
-  # crate, before it can, falls back to the environment's CARGO_REGISTRY_TOKEN.
-  derive:
-    needs: [ci, versions]
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - id: auth
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-      - run: scripts/publish-crate.sh magic_sync_derive "${GITHUB_REF_NAME#v}"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-
-  engine:
-    needs: derive
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - id: auth
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-      - run: scripts/publish-crate.sh magic_sync "${GITHUB_REF_NAME#v}"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-
-  # npm: the dashboard reads the engine's JSON, and goes out at its version.
-  # It is packed (which builds it) in a job with no credentials, and the
-  # tarball is what is published.
+  # The dashboard's tarball, at the version, packed (which builds it) by a
+  # job with no credentials: what the release publishes.
   dashboard-pack:
-    needs: engine
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    defaults:
-      run:
-        working-directory: dashboard
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}
+      - run: git apply "$RUNNER_TEMP/release.patch"
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: dashboard/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile --ignore-scripts
+        working-directory: dashboard
       # `prepack` copies the licenses in and builds.
       - run: pnpm pack --pack-destination "$RUNNER_TEMP/tarball"
+        working-directory: dashboard
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dashboard-tarball
           path: ${{ runner.temp }}/tarball/magic_sync_dashboard-*.tgz
           if-no-files-found: error
 
-  dashboard:
-    needs: dashboard-pack
+  # crates.io, then npm, after a maintainer approves. The engine pins the
+  # derive at its own version, so the derive goes first; `cargo publish`
+  # waits until a crate is in the index before it returns. The crates.io
+  # token is the short-lived one it gives this workflow when the crate trusts
+  # it (Trusted Publishing); the first release of a crate, before it can,
+  # falls back to the environment's CARGO_REGISTRY_TOKEN. npm likewise trusts
+  # the workflow once the package exists, and NPM_TOKEN publishes the first.
+  publish:
+    if: ${{ !inputs.dry_run }}
+    needs: [prepare, ci, dashboard-pack]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}
+      - run: git apply "$RUNNER_TEMP/release.patch"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: scripts/publish-crate.sh magic_sync_derive "$VERSION"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+      - run: scripts/publish-crate.sh magic_sync "$VERSION"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+      # Node 24 carries an npm that publishes through Trusted Publishing.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 24
           package-manager-cache: false
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dashboard-tarball
           path: ${{ runner.temp }}/tarball
-      - name: Publish, unless npm has the version already
+      - name: Publish the dashboard, unless npm has the version already
         run: |
-          version=${GITHUB_REF_NAME#v}
-          if npm view "magic_sync_dashboard@$version" version >/dev/null 2>&1; then
-            echo "magic_sync_dashboard $version is on npm already"
+          if npm view "magic_sync_dashboard@$VERSION" version >/dev/null 2>&1; then
+            echo "magic_sync_dashboard $VERSION is on npm already"
           else
             npm publish "$RUNNER_TEMP"/tarball/magic_sync_dashboard-*.tgz --provenance --access public
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # Every registry took the release: the version committed on the commit
+  # released, and tagged.
+  tag:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-patch
+          path: ${{ runner.temp }}
+      - name: Commit the version, tag it, push the tag
+        run: |
+          git apply "$RUNNER_TEMP/release.patch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "v$VERSION"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # main moves to the release's commit — refused when something was merged
+  # while the release ran: then merge the tag into main by a pull request.
+  main:
+    needs: tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: main at the release
+        run: |
+          git init -q .
+          remote="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q "$remote" "refs/tags/v$VERSION:refs/tags/v$VERSION"
+          git push "$remote" "v$VERSION^{commit}:refs/heads/main" \
+            || { echo "::error::main moved while the release ran: v$VERSION is tagged and published; merge the tag into main"; exit 1; }
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
   # GitHub Pages (Settings → Pages → Source: GitHub Actions): the book and
   # each side's API, as of the release.
   pages:
-    needs: engine
+    needs: tag
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -161,6 +236,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: v${{ inputs.version }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
