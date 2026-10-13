@@ -6,11 +6,14 @@ and brings back what the replicas write.
 Picture a chain of shops. The head office runs PostgreSQL. Every cash register
 runs SQLite and must keep selling when the network is down. The registers
 hold the catalog; each register writes receipts that the head office must end
-up with. That is the system this book builds, one step at a time, and it is
+up with; and each prints a footer of its own, which the head office may ask
+it to change — a *setting*, which the head office *wishes* and the register
+carries out ([Settings and wishes](guide/settings.md)). That is the system
+this book builds, one step at a time, and it is
 also the [example](https://github.com/rsansores/magic_sync/tree/main/examples/shop)
 you can run in five minutes.
 
-![The shop: a head office and two registers, one unplugged](images/shop.png)
+![The shop: a head office and two registers, one offline](images/shop.png)
 
 ## How the book is written
 

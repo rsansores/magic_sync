@@ -12,11 +12,12 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
+use magic_sync::row::KeyPart;
 use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 use magic_sync::status::{
-    Listing, Overview, Progress, ReplicaState, RowProgress, Scope, WishListing,
+    Listing, Overview, Progress, ReplicaState, RowProgress, Scope, WishListing, WishState,
 };
 use magic_sync::Error;
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/registers", post(register))
         .route("/api/registers/{register}/line", post(line))
         .route("/api/registers/{register}/footer", post(wish_footer))
+        .route(
+            "/api/registers/{register}/footer/wish",
+            delete(withdraw_footer),
+        )
         .route("/sync/{register}/next", get(next))
         .route("/sync/{register}/ack/{id}", post(ack))
         .route("/sync/{register}/up", post(up))
@@ -253,9 +258,52 @@ struct ShopState {
     products: Vec<Product>,
     receipts: Vec<Receipt>,
     registers: Vec<RegisterState>,
-    /// Each register's footer, as it last said.
-    footers: Vec<Footer>,
+    footers: Vec<FooterTwin>,
 }
+
+// ANCHOR: twin
+/// A register's footer as the head office knows it: what the register last
+/// said it prints, and what the head office wishes it printed instead, if
+/// anything — with where that wish stands.
+#[derive(Serialize)]
+struct FooterTwin {
+    #[serde(flatten)]
+    reported: Footer,
+    wish: Option<FooterWished>,
+}
+
+#[derive(Serialize)]
+struct FooterWished {
+    text: String,
+    state: WishState,
+    /// The register's reason, for a wish waiting, refused or superseded.
+    reason: Option<String>,
+}
+
+/// Each register's footer, beside the wish of it.
+async fn footers(app: &App) -> Result<Vec<FooterTwin>, Failure> {
+    let reported: Vec<Footer> = sqlx::query_as("SELECT * FROM shop.footers")
+        .fetch_all(&app.pool)
+        .await?;
+    let keys: Vec<_> = reported.iter().map(magic_sync::Row::key).collect();
+    let mut conn = app.pool.acquire().await?;
+    let mut wishes = app.server.wishes::<Footer>(&mut conn, &keys).await?;
+    Ok(reported
+        .into_iter()
+        .map(|reported| {
+            let at = wishes
+                .iter()
+                .position(|w| w.wanted.register_id == reported.register_id);
+            let wish = at.map(|at| wishes.swap_remove(at)).map(|w| FooterWished {
+                text: w.wanted.text,
+                state: w.state,
+                reason: w.reason,
+            });
+            FooterTwin { reported, wish }
+        })
+        .collect())
+}
+// ANCHOR_END: twin
 
 async fn state(State(app): State<App>) -> Result<Json<ShopState>, Failure> {
     let products = sqlx::query_as("SELECT * FROM shop.products ORDER BY name")
@@ -271,9 +319,7 @@ async fn state(State(app): State<App>) -> Result<Json<ShopState>, Failure> {
     for register in &mut registers {
         register.cut = app.deliveries.is_cut(register.id);
     }
-    let footers = sqlx::query_as("SELECT * FROM shop.footers")
-        .fetch_all(&app.pool)
-        .await?;
+    let footers = footers(&app).await?;
     Ok(Json(ShopState {
         products,
         receipts,
@@ -553,6 +599,20 @@ async fn wish_footer(
     let mut tx = app.pool.begin().await?;
     app.server
         .desire(&mut tx, wanted, Some("the head office"))
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The head office lets go of its wish of a register's footer: one refused
+/// or superseded is dismissed, one not carried out yet is not anymore.
+async fn withdraw_footer(
+    State(app): State<App>,
+    Path(register): Path<Uuid>,
+) -> Result<StatusCode, Failure> {
+    let mut tx = app.pool.begin().await?;
+    app.server
+        .withdraw::<Footer>(&mut tx, &vec![KeyPart::Uuid(register)])
         .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)

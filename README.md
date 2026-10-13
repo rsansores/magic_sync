@@ -5,11 +5,11 @@ what the replicas write. Offline-first: a replica keeps working while it is
 unreachable, and catches up when it is back — with nobody repairing data by
 hand.
 
-![The shop example: a head office and two registers, one of them unplugged](https://raw.githubusercontent.com/rsansores/magic_sync/main/book/src/images/shop.png)
+![The shop example: a head office and two registers, one of them offline](https://raw.githubusercontent.com/rsansores/magic_sync/main/book/src/images/shop.png)
 
-*The [shop example](https://rsansores.github.io/magic_sync/getting-started.html): register 2 is unplugged. It keeps selling
+*The [shop example](https://rsansores.github.io/magic_sync/getting-started.html): register 2 is offline. It keeps selling
 from the products it holds; the head office knows it holds 5 of 7, and that
-two receipts are on their way. Plug it back in and both catch up.*
+two receipts are on their way. Bring it back online and both catch up.*
 
 ```rust
 // One struct is one table, and says how it travels. Both sides share it.
@@ -98,6 +98,13 @@ Built on that:
 - **Both directions.** Replicas write rows of their own (receipts, readings)
   that go up and are filed under the replica that sent them — whatever the
   rows claim.
+- **Settings and wishes: a digital twin.** A setting is a value a replica
+  owns and acts on — a device's configuration, a printer's footer. The server
+  keeps what the replica reports, and *wishes* it another value; the replica
+  carries the wish out through your handler (hardware included), refuses it,
+  or finds it changed first, and both sides end showing what it decided.
+  Desired against reported state, in your own tables
+  ([Settings and wishes](https://rsansores.github.io/magic_sync/guide/settings.html)).
 - **A failure contract.** Every failure is either *transient* (the network,
   the database — it waits and retries) or *permanent* (a bug, data no
   declaration allows — it is narrowed down to the one row, set aside, and
@@ -120,7 +127,8 @@ of it in SQLite, must keep working offline, and write records of their own.
 
 It does not try to be a collaborative-editing engine: two writers on the same
 column of the same row is not a case it resolves (a table either goes down,
-goes up, or splits its columns between the two sides). If you need
+goes up, or splits its columns between the two sides; a value the server must
+change on a replica is a setting it *wishes*, which the replica alone writes). If you need
 multi-writer merges, look at CRDT-based tools ([Automerge], [Yjs]). If your
 clients are browsers or mobile apps talking to a hosted service, look at
 [PowerSync] or [ElectricSQL]. `magic_sync` is a library inside your own Rust

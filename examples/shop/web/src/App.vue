@@ -6,15 +6,13 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import {
   RowPlaces,
   SyncDashboard,
-  WishList,
   type Listing,
   type Overview,
   type Progress,
   type ReplicaState,
   type RowProgress,
-  type WishListing,
 } from 'magic_sync_dashboard'
-import { api, type Footer, type Product, type ShopState } from './api'
+import { api, type FooterTwin, type Product, type ShopState } from './api'
 
 const state = ref<ShopState | null>(null)
 const overview = ref<Overview | null>(null)
@@ -27,9 +25,6 @@ const listing = ref<Listing | null>(null)
 // The product whose registers are shown, and where it is on each.
 const holding = ref<string | null>(null)
 const places = ref<RowProgress | null>(null)
-// What the head office wished of the registers' footers, and how each
-// register answered.
-const wishes = ref<WishListing | null>(null)
 const error = ref('')
 
 // The dashboard's names for what the engine knows by id.
@@ -38,11 +33,10 @@ const labels = { products: 'Products', receipts: 'Receipts' }
 
 async function refresh() {
   try {
-    ;[state.value, overview.value, listing.value, wishes.value] = await Promise.all([
+    ;[state.value, overview.value, listing.value] = await Promise.all([
       api.state(),
       api.overview(),
       api.listing(filter.value, offset.value),
-      api.wishes(),
     ])
     progress.value = selected.value ? await api.progress(selected.value) : null
     places.value = holding.value ? await api.row('products', holding.value) : null
@@ -101,17 +95,31 @@ function remove(p: Product) {
 // ANCHOR: footer
 const footerOf = (register: string) => state.value?.footers.find((f) => f.register_id === register)
 // The footer each register's form was opened on: the wish is based on it.
-const asking = ref<{ seen: Footer; text: string } | null>(null)
-function ask(seen: Footer) {
-  asking.value = { seen, text: seen.text }
+const asking = ref<{ seen: FooterTwin; text: string } | null>(null)
+function ask(seen: FooterTwin) {
+  asking.value = { seen, text: seen.wish && open(seen) ? seen.wish.text : seen.text }
 }
 function wish() {
-  const a = asking.value!
+  const { seen, text } = asking.value!
   return act(async () => {
-    await api.wishFooter(a.seen, a.text)
+    await api.wishFooter(
+      { register_id: seen.register_id, text: seen.text, changed_at: seen.changed_at },
+      text,
+    )
     asking.value = null
   })
 }
+function dismiss(f: FooterTwin) {
+  return act(() => api.withdrawFooter(f.register_id))
+}
+// Each register beside its footer, once it said it.
+const twins = computed(() => (state.value?.registers ?? []).map((r) => ({ r, f: footerOf(r.id) })))
+// A wish not carried out yet: on its way, or waiting for the register.
+const open = (f: FooterTwin) => f.wish?.state === 'pending' || f.wish?.state === 'waiting'
+// A wish the register did not carry out, and said why — unless it prints
+// that footer anyway.
+const declined = (f: FooterTwin) =>
+  (f.wish?.state === 'refused' || f.wish?.state === 'superseded') && f.wish.text !== f.text
 // ANCHOR_END: footer
 
 // A register's page, on the host this page was opened with.
@@ -125,13 +133,19 @@ function pageOf(url: string) {
 <template>
   <header>
     <h1>The head office</h1>
-    <p>Edit the catalog here. Every register holds it, and keeps working when it is unplugged.</p>
+    <p>Edit the catalog here. Every register holds it, and keeps working when it is offline.</p>
     <p v-if="error" class="error">{{ error }}</p>
   </header>
   <main>
     <div class="column">
       <section>
         <h2>Products</h2>
+        <p class="legend">
+          Add, edit and delete products here. The catalog is written at the head office and
+          <b>broadcast to every register</b> (<code>mirror = "catalog"</code>,
+          <code>sync = "broadcast"</code>): each register holds all of it, and keeps selling from it while it
+          is offline.
+        </p>
         <form class="add" @submit.prevent="add">
           <input v-model="newName" placeholder="Name" required />
           <input v-model="newPrice" placeholder="Price" type="number" step="0.01" required />
@@ -205,13 +219,75 @@ function pageOf(url: string) {
         <!-- ANCHOR_END: dashboard -->
       </section>
       <section>
-        <h2>Footers wished</h2>
-        <!-- ANCHOR: wishes -->
-        <WishList :wishes="wishes" :names="names" :setting="() => 'footer'" />
-        <!-- ANCHOR_END: wishes -->
+        <h2>Remote update of footers through wishes</h2>
+        <p class="legend">
+          Each register owns the footer it prints under its receipts (<code>mirror = "setting"</code>): it may
+          change it itself, and it tells the head office what it prints. The head office
+          <b>wishes</b> another; the register carries the wish out through its printer and answers. The
+          strategy is <code>apply = "if_unchanged"</code>: a wish based on a footer the register has changed
+          since is not applied — the register's own change stands. See
+          <a
+            href="https://rsansores.github.io/magic_sync/guide/settings.html#strategies-who-wins"
+            target="_blank"
+          >
+            wish strategies</a
+          >
+          in the book.
+        </p>
+        <ul class="twins">
+          <li
+            v-for="{ r, f } in twins"
+            :key="r.id"
+            :class="['twin', { wished: f && open(f), declined: f && declined(f) }]"
+          >
+            <span class="who">{{ r.name }}</span>
+            <span v-if="!f" class="state">has not said its footer yet</span>
+            <form v-else-if="asking?.seen.register_id === r.id" class="wish" @submit.prevent="wish">
+              <input v-model="asking.text" />
+              <button>Wish</button>
+              <button type="button" class="link" @click="asking = null">cancel</button>
+            </form>
+            <template v-else>
+              <span class="value">
+                <template v-if="open(f)">
+                  <s>“{{ f.text }}”</s> → <b>“{{ f.wish!.text }}”</b>
+                </template>
+                <template v-else>“{{ f.text }}”</template>
+              </span>
+              <span class="state">
+                <template v-if="f.wish?.state === 'pending'">wished · on its way to the register</template>
+                <template v-else-if="f.wish?.state === 'waiting'"
+                  >wished · waiting: {{ f.wish.reason }}</template
+                >
+                <template v-else-if="declined(f) && f.wish?.state === 'refused'">
+                  wish refused: {{ f.wish.reason }}
+                </template>
+                <template v-else-if="declined(f) && f.wish?.state === 'superseded'">
+                  “{{ f.wish.text }}” not applied: the register changed its footer first
+                </template>
+                <template v-else>in sync · what the register prints</template>
+              </span>
+              <span class="actions">
+                <button class="link" @click="ask(f)">change</button>
+                <button v-if="open(f) || declined(f)" class="link" @click="dismiss(f)">
+                  {{ open(f) ? 'withdraw' : 'dismiss' }}
+                </button>
+              </span>
+            </template>
+          </li>
+        </ul>
       </section>
       <section>
         <h2>Registers</h2>
+        <p class="legend">
+          Each register's own page, as its cashier sees it. To see the engine at work, break things:
+          <b>Go offline</b> (on a register) — it stops talking to the head office, keeps selling, and its
+          receipts wait in its outbox until it is back online, then go up in order;
+          <b>break the network</b> (here) — every send from the head office to it fails, the dashboard shows
+          it unreachable, and the head office retries, waiting longer each time; nothing it sends is lost,
+          because it is recorded before it is sent; <b>printer off</b> (on a register) — not sync at all: the
+          hardware a footer wish is carried out on, so a wish waits, and applies once the printer is back on.
+        </p>
         <p v-if="state && state.registers.length === 0" class="note">
           No register yet. Start one: <code>cargo run -- --name "Register 1" --port 8081</code> in
           <code>examples/shop/register</code>.
@@ -222,21 +298,9 @@ function pageOf(url: string) {
               {{ r.name }}
               <!-- A demo fault: the head office cannot reach it. -->
               <button class="link" @click="cutLine(r.id)">
-                {{ r.cut ? 'mend the line' : 'cut the line' }}
+                {{ r.cut ? 'restore the network' : 'break the network' }}
               </button>
             </figcaption>
-            <p v-if="footerOf(r.id)" class="note">
-              <template v-if="asking?.seen.register_id === r.id">
-                <form class="wish" @submit.prevent="wish">
-                  <input v-model="asking.text" />
-                  <button>Wish</button>
-                </form>
-              </template>
-              <template v-else>
-                Footer: “{{ footerOf(r.id)!.text }}”
-                <button class="link" @click="ask(footerOf(r.id)!)">wish another</button>
-              </template>
-            </p>
             <iframe :src="pageOf(r.url)" :title="r.name" />
           </figure>
         </div>
@@ -359,7 +423,51 @@ iframe {
 }
 .wish {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   gap: 6px;
+  grid-column: 2 / 5;
+}
+.legend {
+  color: #6b7385;
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+.twins {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.twin {
+  display: grid;
+  grid-template-columns: 110px 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border-left: 4px solid #2f9e44;
+  background: #ebfbee;
+  border-radius: 6px;
+  font-size: 14px;
+}
+.twin.wished {
+  border-left-color: #f08c00;
+  background: #fff4e6;
+}
+.twin.declined {
+  border-left-color: #e03131;
+  background: #fff5f5;
+}
+.twin .who {
+  font-weight: 600;
+}
+.twin .state {
+  color: #6b7385;
+  font-size: 13px;
+}
+.twin.wished b {
+  color: #d9480f;
+}
+.twin s {
+  color: #868e96;
 }
 </style>
