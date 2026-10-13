@@ -12,6 +12,39 @@ Once the system settles — every message applied, every write filed — the
 server and the replica show the same value of every setting, and the same
 answer to every wish, whichever side's write ruled.
 
+## A digital twin
+
+So the server holds two halves of every setting: what the replica **reports**
+it is — the row, as the replica last wrote it — and what the server
+**desires** it to be — the wish, with where it stands. That pair is what IoT
+platforms call a *device twin* or *device shadow*: desired state on one side,
+reported state on the other, and the device reconciling the two. Here the
+twin is rows in your own PostgreSQL, travelling the way every other row
+does: offline-first, in order, confirmed, and set straight after a restore of
+either side. There is no other service to run.
+
+What it unlocks:
+
+- **Remote configuration.** A screen's brightness, a printer's footer, a
+  scale's tare, a module's parameters — set at the head office, carried out
+  on the replica when it can be: now, after it comes back online, or once its
+  hardware answers.
+- **A configuration page that tells the truth.** Beside each value, what the
+  replica reports and what was wished, with where the wish stands: *on its
+  way*, *waiting* and why (the module is off), *applied*, *refused* and why
+  (out of range), or *superseded* (changed on the replica first). The shop's
+  head office shows its registers' footers this way.
+- **Fleet-wide changes you can watch.** Wish the same value on many replicas,
+  and `Engine::wishes` and the dashboard count them where they stand: what is
+  done, what waits, what was refused.
+- **Hardware in the loop.** The replica carries a wish out through your
+  handler, which talks to the device. It answers what the device answered,
+  and a device that is away has the wish wait and be offered again.
+- **Local changes that are not lost.** With `if_unchanged`, a technician's
+  change on site wins over a head office edit based on what was there before.
+- **Who asked.** A wish carries a note of yours (who, or why), and its answer
+  carries when it was given.
+
 ## The row
 
 > **You write**, the row the register owns:
@@ -97,7 +130,7 @@ handler.
 > was recorded offers the same wish again; so does one restored from an older
 > copy. Carrying the same wish out twice must leave the setting as once does.
 
-## Who wins
+## Strategies: who wins
 
 With `always`, every wish is carried out: the last one wins over a change the
 register's user made before it arrived, and a change made after it wins until

@@ -14,7 +14,7 @@ it, and the rest of [the book](https://rsansores.github.io/magic_sync/) for how 
   `server/`. It takes the dashboard as a copy of `../../../dashboard` made at
   install: after changing the dashboard, build it and install again
   (`rm -rf node_modules && pnpm install`)
-- `register/` — a register: sells, works unplugged, sends its receipts up,
+- `register/` — a register: sells, works offline, sends its receipts up,
   and carries out the head office's wishes of its receipt footer through its
   printer
 

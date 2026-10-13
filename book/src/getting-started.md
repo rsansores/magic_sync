@@ -2,8 +2,8 @@
 
 The example is two small programs: the **head office** (PostgreSQL) and a
 **register** (SQLite), each with a page in the browser. You will start one
-head office and two registers, edit the catalog, unplug a register, sell
-while it is unplugged, and plug it back in.
+head office and two registers, edit the catalog, take a register offline, sell
+while it is offline, and bring it back online.
 
 You need [Rust](https://rustup.rs) 1.85 or later, Node 22.13 or later with
 [pnpm](https://pnpm.io), and PostgreSQL 14 or later (Docker brings one).
@@ -83,16 +83,16 @@ Ctrl-C stops either one, and loses nothing it was doing.
 
 - **Add a product** at the head office. Both registers have it within a
   second, and the dashboard stays green: *everything is in sync*.
-- **Unplug Register 2** (its *Unplug* button). Sell a few things on it: it
+- **Take Register 2 offline** (its *Go offline* button). Sell a few things on it: it
   keeps selling, and says how many receipts are not at the head office yet.
   Change a price and add a product at the head office: the dashboard turns
   amber, *catching up*, and after half a minute says Register 2 is not
   answering. Click it to see how far along it is, table by table.
-- **Plug it back in.** Its receipts reach the head office, it catches up
+- **Bring it back online.** Its receipts reach the head office, it catches up
   with the catalog, in order, and the dashboard turns green again.
-- **Restart the head office** while a register is unplugged and a product
+- **Restart the head office** while a register is offline and a product
   has changed. What the head office queued for the register is in its
-  database: plugged back in, the register gets it.
+  database: back online, the register gets it.
 - **Ask where a product is.** *who holds it?* next to a product lists each
   register and where that product stands on it: holds it, on its way, set
   aside. That is the question to answer next to a row, in your own listings.
@@ -106,23 +106,28 @@ Ctrl-C stops either one, and loses nothing it was doing.
   Problems tab says why, and every other product still reaches it. Stop it
   and start it again without `--refuse` — the fix deployed — and within
   seconds the head office's retry gets *Tea* through and the page is green.
-- **Lose a register.** *cut the line* under a register makes every send to it
-  fail, as a network would: it turns *unreachable*, and the head office tries
-  it again, waiting longer each time. *mend the line*, and it catches up.
+- **Lose a register.** *break the network* under a register makes every send
+  to it fail, as a network would: it turns *unreachable*, and the head office
+  tries it again, waiting longer each time. *restore the network*, and it
+  catches up.
 - **Delete a product a register has sold.** That register keeps the product
   for its receipts — it *retires* it: out of the list, still there for what
   points at it — and the other deletes it.
 - **Wish a register another footer.** Each register prints a footer of its
-  own under its receipts, and the head office may wish it another (*wish
-  another*, under the register): it changes on the register within a second,
-  and *Footers wished* says *applied*. Turn the register's printer off first
-  and the wish *waits* — *the printer is off* — until it is back on. Wish one
-  longer than the printer's 40 characters and the register *refuses* it.
-  Change the footer on the register itself while the head office's form is
-  open, then wish: the wish was based on the footer the page showed, so it is
-  *changed there first* — superseded — and the register's own stands. Unplug
-  a register and wish: it is *on its way* until the register is back. Every
-  time, both pages end showing the same footer
+  own under its receipts, and *Remote update of footers through wishes* at
+  the head office shows each one as the register reports it, green: *in
+  sync*. *change* one and wish another: the row turns amber, the register's
+  footer struck through beside the wished one, *on its way* — and within a
+  second the register prints it, and the row is green again, showing what the
+  register now reports. Turn the register's printer off first and the wish
+  *waits* — *the printer is off* — until it is back on. Wish one longer than
+  the printer's 40 characters and the register *refuses* it: the row turns
+  red and says why, and the register's footer stands; *dismiss* lets go of
+  the wish. Change the footer on the register itself while the head office's
+  form is open, then wish: the wish was based on the footer the page showed,
+  so it is not applied — superseded — and the register's own stands. Take a
+  register offline and wish: it is *on its way* until the register is back.
+  Every time, both pages end showing the same footer
   ([Settings and wishes](guide/settings.md)).
 
 The rest of the book builds this from scratch.

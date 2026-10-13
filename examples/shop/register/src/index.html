@@ -15,6 +15,7 @@
   .note { color: var(--muted); font-size: 13px; margin-top: 8px; }
   .footer { display: flex; gap: 6px; align-items: center; margin-top: 10px; font-size: 13px; }
   .footer input { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; width: 150px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 2px 0 0; }
 </style>
 </head>
 <body>
@@ -22,6 +23,7 @@
   <strong><span class="dot" id="dot"></span><span id="name"></span></strong>
   <button class="plug" id="plug"></button>
 </div>
+<p class="hint" id="plug-hint"></p>
 <ul id="products"></ul>
 <p class="note" id="note"></p>
 <form class="footer" id="footer-form">
@@ -29,6 +31,9 @@
   <button>Change here</button>
   <button type="button" class="plug" id="printer"></button>
 </form>
+<p class="hint">The footer is this register's own: a change here goes up to the head office, and a
+  wish the head office based on the footer before it is then not applied.</p>
+<p class="hint" id="printer-hint"></p>
 <script>
 const money = c => (c / 100).toFixed(2);
 async function sell(id) {
@@ -64,8 +69,14 @@ async function refresh() {
   const s = await (await fetch('/api/state')).json();
   document.getElementById('name').textContent = s.name;
   document.getElementById('dot').style.background = s.online ? 'var(--ok)' : 'var(--off)';
-  document.getElementById('plug').textContent = s.online ? 'Unplug' : 'Plug in';
-  document.getElementById('printer').textContent = s.printer ? 'Printer off' : 'Printer on';
+  document.getElementById('plug').textContent = s.online ? 'Go offline' : 'Go online';
+  document.getElementById('plug-hint').textContent = s.online
+    ? 'Online: what it sells goes up to the head office, and what the head office changes comes down.'
+    : 'Offline: it keeps selling from what it holds; its receipts wait here and go up, in order, once it is back online.';
+  document.getElementById('printer').textContent = s.printer ? 'Turn the printer off' : 'Turn the printer on';
+  document.getElementById('printer-hint').textContent = s.printer
+    ? 'Printer on: a footer the head office wishes is printed at once.'
+    : 'Printer off: a footer the head office wishes waits, and is printed once the printer is back on.';
   const footer = document.getElementById('footer');
   // Left alone while it is being edited.
   if (document.activeElement !== footer) footer.value = s.footer;

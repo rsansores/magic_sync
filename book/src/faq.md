@@ -17,6 +17,13 @@ row is not a case the engine resolves. That is deliberate: in the systems it
 was built for, every fact has one owner, and merging two owners' edits is a
 business decision, not a sync one.
 
+When the server must change a value a replica owns — its configuration, a
+device's parameters — that is a **setting**, and the server *wishes* the
+replica another value rather than writing it. The replica stays the one
+writer: it carries the wish out, refuses it, or finds it changed first, and
+both sides end showing what it decided — a digital twin, desired against
+reported ([Settings and wishes](guide/settings.md)).
+
 ## What if a replica is offline for a month?
 
 Nothing special. What it should hold is compared with what it holds when it is
