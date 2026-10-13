@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 — unreleased
+## 0.1.1 — 2026-10-13
 
 - **A foreign key may carry the partition.** With `partitioned_by(column)`,
   the columns of a foreign key that are that column on both sides say the
