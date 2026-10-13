@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1 — unreleased
+
+- **A foreign key may carry the partition.** With `partitioned_by(column)`,
+  the columns of a foreign key that are that column on both sides say the
+  two rows share a partition, not which parent it is: `(company_id,
+  region_id)` into `regions (company_id, id)` — how PostgreSQL keeps a row
+  from pointing into another partition — points at a region by `region_id`,
+  and `follows(region_id)` takes it. A key made only of the partition column
+  points at no parent. Until now, the server refused to start on either.
+  Nothing on the wire or in either schema changes.
+
 ## 0.1.0 — 2026-10-13
 
 The first release. `magic_sync` keeps partial copies of PostgreSQL tables on

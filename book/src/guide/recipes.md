@@ -97,4 +97,22 @@ Give rows and replicas a partition column, and name it:
 Every table that goes down carries `company_id`; a `broadcast` product reaches
 only its company's registers. The triggers `Engine::triggers` prints note it.
 
+PostgreSQL can keep a row from pointing into another company: give each parent
+a unique key on `(company_id, id)`, and point at it by both columns.
+
+```sql
+CREATE TABLE shop.regions (
+    id UUID PRIMARY KEY, company_id UUID NOT NULL, name TEXT NOT NULL,
+    UNIQUE (company_id, id));
+CREATE TABLE shop.stores (
+    id UUID PRIMARY KEY, company_id UUID NOT NULL, region_id UUID NOT NULL,
+    FOREIGN KEY (company_id, region_id) REFERENCES shop.regions (company_id, id));
+```
+
+> **What happens:** the engine reads the partition column on both sides of a
+> foreign key as "the same company", which no row crosses anyway: a store
+> points at its region by `region_id`, so `sync = "follows(region_id)"` works,
+> and a region goes wherever a store that points at it goes. A key made only
+> of `company_id` — into a table of companies, say — points at no parent.
+
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers

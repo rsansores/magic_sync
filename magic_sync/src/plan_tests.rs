@@ -53,17 +53,21 @@ CREATE TABLE fixture.t_families (
 CREATE TABLE fixture.t_kinds (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
     family_id UUID REFERENCES fixture.t_families (id) DEFERRABLE INITIALLY DEFERRED,
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    UNIQUE (id, partition_id));
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
--- Follows a table with no rule of its own: it goes where its kind goes.
+-- Follows a table with no rule of its own: it goes where its kind goes. Its
+-- key into the kinds carries the partition too, after the kind.
 CREATE TABLE fixture.t_kind_notes (
-    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID NOT NULL REFERENCES fixture.t_kinds (id),
-    text TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID NOT NULL,
+    text TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    FOREIGN KEY (kind_id, partition_id) REFERENCES fixture.t_kinds (id, partition_id));
 CREATE TABLE fixture.t_customers (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    UNIQUE (partition_id, id));
 CREATE TABLE fixture.t_lists (id UUID PRIMARY KEY, partition_id UUID NOT NULL);
 CREATE TABLE fixture.t_list_members (
     list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
@@ -73,10 +77,14 @@ CREATE TABLE fixture.t_replica_lists (
     list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
     replica_id UUID NOT NULL REFERENCES fixture.t_replicas (id),
     partition_id UUID NOT NULL, PRIMARY KEY (list_id, replica_id));
+-- Keeps a customer's emails in its partition the way PostgreSQL can: by a
+-- key that carries the partition.
 CREATE TABLE fixture.t_emails (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL,
-    customer_id UUID NOT NULL REFERENCES fixture.t_customers (id), address TEXT NOT NULL,
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    customer_id UUID NOT NULL, address TEXT NOT NULL,
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    CONSTRAINT t_emails_customer_id_fkey FOREIGN KEY (partition_id, customer_id)
+        REFERENCES fixture.t_customers (partition_id, id));
 CREATE TABLE fixture.t_phones (
     customer_id UUID NOT NULL REFERENCES fixture.t_customers (id), number INTEGER NOT NULL,
     partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
@@ -2191,6 +2199,51 @@ async fn bare(pool: &crate::DbPool) -> sqlx::pool::PoolConnection<crate::Db> {
         .await
         .expect("schema");
     conn
+}
+
+/// A foreign key's partition columns say which partition, never which
+/// parent: what is left of the key names the parent, and a key made only of
+/// them names none. Without partitions, every column counts.
+#[test]
+fn the_partition_in_a_foreign_key_names_no_parent() {
+    let relation = |name: &str| Relation {
+        schema: "fixture".to_owned(),
+        name: name.to_owned(),
+    };
+    let key = |child: &str, parent: &str, columns: &[(&str, &str)]| -> ForeignKey {
+        (
+            relation(child),
+            relation(parent),
+            columns.iter().map(|(c, _)| (*c).to_owned()).collect(),
+            columns.iter().map(|(_, p)| (*p).to_owned()).collect(),
+        )
+    };
+    let read = [
+        key(
+            "regions",
+            "companies",
+            &[("partition_id", "partition_id"), ("company_id", "id")],
+        ),
+        key("regions", "tenants", &[("partition_id", "partition_id")]),
+        key(
+            "visits",
+            "regions",
+            &[("region_id", "id"), ("partition_id", "owner_id")],
+        ),
+    ];
+    assert_eq!(
+        super::within_partition(read.to_vec(), Some("partition_id")),
+        vec![
+            key("regions", "companies", &[("company_id", "id")]),
+            key(
+                "visits",
+                "regions",
+                &[("region_id", "id"), ("partition_id", "owner_id")]
+            ),
+        ],
+        "a column that is the partition on one side only is a column of the key"
+    );
+    assert_eq!(super::within_partition(read.to_vec(), None), read.to_vec());
 }
 
 fn refusal(result: Result<Engine, Error>) -> String {
