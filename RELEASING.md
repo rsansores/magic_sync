@@ -1,57 +1,27 @@
 # Releasing
 
 `magic_sync_derive`, `magic_sync` and `magic_sync_dashboard` are released
-together, at one version. A tag publishes them: `.github/workflows/release.yml`
-runs CI on the tag, and only once it is green, and the tag is the version
-everywhere, publishes the derive, then the engine, then the dashboard, then
-the book with each side's API on GitHub Pages. Nothing is published from a
-workstation.
+together, at one version, by one click: **Actions → Release → Run workflow**
+on `main`, with the version. `.github/workflows/release.yml` then:
 
-Nothing that compiles holds a credential. CI's `package` job builds and
-verifies the tarball of each crate on the tagged commit; the release packs the
-same commit again and publishes it without building it (`cargo publish
---no-verify`, in `scripts/publish-crate.sh`), so no build script or proc macro
-runs next to a token. The dashboard is packed by a job with no credentials, and the tarball is
-what a second job publishes. Every action is pinned to a commit
-(`.github/dependabot.yml` proposes the new ones, and those of the lockfiles,
-cargo's and npm's), CI's `workflows` job runs
-[zizmor](https://docs.zizmor.sh) over the workflows, and a scheduled workflow
-(`advisories.yml`) looks every day for an advisory published against what a
-lockfile holds.
+1. sets the version everywhere it is written and dates the changelog's
+   unreleased entry (`scripts/set-version.sh`), in the working tree only, and
+   packs and verifies both sides' crates at it;
+2. runs CI on the commit released, and packs the dashboard at the version;
+3. waits for a maintainer to approve the `release` environment, then
+   publishes the derive, then the engine, then the dashboard;
+4. only once every registry took the release, commits `release:
+   v<version>` on the commit released, tags it `v<version>`, pushes the tag,
+   and moves `main` to it;
+5. publishes the book, with each side's API, on GitHub Pages.
 
-Once, in the repository's settings:
+*Dry run* does steps 1 and 2 — the version set, everything built, packed
+and verified — and publishes, commits and tags nothing. Nothing is published
+from a workstation.
 
-- an environment `release`, with the maintainers who approve a release as its
-  reviewers; Pages served from GitHub Actions;
-- on crates.io, a Trusted Publisher for each of `magic_sync_derive` and
-  `magic_sync` (this repository, workflow `release.yml`, environment
-  `release`): the release asks crates.io for a token that lives for the job.
-  A trusted publisher is set up on a crate that exists, so the first
-  release of each crate has no one yet to trust it: it publishes with the
-  environment's secret `CARGO_REGISTRY_TOKEN` (a token scoped to publishing new
-  crates), which is deleted once the publishers are set;
-- in the environment, the secret `NPM_TOKEN` (npm, allowed to publish
-  `magic_sync_dashboard`).
-
-## 1. The version
-
-On a branch, set the version in:
-
-- the root `Cargo.toml` (`[workspace.package]`);
-- the `=` pin of `magic_sync_derive` in `magic_sync/Cargo.toml`;
-- `dashboard/package.json`;
-- the `magic_sync` requirement of the example's manifests
-  (`examples/shop/*/Cargo.toml`).
-
-Then bring the lockfiles along — the workspace's, the example programs' and
-the book's snippets' — with `cargo update --workspace` in each
-(`--manifest-path …/Cargo.toml` for the last ones). `scripts/check-versions.sh`
-says whether every place agrees; CI runs it.
-
-## 2. The changelog
-
-Move the *unreleased* entry of `CHANGELOG.md` to `## <version> — <date>`. It
-says, for a host upgrading:
+Before the click, the changelog's entry for the release is written: an
+`## <version> — unreleased` (or `## Unreleased`) heading the release dates.
+It says, for a host upgrading:
 
 - whether the stored schema changed (`SERVER_SCHEMA_VERSION`, `REPLICA_SCHEMA_VERSION`: each side's own): the step from the
   version before, for a host with migrations of its own, and that the server's
@@ -61,21 +31,51 @@ says, for a host upgrading:
 - whether the dashboard's contract changed (`status::CONTRACT`);
 - what in the API changed: the difference in `magic_sync/public-api/`.
 
-## 3. The tag
+A release that fails half-way — the derive published, the engine refused — is
+finished by fixing the cause and running the failed jobs again: a publication
+whose version the registry already has says so and succeeds. The release
+refuses a version that is not semver, one tagged already, and a run on any
+branch but `main`. The tag is pushed on its own; `main` is moved to it after,
+and refused when something was merged while the release ran — the release
+is out all the same (registries, tag, book), and the tag is merged into
+`main` by a pull request.
 
-Merge the branch. On main, tag the merge and push the tag:
+Nothing that compiles holds a credential. The `prepare` job packs and
+verifies the tarball of each crate, the version set; the publishing job packs
+the same tree again and publishes it without building it (`cargo publish
+--no-verify`, in `scripts/publish-crate.sh`), so no build script or proc macro
+runs next to a token. The dashboard is packed by a job with no credentials,
+and the tarball is what the publishing job publishes. Every action is pinned
+to a commit (`.github/dependabot.yml` proposes the new ones, and those of the
+lockfiles, cargo's and npm's), CI's `workflows` job runs
+[zizmor](https://docs.zizmor.sh) over the workflows, and a scheduled workflow
+(`advisories.yml`) looks every day for an advisory published against what a
+lockfile holds.
 
-```sh
-git tag -a v<version> -m v<version>
-git push origin v<version>
-```
+## Once, before the first release
 
-The release workflow refuses a tag that is not on main, or that is not the
-version of every place in step 1, or whose changelog entry is missing. A
-release that fails half-way — the derive published, the engine refused —
-is finished by fixing the cause and running the failed jobs again (or all of
-them: a job whose version the registry already has says so and succeeds
-without publishing it again).
+- In the repository's settings, **Environments → New environment**
+  `release`, with the maintainers who approve a release as its required
+  reviewers; and **Pages** served from GitHub Actions.
+- A package's first version has no one to trust yet — crates.io and npm
+  attach a Trusted Publisher only to a package that exists — so the first
+  release publishes with tokens, as the `release` environment's secrets:
+  - `CARGO_REGISTRY_TOKEN`: a crates.io token (Account Settings → API
+    Tokens) with the scopes `publish-new` and `publish-update`;
+  - `NPM_TOKEN`: an npm granular access token, read and write on packages,
+    allowed to publish new ones.
+
+## Once, after the first release
+
+Make the workflow the only publisher, and delete the tokens:
+
+- **crates.io**, for each of `magic_sync_derive` and `magic_sync`: the
+  crate's **Settings → Trusted Publishing → Add**: owner `rsansores`,
+  repository `magic_sync`, workflow `release.yml`, environment `release`.
+- **npm**, `magic_sync_dashboard`: **Settings → Trusted Publisher → GitHub
+  Actions**: the same four.
+- Delete the two secrets from the `release` environment, and revoke the
+  tokens on crates.io and npm.
 
 ## What CI checks before a release can happen
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Publishes one crate of the workspace at the version of the release, unless
 # crates.io already has that version — so a release that failed half-way is
-# finished by running its jobs again. CI's `package` job built and verified
-# the tarball of this very commit; publishing packs that commit again and
-# compiles nothing, so the token never reaches a build script or a proc macro.
+# finished by running its jobs again. The release's `prepare` job packed and
+# verified the tarball of this very tree, the version set in it and not
+# committed yet; publishing packs it again and compiles nothing, so the token
+# never reaches a build script or a proc macro.
 #
 #   scripts/publish-crate.sh <crate> <version>
 #
@@ -23,4 +24,4 @@ case "$status" in
   *) echo "crates.io answered $status for $crate $version" >&2; exit 1 ;;
 esac
 
-cargo publish --locked --no-verify -p "$crate"
+cargo publish --locked --no-verify --allow-dirty -p "$crate"
