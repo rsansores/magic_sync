@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-10-13
 
 The first release. `magic_sync` keeps partial copies of PostgreSQL tables on
 SQLite replicas and brings back what the replicas write, offline-first: for
