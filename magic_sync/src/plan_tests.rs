@@ -53,17 +53,21 @@ CREATE TABLE fixture.t_families (
 CREATE TABLE fixture.t_kinds (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
     family_id UUID REFERENCES fixture.t_families (id) DEFERRABLE INITIALLY DEFERRED,
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    UNIQUE (id, partition_id));
 CREATE TABLE fixture.t_products (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
--- Follows a table with no rule of its own: it goes where its kind goes.
+-- Follows a table with no rule of its own: it goes where its kind goes. Its
+-- key into the kinds carries the partition too, after the kind.
 CREATE TABLE fixture.t_kind_notes (
-    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID NOT NULL REFERENCES fixture.t_kinds (id),
-    text TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID NOT NULL,
+    text TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    FOREIGN KEY (kind_id, partition_id) REFERENCES fixture.t_kinds (id, partition_id));
 CREATE TABLE fixture.t_customers (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL,
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    UNIQUE (partition_id, id));
 CREATE TABLE fixture.t_lists (id UUID PRIMARY KEY, partition_id UUID NOT NULL);
 CREATE TABLE fixture.t_list_members (
     list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
@@ -73,10 +77,14 @@ CREATE TABLE fixture.t_replica_lists (
     list_id UUID NOT NULL REFERENCES fixture.t_lists (id) ON DELETE CASCADE,
     replica_id UUID NOT NULL REFERENCES fixture.t_replicas (id),
     partition_id UUID NOT NULL, PRIMARY KEY (list_id, replica_id));
+-- Keeps a customer's emails in its partition the way PostgreSQL can: by a
+-- key that carries the partition.
 CREATE TABLE fixture.t_emails (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL,
-    customer_id UUID NOT NULL REFERENCES fixture.t_customers (id), address TEXT NOT NULL,
-    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+    customer_id UUID NOT NULL, address TEXT NOT NULL,
+    rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ,
+    CONSTRAINT t_emails_customer_id_fkey FOREIGN KEY (partition_id, customer_id)
+        REFERENCES fixture.t_customers (partition_id, id));
 CREATE TABLE fixture.t_phones (
     customer_id UUID NOT NULL REFERENCES fixture.t_customers (id), number INTEGER NOT NULL,
     partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
@@ -2193,6 +2201,70 @@ async fn bare(pool: &crate::DbPool) -> sqlx::pool::PoolConnection<crate::Db> {
     conn
 }
 
+/// A foreign key's partition columns say which partition, not which parent:
+/// what is left of the key names the parent, and a key made only of them
+/// names none — unless the parent is keyed by the partition, when they name
+/// it with the rest. Without partitions, every column counts.
+#[test]
+fn the_partition_in_a_foreign_key_names_no_parent() {
+    let relation = |name: &str| Relation {
+        schema: "fixture".to_owned(),
+        name: name.to_owned(),
+    };
+    let key = |child: &str, parent: &str, columns: &[(&str, &str)]| -> ForeignKey {
+        (
+            relation(child),
+            relation(parent),
+            columns.iter().map(|(c, _)| (*c).to_owned()).collect(),
+            columns.iter().map(|(_, p)| (*p).to_owned()).collect(),
+        )
+    };
+    let keyed = |by: &[&str]| by.iter().map(|&c| c.to_owned()).collect::<Vec<_>>();
+    let into_logs = key(
+        "lines",
+        "logs",
+        &[("log_id", "id"), ("partition_id", "partition_id")],
+    );
+    let into_settings = key("regions", "settings", &[("partition_id", "partition_id")]);
+    let into_visits = key(
+        "visits",
+        "regions",
+        &[("region_id", "id"), ("partition_id", "owner_id")],
+    );
+    let read = vec![
+        (
+            key(
+                "regions",
+                "companies",
+                &[("partition_id", "partition_id"), ("company_id", "id")],
+            ),
+            keyed(&["id"]),
+        ),
+        (
+            key("regions", "tenants", &[("partition_id", "partition_id")]),
+            keyed(&["id"]),
+        ),
+        (into_visits.clone(), keyed(&["id"])),
+        (into_logs.clone(), keyed(&["id", "partition_id"])),
+        (into_settings.clone(), keyed(&["partition_id"])),
+    ];
+    assert_eq!(
+        super::within_partition(read.clone(), Some("partition_id")),
+        vec![
+            key("regions", "companies", &[("company_id", "id")]),
+            into_visits,
+            into_logs,
+            into_settings,
+        ],
+        "a column that is the partition on one side only, or of a parent keyed by it, is a \
+         column of the key"
+    );
+    assert_eq!(
+        super::within_partition(read.clone(), None),
+        read.into_iter().map(|(fk, _)| fk).collect::<Vec<_>>()
+    );
+}
+
 fn refusal(result: Result<Engine, Error>) -> String {
     match result {
         Err(Error::Misuse(why)) => why,
@@ -2665,6 +2737,65 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
             ("t_counters".into(), log.to_string(), Some(b), pointed),
             ("t_counters".into(), log.to_string(), Some(a), None),
         ]
+    );
+}
+
+/// A line of a log, pointing at it by its whole key, the partition with it.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "t_log_lines",
+    schema = "fixture",
+    mirror = "catalog",
+    sync = "broadcast"
+)]
+struct LogLine {
+    id: Uuid,
+    partition_id: Uuid,
+    log_id: Uuid,
+}
+
+/// A parent keyed by the partition too — as PostgreSQL keys a table
+/// partitioned by it — is pointed at by the partition with the rest: the
+/// engine orders it before the rows that point at it.
+#[sqlx::test(migrations = false)]
+async fn a_key_into_a_parent_keyed_by_the_partition_keeps_it(pool: crate::DbPool) {
+    let mut conn = bare(&pool).await;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.t_logs (id UUID NOT NULL, partition_id UUID NOT NULL, line TEXT NOT NULL,
+             PRIMARY KEY (id, partition_id)) PARTITION BY LIST (partition_id);
+         CREATE TABLE fixture.t_logs_rest PARTITION OF fixture.t_logs DEFAULT;
+         CREATE TABLE fixture.t_log_lines (
+             id UUID PRIMARY KEY, partition_id UUID NOT NULL, log_id UUID NOT NULL,
+             FOREIGN KEY (log_id, partition_id) REFERENCES fixture.t_logs (id, partition_id));",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("tables");
+    let mut codecs = codecs();
+    codecs.push(Codec::json::<Log>(None));
+    codecs.push(Codec::json::<LogLine>(None));
+    let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+    let mut tx = conn.begin().await.expect("a transaction");
+    Engine::install(&mut tx, &tables, REPLICAS)
+        .await
+        .expect("installed");
+    tx.commit().await.expect("installed");
+    let engine = Engine::new(&mut conn, &tables, REPLICAS)
+        .await
+        .expect("a key that is its parent's whole key");
+    let position = |name: &str| engine.plans.iter().position(|p| p.table == name);
+    let (log, line) = (
+        position("t_logs").unwrap(),
+        position("t_log_lines").unwrap(),
+    );
+    let references: Vec<(usize, &[String])> = engine.plans[line]
+        .references
+        .iter()
+        .map(|r| (r.parent, r.columns.as_slice()))
+        .collect();
+    assert_eq!(
+        references,
+        [(log, &["log_id".to_owned(), "partition_id".to_owned()][..])]
     );
 }
 

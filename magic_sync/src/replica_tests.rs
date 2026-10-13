@@ -2915,6 +2915,133 @@ struct Cart {
     at: i64,
 }
 
+/// Which replica this is, once the host learns it.
+#[derive(Clone, Default)]
+struct Later(std::sync::Arc<std::sync::OnceLock<Uuid>>);
+
+impl crate::run::replica::Identity for Later {
+    async fn id(&self, _conn: &mut Conn) -> Result<Option<Uuid>, Error> {
+        Ok(self.0.get().copied())
+    }
+}
+
+/// A replica that does not know which it is yet is set up by its host: its
+/// database takes any write — a placeholder of the server's rows, renamed;
+/// history, renamed and edited — and notes only the replica's own rows, by
+/// the keys they have by then. Once it runs knowing which it is, the
+/// provisioning sets the server's rows straight and every refusal holds.
+#[sqlx::test(migrations = false)]
+async fn a_replica_sets_itself_up_until_it_knows_which_it_is(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    sqlx::raw_sql(&format!(
+        "{TABLES}CREATE TABLE carts (replica_id BLOB NOT NULL, id BLOB NOT NULL, \
+           note TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (replica_id, id));"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    install(&mut pool.acquire().await.unwrap(), &with_carts())
+        .await
+        .unwrap();
+    let identity = Later::default();
+    let replica = Replica::new(
+        pool.clone(),
+        with_carts(),
+        identity.clone(),
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    let [placeholder, named] = ids();
+    let [event, renamed] = ids();
+    let write = |sql: String| sqlx::raw_sql(Box::leak(sql.into_boxed_str())).execute(&pool);
+    for setting_up in [
+        format!(
+            "INSERT INTO items (id, partition_id, name) VALUES (x'{0}', x'{0}', 'mine')",
+            placeholder.simple()
+        ),
+        format!(
+            "UPDATE items SET id = x'{}' WHERE id = x'{}'",
+            named.simple(),
+            placeholder.simple()
+        ),
+        format!(
+            "INSERT INTO carts (replica_id, id, note, at) VALUES (x'{0}', x'{0}', '', 1)",
+            placeholder.simple()
+        ),
+        "UPDATE carts SET note = 'mine'".to_owned(),
+        format!(
+            "INSERT INTO events (id, what) VALUES (x'{}', 'switched on')",
+            event.simple()
+        ),
+        format!(
+            "UPDATE events SET id = x'{}', what = 'switched on, before it was set up'",
+            renamed.simple()
+        ),
+    ] {
+        write(setting_up.clone()).await.expect(&setting_up);
+    }
+    let noted: Vec<String> = sqlx::query_scalar("SELECT row_key FROM sync_notes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        noted,
+        [renamed.to_string()],
+        "the replica's own, as renamed"
+    );
+
+    identity.0.set(named).unwrap();
+    replica
+        .receive(&ending(BASE, 0, "provisioned", &["items", "carts"]))
+        .await
+        .unwrap();
+    for table in ["items", "carts"] {
+        let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "what the server does not send of `{table}` goes");
+    }
+    write(format!(
+        "INSERT INTO items (id, partition_id, name) VALUES (x'{0}', x'{0}', 'mine')",
+        named.simple()
+    ))
+    .await
+    .expect_err("the server's, once it knows which it is");
+    write("UPDATE events SET what = 'edited'".to_owned())
+        .await
+        .expect_err("history, once it knows which it is");
+}
+
+/// A replica that knows which it is from the start is never set up: its
+/// triggers refuse from the moment it is built, before it sends or applies
+/// anything.
+#[sqlx::test(migrations = false)]
+async fn a_replica_that_knows_which_it_is_refuses_from_the_start(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    install(&mut pool.acquire().await.unwrap(), &codecs())
+        .await
+        .unwrap();
+    let me = Uuid::now_v7();
+    Replica::new(
+        pool.clone(),
+        codecs(),
+        me,
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO items (id, partition_id, name) VALUES ($1, $1, 'mine')")
+        .bind(me)
+        .execute(&pool)
+        .await
+        .expect_err("the server's");
+}
+
 /// A replica deletes, of a table written on both sides and keyed by its
 /// replica, only its own rows: the server lets go of no other replica's
 /// row for it, so the replica would hold less than the server records.
@@ -2975,10 +3102,6 @@ async fn a_replica_deletes_only_its_own_rows_of_a_two_way_table(pool: SqlitePool
             .bind(id)
             .execute(&pool)
     };
-    delete(mine)
-        .await
-        .expect_err("until it knows which replica it is");
-    replica.send_lane(0, false).await.unwrap();
     let refused = delete(theirs).await.expect_err("another replica's row");
     assert!(refused.to_string().contains("keyed by"), "{refused}");
     delete(mine).await.expect("its own row");

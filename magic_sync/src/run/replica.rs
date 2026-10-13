@@ -204,7 +204,8 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
     /// A replica over a database the engine can run against
     /// ([`replica::check`]): `codecs` are the tables that travel, parents
     /// first, as the server lists them; `identity` says which replica this
-    /// is; `uplink` how a message reaches the server. Refused, too, when the
+    /// is — one that already knows is set up, and its triggers refuse from
+    /// here on; `uplink` how a message reaches the server. Refused, too, when the
     /// settings cannot send up: no lane, a table on two lanes or on none.
     /// What an earlier run set aside, because it could not go up as it was,
     /// is offered again: this build may send it. What the replica wrote of
@@ -247,6 +248,10 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         if offered > 0 {
             tracing::info!(offered, "sync: writes set aside go up again");
         }
+        // One that knows which it is is set up: its triggers refuse from now.
+        if let Some(id) = identity.id(&mut conn).await? {
+            replica::identified(&mut conn, id).await?;
+        }
         drop(conn);
         Ok(Replica {
             pool,
@@ -286,6 +291,9 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let received = loop {
             let mut conn = self.pool.acquire().await?;
             let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+            if let Some(id) = self.identity.id(&mut tx).await? {
+                replica::identified(&mut tx, id).await?;
+            }
             replica::settled(&mut tx).await?;
             let limits = &self.settings.inbound;
             let stop = match replica::receive(&mut tx, &self.codecs, bytes, limits, &care).await {

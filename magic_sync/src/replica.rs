@@ -111,11 +111,22 @@ struct Trigger {
 ///   and such a delete, go up.
 ///
 /// A write the engine makes while it applies what the server sent is noted
-/// by none and refused by none.
+/// by none and refused by none. Before the replica first runs knowing which
+/// it is ([`identified`]), the host is setting it up: nothing is refused, and
+/// a write to a table the server sends is not noted either — nothing has gone
+/// up yet, and the server's provisioning sets those rows straight. A write
+/// to the replica's own tables is noted then too, and goes up once it knows.
 #[cfg(feature = "sqlite")]
 fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
     use crate::row::Mirror;
-    const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
+    // Until the replica knows which it is, the host sets it up: it writes
+    // what it needs, and the server's provisioning sets its rows straight.
+    const SETTING_UP: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_replica)";
+    const IDENTIFIED: &str = " WHEN EXISTS (SELECT 1 FROM sync_replica)";
+    // Neither the engine applying what the server sent, nor the host setting
+    // the replica up.
+    const GUARDED: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying) \
+                           AND EXISTS (SELECT 1 FROM sync_replica)";
     // A row noted again is one note, written once more: a hot row goes up
     // once, as it is by then, and a write since clears what set it aside.
     const NOTED: &str =
@@ -177,7 +188,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
             Mirror::Catalog => {
                 for event in ["INSERT", "UPDATE", "DELETE"] {
                     let why = format!("`{table}` is the server's: a replica does not write it");
-                    out.push(refuse(event, QUIET, why));
+                    out.push(refuse(event, GUARDED, why));
                 }
             }
             Mirror::Record | Mirror::Setting => {
@@ -189,14 +200,25 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     let why = format!(
                         "`{table}` is history: a row of it is written once (a version column makes it editable)"
                     );
-                    out.push(refuse("UPDATE", "", why));
+                    out.push(refuse("UPDATE", IDENTIFIED, why));
+                    // Nothing went up while it was set up: a key renamed then
+                    // leaves no note of the old one behind.
+                    let renamed = format!(
+                        "DELETE FROM sync_notes WHERE relation = {} AND row_key = {} AND {} IS NOT {}; ",
+                        literal(table),
+                        key("OLD"),
+                        key("OLD"),
+                        key("NEW")
+                    );
+                    let body = format!("{guard}{renamed}{}", note("NEW"));
+                    out.push(noting("UPDATE", "", SETTING_UP, body));
                 }
                 out.push(noting("DELETE", "", "", note("OLD")));
             }
             Mirror::Both => {
                 let why =
                     format!("a row of `{table}` begins on the server: a replica only edits it");
-                out.push(refuse("INSERT", QUIET, why));
+                out.push(refuse("INSERT", GUARDED, why));
                 let (owned, theirs): (Vec<&crate::row::Column>, Vec<&crate::row::Column>) =
                     codec.table.columns.iter().partition(|c| c.replica_owned);
                 let changed = theirs
@@ -208,7 +230,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     "`{table}` is the server's but for the columns a replica owns: a replica \
                      edits only those"
                 );
-                out.push(refuse("UPDATE", &format!("{QUIET} AND ({changed})"), why));
+                out.push(refuse("UPDATE", &format!("{GUARDED} AND ({changed})"), why));
                 let of = if owned.is_empty() {
                     String::new()
                 } else {
@@ -216,24 +238,24 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     format!(" OF {}", owned.join(", "))
                 };
                 let body = format!("{guard}{}{gone}", note("NEW"));
-                out.push(noting("UPDATE", &of, QUIET, body));
+                out.push(noting("UPDATE", &of, GUARDED, body));
                 if let Some(origin) = codec.table.origin.filter(|_| codec.takes_deletes()) {
                     let why = format!(
                         "a row of `{table}` is let go of by the server: a replica deletes only \
                          the ones keyed by it, once it knows which it is"
                     );
                     let others = format!(
-                        "{QUIET} AND NOT EXISTS (SELECT 1 FROM sync_replica WHERE replica = OLD.{})",
+                        "{GUARDED} AND NOT EXISTS (SELECT 1 FROM sync_replica WHERE replica = OLD.{})",
                         ident(origin)
                     );
                     out.push(refuse("DELETE", &others, why));
-                    out.push(noting("DELETE", "", QUIET, note("OLD")));
+                    out.push(noting("DELETE", "", GUARDED, note("OLD")));
                 } else {
                     let why = format!(
                         "a row of `{table}` is let go of by the server: a replica deletes one \
                          only of a table keyed by it"
                     );
-                    out.push(refuse("DELETE", QUIET, why));
+                    out.push(refuse("DELETE", GUARDED, why));
                 }
             }
         }
