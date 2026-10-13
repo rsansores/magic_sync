@@ -14,7 +14,15 @@ that arrives, and run its upward loop in a task of its own.
 `me` says which replica this is: a `Uuid` the server knows (a row of
 `shop.registers`). When a replica does not know its id until it is set up,
 implement [`Identity`] instead, answering `None` until it does: nothing goes
-up until then. `run` sends up until the future it is given resolves,
+up until then.
+
+> **What happens:** until the replica first sends or applies a message with
+> its id, its database refuses none of your writes — it is setting itself
+> up: a placeholder of its own row, say, renamed once it learns its id, and
+> the rows of its own that point at it. What it wrote there is the server's to set straight, and its
+> provisioning does: the rows the server sends overwrite the ones of the same
+> key, and the ones it does not send go. From then on, the server's tables
+> are the server's. `run` sends up until the future it is given resolves,
 finishing what it is sending.
 
 `Replica::new` refuses a connection the engine cannot keep its word on, and

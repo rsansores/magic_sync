@@ -111,11 +111,18 @@ struct Trigger {
 ///   and such a delete, go up.
 ///
 /// A write the engine makes while it applies what the server sent is noted
-/// by none and refused by none.
+/// by none and refused by none. Nor is any write refused before the replica
+/// knows which it is ([`identified`]): it is setting itself up, nothing it
+/// wrote has gone up, and the server's provisioning sets the server's rows
+/// straight.
 #[cfg(feature = "sqlite")]
 fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
     use crate::row::Mirror;
     const QUIET: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying)";
+    // A replica that does not know which it is yet sets itself up: it writes
+    // what it needs, and the server's provisioning sets those rows straight.
+    const GUARDED: &str = " WHEN NOT EXISTS (SELECT 1 FROM sync_applying) \
+                           AND EXISTS (SELECT 1 FROM sync_replica)";
     // A row noted again is one note, written once more: a hot row goes up
     // once, as it is by then, and a write since clears what set it aside.
     const NOTED: &str =
@@ -177,7 +184,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
             Mirror::Catalog => {
                 for event in ["INSERT", "UPDATE", "DELETE"] {
                     let why = format!("`{table}` is the server's: a replica does not write it");
-                    out.push(refuse(event, QUIET, why));
+                    out.push(refuse(event, GUARDED, why));
                 }
             }
             Mirror::Record | Mirror::Setting => {
@@ -189,14 +196,14 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     let why = format!(
                         "`{table}` is history: a row of it is written once (a version column makes it editable)"
                     );
-                    out.push(refuse("UPDATE", "", why));
+                    out.push(refuse("UPDATE", GUARDED, why));
                 }
                 out.push(noting("DELETE", "", "", note("OLD")));
             }
             Mirror::Both => {
                 let why =
                     format!("a row of `{table}` begins on the server: a replica only edits it");
-                out.push(refuse("INSERT", QUIET, why));
+                out.push(refuse("INSERT", GUARDED, why));
                 let (owned, theirs): (Vec<&crate::row::Column>, Vec<&crate::row::Column>) =
                     codec.table.columns.iter().partition(|c| c.replica_owned);
                 let changed = theirs
@@ -208,7 +215,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                     "`{table}` is the server's but for the columns a replica owns: a replica \
                      edits only those"
                 );
-                out.push(refuse("UPDATE", &format!("{QUIET} AND ({changed})"), why));
+                out.push(refuse("UPDATE", &format!("{GUARDED} AND ({changed})"), why));
                 let of = if owned.is_empty() {
                     String::new()
                 } else {
@@ -223,7 +230,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                          the ones keyed by it, once it knows which it is"
                     );
                     let others = format!(
-                        "{QUIET} AND NOT EXISTS (SELECT 1 FROM sync_replica WHERE replica = OLD.{})",
+                        "{GUARDED} AND NOT EXISTS (SELECT 1 FROM sync_replica WHERE replica = OLD.{})",
                         ident(origin)
                     );
                     out.push(refuse("DELETE", &others, why));
@@ -233,7 +240,7 @@ fn generated<P: Sync + 'static>(codecs: &[&Codec<P>]) -> Vec<Trigger> {
                         "a row of `{table}` is let go of by the server: a replica deletes one \
                          only of a table keyed by it"
                     );
-                    out.push(refuse("DELETE", QUIET, why));
+                    out.push(refuse("DELETE", GUARDED, why));
                 }
             }
         }

@@ -149,7 +149,8 @@ The triggers note every insert, update and delete of a table that goes up
 (an update that changes the key notes the old key too), refuse a write the
 engine did not make to a table the server sends, let a row of a two-way table
 begin only on the server, and refuse an update of history (a record without
-a version). `Replica::new` runs [`magic_sync::replica::check`], which refuses
+a version). The refusals wait until the replica knows which it is
+([A replica](replica.md)). `Replica::new` runs [`magic_sync::replica::check`], which refuses
 a database whose triggers are not exactly these; a test of yours runs it too,
 over the database your migrations build.
 

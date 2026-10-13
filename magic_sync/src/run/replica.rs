@@ -286,6 +286,9 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
         let received = loop {
             let mut conn = self.pool.acquire().await?;
             let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+            if let Some(id) = self.identity.id(&mut tx).await? {
+                replica::identified(&mut tx, id).await?;
+            }
             replica::settled(&mut tx).await?;
             let limits = &self.settings.inbound;
             let stop = match replica::receive(&mut tx, &self.codecs, bytes, limits, &care).await {

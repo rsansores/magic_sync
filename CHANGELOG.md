@@ -10,6 +10,13 @@
   and `follows(region_id)` takes it. A key made only of the partition column
   points at no parent. Until now, the server refused to start on either.
   Nothing on the wire or in either schema changes.
+- **A replica sets itself up before it knows which it is.** Its triggers
+  refuse a write of yours — to the server's tables, or an edit of history —
+  only once it has sent or applied a message under its id: before that, a
+  placeholder of its own row may be written and renamed, with the rows that
+  point at it, and the server's provisioning sets the server's rows
+  straight. Print the replica's triggers again (`replica::triggers`):
+  `replica::check` refuses the earlier ones.
 
 ## 0.1.0 — 2026-10-13
 

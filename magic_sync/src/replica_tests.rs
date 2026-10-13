@@ -2915,6 +2915,74 @@ struct Cart {
     at: i64,
 }
 
+/// A replica that does not know which it is yet sets itself up: its
+/// database takes any write of the host's — a placeholder of the server's
+/// rows, renamed; history, edited — and once it applies a message under its
+/// id, the provisioning sets the server's rows straight and every refusal
+/// holds.
+#[sqlx::test(migrations = false)]
+async fn a_replica_sets_itself_up_until_it_knows_which_it_is(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    sqlx::raw_sql(TABLES).execute(&pool).await.unwrap();
+    install(&mut pool.acquire().await.unwrap(), &codecs())
+        .await
+        .unwrap();
+    let replica = Replica::new(
+        pool.clone(),
+        codecs(),
+        Uuid::now_v7(),
+        Uplinked::default(),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    let [placeholder, named] = ids();
+    let write = |sql: String| sqlx::raw_sql(Box::leak(sql.into_boxed_str())).execute(&pool);
+    write(format!(
+        "INSERT INTO items (id, partition_id, name) VALUES (x'{}', x'{}', 'mine')",
+        placeholder.simple(),
+        placeholder.simple()
+    ))
+    .await
+    .expect("a placeholder");
+    write(format!(
+        "UPDATE items SET id = x'{}' WHERE id = x'{}'",
+        named.simple(),
+        placeholder.simple()
+    ))
+    .await
+    .expect("renamed");
+    write(format!(
+        "INSERT INTO events (id, what) VALUES (x'{}', 'switched on')",
+        placeholder.simple()
+    ))
+    .await
+    .expect("history of its own");
+    write("UPDATE events SET what = 'switched on, before it was set up'".to_owned())
+        .await
+        .expect("edited while it sets itself up");
+
+    replica
+        .receive(&ending(BASE, 0, "provisioned", &["items"]))
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM items")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "what the server does not send goes");
+    write(format!(
+        "INSERT INTO items (id, partition_id, name) VALUES (x'{}', x'{}', 'mine')",
+        named.simple(),
+        named.simple()
+    ))
+    .await
+    .expect_err("the server's, once it knows which it is");
+    write("UPDATE events SET what = 'edited'".to_owned())
+        .await
+        .expect_err("history, once it knows which it is");
+}
+
 /// A replica deletes, of a table written on both sides and keyed by its
 /// replica, only its own rows: the server lets go of no other replica's
 /// row for it, so the replica would hold less than the server records.
@@ -2975,10 +3043,6 @@ async fn a_replica_deletes_only_its_own_rows_of_a_two_way_table(pool: SqlitePool
             .bind(id)
             .execute(&pool)
     };
-    delete(mine)
-        .await
-        .expect_err("until it knows which replica it is");
-    replica.send_lane(0, false).await.unwrap();
     let refused = delete(theirs).await.expect_err("another replica's row");
     assert!(refused.to_string().contains("keyed by"), "{refused}");
     delete(mine).await.expect("its own row");
