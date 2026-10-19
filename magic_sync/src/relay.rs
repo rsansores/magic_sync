@@ -229,13 +229,13 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 .await?;
         let mut outcome = Outcome::default();
         let mut covered = Vec::new();
-        let mut planned = notes;
-        // Each audience plans the batch in turn, against its own replicas: a
-        // note one sets aside is set aside for every one after it, and
-        // planned again by all once it is tried again — an audience that
+        let mut planned = notes.clone();
+        // Each audience plans the batch in turn, against its own replicas,
+        // whatever another made of it: a note one sets aside is set aside,
+        // and planned again by all once it is tried again — an audience that
         // planned it finds nothing new.
         for (planner, codecs) in self.engine.audiences.iter().zip(&self.codecs) {
-            let ours: Vec<Note> = planned
+            let ours: Vec<Note> = notes
                 .iter()
                 .filter(|n| self.engine.concerns(planner, &n.change))
                 .cloned()
@@ -248,7 +248,11 @@ impl<P: Sync + 'static> Relay<'_, P> {
                 .record_audience(conn, planner, codecs, ours, (epoch, &secret))
                 .await?;
             planned.retain(|n| !parked.iter().any(|(id, _)| *id == n.id));
-            outcome.parked.extend(parked);
+            let fresh: Vec<(i64, String)> = parked
+                .into_iter()
+                .filter(|(id, _)| !outcome.parked.iter().any(|(p, _)| p == id))
+                .collect();
+            outcome.parked.extend(fresh);
             outcome.quarantined += of.quarantined;
             outcome.written += of.written;
             outcome.upserts += of.upserts;

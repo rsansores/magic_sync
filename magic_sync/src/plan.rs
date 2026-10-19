@@ -140,7 +140,8 @@ impl<P> Audience<P> {
     /// The audience `name` — what the transport and the status call it, and
     /// what the engine records each of its replicas under — of the replicas
     /// `replicas` finds, holding the tables of `codecs`, parents first. A
-    /// replica the relations of two audiences name is the first's.
+    /// replica two audiences count live is the first's, unless it is live in
+    /// the other already, which keeps it until it lets it go.
     #[must_use]
     pub fn new(name: &'static str, replicas: Replicas, codecs: Vec<Codec<P>>) -> Self {
         Audience {
@@ -177,6 +178,9 @@ struct Dependency {
     key: Vec<String>,
     /// The parent has the replicas' partition column, which its notes say.
     partitioned: bool,
+    /// The SQL type of the child's column: a parent's key, as text, is cast
+    /// to it, so the child's rows are found by its index.
+    cast: String,
 }
 
 /// A table of the schema, by its schema and name.
@@ -219,6 +223,8 @@ pub(crate) struct Plan {
     references: Vec<Reference>,
     /// The parents whose columns its rows copy.
     depends: Vec<Dependency>,
+    /// The table has the replicas' partition column, which its notes say.
+    has_partition: bool,
     group: Option<Group>,
     /// The columns the replicas own: a write of only these is no change here.
     owned: Vec<&'static str>,
@@ -1282,7 +1288,10 @@ impl Engine {
     fn noted_rows(&self) -> Result<Vec<Trigger>, Error> {
         struct Noted {
             table: String,
+            /// The partition column its trigger is given, and the one it
+            /// notes: none, when the table has no such column.
             partition: &'static str,
+            effective: &'static str,
             key: Vec<String>,
             references: Vec<(&'static str, Vec<String>)>,
             owned: Vec<&'static str>,
@@ -1297,24 +1306,36 @@ impl Engine {
                     .iter()
                     .map(|r| (planner.plans[r.parent].table, r.columns.clone()))
                     .collect();
+                let effective = if plan.has_partition { partition } else { "" };
+                let key: Vec<String> = plan.key.iter().map(|c| c.name.to_owned()).collect();
                 let Some((_, noted)) = rows.iter_mut().find(|(on, _)| *on == plan.relation) else {
                     rows.push((
                         plan.relation.clone(),
                         Noted {
                             table: plan.table.to_owned(),
                             partition,
-                            key: plan.key.iter().map(|c| c.name.to_owned()).collect(),
+                            effective,
+                            key,
                             references,
                             owned: plan.owned.clone(),
                         },
                     ));
                     continue;
                 };
-                if noted.partition != partition {
+                if noted.effective != effective {
                     return Err(Error::Misuse(format!(
                         "`{}` is held by audiences partitioned by {:?} and by {:?}: one trigger \
                          notes a row's partition by one column",
-                        plan.table, noted.partition, partition
+                        plan.table, noted.effective, effective
+                    )));
+                }
+                // The trigger writes the key in one order, which every
+                // audience reads it in.
+                if noted.key != key {
+                    return Err(Error::Misuse(format!(
+                        "`{}` is keyed by {:?} in one audience and by {key:?} in another: \
+                         declare its key in one order",
+                        plan.table, noted.key
                     )));
                 }
                 for reference in references {
@@ -1331,22 +1352,25 @@ impl Engine {
                 } else {
                     ""
                 };
-                match rows.iter().find(|(on, _)| *on == dependency.parent) {
-                    Some((_, noted)) if noted.partition != partition => {
+                match rows.iter_mut().find(|(on, _)| *on == dependency.parent) {
+                    Some((_, noted)) if noted.effective != partition => {
                         return Err(Error::Misuse(format!(
                             "{} is noted by audiences partitioned by {:?} and by {:?}: one \
                              trigger notes a row's partition by one column",
                             dependency.parent.sql(),
-                            noted.partition,
+                            noted.effective,
                             partition
                         )));
                     }
-                    Some(_) => {}
+                    // Whatever columns of it a row copies, a change of any
+                    // is a change: none is left to the replicas.
+                    Some((_, noted)) => noted.owned.clear(),
                     None => rows.push((
                         dependency.parent.clone(),
                         Noted {
                             table: dependency.parent.name.clone(),
                             partition,
+                            effective: partition,
                             key: dependency.key.clone(),
                             references: Vec::new(),
                             owned: Vec::new(),
@@ -1460,14 +1484,30 @@ impl Engine {
             .collect()
     }
 
-    /// The audience `replica` is of — the first whose relation names it,
-    /// live or not — by its place among the audiences; `None` for a
-    /// replica none names.
+    /// The audience `replica` is of, by its place among the audiences: the
+    /// one the engine records it live in, which plans what it holds; for one
+    /// it has not seen live, the first whose replicas count it live now, then
+    /// the first whose relation names it at all. `None` for a replica none
+    /// names.
     pub(crate) async fn audience_of(
         &self,
         conn: &mut Conn,
         replica: Uuid,
     ) -> Result<Option<usize>, Error> {
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT audience FROM sync.replicas WHERE replica_id = $1 AND live")
+                .bind(replica)
+                .fetch_optional(&mut *conn)
+                .await?
+                .flatten();
+        if let Some(a) = recorded.as_deref().and_then(|name| self.audience(name)) {
+            return Ok(Some(a));
+        }
+        for (i, planner) in self.audiences.iter().enumerate() {
+            if planner.is_live(conn, replica).await? {
+                return Ok(Some(i));
+            }
+        }
         for (i, planner) in self.audiences.iter().enumerate() {
             if planner.is_replica(conn, replica).await? {
                 return Ok(Some(i));
@@ -1480,10 +1520,30 @@ impl Engine {
     /// once what one declares changed, the pending changes of a table no
     /// audience notes any more are done.
     pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
+        let names: Vec<&str> = self.audiences.iter().map(|a| a.name).collect();
         let mut redeclared = false;
         for planner in &self.audiences {
-            redeclared |= planner.observe(conn).await?;
+            redeclared |= planner.observe(conn, &names).await?;
         }
+        // A replica no audience took — of an audience no longer declared,
+        // or seen before there were audiences and live in none now — is
+        // forgotten, as one no longer live is; and so is what the engine
+        // kept of an audience no longer declared.
+        sqlx::query(
+            "WITH gone AS (SELECT replica_id FROM sync.replicas \
+                            WHERE live AND (audience IS NULL OR audience <> ALL($1))), \
+                  forgotten AS (DELETE FROM sync.held h USING gone g WHERE h.replica_id = g.replica_id), \
+                  untaken AS (DELETE FROM sync.gone t USING gone g WHERE t.replica_id = g.replica_id), \
+                  dropped AS (DELETE FROM sync.outbox o USING gone g WHERE o.replica_id = g.replica_id), \
+                  unchained AS (DELETE FROM sync.chains c USING gone g WHERE c.replica_id = g.replica_id), \
+                  undeclared AS (DELETE FROM sync.audiences WHERE name <> ALL($1)), \
+                  legacy AS (UPDATE sync.version SET declared = NULL WHERE declared IS NOT NULL) \
+             UPDATE sync.replicas r SET live = false, partition_id = NULL \
+               FROM gone g WHERE r.replica_id = g.replica_id",
+        )
+        .bind(&names)
+        .execute(&mut *conn)
+        .await?;
         if redeclared {
             sqlx::query(
                 "UPDATE sync.notes SET done_at = now() \
@@ -1733,6 +1793,7 @@ impl Planner {
                 route: t.route,
                 references: Vec::new(),
                 depends: Vec::new(),
+                has_partition: false,
                 group: None,
                 owned: t
                     .columns
@@ -1820,11 +1881,14 @@ impl Planner {
                         )))
                     }
                 };
+                let cast = type_of(&typed_columns(conn, &plan.relation.sql()).await?, column)
+                    .expect("a column of a foreign key is a column");
                 plan.depends.push(Dependency {
                     parent: parent.clone(),
                     columns: vec![column.to_owned()],
                     key,
                     partitioned,
+                    cast,
                 });
             }
         }
@@ -1863,8 +1927,12 @@ impl Planner {
                 .filter_map(|p| p.group.as_ref())
                 .flat_map(|g| [g.members.clone(), g.assigned.clone()]),
         );
+        let mut partitioned = BTreeSet::new();
         for relation in &noted {
             let columns = typed_columns(conn, &relation.sql()).await?;
+            if type_of(&columns, partition).is_some() {
+                partitioned.insert(relation.clone());
+            }
             // The triggers note the partition of every row that has one.
             if type_of(&columns, partition).is_some_and(|t| t != "uuid") {
                 return Err(Error::Misuse(format!(
@@ -1873,6 +1941,9 @@ impl Planner {
                     relation.sql()
                 )));
             }
+        }
+        for plan in &mut plans {
+            plan.has_partition = partitioned.contains(&plan.relation);
         }
         for plan in &mut plans {
             readable(
@@ -2018,6 +2089,17 @@ impl Planner {
     }
 
     /// Whether `replica` is a row of the replicas' relation, live or not.
+    /// Whether `replica` is one the audience's replicas count live now.
+    async fn is_live(&self, conn: &mut Conn, replica: Uuid) -> Result<bool, Error> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {} WHERE s.id = $1)",
+            Self::replicas_of(self.replicas)
+        ))
+        .bind(replica)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     pub(crate) async fn is_replica(&self, conn: &mut Conn, replica: Uuid) -> Result<bool, Error> {
         Ok(sqlx::query_scalar(&format!(
             "SELECT EXISTS (SELECT 1 FROM {} WHERE id = $1)",
@@ -2033,18 +2115,19 @@ impl Planner {
     /// live, or moved to another partition, is noted for provisioning from
     /// scratch; one that is no longer live, or gone, is forgotten — nothing
     /// is recorded as held by it, what waited in its outbox is dropped, and
-    /// nothing is sent it until it is live again. A replica live in an
-    /// audience looked at before this one is that audience's. When what
-    /// places the audience's rows changed since the engine last ran, every
-    /// one of its live replicas is provisioned again: answers whether it
-    /// did. The relay runs it before every pass.
-    pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<bool, Error> {
+    /// nothing is sent it until it is live again. A replica live in another
+    /// of the audiences `declared` is that one's until it lets it go; one
+    /// recorded live in an audience no longer declared is taken as one that
+    /// arrived. When what places the audience's rows changed since the
+    /// engine last ran, every one of its live replicas is provisioned again:
+    /// answers whether it did. The relay runs it before every pass.
+    pub(crate) async fn observe(&self, conn: &mut Conn, declared: &[&str]) -> Result<bool, Error> {
         let name = literal(self.name);
-        sqlx::query(&format!(
+        let claimed: i64 = sqlx::query_scalar(&format!(
             "WITH now AS (SELECT s.id, s.partition FROM {} \
                            WHERE NOT EXISTS (SELECT 1 FROM sync.replicas o \
                                               WHERE o.replica_id = s.id AND o.live \
-                                                AND o.audience <> {name})), \
+                                                AND o.audience <> {name} AND o.audience = ANY($1))), \
              seen AS (SELECT replica_id, partition_id FROM sync.replicas \
                        WHERE live AND (audience = {name} \
                                        OR audience IS NULL AND replica_id IN (SELECT id FROM now))), \
@@ -2060,19 +2143,22 @@ impl Planner {
              unchained AS (DELETE FROM sync.chains c USING gone g WHERE c.replica_id = g.replica_id), \
              claimed AS (UPDATE sync.replicas r SET audience = {name} FROM seen s \
                           WHERE r.replica_id = s.replica_id AND r.audience IS NULL \
-                            AND s.replica_id NOT IN (SELECT id FROM arrived)), \
+                            AND s.replica_id NOT IN (SELECT id FROM arrived) \
+                          RETURNING r.replica_id), \
              came AS (INSERT INTO sync.replicas AS r (replica_id, live, partition_id, audience) \
                       SELECT id, true, partition, {name} FROM arrived \
                       ON CONFLICT (replica_id) DO UPDATE SET live = true, \
-                        partition_id = EXCLUDED.partition_id, audience = EXCLUDED.audience) \
-             UPDATE sync.replicas r SET live = false, partition_id = NULL \
-               FROM gone g WHERE r.replica_id = g.replica_id",
+                        partition_id = EXCLUDED.partition_id, audience = EXCLUDED.audience), \
+             released AS (UPDATE sync.replicas r SET live = false, partition_id = NULL \
+                           FROM gone g WHERE r.replica_id = g.replica_id) \
+             SELECT count(*) FROM claimed",
             Self::replicas_of(self.replicas),
             resync_sql("SELECT id, partition FROM arrived")
         ))
-        .execute(&mut *conn)
+        .bind(declared)
+        .fetch_one(&mut *conn)
         .await?;
-        self.redeclared(conn).await
+        self.redeclared(conn, claimed > 0).await
     }
 
     /// Compares what decides which rows the audience's replicas hold and
@@ -2081,9 +2167,11 @@ impl Planner {
     /// one less, sends another column — every live replica of the audience
     /// is provisioned again, and what the engine kept for them of a table
     /// the audience no longer holds is let go of. Answers whether it
-    /// changed. The first run after an engine of one audience learned of
-    /// audiences takes what that engine last ran with as its own.
-    async fn redeclared(&self, conn: &mut Conn) -> Result<bool, Error> {
+    /// changed. On the first run after an engine of one audience learned of
+    /// audiences, an audience that took over that engine's replicas
+    /// (`legacy`), or declares what it ran with, compares with what it ran
+    /// with.
+    async fn redeclared(&self, conn: &mut Conn, legacy: bool) -> Result<bool, Error> {
         let declared = self.declared();
         let now: String = sqlx::query_scalar("SELECT encode(sync.digest($1), 'hex')")
             .bind(&declared)
@@ -2099,13 +2187,10 @@ impl Planner {
         }
         let before = match own {
             Some(own) => Some(own),
-            None => sqlx::query_scalar(
-                "UPDATE sync.version v SET declared = NULL FROM sync.version was \
-                  WHERE v.declared IS NOT NULL RETURNING was.declared",
-            )
-            .fetch_optional(&mut *conn)
-            .await?
-            .flatten(),
+            None => sqlx::query_scalar::<_, Option<String>>("SELECT declared FROM sync.version")
+                .fetch_one(&mut *conn)
+                .await?
+                .filter(|ran| legacy || *ran == now),
         };
         sqlx::query(
             "INSERT INTO sync.audiences (name, declared) VALUES ($1, $2) \
@@ -2451,10 +2536,11 @@ impl Planner {
                 }
                 let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
                     "SELECT {}, max(p.id) FROM unnest($1::text[], $2::int8[]) AS p(row_key, id) \
-                       JOIN {} t ON {} = p.row_key GROUP BY 1",
+                       JOIN {} t ON t.{} = p.row_key::{} GROUP BY 1",
                     self.key_of_row(i),
                     plan.relation.sql(),
-                    key_sql("t", &dependency.columns),
+                    ident(&dependency.columns[0]),
+                    dependency.cast,
                 ))
                 .bind(&keys)
                 .bind(&ids)

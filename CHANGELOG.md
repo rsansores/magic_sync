@@ -11,8 +11,10 @@ Protocol 1 (unchanged). Dashboard contract 1 (fields added).
   hold a part of what another holds, or a table in a shape of its own. A
   table two audiences declare has one trigger, which notes what either
   needs of it, and is planned for each against its own replicas. A replica
-  the relations of two audiences name is the first's. The wire does not
-  change: a replica is the same whatever audience it is of.
+  two audiences count live is the first's, unless it is live in the other
+  already; an audience renamed takes its replicas over, provisioning them
+  again, and one no longer declared lets them go. The wire does not change:
+  a replica is the same whatever audience it is of.
 - **A row read from a view of its own.** `#[row(from = "schema.view")]`
   reads a catalog row's columns from a view over its table — parent columns
   joined in, rows left out — while the table stays what the row is noted,
@@ -43,8 +45,9 @@ Protocol 1 (unchanged). Dashboard contract 1 (fields added).
 - **Server schema 3.** `Server::install` takes the database there; with
   migrations of your own, run `plan::migration(3)`. Triggers are printed as
   before for a server of one audience: nothing to print again. The replicas
-  the engine recorded are taken over by the audience that sees them, and
-  what 0.1 last ran with is that audience's: nothing is provisioned again.
+  the engine recorded are taken over by the audience that counts them live,
+  which compares its declarations with what 0.1 last ran with, wherever it
+  is declared among the audiences: unchanged, nothing is provisioned again.
 
 ## 0.1.1 — 2026-10-13
 

@@ -5,10 +5,11 @@
 
 use super::*;
 use crate::conformance::audiences::{
-    both as audiences, erp, Region, ERPS, SERVER_SCHEMA as SCHEMA,
+    both as audiences, device_codecs, erp, erp_codecs, Region, DEVICES, ERPS,
+    SERVER_SCHEMA as SCHEMA,
 };
 use crate::envelope::{Body, ToReplica};
-use crate::plan::Audience;
+use crate::plan::{Audience, Replicas};
 use prost::Message as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -626,4 +627,418 @@ async fn a_dependency_that_is_no_foreign_key_is_refused(pool: PgPool) {
         ),
         other => panic!("not refused: {other:?}"),
     }
+}
+
+/// What a replica sends up is filed by the audience the relay plans it in,
+/// and answered under its name: two audiences over one relation, told apart
+/// by which of its rows each counts live.
+#[sqlx::test(migrations = false)]
+async fn an_upload_is_filed_by_the_audience_its_sender_is_planned_in(pool: PgPool) {
+    use crate::envelope::Up;
+    /// Every sender the server asked about, with its audience.
+    #[derive(Clone)]
+    struct Asked(PgPool, Arc<Mutex<Vec<(String, Uuid)>>>);
+    impl Senders for Asked {
+        type Known = ();
+        async fn known(&self, audience: &str, replica: Uuid) -> Result<Option<()>, Error> {
+            self.1.lock().unwrap().push((audience.to_owned(), replica));
+            Ok(Some(()))
+        }
+        async fn filing(
+            &self,
+            _: &(),
+        ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Error> {
+            Ok(self.0.begin().await?)
+        }
+    }
+    sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+    sqlx::raw_sql("ALTER TABLE fixture.devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'till'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (partition, till, kiosk) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for (id, kind) in [(till, "till"), (kiosk, "kiosk")] {
+        sqlx::query("INSERT INTO fixture.devices VALUES ($1, $2, true, $3)")
+            .bind(id)
+            .bind(partition)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let tills = Replicas::new("fixture.devices", "devices")
+        .live("live AND kind = 'till'")
+        .partitioned_by("partition_id");
+    let kiosks = Replicas::new("fixture.devices", "devices")
+        .live("live AND kind = 'kiosk'")
+        .partitioned_by("partition_id");
+    let wire = Wire::default();
+    let asked = Asked(pool.clone(), Arc::default());
+    let server = Server::install(
+        pool.clone(),
+        vec![
+            Audience::new("tills", tills, device_codecs()),
+            Audience::new("kiosks", kiosks, erp_codecs()),
+        ],
+        wire.clone(),
+        asked.clone(),
+        Settings::default(),
+    )
+    .await
+    .expect("the server");
+    while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    let up = Up {
+        uploads: vec![1],
+        protocol: crate::envelope::PROTOCOL,
+        ..Up::default()
+    };
+    server.receive(kiosk, &up.encode_to_vec()).await.unwrap();
+    assert_eq!(
+        asked.1.lock().unwrap().clone(),
+        [("kiosks".to_owned(), kiosk)]
+    );
+    let answered: Vec<String> = wire
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, to, body)| *to == kiosk && matches!(body, Body::Filed(_)))
+        .map(|(audience, _, _)| audience.clone())
+        .collect();
+    assert_eq!(answered, ["kiosks"]);
+    assert_eq!(
+        wire.audiences(),
+        BTreeSet::from([("kiosks".to_owned(), kiosk), ("tills".to_owned(), till)])
+    );
+}
+
+/// An audience renamed takes its replicas over, provisioning each again; an
+/// audience no longer declared lets its replicas go; and a replica of an
+/// engine from before audiences that no audience counts live is let go of.
+#[sqlx::test(migrations = false)]
+async fn replicas_of_an_audience_no_longer_declared_are_taken_over_or_let_go(pool: PgPool) {
+    let world = World::new(pool).await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast');"
+        ))
+        .await;
+    world.settle().await;
+    let audience_of = |replica: Uuid| {
+        let pool = world.pool.clone();
+        async move {
+            sqlx::query_as::<_, (bool, Option<String>)>(
+                "SELECT live, audience FROM sync.replicas WHERE replica_id = $1",
+            )
+            .bind(replica)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let held = |replica: Uuid| {
+        let pool = world.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sync.held WHERE replica_id = $1")
+                .bind(replica)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Renamed: the ERP's replica is the books', sent everything again.
+    let wire = Wire::default();
+    let renamed = Server::install(
+        world.pool.clone(),
+        vec![
+            Audience::new("devices", DEVICES, device_codecs()),
+            Audience::new("books", ERPS, erp_codecs()),
+        ],
+        wire.clone(),
+        Anyone::new(world.pool.clone()),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    while renamed.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    assert_eq!(
+        audience_of(world.erp).await,
+        (true, Some("books".to_owned()))
+    );
+    assert_eq!(
+        wire.audiences(),
+        BTreeSet::from([("books".to_owned(), world.erp)])
+    );
+    assert_eq!(
+        wire.held(world.erp)["regions"].len(),
+        1,
+        "provisioned again"
+    );
+    let declared: Vec<String> = sqlx::query_scalar("SELECT name FROM sync.audiences ORDER BY 1")
+        .fetch_all(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(declared, ["books", "devices"]);
+
+    // Removed: let go of.
+    let removed = Server::install(
+        world.pool.clone(),
+        vec![Audience::new("devices", DEVICES, device_codecs())],
+        Wire::default(),
+        Anyone::new(world.pool.clone()),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    while removed.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    assert!(!audience_of(world.erp).await.0);
+    assert_eq!(held(world.erp).await, 0);
+
+    // Recorded before there were audiences, and live in none now.
+    sqlx::raw_sql(&format!(
+        "UPDATE sync.replicas SET audience = NULL WHERE replica_id = '{}'; \
+         UPDATE fixture.devices SET live = false WHERE id = '{}';",
+        world.device, world.device
+    ))
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    while removed.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    assert!(!audience_of(world.device).await.0);
+    assert_eq!(held(world.device).await, 0);
+}
+
+/// On the first run after an engine of one audience, what that engine ran
+/// with is compared by the audience that takes its replicas over, wherever
+/// it is declared: unchanged, nothing is provisioned again; changed, its
+/// replicas are.
+#[sqlx::test(migrations = false)]
+async fn what_an_engine_of_one_audience_ran_with_is_its_replicas_audiences(pool: PgPool) {
+    let world = World::serving(
+        pool,
+        vec![Audience::new("devices", DEVICES, device_codecs())],
+    )
+    .await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast');"
+        ))
+        .await;
+    world.settle().await;
+    let snapshots_to = |wire: &Wire, replica: Uuid| {
+        wire.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, to, body)| *to == replica && matches!(body, Body::EndSnapshot(_)))
+            .count()
+    };
+    // The ERP is new the first time, and the second its own declaration
+    // stands.
+    for (ran, provisioned, erp_provisioned) in [
+        (
+            "(SELECT declared FROM sync.audiences WHERE name = 'devices')",
+            0,
+            1,
+        ),
+        ("'what it ran with before'", 1, 0),
+    ] {
+        sqlx::raw_sql(&format!(
+            "UPDATE sync.version SET declared = {ran}; \
+             DELETE FROM sync.audiences WHERE name = 'devices'; \
+             UPDATE sync.replicas SET audience = NULL WHERE replica_id = '{}';",
+            world.device
+        ))
+        .execute(&world.pool)
+        .await
+        .unwrap();
+        let wire = Wire::default();
+        // The new audience declared first.
+        let upgraded = Server::install(
+            world.pool.clone(),
+            vec![erp(), Audience::new("devices", DEVICES, device_codecs())],
+            wire.clone(),
+            Anyone::new(world.pool.clone()),
+            Settings::default(),
+        )
+        .await
+        .unwrap();
+        while upgraded.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+        assert_eq!(
+            snapshots_to(&wire, world.device),
+            provisioned,
+            "ran with {ran}"
+        );
+        assert_eq!(snapshots_to(&wire, world.erp), erp_provisioned);
+    }
+}
+
+/// Two audiences that declare one table's key in other orders are refused:
+/// its one trigger writes the key in one.
+#[sqlx::test(migrations = false)]
+async fn one_key_in_two_orders_is_refused(pool: PgPool) {
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "pairs",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast",
+        key = "a, b"
+    )]
+    struct Ab {
+        a: Uuid,
+        b: Uuid,
+        partition_id: Uuid,
+    }
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "pairs",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast",
+        key = "b, a"
+    )]
+    struct Ba {
+        a: Uuid,
+        b: Uuid,
+        partition_id: Uuid,
+    }
+    sqlx::raw_sql(&format!(
+        "{SCHEMA} CREATE TABLE fixture.pairs (a UUID NOT NULL, b UUID NOT NULL, \
+         partition_id UUID NOT NULL, PRIMARY KEY (a, b)); \
+         CREATE INDEX ON fixture.pairs (partition_id);"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let refused = Server::install(
+        pool.clone(),
+        vec![
+            Audience::new("devices", DEVICES, vec![Codec::json::<Ab>(None)]),
+            Audience::new("erp", ERPS, vec![Codec::json::<Ba>(None)]),
+        ],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        Settings::default(),
+    )
+    .await;
+    match refused {
+        Err(Error::Misuse(why)) => assert!(why.contains("declare its key in one order"), "{why}"),
+        other => panic!("not refused: {other:?}"),
+    }
+}
+
+/// A partitioned audience may copy a parent that has no partition column,
+/// and that it holds itself, a column of it the replicas own: one trigger
+/// notes every change of the parent, and the copies go again.
+#[sqlx::test(migrations = false)]
+async fn a_parent_without_the_partition_column_may_be_copied(pool: PgPool) {
+    /// A zone, shared by every partition, with a note each replica keeps.
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(table = "zones", schema = "fixture", mirror = "both")]
+    struct Zone {
+        id: Uuid,
+        code: String,
+        #[row(replica_owned)]
+        note: String,
+    }
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "districts",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast",
+        from = "fixture.zoned",
+        depends = "zone_id",
+        unmirrored = "list_id"
+    )]
+    struct Zoned {
+        id: Uuid,
+        partition_id: Uuid,
+        region_id: Uuid,
+        zone_id: Option<Uuid>,
+        name: String,
+        zone: String,
+    }
+    sqlx::raw_sql(&format!(
+        "{SCHEMA} CREATE TABLE fixture.zones (id UUID PRIMARY KEY, code TEXT NOT NULL, note TEXT NOT NULL); \
+         ALTER TABLE fixture.districts ADD COLUMN zone_id UUID REFERENCES fixture.zones (id); \
+         CREATE INDEX ON fixture.districts (zone_id); \
+         CREATE VIEW fixture.zoned AS \
+             SELECT d.id, d.partition_id, d.region_id, d.zone_id, d.name, z.code || z.note AS zone \
+               FROM fixture.districts d JOIN fixture.zones z ON z.id = d.zone_id;"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let audiences = || -> Vec<Audience<()>> {
+        vec![Audience::new(
+            "erp",
+            ERPS,
+            vec![
+                Codec::json::<Region>(None),
+                Codec::json::<Zone>(None),
+                Codec::json::<Zoned>(None),
+            ],
+        )]
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    crate::plan::tests::install(&mut conn).await;
+    let printed = crate::plan::Engine::triggers(&mut conn, &audiences())
+        .await
+        .expect("a partitioned audience copies a parent with no partition column");
+    let zones = printed
+        .lines()
+        .find(|l| l.contains("\"zones\"") && l.contains("note_row"))
+        .expect("the zones are noted");
+    assert!(
+        !zones.contains("'note'"),
+        "a change of what the replicas own is a change too: {zones}"
+    );
+}
+
+/// A replica counts only the changes its own audience plans: one of a table
+/// another audience holds alone keeps it from nothing.
+#[sqlx::test(migrations = false)]
+async fn a_replica_waits_only_on_what_its_audience_plans(pool: PgPool) {
+    use crate::status::{ReplicaState, Scope};
+    let world = World::serving(
+        pool,
+        vec![
+            Audience::new("devices", DEVICES, device_codecs()),
+            Audience::new("erp", ERPS, vec![Codec::json::<Region>(None)]),
+        ],
+    )
+    .await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast');"
+        ))
+        .await;
+    world.settle().await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.lists VALUES ('{LIST}', '{{p}}', 'A', true);"
+        ))
+        .await;
+    let engine = world.server.engine();
+    let mut conn = world.pool.acquire().await.unwrap();
+    let overview = engine.overview(&mut conn, Scope::All, 10).await.unwrap();
+    let state = |replica: Uuid| {
+        overview
+            .replicas
+            .first
+            .iter()
+            .find(|r| r.replica == replica)
+            .map(|r| (r.state, r.pending))
+            .unwrap()
+    };
+    assert_eq!(state(world.device), (ReplicaState::CatchingUp, 1));
+    assert_eq!(state(world.erp).1, 0, "the lists are not the ERP's");
+    let erp = engine
+        .health(&mut conn, Scope::Audience("erp"), 10)
+        .await
+        .unwrap();
+    assert_eq!(erp.pending, 0);
 }

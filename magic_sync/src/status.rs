@@ -755,6 +755,8 @@ struct Scoped {
     of: HashMap<Uuid, usize>,
     /// The audiences the scope covers, in the engine's order.
     audiences: Vec<usize>,
+    /// The one audience the scope names, when it names one.
+    only: Option<usize>,
     /// Every replica: nothing narrows the notes.
     all: bool,
     /// The partitions the notes are narrowed to.
@@ -816,7 +818,10 @@ struct Folded {
 }
 
 impl Folded {
-    fn of(notes: &[NoteGroup], partition_of: &HashMap<Uuid, Option<Uuid>>) -> Self {
+    fn of<'a>(
+        notes: impl IntoIterator<Item = &'a NoteGroup>,
+        partition_of: &HashMap<Uuid, Option<Uuid>>,
+    ) -> Self {
         let mut folded = Folded::default();
         for note in notes {
             let pending = if note.parked { 0 } else { note.count };
@@ -1333,14 +1338,33 @@ impl Engine {
             replicas,
             of,
             audiences,
+            only: audience,
             all,
             partitions,
         })
     }
 
-    /// The pending notes the scope sees, counted by what they may concern.
+    /// Whether the audience `a` plans the pending notes `note` counts: of
+    /// one of its tables, a group of one, a parent one copies, or of a
+    /// replica.
+    fn plans_note(&self, a: usize, note: &NoteGroup) -> bool {
+        let planner = &self.audiences[a];
+        note.table
+            .as_deref()
+            .is_none_or(|t| planner.knows(t) || planner.depends_on(t))
+    }
+
+    /// Whether no audience knows the table of `note`: every audience plans
+    /// it, and it fails where it is planned.
+    fn nobodys(&self, note: &NoteGroup) -> bool {
+        (0..self.audiences.len()).all(|a| !self.plans_note(a, note))
+    }
+
+    /// The pending notes the scope sees, counted by what they may concern:
+    /// of one audience, those it plans — a note of a table none knows, each
+    /// does.
     async fn notes(&self, conn: &mut Conn, scoped: &Scoped) -> Result<Vec<NoteGroup>, Error> {
-        Ok(sqlx::query_as(&format!(
+        let mut notes: Vec<NoteGroup> = sqlx::query_as(&format!(
             "SELECT n.relation AS table, n.partition_id AS partition, \
                     n.replica_id AS replica, n.parked_at IS NOT NULL AS parked, \
                     count(*) AS count, min(n.noted_at) AS oldest \
@@ -1350,7 +1374,11 @@ impl Engine {
         .bind(&scoped.partitions)
         .bind(scoped.ids())
         .fetch_all(&mut *conn)
-        .await?)
+        .await?;
+        if let Some(a) = scoped.only {
+            notes.retain(|n| self.plans_note(a, n) || self.nobodys(n));
+        }
+        Ok(notes)
     }
 
     async fn health_of(
@@ -1499,12 +1527,27 @@ impl Engine {
         .fetch_all(&mut *conn)
         .await?;
         let partitions: HashMap<Uuid, Option<Uuid>> = scoped.replicas.iter().copied().collect();
-        let folded = Folded::of(notes, &partitions);
+        // Each replica counts the changes its own audience plans.
+        let folded: HashMap<usize, Folded> = scoped
+            .audiences
+            .iter()
+            .map(|&a| {
+                let concerned = notes
+                    .iter()
+                    .filter(|n| self.plans_note(a, n) || self.nobodys(n));
+                (a, Folded::of(concerned, &partitions))
+            })
+            .collect();
         let mut states = ReplicaCounts::default();
         let mut replicas: Vec<ReplicaOverview> = recorded
             .into_iter()
             .map(|r| {
-                let notes = folded.count(r.replica, partitions.get(&r.replica).copied().flatten());
+                let notes = scoped
+                    .of
+                    .get(&r.replica)
+                    .and_then(|a| folded.get(a))
+                    .map(|f| f.count(r.replica, partitions.get(&r.replica).copied().flatten()))
+                    .unwrap_or_default();
                 let failures = r.failures.unwrap_or(0);
                 let backlog = r.backlog.zip(r.backlog_at).map(|(tables, at)| Backlog {
                     tables: tables.0,
@@ -1568,8 +1611,9 @@ impl Engine {
     }
 
     /// Each table of each audience of the scope, over that audience's
-    /// replicas: its pending changes are those of its rows — or of a group
-    /// of it — and a change of a table no audience holds is the first's.
+    /// replicas: its pending changes are those its audience plans — of its
+    /// rows, a group of it, a parent it copies — and a change of a table no
+    /// audience knows is the first's.
     async fn tables_of(
         &self,
         conn: &mut Conn,
@@ -1597,8 +1641,7 @@ impl Engine {
                 .collect();
             for note in notes {
                 let Some(table) = &note.table else { continue };
-                let anyone = |p: &Planner| p.knows(table);
-                if !(planner.knows(table) || n == 0 && !self.audiences.iter().any(anyone)) {
+                if !(self.plans_note(a, note) || n == 0 && self.nobodys(note)) {
                     continue;
                 }
                 let entry = out.entry(table.clone()).or_insert_with(|| blank(table));

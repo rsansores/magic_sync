@@ -19,14 +19,16 @@ the tables they hold, each with its codec.
 > two audiences declare has one trigger, which notes what either needs of it;
 > each audience plans the change against its own replicas, and sends it
 > encoded as its own codec says. A table only one audience declares is never
-> planned, let alone sent, for the other. A note one audience cannot plan is
-> set aside for all, and tried again for all: the ones that planned it find
-> nothing new to send.
+> planned, let alone sent, for the other. A change one audience cannot plan
+> is set aside, and the others plan it all the same; tried again, the ones
+> that planned it find nothing new to send.
 
 Each audience has a name — what the transport is told, what the status
-says, and what the engine records each of its replicas under. A replica the
-relations of two audiences both name is the first's. Renaming an audience,
-or moving a replica from one to another, provisions it again.
+says, and what the engine records each of its replicas under. A replica two
+audiences count live is the first's, unless it was live in the other already:
+it stays there until that audience lets it go, and then comes to this one,
+provisioned again. Renaming an audience provisions its replicas again under
+the new name; an audience no longer declared lets its replicas go.
 
 An audience is the server's alone. A replica is the same whatever audience it
 is of: nothing on the wire names one, and [the protocol](../protocol.md) does
