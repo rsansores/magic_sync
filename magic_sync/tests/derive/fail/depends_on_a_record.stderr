@@ -1,0 +1,5 @@
+error: only a table the server sends down (`catalog` or `both`) has rows it `depends` on
+ --> tests/derive/fail/depends_on_a_record.rs:2:54
+  |
+2 | #[row(table = "things", mirror = "record", depends = "list_id")]
+  |                                                      ^^^^^^^^^

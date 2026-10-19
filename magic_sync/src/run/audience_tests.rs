@@ -83,14 +83,16 @@ struct District {
     name: String,
 }
 
-/// The ERP's district: its list's code joined in, while the list is live.
+/// The ERP's district: its list's code joined in, while the list is live —
+/// so a change of the list is a change of it.
 #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
 #[row(
     table = "districts",
     schema = "fixture",
     mirror = "catalog",
     sync = "broadcast",
-    from = "fixture.erp_districts"
+    from = "fixture.erp_districts",
+    depends = "list_id"
 )]
 struct ErpDistrict {
     id: Uuid,
@@ -98,6 +100,17 @@ struct ErpDistrict {
     region_id: Uuid,
     name: String,
     zone: String,
+}
+
+fn erp() -> Audience<()> {
+    Audience::new(
+        "erp",
+        ERPS,
+        vec![
+            Codec::json::<Region>(None),
+            Codec::json::<ErpDistrict>(None),
+        ],
+    )
 }
 
 fn audiences() -> Vec<Audience<()>> {
@@ -111,14 +124,7 @@ fn audiences() -> Vec<Audience<()>> {
                 Codec::json::<District>(None),
             ],
         ),
-        Audience::new(
-            "erp",
-            ERPS,
-            vec![
-                Codec::json::<Region>(None),
-                Codec::json::<ErpDistrict>(None),
-            ],
-        ),
+        erp(),
     ]
 }
 
@@ -217,6 +223,10 @@ struct World {
 
 impl World {
     async fn new(pool: PgPool) -> Self {
+        Self::serving(pool, audiences()).await
+    }
+
+    async fn serving(pool: PgPool, audiences: Vec<Audience<()>>) -> Self {
         let mut conn = pool.acquire().await.unwrap();
         sqlx::raw_sql(SCHEMA).execute(&mut *conn).await.unwrap();
         let (partition, device, erp) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
@@ -233,7 +243,7 @@ impl World {
         let wire = Wire::default();
         let server = Server::install(
             pool.clone(),
-            audiences(),
+            audiences,
             wire.clone(),
             Anyone::new(pool.clone()),
             Settings::default(),
@@ -583,4 +593,152 @@ async fn digests_are_compared_against_the_replicas_audience(pool: PgPool) {
 
     say(vec![digest("regions", &[REGION]), digest("districts", &[])]).await;
     assert_eq!(resyncs().await, [world.erp], "it alone provisioned again");
+}
+
+/// A change of a list is a change of every ERP district that copies its
+/// code, sent again to the ERP alone: the devices hold the list itself, and
+/// their districts did not change. A list that stops being live takes its
+/// districts out of the ERP's.
+#[sqlx::test(migrations = false)]
+async fn a_change_of_a_parent_is_a_change_of_what_copies_it(pool: PgPool) {
+    let world = World::new(pool).await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast'); \
+             INSERT INTO fixture.lists VALUES ('{LIST}', '{{p}}', 'A', true); \
+             INSERT INTO fixture.districts VALUES ('{NORTH}', '{{p}}', '{REGION}', '{LIST}', 'north'); \
+             INSERT INTO fixture.districts VALUES ('{SOUTH}', '{{p}}', '{REGION}', '{LIST}', 'south');"
+        ))
+        .await;
+    world.settle().await;
+    let sent = |replica: Uuid| {
+        world
+            .wire
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, to, _)| *to == replica)
+            .count()
+    };
+    let device_before = sent(world.device);
+
+    world
+        .exec(&format!(
+            "UPDATE fixture.lists SET code = 'B' WHERE id = '{LIST}';"
+        ))
+        .await;
+    world.settle().await;
+    assert_eq!(
+        world.names(world.erp, "districts", "zone"),
+        set(&["B"]),
+        "both districts again, with the list's new code"
+    );
+    assert_eq!(sent(world.device), device_before + 1, "the list alone");
+    let device = world.wire.held(world.device);
+    assert_eq!(device["lists"][LIST]["code"], "B");
+    assert!(
+        world
+            .wire
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(1)
+            .all(|(_, to, body)| {
+                *to != world.device
+                    || matches!(body, Body::Down(down)
+                    if down.tables.iter().map(|t| t.table.as_str()).eq(["lists"]))
+            }),
+        "no district went to the devices"
+    );
+
+    world
+        .exec(&format!(
+            "UPDATE fixture.lists SET live = false WHERE id = '{LIST}';"
+        ))
+        .await;
+    world.settle().await;
+    assert_eq!(world.names(world.erp, "districts", "name"), set(&[]));
+    assert_eq!(
+        world.names(world.device, "districts", "name"),
+        set(&["north", "south"])
+    );
+}
+
+/// A parent no audience holds is noted all the same, for the rows that copy
+/// it, and its notes plan nothing else.
+#[sqlx::test(migrations = false)]
+async fn a_parent_no_audience_holds_is_noted_for_what_copies_it(pool: PgPool) {
+    let world = World::serving(pool, vec![erp()]).await;
+    let noted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger \
+          WHERE tgname = 'sync_note_row' AND tgrelid = 'fixture.lists'::regclass",
+    )
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!(noted, 1);
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast'); \
+             INSERT INTO fixture.lists VALUES ('{LIST}', '{{p}}', 'A', true); \
+             INSERT INTO fixture.districts VALUES ('{NORTH}', '{{p}}', '{REGION}', '{LIST}', 'north');"
+        ))
+        .await;
+    world.settle().await;
+    assert_eq!(world.names(world.erp, "districts", "zone"), set(&["A"]));
+    world
+        .exec(&format!(
+            "UPDATE fixture.lists SET code = 'C' WHERE id = '{LIST}';"
+        ))
+        .await;
+    world.settle().await;
+    assert_eq!(world.names(world.erp, "districts", "zone"), set(&["C"]));
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM sync.notes WHERE done_at IS NULL")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0, "the list's notes are done");
+}
+
+/// A row may depend only on a column that is a whole foreign key.
+#[sqlx::test(migrations = false)]
+async fn a_dependency_that_is_no_foreign_key_is_refused(pool: PgPool) {
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "districts",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast",
+        depends = "name"
+    )]
+    struct Wrong {
+        id: Uuid,
+        partition_id: Uuid,
+        region_id: Uuid,
+        list_id: Option<Uuid>,
+        name: String,
+    }
+    sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+    let refused = Server::install(
+        pool.clone(),
+        vec![Audience::new(
+            "erp",
+            ERPS,
+            vec![Codec::json::<Region>(None), Codec::json::<Wrong>(None)],
+        )],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        Settings::default(),
+    )
+    .await;
+    match refused {
+        Err(Error::Misuse(why)) => assert!(
+            why.contains("depends on `name`, which is not the whole of a foreign key"),
+            "{why}"
+        ),
+        other => panic!("not refused: {other:?}"),
+    }
 }

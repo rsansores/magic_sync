@@ -14,7 +14,8 @@ pub struct District {
     schema = "geo",
     mirror = "catalog",
     sync = "broadcast",
-    from = "erp.districts"
+    from = "erp.districts",
+    depends = "list_id"
 )]
 pub struct ErpDistrict {
     pub id: uuid::Uuid,
@@ -25,4 +26,5 @@ pub struct ErpDistrict {
 fn main() {
     use magic_sync::Row as _;
     assert_eq!(District::TABLE, ErpDistrict::TABLE);
+    assert_eq!(ErpDistrict::DEPENDS, ["list_id"]);
 }

@@ -45,7 +45,7 @@ pub fn derive_columns(input: Tokens) -> Tokens {
 
 /// The keys `#[row(…)]` takes on a struct that derives `Row`.
 const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `from`, \
-                        `retired`, `origin`, `unmirrored`, `apply` or `crate`";
+                        `depends`, `retired`, `origin`, `unmirrored`, `apply` or `crate`";
 
 /// PostgreSQL keeps the first 63 bytes of a longer name, and would answer
 /// for a table or column the row does not name.
@@ -60,6 +60,7 @@ struct Args {
     sync: Option<LitStr>,
     active: Option<LitStr>,
     from: Option<LitStr>,
+    depends: Option<LitStr>,
     retired: Option<LitStr>,
     origin: Option<LitStr>,
     unmirrored: Option<LitStr>,
@@ -85,6 +86,7 @@ fn parse_args(input: &DeriveInput, only_crate: bool) -> syn::Result<Args> {
                 Some("sync") => &mut args.sync,
                 Some("active") => &mut args.active,
                 Some("from") => &mut args.from,
+                Some("depends") => &mut args.depends,
                 Some("retired") => &mut args.retired,
                 Some("origin") => &mut args.origin,
                 Some("unmirrored") => &mut args.unmirrored,
@@ -787,6 +789,11 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
     };
     let active = relation(args.active.as_ref(), "active")?;
     let from = relation(args.from.as_ref(), "from")?;
+    only_sent_down(args.depends.as_ref(), mirror, "rows it `depends` on")?;
+    let depends = match &args.depends {
+        Some(lit) => names(lit)?,
+        None => Vec::new(),
+    };
     if !mirror.versioned() {
         let refusal = "#[row(version)] in a part flattened in orders the reports of a replica's \
                        table: only a `record` or a `setting` has one";
@@ -843,6 +850,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             const ROUTE: #private::Route = #route;
             const ACTIVE: ::core::option::Option<&'static ::core::primitive::str> = #active;
             const FROM: ::core::option::Option<&'static ::core::primitive::str> = #from;
+            const DEPENDS: &'static [&'static ::core::primitive::str] = &[#(#depends),*];
             const RETIRED: ::core::option::Option<&'static ::core::primitive::str> = #retired;
             const UNMIRRORED: &'static [&'static ::core::primitive::str] = &[#(#unmirrored),*];
             const ORIGIN: ::core::option::Option<&'static ::core::primitive::str> = #origin;

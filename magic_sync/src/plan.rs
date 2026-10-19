@@ -166,6 +166,19 @@ struct Reference {
     columns: Vec<String>,
 }
 
+/// A parent whose columns a table's rows copy: a change of it is a change
+/// of every row pointing at it.
+#[derive(Clone, Debug)]
+struct Dependency {
+    parent: Relation,
+    /// The child's columns that hold the parent's key, in its order.
+    columns: Vec<String>,
+    /// The parent's key, in key order: what its notes name it by.
+    key: Vec<String>,
+    /// The parent has the replicas' partition column, which its notes say.
+    partitioned: bool,
+}
+
 /// A table of the schema, by its schema and name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Relation {
@@ -204,6 +217,8 @@ pub(crate) struct Plan {
     pub(crate) key: Vec<Column>,
     route: Route,
     references: Vec<Reference>,
+    /// The parents whose columns its rows copy.
+    depends: Vec<Dependency>,
     group: Option<Group>,
     /// The columns the replicas own: a write of only these is no change here.
     owned: Vec<&'static str>,
@@ -1266,9 +1281,9 @@ impl Engine {
     /// partition column, or a group table in another role.
     fn noted_rows(&self) -> Result<Vec<Trigger>, Error> {
         struct Noted {
-            table: &'static str,
+            table: String,
             partition: &'static str,
-            key: Vec<&'static str>,
+            key: Vec<String>,
             references: Vec<(&'static str, Vec<String>)>,
             owned: Vec<&'static str>,
         }
@@ -1286,9 +1301,9 @@ impl Engine {
                     rows.push((
                         plan.relation.clone(),
                         Noted {
-                            table: plan.table,
+                            table: plan.table.to_owned(),
                             partition,
-                            key: plan.key.iter().map(|c| c.name).collect(),
+                            key: plan.key.iter().map(|c| c.name.to_owned()).collect(),
                             references,
                             owned: plan.owned.clone(),
                         },
@@ -1308,6 +1323,36 @@ impl Engine {
                     }
                 }
                 noted.owned.retain(|c| plan.owned.contains(c));
+            }
+            // A parent only copied from is noted all the same, by its key.
+            for dependency in planner.plans.iter().flat_map(|p| &p.depends) {
+                let partition = if dependency.partitioned {
+                    partition
+                } else {
+                    ""
+                };
+                match rows.iter().find(|(on, _)| *on == dependency.parent) {
+                    Some((_, noted)) if noted.partition != partition => {
+                        return Err(Error::Misuse(format!(
+                            "{} is noted by audiences partitioned by {:?} and by {:?}: one \
+                             trigger notes a row's partition by one column",
+                            dependency.parent.sql(),
+                            noted.partition,
+                            partition
+                        )));
+                    }
+                    Some(_) => {}
+                    None => rows.push((
+                        dependency.parent.clone(),
+                        Noted {
+                            table: dependency.parent.name.clone(),
+                            partition,
+                            key: dependency.key.clone(),
+                            references: Vec::new(),
+                            owned: Vec::new(),
+                        },
+                    )),
+                }
             }
             for plan in &planner.plans {
                 let (Some(g), Route::Grouped { members, assigned }) = (&plan.group, plan.route)
@@ -1350,14 +1395,25 @@ impl Engine {
                 }
             }
         }
+        // A replica, and the notes, know a table by its name alone.
+        for (i, (on, noted)) in rows.iter().enumerate() {
+            if let Some((other, _)) = rows[..i].iter().find(|(_, n)| n.table == noted.table) {
+                return Err(Error::Misuse(format!(
+                    "{} and {} are both noted as `{}`: the engine tells tables apart by name",
+                    other.sql(),
+                    on.sql(),
+                    noted.table
+                )));
+            }
+        }
         let mut out = Vec::new();
         for (on, noted) in rows {
             let mut args = vec![
-                noted.table.to_owned(),
+                noted.table.clone(),
                 noted.partition.to_owned(),
                 noted.key.len().to_string(),
             ];
-            args.extend(noted.key.iter().map(|c| (*c).to_owned()));
+            args.extend(noted.key.iter().cloned());
             args.push(noted.references.len().to_string());
             for (parent, columns) in &noted.references {
                 args.push((*parent).to_owned());
@@ -1445,7 +1501,7 @@ impl Engine {
     /// no audience knows, which fails where it is planned.
     pub(crate) fn concerns(&self, planner: &Planner, change: &Change) -> bool {
         let knows = |p: &Planner| match change {
-            Change::Row { table, .. } => p.index(table).is_some(),
+            Change::Row { table, .. } => p.index(table).is_some() || p.depends_on(table),
             Change::Members { table, .. } => !p.groups_through(table, |g| &g.members).is_empty(),
             Change::Assigned { table, .. } => !p.groups_through(table, |g| &g.assigned).is_empty(),
             Change::Resync { .. } => true,
@@ -1454,11 +1510,18 @@ impl Engine {
     }
 
     /// The name of every table some audience notes.
-    pub(crate) fn noted_tables(&self) -> Vec<&'static str> {
-        let mut out: Vec<&'static str> = self
+    pub(crate) fn noted_tables(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
             .audiences
             .iter()
             .flat_map(|a| a.plans.iter().map(|p| p.table))
+            .chain(
+                self.audiences
+                    .iter()
+                    .flat_map(|a| &a.plans)
+                    .flat_map(|p| &p.depends)
+                    .map(|d| d.parent.name.as_str()),
+            )
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -1498,6 +1561,9 @@ impl Planner {
         for plan in &self.plans {
             for reference in &plan.references {
                 need(&plan.relation, reference.columns.clone());
+            }
+            for dependency in &plan.depends {
+                need(&plan.relation, dependency.columns.clone());
             }
             match plan.route {
                 Route::Broadcast => {
@@ -1666,6 +1732,7 @@ impl Planner {
                 key,
                 route: t.route,
                 references: Vec::new(),
+                depends: Vec::new(),
                 group: None,
                 owned: t
                     .columns
@@ -1719,6 +1786,47 @@ impl Planner {
         }
         for (c, reference) in references {
             plans[c].references.push(reference);
+        }
+        for (plan, t) in plans.iter_mut().zip(&tables) {
+            for &column in t.depends {
+                let Some((_, parent, _, parent_columns)) = foreign_keys
+                    .iter()
+                    .find(|(child, _, c, _)| *child == plan.relation && c == &[column])
+                else {
+                    return Err(Error::Misuse(format!(
+                        "`{}` depends on `{column}`, which is not the whole of a foreign key \
+                         of its table",
+                        plan.table
+                    )));
+                };
+                let key = crate::dialect::primary_key(conn, &parent.schema, &parent.name).await?;
+                if *parent_columns != key {
+                    return Err(Error::Misuse(format!(
+                        "`{}` depends on `{column}`, which points at {} by {parent_columns:?}, \
+                         not its key",
+                        plan.table,
+                        parent.sql()
+                    )));
+                }
+                let columns = typed_columns(conn, &parent.sql()).await?;
+                let partitioned = match type_of(&columns, partition) {
+                    None => false,
+                    Some(t) if t == "uuid" => true,
+                    Some(_) => {
+                        return Err(Error::Misuse(format!(
+                            "{} has a column `{partition}` that is not a uuid: the replicas \
+                             are partitioned by the uuid of that name",
+                            parent.sql()
+                        )))
+                    }
+                };
+                plan.depends.push(Dependency {
+                    parent: parent.clone(),
+                    columns: vec![column.to_owned()],
+                    key,
+                    partitioned,
+                });
+            }
         }
 
         for plan in &mut plans {
@@ -1836,11 +1944,14 @@ impl Planner {
                 .collect();
             // Read from the table, it says nothing: what an engine of an
             // earlier build declared is declared alike.
-            let read = if p.read == p.relation.sql() {
+            let mut read = if p.read == p.relation.sql() {
                 String::new()
             } else {
                 format!(" from {}", p.read)
             };
+            for d in &p.depends {
+                let _ = write!(read, " depends {} {:?}", d.parent.sql(), d.columns);
+            }
             let _ = writeln!(
                 out,
                 "{} {} active {} key {key:?} {:?} references {references:?} group {:?} columns {:?} \
@@ -1855,6 +1966,14 @@ impl Planner {
             );
         }
         out
+    }
+
+    /// Whether a row of the audience copies columns of `table`'s rows.
+    pub(crate) fn depends_on(&self, table: &str) -> bool {
+        self.plans
+            .iter()
+            .flat_map(|p| &p.depends)
+            .any(|d| d.parent.name == table)
     }
 
     /// Whether a change of `table` is the audience's to plan: one of its
@@ -2262,14 +2381,23 @@ impl Planner {
         let mut released: BTreeSet<(usize, String, usize, String)> = BTreeSet::new();
         let mut regrouped: BTreeSet<(usize, String)> = BTreeSet::new();
         let mut reassigned: BTreeSet<(usize, Uuid)> = BTreeSet::new();
+        // Parents changed whose columns rows of the audience copy, by key,
+        // with their note.
+        let mut copied: Vec<(&str, &str, i64)> = Vec::new();
         for note in notes {
             match &note.change {
                 Change::Row { table, key, retry } => {
-                    let i = self.index(table).ok_or_else(|| {
-                        Error::Misuse(format!(
+                    if !retry && self.depends_on(table) {
+                        copied.push((table.as_str(), key.as_str(), note.id));
+                    }
+                    let Some(i) = self.index(table) else {
+                        if self.depends_on(table) {
+                            continue;
+                        }
+                        return Err(Error::Misuse(format!(
                             "a change to `{table}`, which no row declares: its trigger outlived its declaration"
-                        ))
-                    })?;
+                        )));
+                    };
                     // A key its table cannot have fails here, the same way
                     // every time, rather than wherever a query casts it; one
                     // it can is read in the form every query writes it.
@@ -2307,6 +2435,35 @@ impl Planner {
                     }
                 }
                 Change::Resync { .. } => {}
+            }
+        }
+        // A row that copies a changed parent's columns changed with it, as
+        // of the parent's note.
+        for (i, plan) in self.plans.iter().enumerate() {
+            for dependency in &plan.depends {
+                let (keys, ids): (Vec<&str>, Vec<i64>) = copied
+                    .iter()
+                    .filter(|(table, _, _)| *table == dependency.parent.name)
+                    .map(|(_, key, id)| (*key, *id))
+                    .unzip();
+                if keys.is_empty() {
+                    continue;
+                }
+                let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+                    "SELECT {}, max(p.id) FROM unnest($1::text[], $2::int8[]) AS p(row_key, id) \
+                       JOIN {} t ON {} = p.row_key GROUP BY 1",
+                    self.key_of_row(i),
+                    plan.relation.sql(),
+                    key_sql("t", &dependency.columns),
+                ))
+                .bind(&keys)
+                .bind(&ids)
+                .fetch_all(&mut *conn)
+                .await?;
+                for (key, id) in rows {
+                    let newest = changed.entry((i, key)).or_default();
+                    *newest = (*newest).max(id);
+                }
             }
         }
         let rel = |i: usize| i32::try_from(i).unwrap_or(i32::MAX);

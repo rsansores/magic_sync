@@ -217,6 +217,11 @@ pub trait Row:
     /// noted, keyed and placed by. `None`: the table.
     #[doc(hidden)]
     const FROM: Option<&'static str>;
+    /// The columns of the table, each the whole of a foreign key, whose
+    /// parent's columns the row copies (through [`Row::FROM`]): a change of
+    /// the parent is a change of every row pointing at it so.
+    #[doc(hidden)]
+    const DEPENDS: &'static [&'static str];
     /// The column a replica sets on a row it lets go of but cannot delete,
     /// because a row of its own still points at it. `None`: such a row is a
     /// refusal.
@@ -1543,6 +1548,9 @@ pub(crate) struct Table {
     /// [`Row::FROM`].
     #[cfg(feature = "postgres")]
     pub(crate) from: Option<&'static str>,
+    /// [`Row::DEPENDS`].
+    #[cfg(feature = "postgres")]
+    pub(crate) depends: &'static [&'static str],
     pub(crate) columns: Vec<Column>,
     /// [`Row::RETIRED`].
     pub(crate) retired: Option<&'static str>,
@@ -1570,6 +1578,8 @@ impl Table {
             active: R::ACTIVE,
             #[cfg(feature = "postgres")]
             from: R::FROM,
+            #[cfg(feature = "postgres")]
+            depends: R::DEPENDS,
             columns: declared::<R>(),
             retired: R::RETIRED,
             unmirrored: R::UNMIRRORED,
