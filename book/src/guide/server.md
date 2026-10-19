@@ -1,9 +1,11 @@
 # The server
 
 The server's side is one value, a [`Server`], that you build once and run in a
-task of its own. It needs four things from you: the codecs, where the replicas
-are, how bytes reach a replica, and what you know about a replica that sends
-something up.
+task of its own. It needs three things from you: its audiences — where each
+kind of replica is, and the tables it holds with their codecs — how bytes
+reach a replica, and what you know about a replica that sends something up.
+The shop serves one kind of replica, its registers; a server of several is
+[Several kinds of replica](audiences.md).
 
 ## Where the replicas are
 
@@ -17,6 +19,9 @@ something up.
 name as foreign keys name it; `active` is the condition a register that
 should receive anything meets. A register that becomes active is provisioned
 ([Provisioning](provisioning.md)); one that stops being active is forgotten.
+
+They are the shop's one **audience**: `Audience::new("registers", REGISTERS,
+codecs())` — a name, where the replicas are, and the tables they hold.
 
 `Replicas::partitioned_by("company_id")` names a column that splits rows and
 replicas into groups no row crosses — one per customer of a multi-customer
@@ -33,9 +38,10 @@ nothing it took is lost, a replica's messages arrive in order and one at a
 time, a message comes again until it is acknowledged, and an acknowledgement
 names its message. The engine's guarantees rest on it.
 
-> **You write** one method: send these bytes to that replica. The shop's
-> transport is a queue per register in the head office's own database,
-> which a register reads over HTTP (`examples/shop/server/src/main.rs`):
+> **You write** one method: send these bytes to that replica — of that
+> audience, should the server serve several. The shop's transport is a queue
+> per register in the head office's own database, which a register reads
+> over HTTP (`examples/shop/server/src/main.rs`):
 
 ```rust,ignore
 {{#include ../../../examples/shop/server/src/main.rs:transport}}
@@ -166,6 +172,7 @@ same way:
 ```
 
 A register for which `known` answers `None` is one the server does not know:
-its messages are dropped, with a log.
+its messages are dropped, with a log. `known` is told the replica's audience
+too, for a server of several.
 
 [`Server`]: ../api/server/magic_sync/run/server/struct.Server.html

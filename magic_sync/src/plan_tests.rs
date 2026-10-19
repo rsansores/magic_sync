@@ -602,7 +602,7 @@ fn relay<'a>(
 ) -> crate::relay::Relay<'a, ()> {
     crate::relay::Relay {
         engine,
-        codecs,
+        codecs: vec![codecs],
         limits: LIMITS,
         batch,
         timeout: std::time::Duration::from_secs(5),
@@ -674,7 +674,7 @@ async fn world(pool: crate::DbPool) -> World {
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.expect("a transaction");
-    let engine = Engine::install(&mut tx, &tables, REPLICAS)
+    let engine = Engine::install_one(&mut tx, &tables, REPLICAS)
         .await
         .expect("engine");
     engine.observe(&mut tx).await.expect("observed");
@@ -2276,20 +2276,21 @@ fn refusal(result: Result<Engine, Error>) -> String {
 #[sqlx::test(migrations = false)]
 async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
     let mut conn = bare(&pool).await;
+    let audiences = [Audience::new("test", REPLICAS, codecs())];
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(why.contains("is missing"), "{why}");
 
-    let triggers = Engine::triggers(&mut conn, &codecs, REPLICAS)
+    let triggers = Engine::triggers(&mut conn, &audiences)
         .await
         .expect("the triggers");
     sqlx::raw_sql(&triggers)
         .execute(&mut *conn)
         .await
         .expect("a host's migration");
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
-    let indexes = Engine::indexes(&mut conn, &codecs, REPLICAS)
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
+    let indexes = Engine::indexes(&mut conn, &audiences)
         .await
         .expect("the indexes");
     assert!(
@@ -2304,7 +2305,7 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
     .execute(&mut *conn)
     .await
     .expect("an index of the host's");
-    let indexes = Engine::indexes(&mut conn, &codecs, REPLICAS)
+    let indexes = Engine::indexes(&mut conn, &audiences)
         .await
         .expect("the indexes");
     assert!(
@@ -2315,11 +2316,11 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .execute(&mut *conn)
         .await
         .expect("a host's migration");
-    Engine::new(&mut conn, &tables, REPLICAS)
+    Engine::new_one(&mut conn, &tables, REPLICAS)
         .await
         .expect("the triggers and indexes it printed are the ones it needs");
     assert_eq!(
-        Engine::indexes(&mut conn, &codecs, REPLICAS)
+        Engine::indexes(&mut conn, &audiences)
             .await
             .expect("the indexes"),
         "",
@@ -2336,18 +2337,18 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
     .execute(&mut *conn)
     .await
     .expect("a hand-written trigger");
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(
         why.contains("differs") && why.contains("t_accounts"),
         "{why}"
     );
 
     let mut tx = conn.begin().await.expect("a transaction");
-    Engine::install(&mut tx, &tables, REPLICAS)
+    Engine::install_one(&mut tx, &tables, REPLICAS)
         .await
         .expect("installed");
     tx.commit().await.expect("installed");
-    Engine::new(&mut conn, &tables, REPLICAS)
+    Engine::new_one(&mut conn, &tables, REPLICAS)
         .await
         .expect("install wrote it as it should be");
 
@@ -2355,7 +2356,7 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .execute(&mut *conn)
         .await
         .expect("disabled");
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(
         why.contains("t_kinds"),
         "a disabled trigger notes nothing: {why}"
@@ -2364,7 +2365,7 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .execute(&mut *conn)
         .await
         .expect("enabled for replication sessions");
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(
         why.contains("t_kinds"),
         "a trigger that fires for replication sessions only notes no other write: {why}"
@@ -2373,7 +2374,7 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .execute(&mut *conn)
         .await
         .expect("enabled always");
-    Engine::new(&mut conn, &tables, REPLICAS)
+    Engine::new_one(&mut conn, &tables, REPLICAS)
         .await
         .expect("a trigger enabled always notes every write");
 
@@ -2382,7 +2383,7 @@ async fn the_engine_starts_only_on_the_triggers_it_prints(pool: crate::DbPool) {
         .copied()
         .filter(|t| t.name != "t_task_lines")
         .collect();
-    let why = refusal(Engine::new(&mut conn, &fewer, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &fewer, REPLICAS).await);
     assert!(
         why.contains("t_task_lines") && why.contains("drop it"),
         "a table noted that no row declares: {why}"
@@ -2400,7 +2401,7 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
         let codecs = codecs();
         let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
         let mut tx = pool.begin().await.expect("a transaction");
-        let engine = Engine::install(&mut tx, &tables, REPLICAS).await;
+        let engine = Engine::install_one(&mut tx, &tables, REPLICAS).await;
         tx.commit().await.expect("commit");
         engine.map(|_| ())
     };
@@ -2421,8 +2422,11 @@ async fn installs_at_once_run_one_after_the_other(pool: crate::DbPool) {
 /// is a step of its own.
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
-    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] =
-        [0x404b_35fd_cc9a_ab37, 0xa4c8_9065_538b_9cb5];
+    let released: [u64; crate::SERVER_SCHEMA_VERSION as usize] = [
+        0x404b_35fd_cc9a_ab37,
+        0xa4c8_9065_538b_9cb5,
+        0x64b0_376e_5c2a_ed54,
+    ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -2461,10 +2465,10 @@ async fn a_schema_from_a_later_build_is_left_alone(pool: crate::DbPool) {
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.expect("a transaction");
-    let why = refusal(Engine::install(&mut tx, &tables, REPLICAS).await);
+    let why = refusal(Engine::install_one(&mut tx, &tables, REPLICAS).await);
     assert!(why.contains("later build"), "{why}");
     drop(tx);
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(
         why.contains("later build") && !why.contains("install"),
         "not installed over, nor told to be: {why}"
@@ -2480,7 +2484,7 @@ async fn a_database_without_the_engine_names_both_ways_to_install_it(pool: crate
         .expect("schema");
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(
         why.contains("not installed")
             && why.contains("Server::install")
@@ -2504,10 +2508,10 @@ async fn a_schema_of_the_hosts_named_sync_is_named_as_the_trouble(pool: crate::D
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.expect("a transaction");
-    let why = refusal(Engine::install(&mut tx, &tables, REPLICAS).await);
+    let why = refusal(Engine::install_one(&mut tx, &tables, REPLICAS).await);
     assert!(why.contains("schema named `sync`"), "{why}");
     drop(tx);
-    let why = refusal(Engine::new(&mut conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut conn, &tables, REPLICAS).await);
     assert!(why.contains("schema named `sync`"), "{why}");
 }
 
@@ -2562,7 +2566,11 @@ async fn a_note_for_a_table_no_row_declares_is_refused_not_dropped(pool: crate::
         .await
         .expect("a transaction");
     assert!(matches!(
-        world.engine.plan(&mut tx, &[Note { id: 1, change }]).await,
+        world
+            .engine
+            .only()
+            .plan(&mut tx, &[Note { id: 1, change }])
+            .await,
         Err(Error::Misuse(_))
     ));
 }
@@ -2609,8 +2617,8 @@ async fn a_row_in_two_groups_of_one_replica_is_owed_once(pool: crate::DbPool) {
         .await
         .expect("given");
     }
-    let i = world.engine.index("t_customers").expect("customers");
-    let wanted = world.engine.wanted_sql(i, "true").expect("a rule");
+    let i = world.engine.only().index("t_customers").expect("customers");
+    let wanted = world.engine.only().wanted_sql(i, "true").expect("a rule");
     let owed: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM ({wanted}) w WHERE w.replica_id = $1"
     ))
@@ -2676,11 +2684,11 @@ async fn a_table_notes_what_changed_by_the_name_key_and_partition_the_engine_kno
     codecs.push(Codec::json::<Log>(None));
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.expect("a transaction");
-    Engine::install(&mut tx, &tables, REPLICAS)
+    Engine::install_one(&mut tx, &tables, REPLICAS)
         .await
         .expect("installed");
     tx.commit().await.expect("installed");
-    Engine::new(&mut conn, &tables, REPLICAS)
+    Engine::new_one(&mut conn, &tables, REPLICAS)
         .await
         .expect("a partition's triggers are its table's");
 
@@ -2776,19 +2784,19 @@ async fn a_key_into_a_parent_keyed_by_the_partition_keeps_it(pool: crate::DbPool
     codecs.push(Codec::json::<LogLine>(None));
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.expect("a transaction");
-    Engine::install(&mut tx, &tables, REPLICAS)
+    Engine::install_one(&mut tx, &tables, REPLICAS)
         .await
         .expect("installed");
     tx.commit().await.expect("installed");
-    let engine = Engine::new(&mut conn, &tables, REPLICAS)
+    let engine = Engine::new_one(&mut conn, &tables, REPLICAS)
         .await
         .expect("a key that is its parent's whole key");
-    let position = |name: &str| engine.plans.iter().position(|p| p.table == name);
+    let position = |name: &str| engine.only().plans.iter().position(|p| p.table == name);
     let (log, line) = (
         position("t_logs").unwrap(),
         position("t_log_lines").unwrap(),
     );
-    let references: Vec<(usize, &[String])> = engine.plans[line]
+    let references: Vec<(usize, &[String])> = engine.only().plans[line]
         .references
         .iter()
         .map(|r| (r.parent, r.columns.as_slice()))
@@ -2838,6 +2846,53 @@ async fn what_is_pending_is_found_by_index_among_many_notes(pool: crate::DbPool)
             plan.join("\n")
         );
     }
+}
+
+/// A database an engine ran on before there were audiences: its replicas,
+/// recorded under none, are claimed by the audience that sees them, and what
+/// that engine last ran with is taken as the audience's — nothing is
+/// provisioned again, and the next declaration that changes provisions as
+/// it always did.
+#[sqlx::test(migrations = false)]
+async fn an_engine_from_before_audiences_is_taken_over_without_provisioning(pool: crate::DbPool) {
+    let mut world = world(pool).await;
+    world.settle().await;
+    let declared = world.engine.only().declared();
+    sqlx::raw_sql("UPDATE sync.replicas SET audience = NULL; DELETE FROM sync.audiences;")
+        .execute(&mut *world.conn)
+        .await
+        .expect("as before audiences");
+    sqlx::query("UPDATE sync.version SET declared = encode(sync.digest($1), 'hex')")
+        .bind(&declared)
+        .execute(&mut *world.conn)
+        .await
+        .expect("what the engine last ran with");
+    let pending = "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
+    let mut tx = world.conn.begin().await.expect("a transaction");
+    world.engine.observe(&mut tx).await.expect("observed");
+    let resyncs: i64 = sqlx::query_scalar(pending)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("resyncs");
+    assert_eq!(resyncs, 0, "nothing provisioned again");
+    let unclaimed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sync.replicas WHERE live AND audience IS DISTINCT FROM 'test'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("claimed");
+    assert_eq!(unclaimed, 0, "every live replica claimed");
+    let (legacy, own): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT (SELECT declared FROM sync.version), \
+                (SELECT declared FROM sync.audiences WHERE name = 'test')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("declared");
+    assert_eq!(legacy, None, "taken over");
+    assert!(own.is_some(), "the audience's own");
+    tx.commit().await.expect("commit");
+    world.settle().await;
 }
 
 /// A deploy that changes what places the rows — here, a table mirrored no
@@ -2896,7 +2951,7 @@ async fn a_changed_declaration_provisions_every_replica_again(pool: crate::DbPoo
         .filter(|t| t.name != "t_task_lines")
         .collect();
     let mut tx = world.conn.begin().await.expect("a transaction");
-    let engine = Engine::install(&mut tx, &fewer, REPLICAS)
+    let engine = Engine::install_one(&mut tx, &fewer, REPLICAS)
         .await
         .expect("installed");
     engine.observe(&mut tx).await.expect("observed");
@@ -2924,7 +2979,7 @@ async fn a_changed_declaration_provisions_every_replica_again(pool: crate::DbPoo
 #[sqlx::test(migrations = false)]
 async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate::DbPool) {
     let mut conn = bare(&pool).await;
-    let codecs = codecs();
+    let audiences = [Audience::new("test", REPLICAS, codecs())];
     let refused = |result: Result<String, Error>| match result {
         Err(Error::Misuse(why)) => why,
         other => panic!("not refused: {other:?}"),
@@ -2943,7 +2998,9 @@ async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate
             "no uuid column `retired_at`",
         ),
     ] {
-        let why = refused(Engine::triggers(&mut conn, &codecs, replicas).await);
+        let why = refused(
+            Engine::triggers(&mut conn, &[Audience::new("test", replicas, codecs())]).await,
+        );
         assert!(why.contains(named), "{why}");
     }
     // A table whose partition column is no uuid would fail every write its
@@ -2955,7 +3012,7 @@ async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate
     .execute(&mut *conn)
     .await
     .expect("altered");
-    let why = refused(Engine::triggers(&mut conn, &codecs, REPLICAS).await);
+    let why = refused(Engine::triggers(&mut conn, &audiences).await);
     assert!(
         why.contains("t_list_members") && why.contains("not a uuid"),
         "{why}"
@@ -2964,7 +3021,7 @@ async fn a_declaration_the_database_does_not_hold_is_refused_by_name(pool: crate
         .execute(&mut *conn)
         .await
         .expect("altered back");
-    let why = refused(Engine::triggers(&mut conn, &codecs, REPLICAS).await);
+    let why = refused(Engine::triggers(&mut conn, &audiences).await);
     assert!(
         why.contains("t_kinds") && why.contains("does not read"),
         "an active view that is not there: {why}"
@@ -3069,7 +3126,7 @@ async fn a_follower_something_points_at_keeps_its_parent(pool: crate::DbPool) {
 #[sqlx::test(migrations = false)]
 async fn a_declaration_the_schema_cannot_honour_is_refused_naming_it(pool: crate::DbPool) {
     let mut conn = bare(&pool).await;
-    let codecs = codecs();
+    let audiences = [Audience::new("test", REPLICAS, codecs())];
     for (alteration, named) in [
         (
             "ALTER TABLE fixture.t_sizes DROP CONSTRAINT t_sizes_pkey CASCADE; \
@@ -3117,7 +3174,7 @@ async fn a_declaration_the_schema_cannot_honour_is_refused_naming_it(pool: crate
             .execute(&mut *conn)
             .await
             .expect(alteration);
-        match Engine::triggers(&mut conn, &codecs, REPLICAS).await {
+        match Engine::triggers(&mut conn, &audiences).await {
             Err(Error::Misuse(why)) => assert!(why.contains(named), "{alteration}\n{why}"),
             other => panic!("{alteration}: not refused: {other:?}"),
         }
@@ -3144,7 +3201,7 @@ async fn a_table_mirrored_for_the_first_time_with_rows_provisions_every_replica(
     let pending = || "SELECT count(*) FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL";
     for _ in 0..2 {
         let mut tx = world.conn.begin().await.expect("a transaction");
-        Engine::install(&mut tx, &tables, REPLICAS)
+        Engine::install_one(&mut tx, &tables, REPLICAS)
             .await
             .expect("installed");
         tx.commit().await.expect("committed");
@@ -3176,7 +3233,7 @@ async fn a_trigger_enabled_again_by_install_provisions_every_replica(pool: crate
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = world.conn.begin().await.expect("a transaction");
-    Engine::install(&mut tx, &tables, REPLICAS)
+    Engine::install_one(&mut tx, &tables, REPLICAS)
         .await
         .expect("installed");
     tx.commit().await.expect("committed");
@@ -3343,7 +3400,7 @@ async fn a_role_that_may_not_create_temporary_tables_is_refused_at_start(pool: c
     .expect("a role that may not create temporary tables");
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
-    let why = refusal(Engine::new(&mut world.conn, &tables, REPLICAS).await);
+    let why = refusal(Engine::new_one(&mut world.conn, &tables, REPLICAS).await);
     sqlx::raw_sql(&format!(
         "RESET ROLE; DROP OWNED BY {role}; DROP ROLE {role};"
     ))
@@ -3486,7 +3543,7 @@ async fn a_database_moved_to_another_cluster_keeps_sending_what_changes(pool: cr
         .await
         .expect("a lock timeout");
     let tables: Vec<&Table> = world.codecs.iter().map(|c| &c.table).collect();
-    world.engine = Engine::new(&mut world.conn, &tables, REPLICAS)
+    world.engine = Engine::new_one(&mut world.conn, &tables, REPLICAS)
         .await
         .expect("the engine, moved");
     sqlx::query("UPDATE fixture.t_products SET name = 'moved' WHERE id = $1")
@@ -3575,10 +3632,10 @@ async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
         .fetch_all(&mut *world.conn)
         .await
         .expect("replicas");
-    for i in 0..world.engine.plans.len() {
-        let (sql, ruled) = world.engine.progress_sql(i);
+    for i in 0..world.engine.only().plans.len() {
+        let (sql, ruled) = world.engine.only().progress_sql(i);
         let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {sql}"))
-            .bind(world.engine.table(i))
+            .bind(world.engine.only().table(i))
             .bind(&replicas)
             .bind(ruled)
             .fetch_all(&mut *world.conn)
@@ -3588,7 +3645,7 @@ async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
         assert!(
             !plan.contains("SubPlan"),
             "progress of {} asks row by row:\n{plan}",
-            world.engine.table(i)
+            world.engine.only().table(i)
         );
     }
 }
@@ -3599,7 +3656,7 @@ async fn progress_asks_nothing_row_by_row(pool: crate::DbPool) {
 #[sqlx::test(migrations = false)]
 async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) {
     let mut world = world(pool).await;
-    let i = world.engine.index("t_products").expect("products");
+    let i = world.engine.only().index("t_products").expect("products");
     let mut keys = Vec::new();
     for _ in 0..3 {
         let id = Uuid::now_v7();
@@ -3616,7 +3673,10 @@ async fn rows_are_loaded_as_many_at_once_as_fit_the_budget(pool: crate::DbPool) 
         keys.push(id.to_string());
     }
     for (budget, fit) in [(2_500_000, 2), (10, 1)] {
-        let fitting = world.engine.fitting(&mut world.conn, i, &keys, budget);
+        let fitting = world
+            .engine
+            .only()
+            .fitting(&mut world.conn, i, &keys, budget);
         assert_eq!(
             fitting.await.expect("fits"),
             fit,
@@ -3677,9 +3737,10 @@ async fn a_codec_that_writes_rows_otherwise_declares_otherwise(pool: crate::DbPo
     let mut world = world(pool).await;
     let codecs = codecs();
     let mut tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
-    let before = Engine::new(&mut world.conn, &tables, REPLICAS)
+    let before = Engine::new_one(&mut world.conn, &tables, REPLICAS)
         .await
         .expect("an engine")
+        .only()
         .declared();
     let families = Table {
         encoding: "fixture.Family",
@@ -3690,9 +3751,10 @@ async fn a_codec_that_writes_rows_otherwise_declares_otherwise(pool: crate::DbPo
             *table = &families;
         }
     }
-    let after = Engine::new(&mut world.conn, &tables, REPLICAS)
+    let after = Engine::new_one(&mut world.conn, &tables, REPLICAS)
         .await
         .expect("an engine")
+        .only()
         .declared();
     assert_ne!(before, after);
 }

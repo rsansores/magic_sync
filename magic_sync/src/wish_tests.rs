@@ -28,7 +28,7 @@ pub(super) async fn world(pool: crate::DbPool) -> World {
 impl World {
     pub(super) async fn desire(&self, wanted: Screen, note: Option<&str>) -> crate::wish::Wished {
         let mut tx = self.pool.begin().await.unwrap();
-        let wished = crate::wish::desire(&mut tx, &self.engine, &self.codecs, wanted, note)
+        let wished = crate::wish::desire(&mut tx, &self.engine, &[&self.codecs], wanted, note)
             .await
             .expect("wished");
         tx.commit().await.unwrap();
@@ -942,7 +942,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                         level,
                         revision: based,
                     };
-                    crate::wish::desire(&mut tx, &world.engine, &world.codecs, wanted, None)
+                    crate::wish::desire(&mut tx, &world.engine, &[&world.codecs], wanted, None)
                         .await
                         .unwrap();
                 } else {
@@ -952,7 +952,7 @@ async fn walk_wishes(pool: crate::DbPool, seed: u64) {
                         level,
                         revision: based,
                     };
-                    crate::wish::desire(&mut tx, &world.engine, &world.codecs, wanted, None)
+                    crate::wish::desire(&mut tx, &world.engine, &[&world.codecs], wanted, None)
                         .await
                         .unwrap();
                 }

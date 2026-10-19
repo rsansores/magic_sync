@@ -35,7 +35,7 @@ async fn drain(pool: &crate::DbPool, engine: &Engine) -> Drained {
     let codecs = codecs();
     let relay = crate::relay::Relay {
         engine,
-        codecs: &codecs,
+        codecs: vec![&codecs],
         limits: crate::envelope::Limits {
             rows: 500,
             bytes: 512 * 1024,
@@ -110,7 +110,7 @@ async fn fleet(
     let codecs = codecs();
     let refs: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.expect("a transaction");
-    let engine = Engine::install(&mut tx, &refs, REPLICAS)
+    let engine = Engine::install_one(&mut tx, &refs, REPLICAS)
         .await
         .expect("engine");
     tx.commit().await.expect("installed");

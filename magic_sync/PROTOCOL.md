@@ -16,6 +16,9 @@ Sections 1 to 10 are what a replica does, and the whole of what an
 implementation needs. What the server does with what a replica sends is in
 [Appendix A](#appendix-a-what-the-server-does-with-it): it explains the
 rules, and no replica has to implement any of it.
+[Appendix B](#appendix-b-a-replica-that-applies-through-another-systems-services)
+is how a replica keeps these rules when it does not write the rows itself,
+but hands them to another system's services.
 
 ---
 
@@ -33,6 +36,14 @@ A replica never decides what it should hold. It applies what it is sent,
 reports what it could not apply, and reports what it holds. It follows one
 server installation: two that send it messages each take the other's for a
 new epoch, and provision it again and again.
+
+A server may serve several kinds of replica — **audiences** — from the same
+tables: each kind holds the tables its audience declares, each in the
+encoding and the shape its audience gives it (section 3), and one kind may
+hold a part of what another holds. That is the server's alone. A replica is
+the same whatever audience it is of: nothing on the wire names one, and
+nothing in this protocol changes for it. Its tables are simply the ones it
+is sent.
 
 ---
 
@@ -694,6 +705,14 @@ says how to read it.
   of `to_replica.txt` before its upload is answered — its rows, its
   rejections and what it applied; its digests; the same with a seal the
   server never made — each with what the server makes of it.
+- `tests/golden/audiences.txt`: what one server sends a replica of each of
+  two audiences — a device that holds every table as it is, and an ERP
+  that holds some of them, a table in a shape of its own that joins in a
+  column of a parent it does not hold, sent again when the parent changes
+  and let go of when the parent no longer qualifies it. Each message says
+  what the replica makes of it, and each step is followed by a `holds`
+  line per replica. Both are ordinary replicas: the file is the
+  `to_replica.txt` rules seen from two kinds of replica at once.
 - `tests/golden/to_server_verdicts.txt`: uploads a replica sends after a
   provisioning, a change and a take-back it applied — a refused delete
   with what it applied, an edit of a two-way row, a delete of a row of its
@@ -927,3 +946,62 @@ encoding, and encodes it as it sends the wish: the setting row it holds, or
 the one wished when it holds none, with the wished columns and the version the
 wish is based on laid over it. Table names beginning `sync_` are the
 engine's: no host table may take one.
+
+---
+
+## Appendix B. A replica that applies through another system's services
+
+A replica need not keep the rows in tables it writes itself. One may hand
+each row to another system — call its services, which write that system's
+tables under that system's rules — when it may not write those tables, or
+must not bypass what the services do. Such a replica follows sections 1 to
+10 all the same; this appendix is how, since one transaction no longer
+covers both the rows and what the replica records of them.
+
+It keeps a **ledger** of its own, in storage it owns: per table and key, the
+row as it last applied it — its bytes, or a fingerprint of them — and
+whatever the other system calls the row, when that is not its key.
+
+- **What it holds is the ledger.** "Holds" in sections 4 to 8 means the
+  rows the ledger names: what a snapshot's end sweeps (4.2), what a delete
+  lets go of (4.1), what its digests count (section 8). A row of the other
+  system that the ledger does not name is not the replica's: no sweep ever
+  touches it, whoever wrote it.
+- **Apply, then record.** The other system's writes and the ledger cannot
+  commit together. For each `Down`, in the order of 4.1, the replica hands
+  each row to the services; then, in one transaction of its own, it writes
+  the ledger for every row that took, the rejections of those that did not
+  (section 6), and the message as the last applied (5.2). Only after that
+  commits does it acknowledge the transport (5.1). A crash in between
+  delivers the message again, and the replica applies it again: the other
+  system's services see that row twice.
+- **Skip what it already holds.** Before handing an upserted row to the
+  services, the replica compares it with the ledger: the same bytes as it
+  last applied — or the same fingerprint — and the row is applied already,
+  with no call. A redelivery, a retry after a crash, a snapshot that sends
+  again what it holds: none reaches the other system for a row that did not
+  change. The crash window above is the one way a service sees an
+  unchanged row twice, so a service that is not idempotent costs, at most,
+  a repeat after a crash.
+- **Let go through the services too.** A delete (4.1) or a sweep (4.2) asks
+  the services to let the row go — delete it, archive it, whatever that
+  system does with a row it no longer gets — then removes it from the
+  ledger. A service that refuses is a rejection (section 6): the ledger
+  keeps the row, and the server sends the delete again with the next
+  provisioning or retry.
+- **A refusal is a rejection.** A row the services refuse is reported with
+  the reason they gave, keeps whatever the ledger had of it (nothing, for a
+  row it never held), and is sent again once the server's retry comes: a
+  fix deployed on that system's side lets it through.
+- **Adopting what is already there.** A replica put in front of a system
+  that already holds the rows — copied there by a migration, say — may take
+  its first snapshot into the ledger without calling the services, then
+  apply as above from the next message on. The server sees an ordinary
+  provisioning; whether a replica adopts or applies is the replica's
+  switch, used once.
+
+Its digests are over the ledger, and so never differ from what the server
+records for a reason on the other system's side: a row edited there behind
+the services' back is a row the replica does not know, and the protocol
+cannot see it. Keep every write of the rows the replica owns going through
+it.

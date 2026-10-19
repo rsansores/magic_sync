@@ -44,13 +44,15 @@ that is: a fleet is never upgraded at once, and does not need to be.
 
 ## Your declarations
 
-What decides which rows each replica holds is yours: the replicas'
-relation, and per table its key, its `sync` rule, the tables it points at,
-its groups and its columns. The relay remembers a digest of them
-(`sync.version.declared`); the first pass of a build whose declarations
-differ — a table routed otherwise, mirrored for the first time or no
-more, a column added — provisions every live replica again, and lets go of
-what it kept of a table it mirrors no more. That is an alarm in the log,
+What decides which rows each replica holds is yours: per audience, the
+replicas' relation, and per table its key, its `sync` rule, the tables it
+points at, its groups, its columns, the view it is read `from` and the
+columns it `depends` on. The relay remembers a digest of them per audience
+(`sync.audiences`); the first pass of a build whose declarations of an
+audience differ — a table routed otherwise, held for the first time or no
+more, a column added — provisions every live replica of that audience again,
+and no other, and lets go of what it kept for them of a table they hold no
+more. That is an alarm in the log,
 and a deploy's worth of traffic: change declarations on purpose. A change
 to how a codec encodes a row that leaves its columns alone is not seen:
 provision the replicas yourself ([Provisioning](provisioning.md)).

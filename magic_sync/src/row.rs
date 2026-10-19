@@ -210,6 +210,18 @@ pub trait Row:
     /// of it.
     #[doc(hidden)]
     const ACTIVE: Option<&'static str>;
+    /// The relation, as SQL, a row is read from on the server when not the
+    /// table: a view over the table, keyed as it is, that may join columns
+    /// of other tables in and leave rows out — the rows it leaves out are
+    /// not sent, as with [`Row::ACTIVE`]. The table is still what the row is
+    /// noted, keyed and placed by. `None`: the table.
+    #[doc(hidden)]
+    const FROM: Option<&'static str>;
+    /// The columns of the table, each the whole of a foreign key, whose
+    /// parent's columns the row copies (through [`Row::FROM`]): a change of
+    /// the parent is a change of every row pointing at it so.
+    #[doc(hidden)]
+    const DEPENDS: &'static [&'static str];
     /// The column a replica sets on a row it lets go of but cannot delete,
     /// because a row of its own still points at it. `None`: such a row is a
     /// refusal.
@@ -604,9 +616,19 @@ fn keys_per_statement<R: Row>() -> usize {
     (crate::dialect::MAX_BINDS / R::KEY.len().max(1)).max(1)
 }
 
+/// Where `R`'s rows are read from on this side: its `from` relation on the
+/// server, when it has one, else its table.
+fn read_from<R: Row>() -> &'static str {
+    #[cfg(feature = "postgres")]
+    if let Some(from) = R::FROM {
+        return from;
+    }
+    R::QUALIFIED
+}
+
 /// Every row of `keys` the table holds, retired or not — what sync sends,
-/// read from the table itself rather than as the replicas see it. A key with
-/// no row is left out.
+/// read from the table, or the relation the row is read `from`, rather than
+/// as the replicas see it. A key with no row is left out.
 ///
 /// # Errors
 ///
@@ -616,8 +638,11 @@ pub(crate) async fn get_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
     let mut out = Vec::with_capacity(keys.len());
     for chunk in keys.chunks(keys_per_statement::<R>()) {
-        let mut qb =
-            sqlx::QueryBuilder::new(format!("SELECT {} FROM {}", listed(&names), R::QUALIFIED));
+        let mut qb = sqlx::QueryBuilder::new(format!(
+            "SELECT {} FROM {}",
+            listed(&names),
+            read_from::<R>()
+        ));
         key_filter::<R>(&mut qb, chunk);
         out.extend(qb.build_query_as::<R>().fetch_all(&mut *exec).await?);
     }
@@ -1520,6 +1545,12 @@ pub(crate) struct Table {
     /// [`Row::ACTIVE`].
     #[cfg(feature = "postgres")]
     pub(crate) active: Option<&'static str>,
+    /// [`Row::FROM`].
+    #[cfg(feature = "postgres")]
+    pub(crate) from: Option<&'static str>,
+    /// [`Row::DEPENDS`].
+    #[cfg(feature = "postgres")]
+    pub(crate) depends: &'static [&'static str],
     pub(crate) columns: Vec<Column>,
     /// [`Row::RETIRED`].
     pub(crate) retired: Option<&'static str>,
@@ -1545,6 +1576,10 @@ impl Table {
             route: R::ROUTE,
             #[cfg(feature = "postgres")]
             active: R::ACTIVE,
+            #[cfg(feature = "postgres")]
+            from: R::FROM,
+            #[cfg(feature = "postgres")]
+            depends: R::DEPENDS,
             columns: declared::<R>(),
             retired: R::RETIRED,
             unmirrored: R::UNMIRRORED,
@@ -1552,6 +1587,15 @@ impl Table {
             #[cfg(feature = "postgres")]
             encoding: "",
         }
+    }
+
+    /// The relation its rows are read from on this side when not the table:
+    /// its `from`, on the server.
+    fn read_from(&self) -> Option<&'static str> {
+        #[cfg(feature = "postgres")]
+        return self.from;
+        #[cfg(not(feature = "postgres"))]
+        None
     }
 
     /// The columns replicas write in a table written on both sides.
@@ -1594,9 +1638,24 @@ impl Table {
     /// not compared. Empty when they agree.
     pub(crate) async fn differences(&self, conn: &mut Conn) -> Result<Vec<String>, Error> {
         let mut out = self.contradictions();
-        let actual = crate::dialect::columns(conn, self.schema, self.name).await?;
+        // A row read from a relation of its own is that relation's, column
+        // for column — a view's columns all read as nullable, and none is
+        // written, so only which columns there are and their types are
+        // compared — and the table's key.
+        let from = self.read_from();
+        let actual = match from {
+            #[cfg(feature = "postgres")]
+            Some(from) => crate::dialect::relation_columns(conn, from).await?,
+            _ => crate::dialect::columns(conn, self.schema, self.name).await?,
+        };
         if actual.is_empty() {
-            out.push(format!("the table is not on {}", crate::dialect::NAME));
+            out.push(match from {
+                Some(from) => format!(
+                    "the relation it is read from, {from}, is not on {}",
+                    crate::dialect::NAME
+                ),
+                None => format!("the table is not on {}", crate::dialect::NAME),
+            });
             return Ok(out);
         }
         let left_out = |name: &str| Some(name) == self.retired || self.unmirrored.contains(&name);
@@ -1608,6 +1667,9 @@ impl Table {
                 out.push(format!("the column `{name}` is not a field of the row"));
                 continue;
             };
+            if from.is_some() {
+                continue;
+            }
             if declared.nullable != *nullable {
                 out.push(format!(
                     "`{name}` is {} in the table and {} in the row",
@@ -1630,8 +1692,9 @@ impl Table {
         for column in &self.columns {
             if !actual.iter().any(|(name, _, _)| name == column.name) {
                 out.push(format!(
-                    "the field `{}` is no column of the table",
-                    column.name
+                    "the field `{}` is no column of {}",
+                    column.name,
+                    from.map_or("the table", |_| "the relation it is read from")
                 ));
             }
         }
@@ -1646,9 +1709,11 @@ impl Table {
                 "the primary key is {primary_key:?}, and the row's key {key:?}"
             ));
         }
-        let described =
-            sqlx::Executor::describe(&mut *conn, &format!("SELECT * FROM {}", self.qualified))
-                .await?;
+        let described = sqlx::Executor::describe(
+            &mut *conn,
+            &format!("SELECT * FROM {}", from.unwrap_or(self.qualified)),
+        )
+        .await?;
         for column in described.columns() {
             let name = sqlx::Column::name(column);
             let Some(declared) = self.columns.iter().find(|c| c.name == name) else {

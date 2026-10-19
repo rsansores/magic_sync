@@ -864,7 +864,7 @@ async fn a_row_reaching_a_replica_through_two_groups_counts_once(pool: crate::Db
     }
     let tables = [Table::of::<Item>(), Table::of::<Customer>()];
     let mut tx = conn.begin().await.unwrap();
-    let engine = Engine::install(&mut tx, &[&tables[0], &tables[1]], REPLICAS)
+    let engine = Engine::install_one(&mut tx, &[&tables[0], &tables[1]], REPLICAS)
         .await
         .unwrap();
     tx.commit().await.unwrap();

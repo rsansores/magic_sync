@@ -20,8 +20,8 @@ answer as a scope.
 
 The shop has no login, so it asks over every register (`Scope::All`). A
 system with one answers for the caller instead: a customer's partition
-(`Scope::Partition`), or the replicas this user may see
-(`Scope::Replicas(&ids)`). Each read takes a connection and reads one snapshot
+(`Scope::Partition`), one kind of replica (`Scope::Audience`), or the
+replicas this user may see (`Scope::Replicas(&ids)`). Each read takes a connection and reads one snapshot
 of its own. The answers serialize as they are; return them untouched, and the
 dashboard of the same version reads them — an answer of another contract
 version it refuses, saying so, rather than draw it wrong.

@@ -1,0 +1,5 @@
+error: the rows a row is read `from` are the rows it sends: `active` is left out
+ --> tests/derive/fail/from_with_active.rs:2:76
+  |
+2 | #[row(table = "things", mirror = "catalog", active = "live_things", from = "things_seen")]
+  |                                                                            ^^^^^^^^^^^^^

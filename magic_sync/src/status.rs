@@ -1,8 +1,9 @@
 //! What the engine answers about itself, for a dashboard or an alarm: whether
 //! each replica holds what it should, how far along it is, where one row
 //! stands, and what waits for a fix. Every read takes a [`Scope`], so a host
-//! shows each audience its own replicas and nothing else; the engine knows
-//! replicas only by id, and the host puts names on them.
+//! shows each viewer their own replicas and nothing else; the engine knows
+//! replicas only by id and by the audience each is of, and the host puts
+//! names on them.
 //!
 //! Each read is one snapshot: called on a connection outside a transaction,
 //! it opens a `REPEATABLE READ` one of its own; called inside one, that
@@ -11,7 +12,7 @@
 //! Every answer a dashboard reads serializes as the JSON of contract
 //! [`CONTRACT`], and carries that number.
 
-use crate::plan::{parse_key, stale, Engine, REFUSED};
+use crate::plan::{parse_key, stale, Engine, Planner, REFUSED};
 
 pub use crate::replica::UpProgress;
 use crate::Error;
@@ -60,6 +61,8 @@ pub enum Scope<'a> {
     Replicas(&'a [Uuid]),
     /// Every replica of one partition.
     Partition(Uuid),
+    /// Every replica of one audience, by its name.
+    Audience(&'a str),
     /// Every replica.
     All,
 }
@@ -83,6 +86,8 @@ pub struct Progress {
 pub struct ReplicaProgress {
     /// The replica.
     pub replica: Uuid,
+    /// The audience it is of.
+    pub audience: String,
     /// Each table the server sends down, parents first.
     pub tables: Vec<TableProgress>,
 }
@@ -134,12 +139,14 @@ pub struct RowProgress {
 }
 
 /// Where one row stands on one replica.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[non_exhaustive]
 pub struct RowPlace {
     /// The replica.
     pub replica: Uuid,
+    /// The audience it is of.
+    pub audience: String,
     /// What the row is to it.
     pub state: RowState,
 }
@@ -346,6 +353,8 @@ impl ReplicaCounts {
 pub struct ReplicaOverview {
     /// The replica.
     pub replica: Uuid,
+    /// The audience it is of.
+    pub audience: String,
     /// Where it stands, in one word.
     pub state: ReplicaState,
     /// Changes noted and not yet planned that may concern it.
@@ -403,6 +412,9 @@ pub struct Backlog {
 pub struct TableOverview {
     /// The table.
     pub table: String,
+    /// The audience it is the table of: a table two audiences hold is
+    /// listed once for each, over its replicas.
+    pub audience: String,
     /// Every figure below is zero.
     pub synced: bool,
     /// Changes to its rows not yet planned.
@@ -739,6 +751,12 @@ const NOTES_IN_SCOPE: &str = "n.done_at IS NULL AND ($1 OR ( \
 /// The live replicas a scope names, with their partitions.
 struct Scoped {
     replicas: Vec<(Uuid, Option<Uuid>)>,
+    /// Each replica's audience, by its place among the engine's.
+    of: HashMap<Uuid, usize>,
+    /// The audiences the scope covers, in the engine's order.
+    audiences: Vec<usize>,
+    /// The one audience the scope names, when it names one.
+    only: Option<usize>,
     /// Every replica: nothing narrows the notes.
     all: bool,
     /// The partitions the notes are narrowed to.
@@ -748,6 +766,15 @@ struct Scoped {
 impl Scoped {
     fn ids(&self) -> Vec<Uuid> {
         self.replicas.iter().map(|(r, _)| *r).collect()
+    }
+
+    /// The replicas of the audience `a`.
+    fn ids_of(&self, a: usize) -> Vec<Uuid> {
+        self.replicas
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| self.of.get(r) == Some(&a))
+            .collect()
     }
 }
 
@@ -791,7 +818,10 @@ struct Folded {
 }
 
 impl Folded {
-    fn of(notes: &[NoteGroup], partition_of: &HashMap<Uuid, Option<Uuid>>) -> Self {
+    fn of<'a>(
+        notes: impl IntoIterator<Item = &'a NoteGroup>,
+        partition_of: &HashMap<Uuid, Option<Uuid>>,
+    ) -> Self {
         let mut folded = Folded::default();
         for note in notes {
             let pending = if note.parked { 0 } else { note.count };
@@ -914,115 +944,96 @@ async fn snapshot(conn: &mut Conn) -> Result<sqlx::Transaction<'_, crate::Db>, E
 
 impl Engine {
     /// How far each replica of `scope` is from holding what it should, per
-    /// table, counted from what each has acknowledged applying — never from
-    /// what was merely sent. See [`TableProgress`]. It counts the rows each
-    /// replica should hold: ask it for the replicas a person is looking at.
+    /// table of its audience, counted from what each has acknowledged
+    /// applying — never from what was merely sent. See [`TableProgress`].
+    /// It counts the rows each replica should hold: ask it for the replicas
+    /// a person is looking at.
     ///
     /// # Errors
     ///
     /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
-    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
-    /// [`Scope::Partition`] when the replicas have no partition.
+    /// called inside a transaction weaker than `REPEATABLE READ`, for a
+    /// [`Scope::Partition`] when no audience's replicas have a partition, or
+    /// a [`Scope::Audience`] the engine has none of.
     pub async fn progress(&self, conn: &mut Conn, scope: Scope<'_>) -> Result<Progress, Error> {
         let mut tx = snapshot(conn).await?;
-        let replicas = self.scoped(&mut tx, scope).await?.ids();
+        let scoped = self.scoped(&mut tx, scope).await?;
         let quarantined: HashMap<(Uuid, String), i64> = sqlx::query_as(
             "SELECT replica_id, relation, count(*) FROM sync.quarantine \
               WHERE replica_id = ANY($1) GROUP BY 1, 2",
         )
-        .bind(&replicas)
+        .bind(scoped.ids())
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|(replica, table, n): (Uuid, String, i64)| ((replica, table), n))
         .collect();
-        let mut out: BTreeMap<Uuid, Vec<TableProgress>> =
-            replicas.iter().map(|r| (*r, Vec::new())).collect();
-        for &i in &self.order {
-            let table = self.plans[i].table;
-            let (sql, ruled) = self.progress_sql(i);
-            let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
-                .bind(table)
-                .bind(&replicas)
-                .bind(ruled)
-                .fetch_all(&mut *tx)
-                .await?;
-            let mut counted: HashMap<Uuid, (i64, i64, i64, i64, i64)> = rows
-                .into_iter()
-                .map(|(r, should, holds, outdated, in_flight, to_remove)| {
-                    (r, (should, holds, outdated, in_flight, to_remove))
-                })
-                .collect();
-            for (replica, tables) in out.iter_mut() {
-                let (should, holds, outdated, in_flight, to_remove) =
-                    counted.remove(replica).unwrap_or_default();
-                let quarantined = quarantined
-                    .get(&(*replica, table.to_owned()))
-                    .copied()
-                    .unwrap_or(0);
-                tables.push(TableProgress {
-                    table: table.to_owned(),
-                    should: should + if ruled { 0 } else { quarantined },
-                    holds,
-                    outdated,
-                    in_flight,
-                    to_remove,
-                    quarantined,
-                });
+        let mut replicas = Vec::new();
+        for &a in &scoped.audiences {
+            let planner = &self.audiences[a];
+            let ids = scoped.ids_of(a);
+            if ids.is_empty() {
+                continue;
             }
+            let mut out: BTreeMap<Uuid, Vec<TableProgress>> =
+                ids.iter().map(|r| (*r, Vec::new())).collect();
+            for &i in &planner.order {
+                let table = planner.plans[i].table;
+                let (sql, ruled) = planner.progress_sql(i);
+                let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+                    .bind(table)
+                    .bind(&ids)
+                    .bind(ruled)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let mut counted: HashMap<Uuid, (i64, i64, i64, i64, i64)> = rows
+                    .into_iter()
+                    .map(|(r, should, holds, outdated, in_flight, to_remove)| {
+                        (r, (should, holds, outdated, in_flight, to_remove))
+                    })
+                    .collect();
+                for (replica, tables) in out.iter_mut() {
+                    let (should, holds, outdated, in_flight, to_remove) =
+                        counted.remove(replica).unwrap_or_default();
+                    let quarantined = quarantined
+                        .get(&(*replica, table.to_owned()))
+                        .copied()
+                        .unwrap_or(0);
+                    tables.push(TableProgress {
+                        table: table.to_owned(),
+                        should: should + if ruled { 0 } else { quarantined },
+                        holds,
+                        outdated,
+                        in_flight,
+                        to_remove,
+                        quarantined,
+                    });
+                }
+            }
+            replicas.extend(out.into_iter().map(|(replica, tables)| ReplicaProgress {
+                replica,
+                audience: planner.name.to_owned(),
+                tables,
+            }));
         }
         tx.commit().await?;
+        replicas.sort_by_key(|r| r.replica);
         Ok(Progress {
             contract: CONTRACT,
-            replicas: out
-                .into_iter()
-                .map(|(replica, tables)| ReplicaProgress { replica, tables })
-                .collect(),
+            replicas,
         })
     }
 
-    /// How far the replicas `$2` are from holding what they should of the
-    /// table `i` (named `$1`; `$3`: whether it has a rule): per replica,
-    /// what it should hold, holds, holds outdated, has in flight and holds
-    /// to be removed — each read once, joined as sets, never asked row by
-    /// row. Whether the table has a rule.
-    pub(crate) fn progress_sql(&self, i: usize) -> (String, bool) {
-        // A table that only travels with others is owed what the engine
-        // decided to send it: there is no rule to count it from.
-        let wanted = self.wanted_sql(i, "true");
-        let ruled = wanted.is_some();
-        let wanted = wanted.unwrap_or_else(|| {
-            "SELECT NULL::uuid AS replica_id, NULL::text AS key WHERE false".to_owned()
-        });
-        let sql = format!(
-            "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
-             h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
-                          {} AS outdated \
-                     FROM sync.held h CROSS JOIN sync.epoch e \
-                     LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
-                    WHERE h.relation = $1 AND h.replica_id = ANY($2) AND NOT {REFUSED}) \
-             SELECT coalesce(w.replica_id, h.replica_id), \
-                    count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
-                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed), \
-                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed AND h.outdated), \
-                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND NOT h.confirmed), \
-                    count(*) FILTER (WHERE $3 AND w.key IS NULL AND h.key IS NOT NULL) \
-               FROM w FULL JOIN h ON w.replica_id = h.replica_id AND w.key = h.key \
-              GROUP BY 1",
-            stale("p.noted")
-        );
-        (sql, ruled)
-    }
-
     /// Where one row stands on every replica of `scope` that holds it,
-    /// should, or is owed it. `key` is the row's key as text, in the form
+    /// should, or is owed it — the replicas of every audience that holds
+    /// its table. `key` is the row's key as text, in the form
     /// [`Row::key_text`](crate::Row::key_text) writes: the parts of a key of
     /// several columns joined by `|`, a uuid lowercase and hyphenated.
     ///
     /// # Errors
     ///
-    /// As the other reads, and besides: [`Error::Misuse`] when `table` is not
-    /// mirrored, [`Error::Malformed`] when `key` is not a key of it.
+    /// As the other reads, and besides: [`Error::Misuse`] when no audience
+    /// holds `table`, [`Error::Malformed`] when `key` is not a key of it.
     pub async fn row_progress(
         &self,
         conn: &mut Conn,
@@ -1030,79 +1041,95 @@ impl Engine {
         table: &str,
         key: &str,
     ) -> Result<RowProgress, Error> {
-        let i = self
-            .index(table)
-            .ok_or_else(|| Error::Misuse(format!("`{table}` is not mirrored")))?;
-        parse_key(&self.plans[i].key, key)?;
-        let mut tx = snapshot(conn).await?;
-        let scoped = self.scoped(&mut tx, scope).await?.ids();
-        let keys = [key.to_owned()];
-        let wanted: BTreeSet<Uuid> = self
-            .wanted(&mut tx, i, Some(&keys), Some(&scoped))
-            .await?
-            .into_iter()
-            .map(|(r, _)| r)
-            .collect();
-        let ruled = self.wanted_sql(i, "true").is_some();
-        let held: Vec<(Uuid, bool, bool)> = sqlx::query_as(&format!(
-            "SELECT h.replica_id, {CONFIRMED}, {} \
-               FROM sync.held h CROSS JOIN sync.epoch e \
-               LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
-              WHERE h.relation = $1 AND h.row_key = $2 AND h.replica_id = ANY($3)",
-            stale("p.noted")
-        ))
-        .bind(table)
-        .bind(key)
-        .bind(&scoped)
-        .fetch_all(&mut *tx)
-        .await?;
-        let quarantined: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT replica_id FROM sync.quarantine \
-              WHERE relation = $1 AND row_key = $2 AND replica_id = ANY($3)",
-        )
-        .bind(table)
-        .bind(key)
-        .bind(&scoped)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        let mut out: BTreeMap<Uuid, RowState> = wanted
+        let holding: Vec<(usize, usize)> = self
+            .audiences
             .iter()
-            .map(|replica| (*replica, RowState::Missing))
+            .enumerate()
+            .filter_map(|(a, planner)| planner.index(table).map(|i| (a, i)))
             .collect();
-        for (replica, confirmed, outdated) in held {
-            let state = if ruled && !wanted.contains(&replica) {
-                RowState::Leaving
-            } else if !confirmed {
-                RowState::OnItsWay
-            } else if outdated {
-                RowState::Outdated
-            } else {
-                RowState::Holds
-            };
-            out.insert(replica, state);
+        let Some(&(a, i)) = holding.first() else {
+            return Err(Error::Misuse(format!("`{table}` is not mirrored")));
+        };
+        parse_key(&self.audiences[a].plans[i].key, key)?;
+        let mut tx = snapshot(conn).await?;
+        let scoped = self.scoped(&mut tx, scope).await?;
+        let keys = [key.to_owned()];
+        let mut places = Vec::new();
+        for (a, i) in holding {
+            if !scoped.audiences.contains(&a) {
+                continue;
+            }
+            let planner = &self.audiences[a];
+            let ids = scoped.ids_of(a);
+            let wanted: BTreeSet<Uuid> = planner
+                .wanted(&mut tx, i, Some(&keys), Some(&ids))
+                .await?
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect();
+            let ruled = planner.wanted_sql(i, "true").is_some();
+            let held: Vec<(Uuid, bool, bool)> = sqlx::query_as(&format!(
+                "SELECT h.replica_id, {CONFIRMED}, {} \
+                   FROM sync.held h CROSS JOIN sync.epoch e \
+                   LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
+                  WHERE h.relation = $1 AND h.row_key = $2 AND h.replica_id = ANY($3)",
+                stale("p.noted")
+            ))
+            .bind(table)
+            .bind(key)
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let quarantined: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT replica_id FROM sync.quarantine \
+                  WHERE relation = $1 AND row_key = $2 AND replica_id = ANY($3)",
+            )
+            .bind(table)
+            .bind(key)
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut out: BTreeMap<Uuid, RowState> = wanted
+                .iter()
+                .map(|replica| (*replica, RowState::Missing))
+                .collect();
+            for (replica, confirmed, outdated) in held {
+                let state = if ruled && !wanted.contains(&replica) {
+                    RowState::Leaving
+                } else if !confirmed {
+                    RowState::OnItsWay
+                } else if outdated {
+                    RowState::Outdated
+                } else {
+                    RowState::Holds
+                };
+                out.insert(replica, state);
+            }
+            for replica in quarantined {
+                out.insert(replica, RowState::Quarantined);
+            }
+            places.extend(out.into_iter().map(|(replica, state)| RowPlace {
+                replica,
+                audience: planner.name.to_owned(),
+                state,
+            }));
         }
-        for replica in quarantined {
-            out.insert(replica, RowState::Quarantined);
-        }
+        tx.commit().await?;
+        places.sort_by_key(|p| p.replica);
         Ok(RowProgress {
             contract: CONTRACT,
-            places: out
-                .into_iter()
-                .map(|(replica, state)| RowPlace { replica, state })
-                .collect(),
+            places,
         })
     }
 
     /// Everything a dashboard shows first, over `scope`: the engine's health
     /// with up to `limit` entries of each list, how many replicas are in each
-    /// state with up to `limit` of them worst first, and each table's state.
+    /// state with up to `limit` of them worst first, and each table's state,
+    /// per audience.
     ///
     /// # Errors
     ///
-    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
-    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
-    /// [`Scope::Partition`] when the replicas have no partition.
+    /// As [`Engine::progress`].
     pub async fn overview(
         &self,
         conn: &mut Conn,
@@ -1133,9 +1160,7 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
-    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
-    /// [`Scope::Partition`] when the replicas have no partition.
+    /// As [`Engine::progress`].
     pub async fn listing(
         &self,
         conn: &mut Conn,
@@ -1166,9 +1191,7 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
-    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
-    /// [`Scope::Partition`] when the replicas have no partition.
+    /// As [`Engine::progress`].
     pub async fn wishes(
         &self,
         conn: &mut Conn,
@@ -1234,9 +1257,7 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`Error::Database`] when the database fails; [`Error::Misuse`] when
-    /// called inside a transaction weaker than `REPEATABLE READ`, or for a
-    /// [`Scope::Partition`] when the replicas have no partition.
+    /// As [`Engine::progress`].
     pub async fn health(
         &self,
         conn: &mut Conn,
@@ -1257,28 +1278,53 @@ impl Engine {
             .await?)
     }
 
-    /// The live replicas a scope names.
+    /// The live replicas a scope names, each with its audience.
     async fn scoped(&self, conn: &mut Conn, scope: Scope<'_>) -> Result<Scoped, Error> {
-        let live = self.replicas_sql();
-        let (all, partition, ids): (bool, Option<Uuid>, Option<&[Uuid]>) = match scope {
-            Scope::All => (true, None, None),
-            Scope::Partition(partition) => {
-                if self.replicas.partition.is_none() {
-                    return Err(Error::Misuse("the replicas have no partition".to_owned()));
+        let (all, partition, ids, audience): (bool, Option<Uuid>, Option<&[Uuid]>, Option<usize>) =
+            match scope {
+                Scope::All => (true, None, None, None),
+                Scope::Partition(partition) => {
+                    if self
+                        .audiences
+                        .iter()
+                        .all(|a| a.replicas.partition.is_none())
+                    {
+                        return Err(Error::Misuse("the replicas have no partition".to_owned()));
+                    }
+                    (false, Some(partition), None, None)
                 }
-                (false, Some(partition), None)
+                Scope::Replicas(ids) => (false, None, Some(ids), None),
+                Scope::Audience(name) => {
+                    let Some(a) = self.audience(name) else {
+                        return Err(Error::Misuse(format!("no audience is named `{name}`")));
+                    };
+                    (false, None, None, Some(a))
+                }
+            };
+        let mut replicas = Vec::new();
+        let mut of = HashMap::new();
+        let mut audiences = Vec::new();
+        for (a, planner) in self.audiences.iter().enumerate() {
+            if audience.is_some_and(|only| only != a) {
+                continue;
             }
-            Scope::Replicas(ids) => (false, None, Some(ids)),
-        };
-        let replicas: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(&format!(
-            "SELECT s.id, s.partition FROM {live} \
-              WHERE $1 OR s.partition = $2 OR s.id = ANY($3) ORDER BY s.id"
-        ))
-        .bind(all)
-        .bind(partition)
-        .bind(ids)
-        .fetch_all(&mut *conn)
-        .await?;
+            let mine: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(&format!(
+                "SELECT s.id, s.partition FROM {} \
+                  WHERE $1 OR s.partition = $2 OR s.id = ANY($3) ORDER BY s.id",
+                planner.replicas_sql()
+            ))
+            .bind(all || audience.is_some())
+            .bind(partition)
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await?;
+            if all || audience.is_some() || !mine.is_empty() {
+                audiences.push(a);
+            }
+            of.extend(mine.iter().map(|(r, _)| (*r, a)));
+            replicas.extend(mine);
+        }
+        replicas.sort_unstable();
         let partitions = match partition {
             Some(p) => vec![p],
             None => replicas
@@ -1290,14 +1336,35 @@ impl Engine {
         };
         Ok(Scoped {
             replicas,
+            of,
+            audiences,
+            only: audience,
             all,
             partitions,
         })
     }
 
-    /// The pending notes the scope sees, counted by what they may concern.
+    /// Whether the audience `a` plans the pending notes `note` counts: of
+    /// one of its tables, a group of one, a parent one copies, or of a
+    /// replica.
+    fn plans_note(&self, a: usize, note: &NoteGroup) -> bool {
+        let planner = &self.audiences[a];
+        note.table
+            .as_deref()
+            .is_none_or(|t| planner.knows(t) || planner.depends_on(t))
+    }
+
+    /// Whether no audience knows the table of `note`: every audience plans
+    /// it, and it fails where it is planned.
+    fn nobodys(&self, note: &NoteGroup) -> bool {
+        (0..self.audiences.len()).all(|a| !self.plans_note(a, note))
+    }
+
+    /// The pending notes the scope sees, counted by what they may concern:
+    /// of one audience, those it plans — a note of a table none knows, each
+    /// does.
     async fn notes(&self, conn: &mut Conn, scoped: &Scoped) -> Result<Vec<NoteGroup>, Error> {
-        Ok(sqlx::query_as(&format!(
+        let mut notes: Vec<NoteGroup> = sqlx::query_as(&format!(
             "SELECT n.relation AS table, n.partition_id AS partition, \
                     n.replica_id AS replica, n.parked_at IS NOT NULL AS parked, \
                     count(*) AS count, min(n.noted_at) AS oldest \
@@ -1307,7 +1374,11 @@ impl Engine {
         .bind(&scoped.partitions)
         .bind(scoped.ids())
         .fetch_all(&mut *conn)
-        .await?)
+        .await?;
+        if let Some(a) = scoped.only {
+            notes.retain(|n| self.plans_note(a, n) || self.nobodys(n));
+        }
+        Ok(notes)
     }
 
     async fn health_of(
@@ -1456,12 +1527,27 @@ impl Engine {
         .fetch_all(&mut *conn)
         .await?;
         let partitions: HashMap<Uuid, Option<Uuid>> = scoped.replicas.iter().copied().collect();
-        let folded = Folded::of(notes, &partitions);
+        // Each replica counts the changes its own audience plans.
+        let folded: HashMap<usize, Folded> = scoped
+            .audiences
+            .iter()
+            .map(|&a| {
+                let concerned = notes
+                    .iter()
+                    .filter(|n| self.plans_note(a, n) || self.nobodys(n));
+                (a, Folded::of(concerned, &partitions))
+            })
+            .collect();
         let mut states = ReplicaCounts::default();
         let mut replicas: Vec<ReplicaOverview> = recorded
             .into_iter()
             .map(|r| {
-                let notes = folded.count(r.replica, partitions.get(&r.replica).copied().flatten());
+                let notes = scoped
+                    .of
+                    .get(&r.replica)
+                    .and_then(|a| folded.get(a))
+                    .map(|f| f.count(r.replica, partitions.get(&r.replica).copied().flatten()))
+                    .unwrap_or_default();
                 let failures = r.failures.unwrap_or(0);
                 let backlog = r.backlog.zip(r.backlog_at).map(|(tables, at)| Backlog {
                     tables: tables.0,
@@ -1486,6 +1572,10 @@ impl Engine {
                 *states.of(state) += 1;
                 ReplicaOverview {
                     replica: r.replica,
+                    audience: scoped
+                        .of
+                        .get(&r.replica)
+                        .map_or_else(String::new, |&a| self.audiences[a].name.to_owned()),
                     state,
                     pending: notes.pending,
                     owed: r.owed,
@@ -1520,6 +1610,9 @@ impl Engine {
         Ok(Fleet { states, replicas })
     }
 
+    /// Each table of each audience of the scope, over that audience's
+    /// replicas: its pending changes are those of its rows or a group of
+    /// it, and a change of a table no audience knows is the first's.
     async fn tables_of(
         &self,
         conn: &mut Conn,
@@ -1527,79 +1620,131 @@ impl Engine {
         notes: &[NoteGroup],
         fleet: &Fleet,
     ) -> Result<Vec<TableOverview>, Error> {
-        let blank = |table: &str| TableOverview {
-            table: table.to_owned(),
-            ..TableOverview::default()
-        };
-        let mut out: BTreeMap<String, TableOverview> = self
-            .order
-            .iter()
-            .map(|&i| (self.plans[i].table.to_owned(), blank(self.plans[i].table)))
-            .collect();
-        for note in notes {
-            let Some(table) = &note.table else { continue };
-            let entry = out.entry(table.clone()).or_insert_with(|| blank(table));
-            if note.parked {
-                entry.parked += note.count;
-            } else {
-                entry.pending += note.count;
+        let mut all = Vec::new();
+        for (n, &a) in scoped.audiences.iter().enumerate() {
+            let planner = &self.audiences[a];
+            let blank = |table: &str| TableOverview {
+                table: table.to_owned(),
+                audience: planner.name.to_owned(),
+                ..TableOverview::default()
+            };
+            let mut out: BTreeMap<String, TableOverview> = planner
+                .order
+                .iter()
+                .map(|&i| {
+                    (
+                        planner.plans[i].table.to_owned(),
+                        blank(planner.plans[i].table),
+                    )
+                })
+                .collect();
+            for note in notes {
+                let Some(table) = &note.table else { continue };
+                // A parent the audience only copies is no table of its: its
+                // changes count on the replicas, not here.
+                let holds = planner.knows(table);
+                if !(holds || n == 0 && self.nobodys(note)) {
+                    continue;
+                }
+                let entry = out.entry(table.clone()).or_insert_with(|| blank(table));
+                if note.parked {
+                    entry.parked += note.count;
+                } else {
+                    entry.pending += note.count;
+                }
             }
+            // Only the replicas with a message unconfirmed have a row in
+            // flight, and only the rows past what each confirmed are read.
+            let unconfirmed: Vec<Uuid> = fleet
+                .replicas
+                .iter()
+                .filter(|r| r.unconfirmed && scoped.of.get(&r.replica) == Some(&a))
+                .map(|r| r.replica)
+                .collect();
+            let counted: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&format!(
+                "WITH c AS ( \
+                     SELECT h.relation, h.replica_id, count(*) AS in_flight, 0 AS quarantined, 0 AS unfiled \
+                       FROM sync.epoch e CROSS JOIN unnest($1::uuid[]) AS u(replica_id) \
+                       LEFT JOIN sync.replicas r ON r.replica_id = u.replica_id \
+                       JOIN sync.held h ON h.replica_id = u.replica_id \
+                                       AND h.sequence > CASE WHEN r.applied_epoch = e.epoch \
+                                                             THEN coalesce(r.applied_sequence, 0) ELSE 0 END \
+                      WHERE NOT {REFUSED} \
+                      GROUP BY 1, 2 \
+                     UNION ALL \
+                     SELECT relation, replica_id, 0, count(*), 0 FROM sync.quarantine \
+                      WHERE replica_id = ANY($2) GROUP BY 1, 2 \
+                     UNION ALL \
+                     SELECT relation, replica_id, 0, 0, count(*) FROM sync.inbox \
+                      WHERE replica_id = ANY($2) AND relation IS NOT NULL GROUP BY 1, 2) \
+                 SELECT relation, sum(in_flight)::int8, sum(quarantined)::int8, sum(unfiled)::int8, \
+                        count(DISTINCT replica_id) \
+                   FROM c GROUP BY 1"),
+            )
+            .bind(&unconfirmed)
+            .bind(scoped.ids_of(a))
+            .fetch_all(&mut *conn)
+            .await?;
+            for (table, in_flight, quarantined, unfiled, replicas) in counted {
+                let entry = out.entry(table.clone()).or_insert_with(|| blank(&table));
+                entry.in_flight = in_flight;
+                entry.quarantined = quarantined;
+                entry.unfiled = unfiled;
+                entry.replicas = replicas;
+            }
+            for entry in out.values_mut() {
+                entry.synced = entry.pending == 0
+                    && entry.parked == 0
+                    && entry.in_flight == 0
+                    && entry.quarantined == 0
+                    && entry.unfiled == 0;
+            }
+            // Parents first, as the engine sends them; tables only an
+            // upload names after.
+            all.extend(
+                planner
+                    .order
+                    .iter()
+                    .filter_map(|&i| out.remove(planner.plans[i].table)),
+            );
+            all.extend(out.into_values());
         }
-        // Only the replicas with a message unconfirmed have a row in flight,
-        // and only the rows past what each confirmed are read.
-        let unconfirmed: Vec<Uuid> = fleet
-            .replicas
-            .iter()
-            .filter(|r| r.unconfirmed)
-            .map(|r| r.replica)
-            .collect();
-        let counted: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&format!(
-            "WITH c AS ( \
-                 SELECT h.relation, h.replica_id, count(*) AS in_flight, 0 AS quarantined, 0 AS unfiled \
-                   FROM sync.epoch e CROSS JOIN unnest($1::uuid[]) AS u(replica_id) \
-                   LEFT JOIN sync.replicas r ON r.replica_id = u.replica_id \
-                   JOIN sync.held h ON h.replica_id = u.replica_id \
-                                   AND h.sequence > CASE WHEN r.applied_epoch = e.epoch \
-                                                         THEN coalesce(r.applied_sequence, 0) ELSE 0 END \
-                  WHERE NOT {REFUSED} \
-                  GROUP BY 1, 2 \
-                 UNION ALL \
-                 SELECT relation, replica_id, 0, count(*), 0 FROM sync.quarantine \
-                  WHERE replica_id = ANY($2) GROUP BY 1, 2 \
-                 UNION ALL \
-                 SELECT relation, replica_id, 0, 0, count(*) FROM sync.inbox \
-                  WHERE replica_id = ANY($2) AND relation IS NOT NULL GROUP BY 1, 2) \
-             SELECT relation, sum(in_flight)::int8, sum(quarantined)::int8, sum(unfiled)::int8, \
-                    count(DISTINCT replica_id) \
-               FROM c GROUP BY 1"),
-        )
-        .bind(&unconfirmed)
-        .bind(scoped.ids())
-        .fetch_all(&mut *conn)
-        .await?;
-        for (table, in_flight, quarantined, unfiled, replicas) in counted {
-            let entry = out.entry(table.clone()).or_insert_with(|| blank(&table));
-            entry.in_flight = in_flight;
-            entry.quarantined = quarantined;
-            entry.unfiled = unfiled;
-            entry.replicas = replicas;
-        }
-        for entry in out.values_mut() {
-            entry.synced = entry.pending == 0
-                && entry.parked == 0
-                && entry.in_flight == 0
-                && entry.quarantined == 0
-                && entry.unfiled == 0;
-        }
-        // Parents first, as the engine sends them; tables only an upload
-        // names after.
-        let mut ordered: Vec<TableOverview> = self
-            .order
-            .iter()
-            .filter_map(|&i| out.remove(self.plans[i].table))
-            .collect();
-        ordered.extend(out.into_values());
-        Ok(ordered)
+        Ok(all)
+    }
+}
+
+impl Planner {
+    /// How far the replicas `$2` are from holding what they should of the
+    /// table `i` (named `$1`; `$3`: whether it has a rule): per replica,
+    /// what it should hold, holds, holds outdated, has in flight and holds
+    /// to be removed — each read once, joined as sets, never asked row by
+    /// row. Whether the table has a rule.
+    pub(crate) fn progress_sql(&self, i: usize) -> (String, bool) {
+        // A table that only travels with others is owed what the engine
+        // decided to send it: there is no rule to count it from.
+        let wanted = self.wanted_sql(i, "true");
+        let ruled = wanted.is_some();
+        let wanted = wanted.unwrap_or_else(|| {
+            "SELECT NULL::uuid AS replica_id, NULL::text AS key WHERE false".to_owned()
+        });
+        let sql = format!(
+            "WITH w AS (SELECT replica_id, key FROM ({wanted}) x WHERE replica_id = ANY($2)), \
+             h AS (SELECT h.replica_id, h.row_key AS key, {CONFIRMED} AS confirmed, \
+                          {} AS outdated \
+                     FROM sync.held h CROSS JOIN sync.epoch e \
+                     LEFT JOIN sync.replicas r ON r.replica_id = h.replica_id {PENDING} \
+                    WHERE h.relation = $1 AND h.replica_id = ANY($2) AND NOT {REFUSED}) \
+             SELECT coalesce(w.replica_id, h.replica_id), \
+                    count(w.key) + CASE WHEN $3 THEN 0 ELSE count(h.key) END, \
+                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed), \
+                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND h.confirmed AND h.outdated), \
+                    count(*) FILTER (WHERE (NOT $3 OR w.key IS NOT NULL) AND NOT h.confirmed), \
+                    count(*) FILTER (WHERE $3 AND w.key IS NULL AND h.key IS NOT NULL) \
+               FROM w FULL JOIN h ON w.replica_id = h.replica_id AND w.key = h.key \
+              GROUP BY 1",
+            stale("p.noted")
+        );
+        (sql, ruled)
     }
 }
 

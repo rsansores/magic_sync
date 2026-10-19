@@ -564,6 +564,305 @@ fn the_malformed_corpus_is_the_one_checked_in() {
     matches_golden(MALFORMED, &format!("{header}{text}"));
 }
 
+/// Two kinds of replica one server serves, as both sides hold them: a fleet
+/// of devices that holds every table as it is, and an ERP that holds some
+/// of them, its districts in a shape of its own — the list's code joined in,
+/// and only while the list is live. Each replica is an ordinary one: an
+/// audience is the server's, and the wire does not change.
+pub mod audiences {
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    /// The golden messages of the two audiences.
+    pub const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/audiences.txt");
+
+    /// The device and the ERP the golden messages are for.
+    pub const DEVICE: &str = "0192f6a0-0000-7000-8000-0000000000d1";
+    pub const ERP: &str = "0192f6a0-0000-7000-8000-0000000000e1";
+
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, Serialize, Deserialize, crate::Row)]
+    #[row(
+        table = "regions",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast"
+    )]
+    pub struct Region {
+        pub id: Uuid,
+        pub partition_id: Uuid,
+        pub name: String,
+    }
+
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, Serialize, Deserialize, crate::Row)]
+    #[row(
+        table = "lists",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast"
+    )]
+    pub struct List {
+        pub id: Uuid,
+        pub partition_id: Uuid,
+        pub code: String,
+        pub live: bool,
+    }
+
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, Serialize, Deserialize, crate::Row)]
+    #[row(
+        table = "districts",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast"
+    )]
+    pub struct District {
+        pub id: Uuid,
+        pub partition_id: Uuid,
+        pub region_id: Uuid,
+        pub list_id: Option<Uuid>,
+        pub name: String,
+    }
+
+    /// The ERP's district: its list's code joined in, while the list is
+    /// live — so a change of the list is a change of it.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, Serialize, Deserialize, crate::Row)]
+    #[row(
+        table = "districts",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast",
+        from = "fixture.erp_districts",
+        depends = "list_id"
+    )]
+    pub struct ErpDistrict {
+        pub id: Uuid,
+        pub partition_id: Uuid,
+        pub region_id: Uuid,
+        pub name: String,
+        pub zone: String,
+    }
+
+    /// The devices' tables, parents first.
+    pub fn device_codecs() -> Vec<crate::wire::Codec<()>> {
+        vec![
+            crate::wire::Codec::json::<Region>(None),
+            crate::wire::Codec::json::<List>(None),
+            crate::wire::Codec::json::<District>(None),
+        ]
+    }
+
+    /// The ERP's tables, parents first.
+    pub fn erp_codecs() -> Vec<crate::wire::Codec<()>> {
+        vec![
+            crate::wire::Codec::json::<Region>(None),
+            crate::wire::Codec::json::<ErpDistrict>(None),
+        ]
+    }
+
+    /// The server's tables: both kinds of replica, the catalog, and the
+    /// ERP's view of the districts.
+    #[cfg(feature = "postgres")]
+    pub const SERVER_SCHEMA: &str = "
+    CREATE SCHEMA fixture;
+    CREATE TABLE fixture.devices (id UUID PRIMARY KEY, partition_id UUID NOT NULL, live BOOLEAN NOT NULL);
+    CREATE TABLE fixture.erps (id UUID PRIMARY KEY, partition_id UUID NOT NULL, live BOOLEAN NOT NULL);
+    CREATE TABLE fixture.regions (id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL);
+    CREATE INDEX ON fixture.regions (partition_id);
+    CREATE TABLE fixture.lists (
+        id UUID PRIMARY KEY, partition_id UUID NOT NULL, code TEXT NOT NULL, live BOOLEAN NOT NULL);
+    CREATE INDEX ON fixture.lists (partition_id);
+    CREATE TABLE fixture.districts (
+        id UUID PRIMARY KEY, partition_id UUID NOT NULL,
+        region_id UUID NOT NULL REFERENCES fixture.regions (id),
+        list_id UUID REFERENCES fixture.lists (id),
+        name TEXT NOT NULL);
+    CREATE INDEX ON fixture.districts (partition_id);
+    CREATE INDEX ON fixture.districts (region_id);
+    CREATE INDEX ON fixture.districts (list_id);
+    CREATE VIEW fixture.erp_districts AS
+        SELECT d.id, d.partition_id, d.region_id, d.name, l.code AS zone
+          FROM fixture.districts d JOIN fixture.lists l ON l.id = d.list_id
+         WHERE l.live;
+    ";
+
+    /// The devices.
+    #[cfg(feature = "postgres")]
+    pub const DEVICES: crate::plan::Replicas =
+        crate::plan::Replicas::new("fixture.devices", "devices")
+            .live("live")
+            .partitioned_by("partition_id");
+
+    /// The ERPs.
+    #[cfg(feature = "postgres")]
+    pub const ERPS: crate::plan::Replicas = crate::plan::Replicas::new("fixture.erps", "erps")
+        .live("live")
+        .partitioned_by("partition_id");
+
+    /// The ERP's audience.
+    #[cfg(feature = "postgres")]
+    pub fn erp() -> crate::plan::Audience<()> {
+        crate::plan::Audience::new("erp", ERPS, erp_codecs())
+    }
+
+    /// Both audiences: the devices', then the ERP's.
+    #[cfg(feature = "postgres")]
+    pub fn both() -> Vec<crate::plan::Audience<()>> {
+        vec![
+            crate::plan::Audience::new("devices", DEVICES, device_codecs()),
+            erp(),
+        ]
+    }
+
+    /// A device's tables.
+    #[cfg(feature = "sqlite")]
+    pub const DEVICE_TABLES: &str = "
+    CREATE TABLE regions (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL);
+    CREATE TABLE lists (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, code TEXT NOT NULL,
+        live INTEGER NOT NULL);
+    CREATE TABLE districts (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL,
+        region_id BLOB NOT NULL REFERENCES regions (id), list_id BLOB REFERENCES lists (id),
+        name TEXT NOT NULL);
+    ";
+
+    /// The ERP's tables: no lists, and a district of its own shape.
+    #[cfg(feature = "sqlite")]
+    pub const ERP_TABLES: &str = "
+    CREATE TABLE regions (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL, name TEXT NOT NULL);
+    CREATE TABLE districts (id BLOB PRIMARY KEY NOT NULL, partition_id BLOB NOT NULL,
+        region_id BLOB NOT NULL REFERENCES regions (id), name TEXT NOT NULL, zone TEXT NOT NULL);
+    ";
+
+    /// What each replica holds, as the `holds` lines say it.
+    #[cfg(feature = "sqlite")]
+    pub const HOLDS_SQL: &[(&str, &str, &str)] = &[
+        (
+            "devices",
+            "districts",
+            "SELECT name FROM districts ORDER BY name",
+        ),
+        (
+            "devices",
+            "lists",
+            "SELECT code || CASE WHEN live THEN ' live' ELSE ' idle' END FROM lists ORDER BY 1",
+        ),
+        (
+            "devices",
+            "regions",
+            "SELECT name FROM regions ORDER BY name",
+        ),
+        (
+            "erp",
+            "districts",
+            "SELECT name || ' ' || zone FROM districts ORDER BY 1",
+        ),
+        ("erp", "regions", "SELECT name FROM regions ORDER BY name"),
+    ];
+
+    /// Each step: its name and the statements run before its passes.
+    #[cfg(feature = "postgres")]
+    pub const STEPS: &[(&str, &str)] = &[
+        // Each provisioned: the devices with every table, the ERP with the
+        // regions and the district of a live list, its code joined in.
+        (
+            "rows",
+            "INSERT INTO fixture.regions VALUES
+               ('0192f6a0-0000-7000-8000-000000000a01', '00000000-0000-0000-0000-000000000000', 'coast');
+             INSERT INTO fixture.lists VALUES
+               ('0192f6a0-0000-7000-8000-000000000b01', '00000000-0000-0000-0000-000000000000', 'A', true);
+             INSERT INTO fixture.districts VALUES
+               ('0192f6a0-0000-7000-8000-000000000c01', '00000000-0000-0000-0000-000000000000',
+                '0192f6a0-0000-7000-8000-000000000a01', '0192f6a0-0000-7000-8000-000000000b01', 'north'),
+               ('0192f6a0-0000-7000-8000-000000000c02', '00000000-0000-0000-0000-000000000000',
+                '0192f6a0-0000-7000-8000-000000000a01', NULL, 'south');",
+        ),
+        // The list's code: the devices get the list, the ERP its district.
+        (
+            "copied",
+            "UPDATE fixture.lists SET code = 'B' WHERE id = '0192f6a0-0000-7000-8000-000000000b01';",
+        ),
+        // The list no longer live: the ERP lets go of its district.
+        (
+            "left",
+            "UPDATE fixture.lists SET live = false WHERE id = '0192f6a0-0000-7000-8000-000000000b01';",
+        ),
+        (
+            "back",
+            "UPDATE fixture.lists SET live = true WHERE id = '0192f6a0-0000-7000-8000-000000000b01';",
+        ),
+        // A district joins the list: the ERP gets it.
+        (
+            "joined",
+            "UPDATE fixture.districts SET list_id = '0192f6a0-0000-7000-8000-000000000b01'
+              WHERE id = '0192f6a0-0000-7000-8000-000000000c02';",
+        ),
+        (
+            "gone",
+            "DELETE FROM fixture.districts WHERE id = '0192f6a0-0000-7000-8000-000000000c01';",
+        ),
+    ];
+
+    /// What each replica holds after each step, written by hand from what
+    /// the protocol says.
+    #[cfg(feature = "postgres")]
+    pub const HOLDS: &[(&str, &str, &str)] = &[
+        (
+            "rows",
+            "devices",
+            r#"{"districts":["north","south"],"lists":["A live"],"regions":["coast"]}"#,
+        ),
+        (
+            "rows",
+            "erp",
+            r#"{"districts":["north A"],"regions":["coast"]}"#,
+        ),
+        (
+            "copied",
+            "devices",
+            r#"{"districts":["north","south"],"lists":["B live"],"regions":["coast"]}"#,
+        ),
+        (
+            "copied",
+            "erp",
+            r#"{"districts":["north B"],"regions":["coast"]}"#,
+        ),
+        (
+            "left",
+            "devices",
+            r#"{"districts":["north","south"],"lists":["B idle"],"regions":["coast"]}"#,
+        ),
+        ("left", "erp", r#"{"districts":[],"regions":["coast"]}"#),
+        (
+            "back",
+            "devices",
+            r#"{"districts":["north","south"],"lists":["B live"],"regions":["coast"]}"#,
+        ),
+        (
+            "back",
+            "erp",
+            r#"{"districts":["north B"],"regions":["coast"]}"#,
+        ),
+        (
+            "joined",
+            "devices",
+            r#"{"districts":["north","south"],"lists":["B live"],"regions":["coast"]}"#,
+        ),
+        (
+            "joined",
+            "erp",
+            r#"{"districts":["north B","south B"],"regions":["coast"]}"#,
+        ),
+        (
+            "gone",
+            "devices",
+            r#"{"districts":["south"],"lists":["B live"],"regions":["coast"]}"#,
+        ),
+        (
+            "gone",
+            "erp",
+            r#"{"districts":["south B"],"regions":["coast"]}"#,
+        ),
+    ];
+}
+
 /// The server's side of the golden messages: a server with every table of
 /// the suite and one replica, run step by step — the real relay's passes,
 /// and the real filing of the golden upload — each message it sends that
@@ -810,6 +1109,7 @@ mod server {
     impl Transport for Kept {
         async fn send(
             &self,
+            _audience: &str,
             _replica: Uuid,
             message: Vec<u8>,
             _id: &str,
@@ -855,8 +1155,11 @@ mod server {
         };
         let server = Server::install(
             pool.clone(),
-            golden_codecs(),
-            replicas,
+            vec![crate::plan::Audience::new(
+                "test",
+                replicas,
+                golden_codecs(),
+            )],
             kept.clone(),
             Anyone::new(pool.clone()),
             settings,
@@ -867,8 +1170,11 @@ mod server {
         // rejections past the two a message down carries here.
         let filer = Server::new(
             pool.clone(),
-            golden_codecs(),
-            replicas,
+            vec![crate::plan::Audience::new(
+                "test",
+                replicas,
+                golden_codecs(),
+            )],
             kept.clone(),
             Anyone::new(pool.clone()),
             Settings::default(),
@@ -1100,6 +1406,114 @@ mod server {
         matches_golden(GOLDEN, &format!("{header}{}", sent(pool).await));
     }
 
+    /// What one server sends a device and an ERP, step by step: each an
+    /// ordinary replica, its audience's tables in its audience's shapes.
+    /// Checked in beside the others, applied by the sqlite side's suite as
+    /// each kind of replica; `MAGIC_SYNC_BLESS=1` writes them anew.
+    #[sqlx::test(migrations = false)]
+    async fn the_golden_messages_of_two_audiences_are_what_the_server_sends(pool: crate::DbPool) {
+        use super::audiences::{self, DEVICE, ERP, HOLDS, STEPS};
+        /// A message, and the replica it went to.
+        type Addressed = (Uuid, Vec<u8>);
+        /// What the server sends, by replica.
+        #[derive(Clone, Default)]
+        struct ByReplica(Arc<Mutex<Vec<Addressed>>>);
+        impl Transport for ByReplica {
+            async fn send(
+                &self,
+                _audience: &str,
+                replica: Uuid,
+                message: Vec<u8>,
+                _id: &str,
+            ) -> Result<(), crate::Error> {
+                self.0.lock().unwrap().push((replica, message));
+                Ok(())
+            }
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        crate::plan::tests::install(&mut conn).await;
+        sqlx::raw_sql(audiences::SERVER_SCHEMA)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync.epoch SET epoch = $1::uuid, secret = '\\x5eed'")
+            .bind(EPOCH)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        crate::envelope::PINNED_NONCES.set(Some(nonce_of(1)));
+        for (table, replica) in [("devices", DEVICE), ("erps", ERP)] {
+            sqlx::query(&format!(
+                "INSERT INTO fixture.{table} VALUES ($1::uuid, '00000000-0000-0000-0000-000000000000', true)"
+            ))
+            .bind(replica)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        drop(conn);
+        let sent = ByReplica::default();
+        let server = Server::install(
+            pool.clone(),
+            audiences::both(),
+            sent.clone(),
+            Anyone::new(pool.clone()),
+            Settings::default(),
+        )
+        .await
+        .unwrap();
+        let mut snapshots: Vec<String> = Vec::new();
+        let mut out = String::new();
+        for (step, sql) in STEPS {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+            while server.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+            let messages = std::mem::take(&mut *sent.0.lock().unwrap());
+            for (audience, replica) in [("devices", DEVICE), ("erp", ERP)] {
+                for (_, bytes) in messages.iter().filter(|(to, _)| to.to_string() == replica) {
+                    let mut message = ToReplica::decode(bytes.as_slice()).unwrap();
+                    let (snapshot, outcome) = match &mut message.body {
+                        Some(Body::Down(m)) => (&mut m.snapshot_id, "applied"),
+                        Some(Body::EndSnapshot(m)) => (&mut m.snapshot_id, "ended"),
+                        other => panic!("{step}: {other:?}"),
+                    };
+                    if !snapshot.is_empty() {
+                        let at =
+                            snapshots
+                                .iter()
+                                .position(|s| s == snapshot)
+                                .unwrap_or_else(|| {
+                                    snapshots.push(snapshot.clone());
+                                    snapshots.len() - 1
+                                });
+                        *snapshot = format!("0192f6a0-0000-7000-8000-{:012x}", 0x5000 + at);
+                    }
+                    out.push_str(&format!(
+                        "{audience}.{step} {outcome} {}\n",
+                        hex(&message.encode_to_vec())
+                    ));
+                }
+                let holds = HOLDS
+                    .iter()
+                    .find(|(s, a, _)| s == step && *a == audience)
+                    .expect("what it holds")
+                    .2;
+                out.push_str(&format!("holds {audience}.{step} {holds}\n"));
+            }
+        }
+        let header = "# What one server sends a replica of each of two audiences, step by step:\n\
+                      # `audience.step outcome hex` per message, `outcome` what the replica makes\n\
+                      # of it — applied, ended. After a step, `holds audience.step json`: what\n\
+                      # the replica then holds, per table its rows as text (districts: name, and\n\
+                      # the ERP's its zone; lists: code, and live or idle; regions: name).\n\
+                      # The devices hold regions, lists and districts as they are; the ERP holds\n\
+                      # regions and its own districts — the list's code joined in as `zone`, only\n\
+                      # while the list is live, sent again when the list changes. Each is an\n\
+                      # ordinary replica: the wire knows no audience.\n\
+                      # Generated by conformance::server; applied by the replica conformance\n\
+                      # suite, as a device and as the ERP.\n";
+        matches_golden(audiences::GOLDEN, &format!("{header}{out}"));
+    }
+
     /// What the server makes of what a replica says, and of what it does to
     /// rows written on both sides and its own — each upload as a replica
     /// sends it, after a provisioning, a change and a take-back it applied:
@@ -1139,8 +1553,11 @@ mod server {
         let kept = Kept::default();
         let server = Server::install(
             pool.clone(),
-            golden_codecs(),
-            Replicas::new("fixture.t_replicas", "t_replicas").live("live"),
+            vec![crate::plan::Audience::new(
+                "test",
+                Replicas::new("fixture.t_replicas", "t_replicas").live("live"),
+                golden_codecs(),
+            )],
             kept.clone(),
             Anyone::new(pool.clone()),
             Settings::default(),

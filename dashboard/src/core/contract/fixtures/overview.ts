@@ -97,6 +97,7 @@ export default {
     "first": [
       {
         "applied_at": "2026-01-01T00:00:00.123456Z",
+        "audience": "test",
         "backlog": null,
         "failures": 0,
         "last_error": null,
@@ -120,6 +121,7 @@ export default {
       },
       {
         "applied_at": null,
+        "audience": "test",
         "backlog": null,
         "failures": 1,
         "last_error": "00000000-0000-7000-8000-000000000001 unreachable",
@@ -143,6 +145,7 @@ export default {
       },
       {
         "applied_at": null,
+        "audience": "test",
         "backlog": {
           "at": "2026-01-01T00:00:00.123456Z",
           "tables": [
@@ -176,6 +179,7 @@ export default {
       },
       {
         "applied_at": "2026-01-01T00:00:00.123456Z",
+        "audience": "test",
         "backlog": null,
         "failures": 0,
         "last_error": null,
@@ -208,6 +212,7 @@ export default {
   },
   "tables": [
     {
+      "audience": "test",
       "in_flight": 6,
       "parked": 1,
       "pending": 0,
@@ -218,6 +223,7 @@ export default {
       "unfiled": 0
     },
     {
+      "audience": "test",
       "in_flight": 0,
       "parked": 0,
       "pending": 0,
@@ -228,6 +234,7 @@ export default {
       "unfiled": 1
     },
     {
+      "audience": "test",
       "in_flight": 0,
       "parked": 1,
       "pending": 0,
@@ -238,6 +245,7 @@ export default {
       "unfiled": 0
     },
     {
+      "audience": "test",
       "in_flight": 0,
       "parked": 1,
       "pending": 0,

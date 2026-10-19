@@ -1,10 +1,11 @@
 //! The server's side.
 
+pub mod audiences;
 pub mod partitioned;
 
 use crate::rows::RegisterSetting;
 use magic_sync::envelope::Limits;
-use magic_sync::plan::Engine;
+use magic_sync::plan::{Audience, Engine};
 use magic_sync::run::server::{Senders, Server, Settings, Transport, Wished};
 use magic_sync::status::{ReplicaState, RowState, Scope, WishState};
 use magic_sync::Error;
@@ -17,15 +18,14 @@ use uuid::Uuid;
 // ANCHOR: triggers
 pub async fn print_triggers(pool: &PgPool) -> Result<(), Error> {
     let mut conn = pool.acquire().await?;
-    println!(
-        "{}",
-        Engine::triggers(&mut conn, &codecs(), REGISTERS).await?
-    );
-    println!(
-        "{}",
-        Engine::indexes(&mut conn, &codecs(), REGISTERS).await?
-    );
+    println!("{}", Engine::triggers(&mut conn, &audiences()).await?);
+    println!("{}", Engine::indexes(&mut conn, &audiences()).await?);
     Ok(())
+}
+
+/// The one kind of replica the shop serves: its registers.
+fn audiences() -> [Audience<()>; 1] {
+    [Audience::new("registers", REGISTERS, codecs())]
 }
 // ANCHOR_END: triggers
 
@@ -59,7 +59,7 @@ pub struct Companies(pub PgPool);
 impl Senders for Companies {
     type Known = Company; // the `P` of `Codec<P>`
 
-    async fn known(&self, register: Uuid) -> Result<Option<Company>, Error> {
+    async fn known(&self, _audience: &str, register: Uuid) -> Result<Option<Company>, Error> {
         let company = sqlx::query_scalar("SELECT company_id FROM shop.registers WHERE id = $1")
             .bind(register)
             .fetch_optional(&self.0)
@@ -238,7 +238,7 @@ mod tests {
             .execute(&mut *conn)
             .await
             .expect("the shop's tables");
-        let printed = Engine::triggers(&mut conn, &codecs(), REGISTERS)
+        let printed = Engine::triggers(&mut conn, &audiences())
             .await
             .expect("the triggers");
         let path = format!("{root}/../src/guide/shop-triggers.sql");

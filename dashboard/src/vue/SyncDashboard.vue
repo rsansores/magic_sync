@@ -69,6 +69,8 @@ const {
 })
 
 const n = (value: number) => count(value, locale.value)
+// One audience goes without saying; several, each row says its own.
+const several = computed(() => (summary.value?.audiences.length ?? 0) > 1)
 const states: ReplicaState[] = ['awaiting_fix', 'unreachable', 'catching_up', 'synced']
 
 type Tab = 'replicas' | 'tables' | 'problems'
@@ -269,6 +271,7 @@ watch(selected, async (now, before) => {
                 <span class="msd-row-head">
                   <span class="msd-state" :data-state="r.state">{{ describeState(r.state, t) }}</span>
                   <span class="msd-name">{{ r.name }}</span>
+                  <span v-if="several" class="msd-muted">{{ r.audience }}</span>
                 </span>
                 <span v-for="line in describeReplica(r, speech)" :key="line" class="msd-muted">{{
                   line
@@ -300,10 +303,11 @@ watch(selected, async (now, before) => {
           tabindex="0"
         >
           <ul class="msd-list">
-            <li v-for="tb in summary.tables" :key="tb.table" class="msd-item">
+            <li v-for="tb in summary.tables" :key="`${tb.audience}/${tb.table}`" class="msd-item">
               <span class="msd-row-head">
                 <span class="msd-dot msd-dot-small" :data-mood="tableMood(tb)" aria-hidden="true" />
                 <span class="msd-name">{{ tb.label }}</span>
+                <span v-if="several" class="msd-muted">{{ tb.audience }}</span>
               </span>
               <span v-for="line in describeTable(tb, speech)" :key="line" class="msd-muted">{{ line }}</span>
             </li>

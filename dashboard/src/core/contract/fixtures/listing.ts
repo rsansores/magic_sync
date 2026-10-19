@@ -9,6 +9,7 @@ export default {
     "first": [
       {
         "applied_at": null,
+        "audience": "test",
         "backlog": {
           "at": "2026-01-01T00:00:00.123456Z",
           "tables": [

@@ -122,6 +122,8 @@ pub use row::{Columns, Row};
 /// | `sync` | which replicas hold which rows, for `catalog` and `both`: `broadcast` (every replica of the row's partition), `assigned(col)` (the replica `col` names: a uuid, or an `Option` of one), `follows(col)` (wherever the row `col` points at goes: one column, the whole of a foreign key into a mirrored table) or `grouped(members = t, assigned = t)` (every replica a group holding the row is given to). Left out, a row travels only with a row that points at it |
 /// | `key` | the primary key's columns, in any order, when it is not `id`: `key = "list_id, customer_id"`. Each is a uuid or an integer ([`row::KeyValue`]), and a field of the row itself — not of a part flattened in |
 /// | `active` | for `catalog` and `both`, the relation the rows the table's rule sends are read through on the server — `view` or `schema.view` (a name has no dot), a view that leaves out the rows no replica is sent for their own sake; one it leaves out still travels while a row a replica holds points at it |
+/// | `from` | for `catalog`, the relation a row is read from on the server when not the table — `view` or `schema.view` — a view over the table, keyed as it is, that may join columns of other tables in and leave rows out: the rows it leaves out are not sent, as with `active`, which it replaces. The table is still what the row is noted, keyed and placed by, so two audiences (the server's `plan::Audience`) may hold one table in two shapes. A row it leaves out that a row sent points at cannot go, and neither can that row |
+/// | `depends` | for `catalog` and `both`, columns of the table — each a foreign key of its own, or beside the partition column when the parent's key holds that too — whose parent's columns the row copies through `from`: `depends = "list_id"`. A change of the parent is a change of every row pointing at it so, sent again to whoever holds it, in the audience whose row says so. The parent need not be mirrored: the engine notes it all the same. One hop: a grandparent's columns are the parent's to say |
 /// | `retired` | for `catalog` and `both`, the column a replica sets on a row it lets go of but must keep, because a row of its own points at it. It is left out of the row as a rule; a row that has it as a field too gets it back as the server sends it, which is live |
 /// | `origin` | for `record`, `both` and `setting` — required for a `setting`, where it is the replica a wish of the row goes to — the uuid key column naming the replica a row belongs to: a replica deletes only its own rows |
 /// | `apply` | for a `setting`, which wish its replica carries out ([`row::Apply`]): `always` (the default) or `if_unchanged`, only while it still holds the version the wish is based on |
@@ -194,7 +196,7 @@ pub type Conn = sqlx::SqliteConnection;
 /// refuses to run against a database that installed another. It counts the
 /// server's own steps, independent of the replicas' version.
 #[cfg(feature = "postgres")]
-pub const SERVER_SCHEMA_VERSION: i32 = 2;
+pub const SERVER_SCHEMA_VERSION: i32 = 3;
 
 /// The version of the engine's tables on a replica: the replica refuses to
 /// run against a database that installed another. It counts the replica's own

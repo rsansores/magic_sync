@@ -34,8 +34,7 @@ pub struct Product {
 let server = Arc::new(
     Server::new(
         pool.clone(),
-        codecs(),
-        REGISTERS,
+        vec![Audience::new("registers", REGISTERS, codecs())],
         transport,
         Anyone::new(pool),
         Settings::default(),

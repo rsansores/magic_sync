@@ -1,0 +1,5 @@
+error: from = "a.b.c": expected `view` or `schema.view`
+ --> tests/derive/fail/from_with_two_dots.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", from = "a.b.c")]
+  |                                                    ^^^^^^^

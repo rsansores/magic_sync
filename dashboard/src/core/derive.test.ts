@@ -180,7 +180,7 @@ describe('progressOf', () => {
   })
 
   it('is complete when a replica should hold nothing', () => {
-    expect(progressOf({ replica: id(9), tables: [] }).share).toBe(1)
+    expect(progressOf({ replica: id(9), audience: 'registers', tables: [] }).share).toBe(1)
   })
 })
 
@@ -203,5 +203,28 @@ describe('a value an engine newer than the dashboard added', () => {
     expect(placeMoodOf('holds')).toBe('holds')
     expect(placeMoodOf('quarantined')).toBe('set_aside')
     expect(['teleporting', 'toString'].map(placeMoodOf)).toEqual(['unknown', 'unknown'])
+  })
+})
+
+describe('an engine of several audiences', () => {
+  it('lists a table once for each audience that holds it, and says which', () => {
+    const table = settled.tables[0]!
+    const two: Overview = {
+      ...settled,
+      tables: [
+        { ...table, audience: 'devices' },
+        { ...table, audience: 'erp' },
+      ],
+    }
+    const summary = summarize(two, options)
+    expect(summary.audiences).toEqual(['devices', 'erp'])
+    expect(summary.tables.map((t) => [t.table, t.audience])).toEqual([
+      [table.table, 'devices'],
+      [table.table, 'erp'],
+    ])
+  })
+
+  it('names one when the engine serves one', () => {
+    expect(summarize(settled, options).audiences).toHaveLength(1)
   })
 })
