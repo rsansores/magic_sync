@@ -604,7 +604,6 @@ impl Mirror {
     }
 }
 
-/// Refuses `lit`, given on a table that is not sent down.
 /// The relation `key = "…"` names, `view` or `schema.view`, quoted.
 fn relation(lit: Option<&LitStr>, key: &str) -> syn::Result<Option<String>> {
     let Some(lit) = lit else {
@@ -625,6 +624,7 @@ fn relation(lit: Option<&LitStr>, key: &str) -> syn::Result<Option<String>> {
     Ok(Some(quoted.join(".")))
 }
 
+/// Refuses `lit`, given on a table that is not sent down.
 fn only_sent_down(lit: Option<&LitStr>, mirror: Mirror, what: &str) -> syn::Result<()> {
     match lit {
         Some(lit) if !mirror.sent_down() => Err(syn::Error::new_spanned(

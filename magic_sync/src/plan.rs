@@ -178,9 +178,10 @@ struct Dependency {
     key: Vec<String>,
     /// The parent has the replicas' partition column, which its notes say.
     partitioned: bool,
-    /// The SQL type of the child's column: a parent's key, as text, is cast
-    /// to it, so the child's rows are found by its index.
-    cast: String,
+    /// The SQL types of the child's columns: each part of a parent's key,
+    /// as text, is cast to its column's, so the child's rows are found by
+    /// its index.
+    casts: Vec<String>,
 }
 
 /// A table of the schema, by its schema and name.
@@ -1329,6 +1330,11 @@ impl Engine {
                         plan.table, noted.effective, effective
                     )));
                 }
+                // Partitioned otherwise, the audiences agree the table has no
+                // partition column: the trigger says none, whatever their order.
+                if noted.partition != partition {
+                    noted.partition = "";
+                }
                 // The trigger writes the key in one order, which every
                 // audience reads it in.
                 if noted.key != key {
@@ -1364,7 +1370,12 @@ impl Engine {
                     }
                     // Whatever columns of it a row copies, a change of any
                     // is a change: none is left to the replicas.
-                    Some((_, noted)) => noted.owned.clear(),
+                    Some((_, noted)) => {
+                        if noted.partition != partition {
+                            noted.partition = "";
+                        }
+                        noted.owned.clear();
+                    }
                     None => rows.push((
                         dependency.parent.clone(),
                         Noted {
@@ -1517,13 +1528,11 @@ impl Engine {
     }
 
     /// Looks at every audience's replicas, as [`Planner::observe`] does;
-    /// once what one declares changed, the pending changes of a table no
-    /// audience notes any more are done.
+    /// the pending changes of a table no audience notes any more are done.
     pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
         let names: Vec<&str> = self.audiences.iter().map(|a| a.name).collect();
-        let mut redeclared = false;
         for planner in &self.audiences {
-            redeclared |= planner.observe(conn, &names).await?;
+            planner.observe(conn, &names).await?;
         }
         // A replica no audience took — of an audience no longer declared,
         // or seen before there were audiences and live in none now — is
@@ -1544,15 +1553,15 @@ impl Engine {
         .bind(&names)
         .execute(&mut *conn)
         .await?;
-        if redeclared {
-            sqlx::query(
-                "UPDATE sync.notes SET done_at = now() \
-                  WHERE done_at IS NULL AND kind IN ('row', 'retry') AND relation <> ALL($1)",
-            )
-            .bind(self.noted_tables())
-            .execute(&mut *conn)
-            .await?;
-        }
+        // A change of a table no audience notes any more — no longer
+        // declared, or of an audience gone — is done: nothing plans it.
+        sqlx::query(
+            "UPDATE sync.notes SET done_at = now() \
+              WHERE done_at IS NULL AND kind IN ('row', 'retry') AND relation <> ALL($1)",
+        )
+        .bind(self.noted_tables())
+        .execute(&mut *conn)
+        .await?;
         Ok(())
     }
 
@@ -1850,27 +1859,42 @@ impl Planner {
         }
         for (plan, t) in plans.iter_mut().zip(&tables) {
             for &column in t.depends {
-                let Some((_, parent, _, parent_columns)) = foreign_keys
-                    .iter()
-                    .find(|(child, _, c, _)| *child == plan.relation && c == &[column])
+                // The foreign key of the column — beside the partition
+                // column, when the parent's key holds that too.
+                let Some((_, parent, child_columns, parent_columns)) =
+                    foreign_keys.iter().find(|(child, _, c, _)| {
+                        *child == plan.relation
+                            && c.iter().any(|c| c == column)
+                            && c.iter().all(|c| c == column || c == partition)
+                    })
                 else {
                     return Err(Error::Misuse(format!(
-                        "`{}` depends on `{column}`, which is not the whole of a foreign key \
-                         of its table",
+                        "`{}` depends on `{column}`, which is no foreign key of its table — \
+                         alone, or beside the partition column",
                         plan.table
                     )));
                 };
                 let key = crate::dialect::primary_key(conn, &parent.schema, &parent.name).await?;
-                if *parent_columns != key {
+                let in_key_order: Option<Vec<String>> = key
+                    .iter()
+                    .map(|k| {
+                        parent_columns
+                            .iter()
+                            .position(|p| p == k)
+                            .map(|i| child_columns[i].clone())
+                    })
+                    .collect();
+                let Some(columns) = in_key_order.filter(|_| parent_columns.len() == key.len())
+                else {
                     return Err(Error::Misuse(format!(
                         "`{}` depends on `{column}`, which points at {} by {parent_columns:?}, \
                          not its key",
                         plan.table,
                         parent.sql()
                     )));
-                }
-                let columns = typed_columns(conn, &parent.sql()).await?;
-                let partitioned = match type_of(&columns, partition) {
+                };
+                let parent_typed = typed_columns(conn, &parent.sql()).await?;
+                let partitioned = match type_of(&parent_typed, partition) {
                     None => false,
                     Some(t) if t == "uuid" => true,
                     Some(_) => {
@@ -1881,14 +1905,17 @@ impl Planner {
                         )))
                     }
                 };
-                let cast = type_of(&typed_columns(conn, &plan.relation.sql()).await?, column)
-                    .expect("a column of a foreign key is a column");
+                let typed = typed_columns(conn, &plan.relation.sql()).await?;
+                let casts = columns
+                    .iter()
+                    .map(|c| type_of(&typed, c).expect("a column of a foreign key is a column"))
+                    .collect();
                 plan.depends.push(Dependency {
                     parent: parent.clone(),
-                    columns: vec![column.to_owned()],
+                    columns,
                     key,
                     partitioned,
-                    cast,
+                    casts,
                 });
             }
         }
@@ -2119,9 +2146,9 @@ impl Planner {
     /// of the audiences `declared` is that one's until it lets it go; one
     /// recorded live in an audience no longer declared is taken as one that
     /// arrived. When what places the audience's rows changed since the
-    /// engine last ran, every one of its live replicas is provisioned again:
-    /// answers whether it did. The relay runs it before every pass.
-    pub(crate) async fn observe(&self, conn: &mut Conn, declared: &[&str]) -> Result<bool, Error> {
+    /// engine last ran, every one of its live replicas is provisioned again.
+    /// The relay runs it before every pass.
+    pub(crate) async fn observe(&self, conn: &mut Conn, declared: &[&str]) -> Result<(), Error> {
         let name = literal(self.name);
         let claimed: i64 = sqlx::query_scalar(&format!(
             "WITH now AS (SELECT s.id, s.partition FROM {} \
@@ -2166,12 +2193,11 @@ impl Planner {
     /// changed — a deploy that routes a table otherwise, mirrors one more or
     /// one less, sends another column — every live replica of the audience
     /// is provisioned again, and what the engine kept for them of a table
-    /// the audience no longer holds is let go of. Answers whether it
-    /// changed. On the first run after an engine of one audience learned of
+    /// the audience no longer holds is let go of. On the first run after an engine of one audience learned of
     /// audiences, an audience that took over that engine's replicas
     /// (`legacy`), or declares what it ran with, compares with what it ran
     /// with.
-    async fn redeclared(&self, conn: &mut Conn, legacy: bool) -> Result<bool, Error> {
+    async fn redeclared(&self, conn: &mut Conn, legacy: bool) -> Result<(), Error> {
         let declared = self.declared();
         let now: String = sqlx::query_scalar("SELECT encode(sync.digest($1), 'hex')")
             .bind(&declared)
@@ -2183,7 +2209,7 @@ impl Planner {
                 .fetch_optional(&mut *conn)
                 .await?;
         if own.as_deref() == Some(now.as_str()) {
-            return Ok(false);
+            return Ok(());
         }
         let before = match own {
             Some(own) => Some(own),
@@ -2201,7 +2227,7 @@ impl Planner {
         .execute(&mut *conn)
         .await?;
         if before.is_none_or(|before| before == now) {
-            return Ok(false);
+            return Ok(());
         }
         tracing::warn!(audience = self.name, "sync: what places the rows changed since the engine last ran — every replica of the audience is provisioned again");
         let tables: Vec<&str> = self.plans.iter().map(|p| p.table).collect();
@@ -2225,7 +2251,7 @@ impl Planner {
         )))
         .execute(&mut *conn)
         .await?;
-        Ok(true)
+        Ok(())
     }
 
     /// How a broadcast row meets the replicas of its partition.
@@ -2534,13 +2560,25 @@ impl Planner {
                 if keys.is_empty() {
                     continue;
                 }
+                let parts: Vec<String> = dependency
+                    .columns
+                    .iter()
+                    .zip(&dependency.casts)
+                    .enumerate()
+                    .map(|(n, (c, cast))| {
+                        format!(
+                            "t.{} = split_part(p.row_key, '|', {})::{cast}",
+                            ident(c),
+                            n + 1
+                        )
+                    })
+                    .collect();
                 let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
                     "SELECT {}, max(p.id) FROM unnest($1::text[], $2::int8[]) AS p(row_key, id) \
-                       JOIN {} t ON t.{} = p.row_key::{} GROUP BY 1",
+                       JOIN {} t ON {} GROUP BY 1",
                     self.key_of_row(i),
                     plan.relation.sql(),
-                    ident(&dependency.columns[0]),
-                    dependency.cast,
+                    parts.join(" AND "),
                 ))
                 .bind(&keys)
                 .bind(&ids)

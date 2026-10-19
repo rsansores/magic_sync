@@ -737,7 +737,7 @@ async fn a_send_that_never_answers_holds_back_no_other_replica(pool: crate::DbPo
     impl Transport for Stuck {
         async fn send(
             &self,
-            _audience: &str,
+            audience: &str,
             replica: Uuid,
             message: Vec<u8>,
             id: &str,
@@ -745,7 +745,7 @@ async fn a_send_that_never_answers_holds_back_no_other_replica(pool: crate::DbPo
             if replica == self.replica {
                 std::future::pending::<()>().await;
             }
-            self.fake.send(_audience, replica, message, id).await
+            self.fake.send(audience, replica, message, id).await
         }
     }
     let world = world(pool).await;
@@ -1383,7 +1383,7 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
     impl Transport for Partial {
         async fn send(
             &self,
-            _audience: &str,
+            audience: &str,
             replica: Uuid,
             message: Vec<u8>,
             id: &str,
@@ -1395,7 +1395,7 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
                 }
                 *left -= 1;
             }
-            self.wire.send(_audience, replica, message, id).await
+            self.wire.send(audience, replica, message, id).await
         }
     }
     let world = world(pool).await;
@@ -2349,7 +2349,7 @@ async fn replicas_are_sent_to_side_by_side_each_in_order(pool: crate::DbPool) {
     impl Transport for Slow {
         async fn send(
             &self,
-            _audience: &str,
+            audience: &str,
             replica: Uuid,
             message: Vec<u8>,
             id: &str,
@@ -2359,7 +2359,7 @@ async fn replicas_are_sent_to_side_by_side_each_in_order(pool: crate::DbPool) {
             self.most.fetch_max(now, SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             self.under_way.fetch_sub(1, SeqCst);
-            self.fake.send(_audience, replica, message, id).await
+            self.fake.send(audience, replica, message, id).await
         }
     }
     let world = world(pool).await;

@@ -71,8 +71,8 @@ points at it, for the audience whose row copies it: the books get their
 products again with the new code, and the registers, whose products copy
 nothing, get nothing.
 
-Each column `depends` names is the whole of a foreign key of the table (the
-partition column aside). The parent need not be one of anyone's tables: the
+Each column `depends` names is a foreign key of the table: alone, or beside
+the partition column when the parent's key holds that too. The parent need not be one of anyone's tables: the
 engine notes it all the same, with a trigger of its own. One hop: a column
 copied from a grandparent is the parent's change to make.
 

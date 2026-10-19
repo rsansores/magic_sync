@@ -616,14 +616,6 @@ fn keys_per_statement<R: Row>() -> usize {
     (crate::dialect::MAX_BINDS / R::KEY.len().max(1)).max(1)
 }
 
-/// Every row of `keys` the table holds, retired or not — what sync sends,
-/// read from the table itself rather than as the replicas see it. A key with
-/// no row is left out.
-///
-/// # Errors
-///
-/// [`Error::Database`] when the database fails, or a row does not decode as
-/// `R`.
 /// Where `R`'s rows are read from on this side: its `from` relation on the
 /// server, when it has one, else its table.
 fn read_from<R: Row>() -> &'static str {
@@ -634,6 +626,14 @@ fn read_from<R: Row>() -> &'static str {
     R::QUALIFIED
 }
 
+/// Every row of `keys` the table holds, retired or not — what sync sends,
+/// read from the table, or the relation the row is read `from`, rather than
+/// as the replicas see it. A key with no row is left out.
+///
+/// # Errors
+///
+/// [`Error::Database`] when the database fails, or a row does not decode as
+/// `R`.
 pub(crate) async fn get_by_keys<R: Row>(exec: &mut Conn, keys: &[Key]) -> Result<Vec<R>, Error> {
     let names: Vec<&str> = declared::<R>().into_iter().map(|c| c.name).collect();
     let mut out = Vec::with_capacity(keys.len());

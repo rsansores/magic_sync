@@ -1611,9 +1611,8 @@ impl Engine {
     }
 
     /// Each table of each audience of the scope, over that audience's
-    /// replicas: its pending changes are those its audience plans — of its
-    /// rows, a group of it, a parent it copies — and a change of a table no
-    /// audience knows is the first's.
+    /// replicas: its pending changes are those of its rows or a group of
+    /// it, and a change of a table no audience knows is the first's.
     async fn tables_of(
         &self,
         conn: &mut Conn,
@@ -1641,7 +1640,10 @@ impl Engine {
                 .collect();
             for note in notes {
                 let Some(table) = &note.table else { continue };
-                if !(self.plans_note(a, note) || n == 0 && self.nobodys(note)) {
+                // A parent the audience only copies is no table of its: its
+                // changes count on the replicas, not here.
+                let holds = planner.knows(table);
+                if !(holds || n == 0 && self.nobodys(note)) {
                     continue;
                 }
                 let entry = out.entry(table.clone()).or_insert_with(|| blank(table));

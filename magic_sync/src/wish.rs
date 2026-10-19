@@ -512,12 +512,15 @@ mod server {
         codecs
             .iter()
             .find(|c| c.table.name == R::TABLE)
-            .ok_or_else(|| {
-                Error::Misuse(format!(
-                    "`{}` is no table this server mirrors: list its codec",
-                    R::TABLE
-                ))
-            })
+            .ok_or_else(unmirrored::<R>)
+    }
+
+    /// `R` is no table of the server's.
+    fn unmirrored<R: Setting>() -> Error {
+        Error::Misuse(format!(
+            "`{}` is no table this server mirrors: list its codec",
+            R::TABLE
+        ))
     }
 
     /// The replica a setting row belongs to: its origin.
@@ -541,7 +544,7 @@ mod server {
         note: Option<&str>,
     ) -> Result<Wished, Error> {
         if !codecs.iter().any(|c| codec_of::<R, P>(c).is_ok()) {
-            codec_of::<R, P>(&[])?;
+            return Err(unmirrored::<R>());
         }
         let key = wanted.key();
         let replica = replica_of::<R>(&key);

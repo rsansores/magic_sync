@@ -504,7 +504,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         };
         let codecs = &self.audiences[audience].codecs;
         let name = self.audiences[audience].name;
-        let filed = match self.file(name, codecs, replica, &up).await {
+        let filed = match self.file(audience, replica, &up).await {
             Ok(Some(filed)) => filed,
             Ok(None) => {
                 tracing::warn!(%replica, "sync: an upload from no replica this server knows — dropped");
@@ -558,31 +558,28 @@ impl<S: Senders, T: Transport> Server<S, T> {
         Ok(filed)
     }
 
-    /// Files `up` from `replica`, of the audience `audience` whose tables
-    /// `codecs` write, in the transaction the host gives for it; `None` for
-    /// a replica the host does not know, or that is no row of the
-    /// audience's replicas any more.
+    /// Files `up` from `replica`, of the audience at `audience`, by its
+    /// tables, in the transaction the host gives for it; `None` for a
+    /// replica the host does not know, or that is no row of the audience's
+    /// replicas any more.
     async fn file(
         &self,
-        audience: &str,
-        codecs: &[Codec<S::Known>],
+        audience: usize,
         replica: Uuid,
         up: &Up,
     ) -> Result<Option<Vec<filing::Filed>>, Error> {
-        let Some(known) = self.senders.known(audience, replica).await? else {
+        let of = &self.audiences[audience];
+        let Some(known) = self.senders.known(of.name, replica).await? else {
             return Ok(None);
         };
         let mut tx = self.senders.filing(&known).await?;
-        let Some(of) = self.engine.audience(audience) else {
-            return Ok(None);
-        };
-        if !self.engine.audiences[of]
+        if !self.engine.audiences[audience]
             .is_replica(&mut tx, replica)
             .await?
         {
             return Ok(None);
         }
-        let filed = filing::file(&mut tx, codecs, up, replica, &known, self.inbox()).await?;
+        let filed = filing::file(&mut tx, &of.codecs, up, replica, &known, self.inbox()).await?;
         tx.commit().await?;
         Ok(Some(filed))
     }

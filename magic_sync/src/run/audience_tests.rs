@@ -113,8 +113,12 @@ impl World {
     }
 
     async fn serving(pool: PgPool, audiences: Vec<Audience<()>>) -> Self {
+        Self::serving_with(pool, SCHEMA, audiences).await
+    }
+
+    async fn serving_with(pool: PgPool, schema: &str, audiences: Vec<Audience<()>>) -> Self {
         let mut conn = pool.acquire().await.unwrap();
-        sqlx::raw_sql(SCHEMA).execute(&mut *conn).await.unwrap();
+        sqlx::raw_sql(schema).execute(&mut *conn).await.unwrap();
         let (partition, device, erp) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
         for (table, id) in [("devices", device), ("erps", erp)] {
             sqlx::query(&format!(
@@ -622,7 +626,7 @@ async fn a_dependency_that_is_no_foreign_key_is_refused(pool: PgPool) {
     .await;
     match refused {
         Err(Error::Misuse(why)) => assert!(
-            why.contains("depends on `name`, which is not the whole of a foreign key"),
+            why.contains("depends on `name`, which is no foreign key of its table"),
             "{why}"
         ),
         other => panic!("not refused: {other:?}"),
@@ -996,6 +1000,36 @@ async fn a_parent_without_the_partition_column_may_be_copied(pool: PgPool) {
         !zones.contains("'note'"),
         "a change of what the replicas own is a change too: {zones}"
     );
+    // An audience of no partition holds the zones too: the one trigger is
+    // the same whichever is declared first.
+    let plain = || {
+        Audience::new(
+            "plain",
+            Replicas::new("fixture.devices", "devices"),
+            vec![Codec::json::<Zone>(None)],
+        )
+    };
+    let mut first = audiences();
+    first.push(plain());
+    let mut second = vec![plain()];
+    second.extend(audiences());
+    let zones_of = |printed: String| {
+        printed
+            .lines()
+            .find(|l| l.contains("\"zones\"") && l.contains("note_row"))
+            .map(str::to_owned)
+    };
+    let one = zones_of(
+        crate::plan::Engine::triggers(&mut conn, &first)
+            .await
+            .unwrap(),
+    );
+    let other = zones_of(
+        crate::plan::Engine::triggers(&mut conn, &second)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(one, other);
 }
 
 /// A replica counts only the changes its own audience plans: one of a table
@@ -1041,4 +1075,121 @@ async fn a_replica_waits_only_on_what_its_audience_plans(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(erp.pending, 0);
+}
+
+/// A table only an audience no longer declared held leaves no change behind
+/// to fail for ever: its pending changes are done.
+#[sqlx::test(migrations = false)]
+async fn changes_of_a_table_no_audience_holds_any_more_are_done(pool: PgPool) {
+    let world = World::serving(
+        pool,
+        vec![
+            Audience::new("devices", DEVICES, device_codecs()),
+            Audience::new("erp", ERPS, vec![Codec::json::<Region>(None)]),
+        ],
+    )
+    .await;
+    world.settle().await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.lists VALUES ('{LIST}', '{{p}}', 'A', true);"
+        ))
+        .await;
+    let without = Server::install(
+        world.pool.clone(),
+        vec![Audience::new(
+            "erp",
+            ERPS,
+            vec![Codec::json::<Region>(None)],
+        )],
+        Wire::default(),
+        Anyone::new(world.pool.clone()),
+        Settings::default(),
+    )
+    .await
+    .unwrap();
+    while without.pass_now().await.unwrap().unwrap_or_default() > 0 {}
+    let (pending, parked): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE done_at IS NULL), count(*) FILTER (WHERE parked_at IS NOT NULL) \
+           FROM sync.notes WHERE relation = 'lists'",
+    )
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!((pending, parked), (0, 0));
+}
+
+/// A row may copy a parent keyed by the partition column beside its own:
+/// the foreign key holds both, and a change of the parent is a change of
+/// the rows pointing at it.
+#[sqlx::test(migrations = false)]
+async fn a_parent_keyed_by_its_partition_may_be_copied(pool: PgPool) {
+    use crate::status::Scope;
+    #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+    #[row(
+        table = "districts",
+        schema = "fixture",
+        mirror = "catalog",
+        sync = "broadcast",
+        from = "fixture.banded",
+        depends = "band_id",
+        unmirrored = "list_id"
+    )]
+    struct Banded {
+        id: Uuid,
+        partition_id: Uuid,
+        region_id: Uuid,
+        band_id: Option<Uuid>,
+        name: String,
+        band: String,
+    }
+    let schema = format!(
+        "{SCHEMA} CREATE TABLE fixture.bands (partition_id UUID NOT NULL, id UUID NOT NULL, \
+             label TEXT NOT NULL, PRIMARY KEY (partition_id, id)); \
+         ALTER TABLE fixture.districts ADD COLUMN band_id UUID, \
+             ADD FOREIGN KEY (partition_id, band_id) REFERENCES fixture.bands (partition_id, id); \
+         CREATE INDEX ON fixture.districts (partition_id, band_id); \
+         CREATE VIEW fixture.banded AS \
+             SELECT d.id, d.partition_id, d.region_id, d.band_id, d.name, b.label AS band \
+               FROM fixture.districts d \
+               JOIN fixture.bands b ON b.partition_id = d.partition_id AND b.id = d.band_id;"
+    );
+    let pool_for = pool.clone();
+    let world = World::serving_with(
+        pool,
+        &schema,
+        vec![Audience::new(
+            "erp",
+            ERPS,
+            vec![Codec::json::<Region>(None), Codec::json::<Banded>(None)],
+        )],
+    )
+    .await;
+    let band = "01900000-0000-7000-8000-0000000000b9";
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast'); \
+             INSERT INTO fixture.bands VALUES ('{{p}}', '{band}', 'low'); \
+             INSERT INTO fixture.districts (id, partition_id, region_id, band_id, name) \
+             VALUES ('{NORTH}', '{{p}}', '{REGION}', '{band}', 'north');"
+        ))
+        .await;
+    world.settle().await;
+    assert_eq!(world.names(world.erp, "districts", "band"), set(&["low"]));
+    world
+        .exec(&format!(
+            "UPDATE fixture.bands SET label = 'high' WHERE id = '{band}';"
+        ))
+        .await;
+    // A change of the parent pending: no table of the ERP's is the bands.
+    let mut conn = pool_for.acquire().await.unwrap();
+    let overview = world
+        .server
+        .engine()
+        .overview(&mut conn, Scope::All, 10)
+        .await
+        .unwrap();
+    assert!(overview.tables.iter().all(|t| t.table != "bands"));
+    world.settle().await;
+    assert_eq!(world.names(world.erp, "districts", "band"), set(&["high"]));
 }
