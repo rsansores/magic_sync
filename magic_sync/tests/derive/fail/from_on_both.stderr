@@ -1,0 +1,5 @@
+error: a row read `from` a relation of its own is only sent down: needs `mirror = "catalog"`
+ --> tests/derive/fail/from_on_both.rs:2:49
+  |
+2 | #[row(table = "things", mirror = "both", from = "things_seen")]
+  |                                                 ^^^^^^^^^^^^^

@@ -50,6 +50,23 @@ mod imp {
         .await?)
     }
 
+    /// The columns of the relation SQL names `relation` — a table or a
+    /// view — as [`columns`] answers them; none when there is no such
+    /// relation.
+    pub(crate) async fn relation_columns(
+        conn: &mut Conn,
+        relation: &str,
+    ) -> Result<Vec<(String, bool, bool)>, Error> {
+        Ok(sqlx::query_as(
+            "SELECT a.attname::text, NOT a.attnotnull, a.attgenerated <> '' \
+               FROM pg_attribute a \
+              WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(relation)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
     /// The primary key's columns of `schema.table`, in key order.
     pub(crate) async fn primary_key(
         conn: &mut Conn,

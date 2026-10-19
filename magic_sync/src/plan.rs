@@ -198,6 +198,9 @@ pub(crate) struct Plan {
     relation: Relation,
     /// What the rows replicas should hold are read from.
     active: String,
+    /// What a row's columns are read from: the table, or the relation the
+    /// row is read `from`.
+    read: String,
     pub(crate) key: Vec<Column>,
     route: Route,
     references: Vec<Reference>,
@@ -1654,7 +1657,11 @@ impl Planner {
             }
             plans.push(Plan {
                 table: t.name,
-                active: t.active.map_or_else(|| relation.sql(), str::to_owned),
+                active: t
+                    .active
+                    .or(t.from)
+                    .map_or_else(|| relation.sql(), str::to_owned),
+                read: t.from.map_or_else(|| relation.sql(), str::to_owned),
                 relation,
                 key,
                 route: t.route,
@@ -1766,7 +1773,7 @@ impl Planner {
                 &format!("the active rows of `{}`, `{}`", plan.table, plan.active),
             )
             .await?;
-            let columns = typed_columns(conn, &plan.relation.sql()).await?;
+            let columns = typed_columns(conn, &plan.read).await?;
             // The length of text and bytes is read off the stored value
             // without decompressing it; anything else, as its text.
             plan.size = plan
@@ -1827,10 +1834,17 @@ impl Planner {
                 .iter()
                 .map(|r| format!("{} {:?}", self.plans[r.parent].table, r.columns))
                 .collect();
+            // Read from the table, it says nothing: what an engine of an
+            // earlier build declared is declared alike.
+            let read = if p.read == p.relation.sql() {
+                String::new()
+            } else {
+                format!(" from {}", p.read)
+            };
             let _ = writeln!(
                 out,
                 "{} {} active {} key {key:?} {:?} references {references:?} group {:?} columns {:?} \
-                 as {}",
+                 as {}{read}",
                 p.table,
                 p.relation.sql(),
                 p.active,
@@ -3526,7 +3540,7 @@ impl Planner {
                FROM unnest($1::text[]) WITH ORDINALITY AS k(row_key, n) \
                LEFT JOIN {} t ON {} ORDER BY k.n",
             plan.size,
-            plan.relation.sql(),
+            plan.read,
             self.row_is(i, "k.row_key"),
         ))
         .bind(keys)

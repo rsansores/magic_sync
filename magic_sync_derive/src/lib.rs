@@ -44,8 +44,8 @@ pub fn derive_columns(input: Tokens) -> Tokens {
 }
 
 /// The keys `#[row(…)]` takes on a struct that derives `Row`.
-const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `retired`, \
-                        `origin`, `unmirrored`, `apply` or `crate`";
+const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `from`, \
+                        `retired`, `origin`, `unmirrored`, `apply` or `crate`";
 
 /// PostgreSQL keeps the first 63 bytes of a longer name, and would answer
 /// for a table or column the row does not name.
@@ -59,6 +59,7 @@ struct Args {
     mirror: Option<LitStr>,
     sync: Option<LitStr>,
     active: Option<LitStr>,
+    from: Option<LitStr>,
     retired: Option<LitStr>,
     origin: Option<LitStr>,
     unmirrored: Option<LitStr>,
@@ -83,6 +84,7 @@ fn parse_args(input: &DeriveInput, only_crate: bool) -> syn::Result<Args> {
                 Some("mirror") => &mut args.mirror,
                 Some("sync") => &mut args.sync,
                 Some("active") => &mut args.active,
+                Some("from") => &mut args.from,
                 Some("retired") => &mut args.retired,
                 Some("origin") => &mut args.origin,
                 Some("unmirrored") => &mut args.unmirrored,
@@ -601,6 +603,26 @@ impl Mirror {
 }
 
 /// Refuses `lit`, given on a table that is not sent down.
+/// The relation `key = "…"` names, `view` or `schema.view`, quoted.
+fn relation(lit: Option<&LitStr>, key: &str) -> syn::Result<Option<String>> {
+    let Some(lit) = lit else {
+        return Ok(None);
+    };
+    let text = lit.value();
+    let parts: Vec<&str> = text.split('.').collect();
+    if parts.len() > 2 {
+        return Err(syn::Error::new_spanned(
+            lit,
+            format!("{key} = \"{text}\": expected `view` or `schema.view`"),
+        ));
+    }
+    let quoted: Vec<String> = parts
+        .into_iter()
+        .map(|p| identifier(p, lit.span()).map(|p| quoted(&p)))
+        .collect::<syn::Result<_>>()?;
+    Ok(Some(quoted.join(".")))
+}
+
 fn only_sent_down(lit: Option<&LitStr>, mirror: Mirror, what: &str) -> syn::Result<()> {
     match lit {
         Some(lit) if !mirror.sent_down() => Err(syn::Error::new_spanned(
@@ -674,6 +696,21 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
     }
     let (route, mut checks) = route(args.sync.as_ref(), mirror, &direct, &krate)?;
     only_sent_down(args.active.as_ref(), mirror, "an `active` relation")?;
+    if let Some(lit) = &args.from {
+        if mirror != Mirror::Catalog {
+            return Err(syn::Error::new_spanned(
+                lit,
+                "a row read `from` a relation of its own is only sent down: needs \
+                 `mirror = \"catalog\"`",
+            ));
+        }
+        if args.active.is_some() {
+            return Err(syn::Error::new_spanned(
+                lit,
+                "the rows a row is read `from` are the rows it sends: `active` is left out",
+            ));
+        }
+    }
     only_sent_down(args.retired.as_ref(), mirror, "a `retired` column")?;
 
     let key_at = args.key.as_ref().map_or(ident.span(), LitStr::span);
@@ -748,24 +785,8 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         }
         None => Vec::new(),
     };
-    let active = match &args.active {
-        Some(lit) => {
-            let text = lit.value();
-            let parts: Vec<&str> = text.split('.').collect();
-            if parts.len() > 2 {
-                return Err(syn::Error::new_spanned(
-                    lit,
-                    format!("active = \"{text}\": expected `view` or `schema.view`"),
-                ));
-            }
-            let quoted: Vec<String> = parts
-                .into_iter()
-                .map(|p| identifier(p, lit.span()).map(|p| quoted(&p)))
-                .collect::<syn::Result<_>>()?;
-            Some(quoted.join("."))
-        }
-        None => None,
-    };
+    let active = relation(args.active.as_ref(), "active")?;
+    let from = relation(args.from.as_ref(), "from")?;
     if !mirror.versioned() {
         let refusal = "#[row(version)] in a part flattened in orders the reports of a replica's \
                        table: only a `record` or a `setting` has one";
@@ -792,6 +813,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
     };
 
     let active = option(active);
+    let from = option(from);
     let retired = option(retired);
     let origin = option(args.origin.as_ref().map(LitStr::value));
     let variant = mirror.variant();
@@ -820,6 +842,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             const QUALIFIED: &'static ::core::primitive::str = #krate::__qualified!(#quoted_schema, #quoted_table);
             const ROUTE: #private::Route = #route;
             const ACTIVE: ::core::option::Option<&'static ::core::primitive::str> = #active;
+            const FROM: ::core::option::Option<&'static ::core::primitive::str> = #from;
             const RETIRED: ::core::option::Option<&'static ::core::primitive::str> = #retired;
             const UNMIRRORED: &'static [&'static ::core::primitive::str] = &[#(#unmirrored),*];
             const ORIGIN: ::core::option::Option<&'static ::core::primitive::str> = #origin;

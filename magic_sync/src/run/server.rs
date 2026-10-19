@@ -1052,3 +1052,7 @@ impl Lock {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "audience_tests.rs"]
+mod audience_tests;
