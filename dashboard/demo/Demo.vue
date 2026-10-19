@@ -30,10 +30,10 @@ const names = Object.fromEntries(Array.from({ length: FLEET }, (_, i) => [id(i),
 const places: RowProgress = {
   contract: CONTRACT,
   places: [
-    { replica: id(0), state: 'holds' },
-    { replica: id(1), state: 'on_its_way' },
-    { replica: id(2), state: 'quarantined' },
-    { replica: id(3), state: 'outdated' },
+    { replica: id(0), audience: 'registers', state: 'holds' },
+    { replica: id(1), audience: 'registers', state: 'on_its_way' },
+    { replica: id(2), audience: 'registers', state: 'quarantined' },
+    { replica: id(3), audience: 'registers', state: 'outdated' },
   ],
 }
 const labels = { products: 'Products', prices: 'Prices', customers: 'Customers', receipts: 'Receipts' }
@@ -41,6 +41,7 @@ const labels = { products: 'Products', prices: 'Prices', customers: 'Customers',
 function replica(i: number, scenario: Scenario): ReplicaOverview {
   const base: ReplicaOverview = {
     replica: id(i),
+    audience: 'registers',
     state: 'synced',
     pending: 0,
     owed: 0,
@@ -87,6 +88,7 @@ function table(name: string, scenario: Scenario): TableOverview {
   const broken = scenario === 'attention' && name === 'products'
   return {
     table: name,
+    audience: 'registers',
     synced: !busy && !broken,
     pending: busy ? 120 : 0,
     parked: 0,
@@ -157,6 +159,7 @@ const progress = computed<Progress | null>(() => {
     replicas: [
       {
         replica: selected.value,
+        audience: 'registers',
         tables: [
           {
             table: 'products',

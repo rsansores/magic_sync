@@ -37,6 +37,8 @@ export interface SummaryOptions {
 export interface ReplicaRow {
   id: string
   name: string
+  /** The audience it is of: the kind of replica, as the server names it. */
+  audience: string
   state: ReplicaState
   /** How long it has not answered, when that is longer than `silentAfter`. */
   silentFor: number | null
@@ -73,6 +75,9 @@ export interface ReplicaPage {
 export interface TableRow {
   table: string
   label: string
+  /** The audience it is the table of: a table two audiences hold is a row
+   * for each. */
+  audience: string
   synced: boolean
   pending: number
   parked: number
@@ -116,6 +121,9 @@ export interface Summary {
   /** The replicas that need attention most, worst first. */
   worst: ReplicaRow[]
   tables: TableRow[]
+  /** The audiences the tables are of, in the engine's order: a page of one
+   * need not say which. */
+  audiences: string[]
   problems: Problem[]
   /** Problems the engine counted and did not list. */
   more: number
@@ -194,6 +202,8 @@ function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
   return {
     id: r.replica,
     name: nameOf(options, r.replica),
+    // An engine that predates audiences serves one, and names none.
+    audience: r.audience ?? '',
     state: r.state,
     silentFor,
     heardAt: timeOf(r.applied_at),
@@ -285,6 +295,7 @@ export function summarize(overview: Overview, options: SummaryOptions): Summary 
     .map((t): TableRow => ({
       table: t.table,
       label: labelOf(options, t.table),
+      audience: t.audience ?? '',
       synced: t.synced,
       pending: t.pending,
       parked: t.parked,
@@ -311,6 +322,7 @@ export function summarize(overview: Overview, options: SummaryOptions): Summary 
     stuck,
     worst,
     tables,
+    audiences: [...new Set(overview.tables.map((t) => t.audience ?? ''))],
     problems: listed,
     more: fixes + health.failing.total - listed.length,
   }

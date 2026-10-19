@@ -67,6 +67,10 @@ export type ReplicaOverview = {
  */
 replica: string, 
 /**
+ * The audience it is of.
+ */
+audience: string, 
+/**
  * Where it stands, in one word.
  */
 state: ReplicaState, 
@@ -163,6 +167,11 @@ export type TableOverview = {
  * The table.
  */
 table: string, 
+/**
+ * The audience it is the table of: a table two audiences hold is
+ * listed once for each, over its replicas.
+ */
+audience: string, 
 /**
  * Every figure below is zero.
  */
@@ -473,6 +482,10 @@ export type ReplicaProgress = {
  */
 replica: string, 
 /**
+ * The audience it is of.
+ */
+audience: string, 
+/**
  * Each table the server sends down, parents first.
  */
 tables: Array<TableProgress>, };
@@ -499,6 +512,10 @@ export type RowPlace = {
  * The replica.
  */
 replica: string, 
+/**
+ * The audience it is of.
+ */
+audience: string, 
 /**
  * What the row is to it.
  */

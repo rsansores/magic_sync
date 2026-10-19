@@ -1857,6 +1857,14 @@ impl Planner {
         out
     }
 
+    /// Whether a change of `table` is the audience's to plan: one of its
+    /// tables, or a group table of one.
+    pub(crate) fn knows(&self, table: &str) -> bool {
+        self.index(table).is_some()
+            || !self.groups_through(table, |g| &g.members).is_empty()
+            || !self.groups_through(table, |g| &g.assigned).is_empty()
+    }
+
     pub(crate) fn index(&self, table: &str) -> Option<usize> {
         self.by_name.get(table).copied()
     }

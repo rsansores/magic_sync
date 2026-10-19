@@ -6,18 +6,22 @@ export default [
     "contract": 1,
     "places": [
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000005",
         "state": "outdated"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000002",
         "state": "outdated"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000004",
         "state": "on_its_way"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "on_its_way"
       }
@@ -27,18 +31,22 @@ export default [
     "contract": 1,
     "places": [
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000005",
         "state": "leaving"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000002",
         "state": "quarantined"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000004",
         "state": "leaving"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "leaving"
       }
@@ -48,18 +56,22 @@ export default [
     "contract": 1,
     "places": [
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000005",
         "state": "holds"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000002",
         "state": "holds"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000004",
         "state": "on_its_way"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "on_its_way"
       }
@@ -69,18 +81,22 @@ export default [
     "contract": 1,
     "places": [
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000005",
         "state": "missing"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000002",
         "state": "missing"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000004",
         "state": "missing"
       },
       {
+        "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "missing"
       }

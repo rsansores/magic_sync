@@ -5,6 +5,7 @@ export default {
   "contract": 1,
   "replicas": [
     {
+      "audience": "test",
       "replica": "00000000-0000-7000-8000-000000000005",
       "tables": [
         {
@@ -19,6 +20,7 @@ export default {
       ]
     },
     {
+      "audience": "test",
       "replica": "00000000-0000-7000-8000-000000000004",
       "tables": [
         {

@@ -414,3 +414,173 @@ async fn a_row_read_from_a_view_is_held_to_it(pool: PgPool) {
         other => panic!("not refused: {other:?}"),
     }
 }
+
+/// What the engine answers about itself says which audience each replica
+/// and each table is of, lists a table once for each audience that holds
+/// it, and narrows to one audience when asked.
+#[sqlx::test(migrations = false)]
+async fn the_status_says_which_audience_each_replica_and_table_is_of(pool: PgPool) {
+    use crate::status::{RowState, Scope};
+    let world = World::new(pool).await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast'); \
+             INSERT INTO fixture.lists VALUES ('{LIST}', '{{p}}', 'A', true); \
+             INSERT INTO fixture.districts VALUES ('{NORTH}', '{{p}}', '{REGION}', '{LIST}', 'north');"
+        ))
+        .await;
+    world.settle().await;
+    let engine = world.server.engine();
+    let mut conn = world.pool.acquire().await.unwrap();
+
+    let overview = engine.overview(&mut conn, Scope::All, 10).await.unwrap();
+    let mut replicas: Vec<(Uuid, &str)> = overview
+        .replicas
+        .first
+        .iter()
+        .map(|r| (r.replica, r.audience.as_str()))
+        .collect();
+    replicas.sort_unstable();
+    let mut expected = vec![(world.device, "devices"), (world.erp, "erp")];
+    expected.sort_unstable();
+    assert_eq!(replicas, expected);
+    let tables: Vec<(&str, &str)> = overview
+        .tables
+        .iter()
+        .map(|t| (t.audience.as_str(), t.table.as_str()))
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            ("devices", "regions"),
+            ("devices", "lists"),
+            ("devices", "districts"),
+            ("erp", "regions"),
+            ("erp", "districts"),
+        ]
+    );
+
+    let erp = engine
+        .overview(&mut conn, Scope::Audience("erp"), 10)
+        .await
+        .unwrap();
+    assert_eq!(erp.replicas.total, 1);
+    assert_eq!(erp.replicas.first[0].replica, world.erp);
+    assert!(erp.tables.iter().all(|t| t.audience == "erp"));
+    assert!(matches!(
+        engine
+            .overview(&mut conn, Scope::Audience("nobody"), 10)
+            .await,
+        Err(Error::Misuse(_))
+    ));
+
+    let progress = engine
+        .progress(&mut conn, Scope::Replicas(&[world.erp]))
+        .await
+        .unwrap();
+    assert_eq!(progress.replicas.len(), 1);
+    assert_eq!(progress.replicas[0].audience, "erp");
+    let tables: Vec<&str> = progress.replicas[0]
+        .tables
+        .iter()
+        .map(|t| t.table.as_str())
+        .collect();
+    assert_eq!(tables, ["regions", "districts"]);
+
+    let places = engine
+        .row_progress(&mut conn, Scope::All, "districts", NORTH)
+        .await
+        .unwrap();
+    let mut seen: Vec<(Uuid, &str)> = places
+        .places
+        .iter()
+        .map(|p| (p.replica, p.audience.as_str()))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen, expected,
+        "the row's place on every audience's replicas"
+    );
+    assert!(places.places.iter().all(|p| p.state != RowState::Leaving));
+    let lists = engine
+        .row_progress(&mut conn, Scope::All, "lists", LIST)
+        .await
+        .unwrap();
+    assert_eq!(
+        lists.places.iter().map(|p| p.replica).collect::<Vec<_>>(),
+        [world.device],
+        "only the devices hold the lists"
+    );
+}
+
+/// A replica's digests are compared with what its own audience records of
+/// it: a table its audience does not hold is its own business, and a table
+/// it holds otherwise than recorded provisions it again — no other replica.
+#[sqlx::test(migrations = false)]
+async fn digests_are_compared_against_the_replicas_audience(pool: PgPool) {
+    use crate::envelope::{fingerprint, Digest, Up};
+    let world = World::new(pool).await;
+    world
+        .exec(&format!(
+            "INSERT INTO fixture.regions VALUES ('{REGION}', '{{p}}', 'coast'); \
+             INSERT INTO fixture.lists VALUES ('{LIST}', '{{p}}', 'A', true); \
+             INSERT INTO fixture.districts VALUES ('{NORTH}', '{{p}}', '{REGION}', '{LIST}', 'north');"
+        ))
+        .await;
+    world.settle().await;
+    let last: i64 =
+        sqlx::query_scalar("SELECT last_sequence FROM sync.chains WHERE replica_id = $1")
+            .bind(world.erp)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    let last = u64::try_from(last).unwrap();
+    let digest = |table: &str, keys: &[&str]| {
+        let keys: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        Digest {
+            table: table.to_owned(),
+            count: keys.len() as u64,
+            fingerprint: fingerprint(keys),
+        }
+    };
+    let resyncs = || async {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT replica_id FROM sync.notes WHERE kind = 'resync' AND done_at IS NULL",
+        )
+        .fetch_all(&world.pool)
+        .await
+        .unwrap()
+    };
+    let say = |digests: Vec<Digest>| {
+        let world = &world;
+        async move {
+            sqlx::query("UPDATE sync.replicas SET compared_at = now() - interval '11 minutes'")
+                .execute(&world.pool)
+                .await
+                .unwrap();
+            let up = Up {
+                digests,
+                ..crate::testkit::confirmation(&world.pool, world.erp, last).await
+            };
+            world
+                .server
+                .receive(world.erp, &up.encode_to_vec())
+                .await
+                .unwrap();
+        }
+    };
+
+    say(vec![
+        digest("regions", &[REGION]),
+        digest("districts", &[NORTH]),
+        digest("lists", &["whatever it keeps"]),
+    ])
+    .await;
+    assert!(
+        resyncs().await.is_empty(),
+        "holds what its audience records"
+    );
+
+    say(vec![digest("regions", &[REGION]), digest("districts", &[])]).await;
+    assert_eq!(resyncs().await, [world.erp], "it alone provisioned again");
+}
