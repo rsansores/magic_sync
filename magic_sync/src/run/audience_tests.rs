@@ -4,129 +4,14 @@
 //! list is live.
 
 use super::*;
+use crate::conformance::audiences::{
+    both as audiences, erp, Region, ERPS, SERVER_SCHEMA as SCHEMA,
+};
 use crate::envelope::{Body, ToReplica};
-use crate::plan::{Audience, Replicas};
+use crate::plan::Audience;
 use prost::Message as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-
-const SCHEMA: &str = "
-CREATE SCHEMA fixture;
-CREATE TABLE fixture.devices (id UUID PRIMARY KEY, partition_id UUID NOT NULL, live BOOLEAN NOT NULL);
-CREATE TABLE fixture.erps (id UUID PRIMARY KEY, partition_id UUID NOT NULL, live BOOLEAN NOT NULL);
-CREATE TABLE fixture.regions (id UUID PRIMARY KEY, partition_id UUID NOT NULL, name TEXT NOT NULL);
-CREATE INDEX ON fixture.regions (partition_id);
-CREATE TABLE fixture.lists (
-    id UUID PRIMARY KEY, partition_id UUID NOT NULL, code TEXT NOT NULL, live BOOLEAN NOT NULL);
-CREATE INDEX ON fixture.lists (partition_id);
-CREATE TABLE fixture.districts (
-    id UUID PRIMARY KEY, partition_id UUID NOT NULL,
-    region_id UUID NOT NULL REFERENCES fixture.regions (id),
-    list_id UUID REFERENCES fixture.lists (id),
-    name TEXT NOT NULL);
-CREATE INDEX ON fixture.districts (partition_id);
-CREATE INDEX ON fixture.districts (region_id);
-CREATE INDEX ON fixture.districts (list_id);
-CREATE VIEW fixture.erp_districts AS
-    SELECT d.id, d.partition_id, d.region_id, d.name, l.code AS zone
-      FROM fixture.districts d JOIN fixture.lists l ON l.id = d.list_id
-     WHERE l.live;
-";
-
-const DEVICES: Replicas = Replicas::new("fixture.devices", "devices")
-    .live("live")
-    .partitioned_by("partition_id");
-
-const ERPS: Replicas = Replicas::new("fixture.erps", "erps")
-    .live("live")
-    .partitioned_by("partition_id");
-
-#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
-#[row(
-    table = "regions",
-    schema = "fixture",
-    mirror = "catalog",
-    sync = "broadcast"
-)]
-struct Region {
-    id: Uuid,
-    partition_id: Uuid,
-    name: String,
-}
-
-#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
-#[row(
-    table = "lists",
-    schema = "fixture",
-    mirror = "catalog",
-    sync = "broadcast"
-)]
-struct List {
-    id: Uuid,
-    partition_id: Uuid,
-    code: String,
-    live: bool,
-}
-
-#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
-#[row(
-    table = "districts",
-    schema = "fixture",
-    mirror = "catalog",
-    sync = "broadcast"
-)]
-struct District {
-    id: Uuid,
-    partition_id: Uuid,
-    region_id: Uuid,
-    list_id: Option<Uuid>,
-    name: String,
-}
-
-/// The ERP's district: its list's code joined in, while the list is live —
-/// so a change of the list is a change of it.
-#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
-#[row(
-    table = "districts",
-    schema = "fixture",
-    mirror = "catalog",
-    sync = "broadcast",
-    from = "fixture.erp_districts",
-    depends = "list_id"
-)]
-struct ErpDistrict {
-    id: Uuid,
-    partition_id: Uuid,
-    region_id: Uuid,
-    name: String,
-    zone: String,
-}
-
-fn erp() -> Audience<()> {
-    Audience::new(
-        "erp",
-        ERPS,
-        vec![
-            Codec::json::<Region>(None),
-            Codec::json::<ErpDistrict>(None),
-        ],
-    )
-}
-
-fn audiences() -> Vec<Audience<()>> {
-    vec![
-        Audience::new(
-            "devices",
-            DEVICES,
-            vec![
-                Codec::json::<Region>(None),
-                Codec::json::<List>(None),
-                Codec::json::<District>(None),
-            ],
-        ),
-        erp(),
-    ]
-}
 
 /// What each replica was sent, by audience, each message once.
 #[derive(Clone, Default)]

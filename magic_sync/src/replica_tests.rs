@@ -552,6 +552,78 @@ async fn the_golden_uploads_are_what_the_replica_sends(pool: SqlitePool) {
     assert_eq!(golden(&text).len(), 3);
 }
 
+/// The golden messages of two audiences, as `audience` of them receives
+/// them: its replica, with its own tables, holds after each step what the
+/// file says — a stock replica, whatever audience the server counts it in.
+async fn follow_audience(pool: SqlitePool, audience: &str) {
+    use crate::conformance::audiences::{self, GOLDEN, HOLDS_SQL};
+    use crate::conformance::{golden, holds};
+    let (me, tables, codecs) = match audience {
+        "devices" => (
+            audiences::DEVICE,
+            audiences::DEVICE_TABLES,
+            audiences::device_codecs(),
+        ),
+        _ => (
+            audiences::ERP,
+            audiences::ERP_TABLES,
+            audiences::erp_codecs(),
+        ),
+    };
+    let w = world_as(
+        me.parse().unwrap(),
+        pool,
+        tables,
+        Settings::default(),
+        codecs,
+    )
+    .await;
+    let text = std::fs::read_to_string(GOLDEN).expect("the golden messages");
+    let prefix = format!("{audience}.");
+    let messages: Vec<(String, String, Vec<u8>)> = golden(&text)
+        .into_iter()
+        .filter_map(|(step, outcome, bytes)| {
+            step.strip_prefix(&prefix)
+                .map(|step| (step.to_owned(), outcome, bytes))
+        })
+        .collect();
+    let expected: Vec<(String, serde_json::Value)> = holds(&text)
+        .into_iter()
+        .filter_map(|(step, json)| step.strip_prefix(&prefix).map(|s| (s.to_owned(), json)))
+        .collect();
+    assert!(!messages.is_empty());
+    for (step, json) in &expected {
+        for (_, outcome, bytes) in messages.iter().filter(|(s, _, _)| s == step) {
+            let got = w.receive(bytes).await;
+            assert_eq!(self::outcome(&got), outcome, "{step}: {got:?}");
+            assert!(
+                matches!(w.receive(bytes).await, Received::AlreadyApplied),
+                "{step}, delivered again"
+            );
+        }
+        let mut held = serde_json::Map::new();
+        for (_, table, sql) in HOLDS_SQL.iter().filter(|(a, _, _)| *a == audience) {
+            held.insert((*table).to_owned(), w.texts(sql).await.into());
+        }
+        assert_eq!(
+            &serde_json::Value::Object(held),
+            json,
+            "{audience} after {step}"
+        );
+    }
+    assert!(w.rejected().await.is_empty(), "{:?}", w.rejected().await);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_device_holds_what_the_golden_messages_of_two_audiences_say(pool: SqlitePool) {
+    follow_audience(pool, "devices").await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_erp_holds_what_the_golden_messages_of_two_audiences_say(pool: SqlitePool) {
+    follow_audience(pool, "erp").await;
+}
+
 /// What a replica made of a message, as the corpora name it.
 fn outcome(received: &Received) -> &'static str {
     match received {
