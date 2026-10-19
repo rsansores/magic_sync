@@ -9,9 +9,9 @@
 
 use crate::envelope::{self, Body, Limits, Up};
 use crate::filing;
-use crate::plan::{Engine, Replicas};
+use crate::plan::{Audience, Declared, Engine};
 use crate::relay::{self, Relay};
-use crate::row::{Key, Setting, Table};
+use crate::row::{Key, Row, Setting};
 use crate::run::Backoff;
 use crate::wire::Codec;
 use crate::{Conn, Error};
@@ -31,8 +31,9 @@ pub trait Senders: Send + Sync + 'static {
     /// What a codec stamps on an uploaded row: the `P` of [`Codec<P>`].
     type Known: Send + Sync + 'static;
 
-    /// What the server knows about `replica`; `None` for one it does not know,
-    /// whose messages are dropped with a log.
+    /// What the server knows about `replica`, of the audience named
+    /// `audience`; `None` for one it does not know, whose messages are
+    /// dropped with a log.
     ///
     /// # Errors
     ///
@@ -41,6 +42,7 @@ pub trait Senders: Send + Sync + 'static {
     /// the inbox, filed again after a deploy.
     fn known(
         &self,
+        audience: &str,
         replica: Uuid,
     ) -> impl Future<Output = Result<Option<Self::Known>, Error>> + Send;
 
@@ -77,13 +79,26 @@ impl Anyone {
     }
 }
 
+/// `audiences`, each with the engine's own tables after its codecs.
+fn with_wishes<P: Sync + 'static>(audiences: Vec<Audience<P>>) -> Result<Vec<Audience<P>>, Error> {
+    audiences
+        .into_iter()
+        .map(|a| {
+            Ok(Audience {
+                codecs: crate::wish::with_wishes(a.codecs)?,
+                ..a
+            })
+        })
+        .collect()
+}
+
 /// The advisory lock only the running relay holds ("SYNCENGN").
 pub const LOCK_KEY: i64 = 0x5359_4e43_454e_474e;
 
 impl Senders for Anyone {
     type Known = ();
 
-    async fn known(&self, _replica: Uuid) -> Result<Option<()>, Error> {
+    async fn known(&self, _audience: &str, _replica: Uuid) -> Result<Option<()>, Error> {
         Ok(Some(()))
     }
 
@@ -198,7 +213,7 @@ impl Settings {
 /// of its own, and handed every message a replica sends up.
 ///
 /// ```no_run
-/// use magic_sync::plan::Replicas;
+/// use magic_sync::plan::{Audience, Replicas};
 /// use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 /// use magic_sync::wire::Codec;
 /// use magic_sync::Error;
@@ -209,7 +224,7 @@ impl Settings {
 /// struct Queues;
 ///
 /// impl Transport for Queues {
-///     async fn send(&self, register: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
+///     async fn send(&self, _audience: &str, register: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
 ///         // hand `message` to `register`'s queue
 ///         Ok(())
 ///     }
@@ -218,8 +233,9 @@ impl Settings {
 /// # async fn start(pool: sqlx::PgPool, codecs: Vec<Codec<()>>, upload: (Uuid, Vec<u8>)) -> Result<(), Error> {
 /// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
 ///
+/// let audiences = vec![Audience::new("registers", REGISTERS, codecs)];
 /// let server = Arc::new(
-///     Server::new(pool.clone(), codecs, REGISTERS, Queues, Anyone::new(pool), Settings::default())
+///     Server::new(pool.clone(), audiences, Queues, Anyone::new(pool), Settings::default())
 ///         .await?,
 /// );
 /// let relay = server.clone();
@@ -234,7 +250,9 @@ impl Settings {
 pub struct Server<S: Senders, T: Transport> {
     pool: PgPool,
     engine: Engine,
-    codecs: Vec<Codec<S::Known>>,
+    /// Each beside its planner in the engine, its codecs with the engine's
+    /// own tables after them.
+    audiences: Vec<Audience<S::Known>>,
     transport: T,
     senders: S,
     settings: Settings,
@@ -250,35 +268,34 @@ impl<S: Senders, T: Transport> std::fmt::Debug for Server<S, T> {
 }
 
 impl<S: Senders, T: Transport> Server<S, T> {
-    /// The server over a database its migrations set up: `codecs` are the
-    /// tables that travel, parents first; `replicas` where it finds the
-    /// replicas; `transport` how a message reaches one; `senders` what the
-    /// host knows of a replica that sends something up.
+    /// The server over a database its migrations set up: `audiences` are
+    /// the kinds of replica it serves — where it finds each kind, and the
+    /// tables they hold, parents first; `transport` how a message reaches a
+    /// replica; `senders` what the host knows of a replica that sends
+    /// something up.
     ///
     /// # Errors
     ///
     /// [`Error::Misuse`] when the database is not what the engine needs —
     /// its schema at another version, a table that is not its row column for
     /// column, a trigger missing or different from what [`Engine::triggers`]
-    /// prints, an index [`Engine::indexes`] prints — or for a declaration the schema cannot honour, or settings
-    /// the server cannot run with; [`Error::Database`] when the database
-    /// fails.
+    /// prints, an index [`Engine::indexes`] prints — or for a declaration the schema cannot honour,
+    /// two audiences of one name, or settings the server cannot run with;
+    /// [`Error::Database`] when the database fails.
     pub async fn new(
         pool: PgPool,
-        codecs: Vec<Codec<S::Known>>,
-        replicas: Replicas,
+        audiences: Vec<Audience<S::Known>>,
         transport: T,
         senders: S,
         settings: Settings,
     ) -> Result<Self, Error> {
         settings.check()?;
-        let codecs = crate::wish::with_wishes(codecs)?;
-        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        let audiences = with_wishes(audiences)?;
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
-        let engine = Engine::new(&mut tx, &tables, replicas).await?;
+        let engine = Engine::new(&mut tx, &Declared::of(&audiences)).await?;
         tx.rollback().await?;
         Ok(Self::with(
-            pool, engine, codecs, transport, senders, settings,
+            pool, engine, audiences, transport, senders, settings,
         ))
     }
 
@@ -299,27 +316,25 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// installed.
     pub async fn install(
         pool: PgPool,
-        codecs: Vec<Codec<S::Known>>,
-        replicas: Replicas,
+        audiences: Vec<Audience<S::Known>>,
         transport: T,
         senders: S,
         settings: Settings,
     ) -> Result<Self, Error> {
         settings.check()?;
-        let codecs = crate::wish::with_wishes(codecs)?;
-        let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
+        let audiences = with_wishes(audiences)?;
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
-        let engine = Engine::install(&mut tx, &tables, replicas).await?;
+        let engine = Engine::install(&mut tx, &Declared::of(&audiences)).await?;
         tx.commit().await?;
         Ok(Self::with(
-            pool, engine, codecs, transport, senders, settings,
+            pool, engine, audiences, transport, senders, settings,
         ))
     }
 
     fn with(
         pool: PgPool,
         engine: Engine,
-        codecs: Vec<Codec<S::Known>>,
+        audiences: Vec<Audience<S::Known>>,
         transport: T,
         senders: S,
         settings: Settings,
@@ -327,7 +342,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         Server {
             pool,
             engine,
-            codecs,
+            audiences,
             transport,
             senders,
             settings,
@@ -364,7 +379,9 @@ impl<S: Senders, T: Transport> Server<S, T> {
         wanted: R,
         note: Option<&str>,
     ) -> Result<Wished, Error> {
-        crate::wish::desire(conn, &self.engine, &self.codecs, wanted, note).await
+        let codecs: Vec<&[Codec<S::Known>]> =
+            self.audiences.iter().map(|a| a.codecs.as_slice()).collect();
+        crate::wish::desire(conn, &self.engine, &codecs, wanted, note).await
     }
 
     /// Withdraws the wish of the setting row `key`, answered or not, in the
@@ -375,7 +392,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     ///
     /// [`Error::Database`] when the database fails.
     pub async fn withdraw<R: Setting>(&self, conn: &mut Conn, key: &Key) -> Result<bool, Error> {
-        crate::wish::withdraw::<R, _>(conn, &self.codecs, key).await
+        crate::wish::withdraw::<R, _>(conn, self.holding::<R>(), key).await
     }
 
     /// The wishes of the setting rows `keys` — those that have one — with
@@ -391,7 +408,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         conn: &mut Conn,
         keys: &[Key],
     ) -> Result<Vec<WishOf<R>>, Error> {
-        crate::wish::wishes(conn, &self.codecs, keys).await
+        crate::wish::wishes(conn, self.holding::<R>(), keys).await
     }
 
     /// A transaction as the engine's own begin — assuming the settings'
@@ -475,7 +492,19 @@ impl<S: Senders, T: Transport> Server<S, T> {
             tracing::error!(%replica, rows, rejected = up.rejected.len(), limit = limits.rows(), "sync: an upload of more rows and rejections than the server's limits — dropped, unanswered");
             return Ok(Vec::new());
         }
-        let filed = match self.file(replica, &up).await {
+        let audience = {
+            let mut tx = self.begin().await?;
+            let audience = self.engine.audience_of(&mut tx, replica).await?;
+            tx.commit().await?;
+            audience
+        };
+        let Some(audience) = audience else {
+            tracing::warn!(%replica, "sync: an upload from no replica this server knows — dropped");
+            return Ok(Vec::new());
+        };
+        let codecs = &self.audiences[audience].codecs;
+        let name = self.audiences[audience].name;
+        let filed = match self.file(name, codecs, replica, &up).await {
             Ok(Some(filed)) => filed,
             Ok(None) => {
                 tracing::warn!(%replica, "sync: an upload from no replica this server knows — dropped");
@@ -484,10 +513,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
             Err(e) if e.is_transient() => return Err(e),
             Err(e) => {
                 let mut tx = self.begin().await?;
-                if self.engine.is_replica(&mut tx, replica).await? {
+                if self.engine.audience_of(&mut tx, replica).await? == Some(audience) {
                     filing::file_failed(
                         &mut tx,
-                        &self.codecs,
+                        codecs,
                         &up,
                         replica,
                         &e.to_string(),
@@ -495,15 +524,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
                     )
                     .await?;
                 } else {
-                    filing::keep_whole(
-                        &mut tx,
-                        &self.codecs,
-                        replica,
-                        &up,
-                        &e.to_string(),
-                        self.inbox(),
-                    )
-                    .await?;
+                    filing::keep_whole(&mut tx, codecs, replica, &up, &e.to_string(), self.inbox())
+                        .await?;
                 }
                 tx.commit().await?;
                 Vec::new()
@@ -516,7 +538,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
             let id = format!("filed-{replica}-{last}");
             let sent = tokio::time::timeout(
                 self.settings.send_timeout,
-                self.transport.send(replica, answer.encoded(), &id),
+                self.transport.send(name, replica, answer.encoded(), &id),
             )
             .await
             .unwrap_or_else(|_| {
@@ -536,20 +558,42 @@ impl<S: Senders, T: Transport> Server<S, T> {
         Ok(filed)
     }
 
-    /// Files `up` from `replica` in the transaction the host gives for it;
-    /// `None` for a replica the host does not know, or that is no row of
-    /// the replicas.
-    async fn file(&self, replica: Uuid, up: &Up) -> Result<Option<Vec<filing::Filed>>, Error> {
-        let Some(known) = self.senders.known(replica).await? else {
+    /// Files `up` from `replica`, of the audience `audience` whose tables
+    /// `codecs` write, in the transaction the host gives for it; `None` for
+    /// a replica the host does not know, or that is no row of the
+    /// audience's replicas any more.
+    async fn file(
+        &self,
+        audience: &str,
+        codecs: &[Codec<S::Known>],
+        replica: Uuid,
+        up: &Up,
+    ) -> Result<Option<Vec<filing::Filed>>, Error> {
+        let Some(known) = self.senders.known(audience, replica).await? else {
             return Ok(None);
         };
         let mut tx = self.senders.filing(&known).await?;
-        if !self.engine.is_replica(&mut tx, replica).await? {
+        let Some(of) = self.engine.audience(audience) else {
+            return Ok(None);
+        };
+        if !self.engine.audiences[of]
+            .is_replica(&mut tx, replica)
+            .await?
+        {
             return Ok(None);
         }
-        let filed = filing::file(&mut tx, &self.codecs, up, replica, &known, self.inbox()).await?;
+        let filed = filing::file(&mut tx, codecs, up, replica, &known, self.inbox()).await?;
         tx.commit().await?;
         Ok(Some(filed))
+    }
+
+    /// The codecs of the first audience that holds `R`'s table; none when
+    /// none does.
+    fn holding<R: Row>(&self) -> &[Codec<S::Known>] {
+        self.audiences
+            .iter()
+            .find(|a| a.codecs.iter().any(|c| c.table.name == R::TABLE))
+            .map_or(&[], |a| a.codecs.as_slice())
     }
 
     /// One pass now, as the relay, for a host's tests or a tool: how many
@@ -576,7 +620,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     fn relay(&self) -> Relay<'_, S::Known> {
         Relay {
             engine: &self.engine,
-            codecs: &self.codecs,
+            codecs: self.audiences.iter().map(|a| a.codecs.as_slice()).collect(),
             limits: self.settings.limits,
             batch: i64::from(self.settings.batch.get()),
             timeout: self.settings.send_timeout,
@@ -756,20 +800,40 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// host no longer knows, or that is no replica any more, waits — and is
     /// dropped, an alarm, once it waited `prune_after`.
     async fn refile(&self, kept: &filing::Kept) -> Result<bool, Error> {
-        let known = self.senders.known(kept.replica_id).await?;
+        let audience = {
+            let mut tx = self.begin().await?;
+            let audience = self.engine.audience_of(&mut tx, kept.replica_id).await?;
+            tx.commit().await?;
+            audience
+        };
+        let known = match audience {
+            Some(of) => {
+                self.senders
+                    .known(self.audiences[of].name, kept.replica_id)
+                    .await?
+            }
+            None => None,
+        };
         let mut tx = match &known {
             Some(known) => self.senders.filing(known).await?,
             None => self.begin().await?,
         };
-        let replica = self.engine.is_replica(&mut tx, kept.replica_id).await?;
-        let (Some(known), true) = (known, replica) else {
+        let replica = match audience {
+            Some(of) => {
+                self.engine.audiences[of]
+                    .is_replica(&mut tx, kept.replica_id)
+                    .await?
+            }
+            None => false,
+        };
+        let (Some(known), Some(of), true) = (known, audience, replica) else {
             if filing::forget(&mut tx, kept, self.settings.prune_after).await? {
                 tracing::error!(replica = %kept.replica_id, "sync ALARM: what a sender no longer known uploaded waited too long to be filed — dropped");
             }
             tx.commit().await?;
             return Ok(false);
         };
-        let all = filing::refile(&mut tx, &self.codecs, kept, &known).await?;
+        let all = filing::refile(&mut tx, &self.audiences[of].codecs, kept, &known).await?;
         tx.commit().await?;
         Ok(all)
     }

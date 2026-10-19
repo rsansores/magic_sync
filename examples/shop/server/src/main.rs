@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use magic_sync::plan::Audience;
 use magic_sync::row::KeyPart;
 use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 use magic_sync::status::{
@@ -51,7 +52,13 @@ struct Deliveries {
 }
 
 impl Transport for Deliveries {
-    async fn send(&self, register: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+    async fn send(
+        &self,
+        _audience: &str,
+        register: Uuid,
+        message: Vec<u8>,
+        id: &str,
+    ) -> Result<(), Error> {
         if self.is_cut(register) {
             // A retry may get it through: the network's failure, not the
             // message's.
@@ -117,8 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Arc::new(
         Server::install(
             pool.clone(),
-            codecs(),
-            REGISTERS,
+            vec![Audience::new("registers", REGISTERS, codecs())],
             deliveries.clone(),
             Anyone::new(pool.clone()),
             settings,

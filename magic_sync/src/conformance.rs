@@ -810,6 +810,7 @@ mod server {
     impl Transport for Kept {
         async fn send(
             &self,
+            _audience: &str,
             _replica: Uuid,
             message: Vec<u8>,
             _id: &str,
@@ -855,8 +856,11 @@ mod server {
         };
         let server = Server::install(
             pool.clone(),
-            golden_codecs(),
-            replicas,
+            vec![crate::plan::Audience::new(
+                "test",
+                replicas,
+                golden_codecs(),
+            )],
             kept.clone(),
             Anyone::new(pool.clone()),
             settings,
@@ -867,8 +871,11 @@ mod server {
         // rejections past the two a message down carries here.
         let filer = Server::new(
             pool.clone(),
-            golden_codecs(),
-            replicas,
+            vec![crate::plan::Audience::new(
+                "test",
+                replicas,
+                golden_codecs(),
+            )],
             kept.clone(),
             Anyone::new(pool.clone()),
             Settings::default(),
@@ -1139,8 +1146,11 @@ mod server {
         let kept = Kept::default();
         let server = Server::install(
             pool.clone(),
-            golden_codecs(),
-            Replicas::new("fixture.t_replicas", "t_replicas").live("live"),
+            vec![crate::plan::Audience::new(
+                "test",
+                Replicas::new("fixture.t_replicas", "t_replicas").live("live"),
+                golden_codecs(),
+            )],
             kept.clone(),
             Anyone::new(pool.clone()),
             Settings::default(),

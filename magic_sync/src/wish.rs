@@ -536,17 +536,27 @@ mod server {
     pub(crate) async fn desire<R: Setting, P: Sync + 'static>(
         conn: &mut Conn,
         engine: &Engine,
-        codecs: &[Codec<P>],
+        codecs: &[&[Codec<P>]],
         wanted: R,
         note: Option<&str>,
     ) -> Result<Wished, Error> {
-        codec_of::<R, P>(codecs)?;
+        if !codecs.iter().any(|c| codec_of::<R, P>(c).is_ok()) {
+            codec_of::<R, P>(&[])?;
+        }
         let key = wanted.key();
         let replica = replica_of::<R>(&key);
-        if !engine.is_replica(conn, replica).await? {
+        let Some(audience) = engine.audience_of(conn, replica).await? else {
             return Err(Error::Misuse(format!(
                 "a wish of a row of `{}` whose origin, {replica}, is no replica",
                 R::TABLE
+            )));
+        };
+        if codec_of::<R, P>(codecs[audience]).is_err() {
+            return Err(Error::Misuse(format!(
+                "a wish of a row of `{}` whose origin, {replica}, is a replica of `{}`, \
+                 which does not hold the table",
+                R::TABLE,
+                engine.audiences[audience].name
             )));
         }
         let row_key = key_text(&key);

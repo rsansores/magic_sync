@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::envelope::{self, Body, Table as WireTable, ToReplica};
+use crate::plan::Replicas;
+use crate::row::Table;
 use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use crate::wire::MapError;
@@ -38,7 +40,13 @@ const REPLICAS: Replicas = Replicas {
 struct Wire(Arc<Mutex<Vec<(Uuid, Body)>>>, Arc<Mutex<BTreeSet<String>>>);
 
 impl Transport for Wire {
-    async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+    async fn send(
+        &self,
+        _audience: &str,
+        replica: Uuid,
+        message: Vec<u8>,
+        id: &str,
+    ) -> Result<(), Error> {
         let message = ToReplica::decode(message.as_slice()).expect("a message");
         if self.1.lock().unwrap().insert(id.to_owned()) {
             self.0
@@ -159,7 +167,9 @@ async fn world(pool: &PgPool) -> (Uuid, [Uuid; 2]) {
     let codecs = codecs();
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = conn.begin().await.unwrap();
-    Engine::install(&mut tx, &tables, REPLICAS).await.unwrap();
+    Engine::install_one(&mut tx, &tables, REPLICAS)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     (partition, replicas)
 }
@@ -214,20 +224,156 @@ async fn the_server_and_what_it_hands_out_print(pool: PgPool) {
     world(&pool).await;
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
     )
     .await
     .expect("the server");
-    assert!(format!("{server:?}").starts_with("Server { engine: Engine { tables: ["));
+    assert!(format!("{server:?}")
+        .starts_with("Server { engine: Engine { audiences: [Audience { name: \"test\", tables: ["));
     assert!(format!("{:?}", server.engine()).contains("items"));
     assert_eq!(format!("{:?}", Anyone::new(pool)), "Anyone { .. }");
     assert_eq!(
         format!("{:?}", codecs()[0]).split(',').next().unwrap(),
         "Codec { table: \"items\""
+    );
+}
+
+/// A transport that also says which audience each message went to.
+#[derive(Clone, Default)]
+struct Named {
+    wire: Wire,
+    sent: Arc<Mutex<BTreeSet<(String, Uuid)>>>,
+}
+
+impl Transport for Named {
+    async fn send(
+        &self,
+        audience: &str,
+        replica: Uuid,
+        message: Vec<u8>,
+        id: &str,
+    ) -> Result<(), Error> {
+        self.sent
+            .lock()
+            .unwrap()
+            .insert((audience.to_owned(), replica));
+        self.wire.send(audience, replica, message, id).await
+    }
+}
+
+/// One server serves two kinds of replica from one stream of changes: each
+/// is sent what its audience holds, under its audience's name; a replica
+/// both relations name is the first audience's; and what one uploads is
+/// filed by its own audience's tables.
+#[sqlx::test(migrations = false)]
+async fn each_audience_is_sent_what_it_holds(pool: PgPool) {
+    let (partition, [a, b]) = world(&pool).await;
+    let ledger = Uuid::now_v7();
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.ledgers (id UUID PRIMARY KEY, partition_id UUID NOT NULL, \
+                                       live BOOLEAN NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for replica in [ledger, a] {
+        sqlx::query("INSERT INTO fixture.ledgers VALUES ($1, $2, true)")
+            .bind(replica)
+            .bind(partition)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let ledgers = Replicas::new("fixture.ledgers", "ledgers")
+        .live("live")
+        .partitioned_by("partition_id");
+    let named = Named::default();
+    let server = Server::new(
+        pool.clone(),
+        vec![
+            crate::plan::Audience::new("registers", REPLICAS, codecs()),
+            crate::plan::Audience::new(
+                "ledgers",
+                ledgers,
+                vec![Codec::new::<Item, ItemRow>(to_wire, from_wire, None)],
+            ),
+        ],
+        named.clone(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the server");
+
+    item(&pool, partition, "one").await;
+    until(&[&server], || async {
+        [a, b, ledger]
+            .iter()
+            .all(|r| named.wire.items(*r) == ["one"])
+    })
+    .await;
+    let sent = named.sent.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        BTreeSet::from([
+            ("ledgers".to_owned(), ledger),
+            ("registers".to_owned(), a),
+            ("registers".to_owned(), b),
+        ])
+    );
+    let audiences: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT replica_id, audience FROM sync.replicas WHERE live ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut expected = vec![
+        (a, "registers".to_owned()),
+        (b, "registers".to_owned()),
+        (ledger, "ledgers".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(audiences, expected);
+
+    let readings = |replica: Uuid| {
+        let id = Uuid::now_v7().to_string();
+        Up {
+            tables: vec![WireTable {
+                table: "readings".to_owned(),
+                upserts: vec![ReadingRow {
+                    id: id.clone(),
+                    replica_id: replica.to_string(),
+                    value: "seven".to_owned(),
+                }
+                .encode_to_vec()],
+                keys: vec![envelope::Key { parts: vec![id] }],
+                ..WireTable::default()
+            }],
+            uploads: vec![1],
+            protocol: envelope::PROTOCOL,
+            ..Up::default()
+        }
+    };
+    server
+        .receive(ledger, &readings(ledger).encode_to_vec())
+        .await
+        .unwrap();
+    server
+        .receive(a, &readings(a).encode_to_vec())
+        .await
+        .unwrap();
+    let (stored, kept): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM fixture.readings), (SELECT count(*) FROM sync.inbox)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (stored, kept),
+        (1, 1),
+        "a register's reading filed; a ledger holds no readings, and its is kept"
     );
 }
 
@@ -239,8 +385,7 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
     let wire = Wire::default();
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         Anyone::new(pool.clone()),
         settings(),
@@ -300,8 +445,7 @@ async fn one_process_at_a_time_runs_the_relay(pool: PgPool) {
         servers.push(
             Server::new(
                 pool.clone(),
-                codecs(),
-                REPLICAS,
+                vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
                 wire.clone(),
                 Anyone::new(pool.clone()),
                 settings(),
@@ -330,8 +474,7 @@ async fn what_was_set_aside_goes_once_a_fixed_build_runs_the_relay(pool: PgPool)
     let server = || {
         Server::new(
             pool.clone(),
-            codecs(),
-            REPLICAS,
+            vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
             wire.clone(),
             Anyone::new(pool.clone()),
             settings(),
@@ -396,8 +539,7 @@ async fn a_table_no_longer_mirrored_leaves_nothing_set_aside_behind(pool: PgPool
     let server = |codecs| {
         Server::new(
             pool.clone(),
-            codecs,
-            REPLICAS,
+            vec![crate::plan::Audience::new("test", REPLICAS, codecs)],
             wire.clone(),
             Anyone::new(pool.clone()),
             settings(),
@@ -451,8 +593,7 @@ async fn a_relay_that_lost_its_lock_records_nothing(pool: PgPool) {
     let (partition, _) = world(&pool).await;
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
@@ -526,8 +667,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
     item(&pool, partition, "before").await;
     let refused = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
@@ -538,8 +678,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
     let wire = Wire::default();
     let server = Server::install(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         Anyone::new(pool.clone()),
         settings(),
@@ -548,8 +687,7 @@ async fn install_sets_up_a_database_that_has_none_of_the_engine(pool: PgPool) {
     .expect("installed");
     Server::install(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
@@ -578,7 +716,7 @@ struct Broken {
 impl Senders for Broken {
     type Known = ();
 
-    async fn known(&self, replica: Uuid) -> Result<Option<()>, Error> {
+    async fn known(&self, _audience: &str, replica: Uuid) -> Result<Option<()>, Error> {
         if self.failing.lock().unwrap().contains(&replica) {
             return Err(Error::host(false, format!("{replica}: a bug in the host")));
         }
@@ -652,8 +790,7 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     };
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         senders.clone(),
         settings(),
@@ -744,8 +881,7 @@ async fn a_delete_the_server_refuses_is_kept_and_the_rest_filed(pool: PgPool) {
     let wire = Wire::default();
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         Anyone::new(pool.clone()),
         settings(),
@@ -815,8 +951,7 @@ async fn the_running_server_provisions_again_a_replica_silent_on_what_it_was_sen
     let wire = Wire::default();
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         Anyone::new(pool.clone()),
         Settings {
@@ -854,8 +989,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
     let wire = Wire::default();
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         Anyone::new(pool.clone()),
         settings(),
@@ -1109,8 +1243,7 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
     world(&pool).await;
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
@@ -1123,16 +1256,14 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
     spawnable(server.begin());
     spawnable(Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
     ));
     spawnable(Server::install(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
         Anyone::new(pool.clone()),
         settings(),
@@ -1140,7 +1271,10 @@ async fn what_a_host_spawns_can_be_spawned(pool: PgPool) {
     let mut conn = pool.acquire().await.unwrap();
     spawnable(crate::plan::note_resync(&mut conn, Uuid::nil(), None));
 
-    spawnable(Engine::triggers(&mut conn, &codecs(), REPLICAS));
+    spawnable(Engine::triggers(
+        &mut conn,
+        &[crate::plan::Audience::new("test", REPLICAS, codecs())],
+    ));
     spawnable(crate::row::upsert::<Item>(&mut conn, Vec::new()));
     spawnable(crate::row::get_by_keys::<Item>(&mut conn, &[]));
     let engine = server.engine();
@@ -1188,8 +1322,7 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
         set(&mut wrong);
         let refused = Server::new(
             pool.clone(),
-            codecs(),
-            REPLICAS,
+            vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
             Wire::default(),
             Anyone::new(pool.clone()),
             wrong,
@@ -1213,8 +1346,7 @@ async fn an_upload_beyond_the_limits_or_from_no_replica_is_dropped_unanswered(po
     let wire = Wire::default();
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         Anyone::new(pool.clone()),
         Settings {
@@ -1302,15 +1434,14 @@ async fn an_upload_beyond_the_limits_or_from_no_replica_is_dropped_unanswered(po
 async fn an_answer_the_transport_never_takes_has_the_upload_come_again(pool: PgPool) {
     struct Silent;
     impl Transport for Silent {
-        async fn send(&self, _: Uuid, _: Vec<u8>, _: &str) -> Result<(), Error> {
+        async fn send(&self, _audience: &str, _: Uuid, _: Vec<u8>, _: &str) -> Result<(), Error> {
             std::future::pending().await
         }
     }
     let (_, [a, _]) = world(&pool).await;
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Silent,
         Anyone::new(pool.clone()),
         Settings {
@@ -1348,10 +1479,13 @@ async fn a_replica_named_twice_by_its_relation_is_one(pool: PgPool) {
     let wire = Wire::default();
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        Replicas::new("fixture.twice", "t_replicas")
-            .live("live")
-            .partitioned_by("partition_id"),
+        vec![crate::plan::Audience::new(
+            "test",
+            Replicas::new("fixture.twice", "t_replicas")
+                .live("live")
+                .partitioned_by("partition_id"),
+            codecs(),
+        )],
         wire.clone(),
         Anyone::new(pool.clone()),
         settings(),
@@ -1374,7 +1508,7 @@ struct Known {
 impl Senders for Known {
     type Known = ();
 
-    async fn known(&self, replica: Uuid) -> Result<Option<()>, Error> {
+    async fn known(&self, _audience: &str, replica: Uuid) -> Result<Option<()>, Error> {
         Ok(self.known.lock().unwrap().contains(&replica).then_some(()))
     }
 
@@ -1400,8 +1534,7 @@ async fn the_inbox_is_bounded_per_replica_filed_a_page_at_a_time_and_pruned_of_s
     };
     let server = Server::new(
         pool.clone(),
-        codecs(),
-        REPLICAS,
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         wire.clone(),
         senders.clone(),
         Settings {

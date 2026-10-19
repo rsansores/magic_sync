@@ -1062,6 +1062,7 @@ impl Wire {
 impl Transport for Wire {
     fn send(
         &self,
+        _audience: &str,
         replica: Uuid,
         message: Vec<u8>,
         id: &str,

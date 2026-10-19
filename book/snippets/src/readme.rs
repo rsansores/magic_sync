@@ -23,6 +23,7 @@ pub mod rows {
 
 #[cfg(feature = "server")]
 pub mod server {
+    use magic_sync::plan::Audience;
     use magic_sync::run::server::{Anyone, Server, Settings, Transport};
     use magic_sync::Error;
     use shop_rows::{codecs, REGISTERS};
@@ -43,8 +44,7 @@ pub mod server {
         let server = Arc::new(
             Server::new(
                 pool.clone(),
-                codecs(),
-                REGISTERS,
+                vec![Audience::new("registers", REGISTERS, codecs())],
                 transport,
                 Anyone::new(pool),
                 Settings::default(),

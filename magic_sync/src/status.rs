@@ -11,7 +11,7 @@
 //! Every answer a dashboard reads serializes as the JSON of contract
 //! [`CONTRACT`], and carries that number.
 
-use crate::plan::{parse_key, stale, Engine, REFUSED};
+use crate::plan::{parse_key, stale, Engine, Planner, REFUSED};
 
 pub use crate::replica::UpProgress;
 use crate::Error;
@@ -913,6 +913,92 @@ async fn snapshot(conn: &mut Conn) -> Result<sqlx::Transaction<'_, crate::Db>, E
 }
 
 impl Engine {
+    /// The first audience's `progress`; split per audience next.
+    ///
+    /// # Errors
+    ///
+    /// As the planner's.
+    pub async fn progress(&self, conn: &mut Conn, scope: Scope<'_>) -> Result<Progress, Error> {
+        self.audiences[0].progress(conn, scope).await
+    }
+
+    /// The first audience's `row_progress`.
+    ///
+    /// # Errors
+    ///
+    /// As the planner's.
+    pub async fn row_progress(
+        &self,
+        conn: &mut Conn,
+        scope: Scope<'_>,
+        table: &str,
+        key: &str,
+    ) -> Result<RowProgress, Error> {
+        self.audiences[0]
+            .row_progress(conn, scope, table, key)
+            .await
+    }
+
+    /// The first audience's `overview`.
+    ///
+    /// # Errors
+    ///
+    /// As the planner's.
+    pub async fn overview(
+        &self,
+        conn: &mut Conn,
+        scope: Scope<'_>,
+        limit: u32,
+    ) -> Result<Overview, Error> {
+        self.audiences[0].overview(conn, scope, limit).await
+    }
+
+    /// The first audience's `listing`.
+    ///
+    /// # Errors
+    ///
+    /// As the planner's.
+    pub async fn listing(
+        &self,
+        conn: &mut Conn,
+        scope: Scope<'_>,
+        state: Option<ReplicaState>,
+        page: Page,
+    ) -> Result<Listing, Error> {
+        self.audiences[0].listing(conn, scope, state, page).await
+    }
+
+    /// The first audience's `wishes`.
+    ///
+    /// # Errors
+    ///
+    /// As the planner's.
+    pub async fn wishes(
+        &self,
+        conn: &mut Conn,
+        scope: Scope<'_>,
+        state: Option<WishState>,
+        page: Page,
+    ) -> Result<WishListing, Error> {
+        self.audiences[0].wishes(conn, scope, state, page).await
+    }
+
+    /// The first audience's `health`.
+    ///
+    /// # Errors
+    ///
+    /// As the planner's.
+    pub async fn health(
+        &self,
+        conn: &mut Conn,
+        scope: Scope<'_>,
+        limit: u32,
+    ) -> Result<Health, Error> {
+        self.audiences[0].health(conn, scope, limit).await
+    }
+}
+
+impl Planner {
     /// How far each replica of `scope` is from holding what it should, per
     /// table, counted from what each has acknowledged applying — never from
     /// what was merely sent. See [`TableProgress`]. It counts the rows each

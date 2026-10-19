@@ -89,6 +89,7 @@ struct Fake {
 impl Transport for Fake {
     fn send(
         &self,
+        _audience: &str,
         replica: Uuid,
         message: Vec<u8>,
         id: &str,
@@ -208,7 +209,7 @@ async fn provisioned(
     let codecs = crate::wish::with_wishes(codecs).expect("the codecs");
     let tables: Vec<&Table> = codecs.iter().map(|c| &c.table).collect();
     let mut tx = pool.begin().await.expect("a transaction");
-    let engine = Engine::install(&mut tx, &tables, REPLICAS)
+    let engine = Engine::install_one(&mut tx, &tables, REPLICAS)
         .await
         .expect("the engine");
     tx.commit().await.expect("installed");
@@ -248,7 +249,7 @@ impl World {
     fn relay(&self) -> Relay<'_, ()> {
         Relay {
             engine: &self.engine,
-            codecs: &self.codecs,
+            codecs: vec![&self.codecs],
             limits: Limits {
                 rows: 100,
                 bytes: 1 << 20,
@@ -734,11 +735,17 @@ async fn a_send_that_never_answers_holds_back_no_other_replica(pool: crate::DbPo
         fake: Fake,
     }
     impl Transport for Stuck {
-        async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+        async fn send(
+            &self,
+            _audience: &str,
+            replica: Uuid,
+            message: Vec<u8>,
+            id: &str,
+        ) -> Result<(), Error> {
             if replica == self.replica {
                 std::future::pending::<()>().await;
             }
-            self.fake.send(replica, message, id).await
+            self.fake.send(_audience, replica, message, id).await
         }
     }
     let world = world(pool).await;
@@ -1374,7 +1381,13 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
         replica: Uuid,
     }
     impl Transport for Partial {
-        async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+        async fn send(
+            &self,
+            _audience: &str,
+            replica: Uuid,
+            message: Vec<u8>,
+            id: &str,
+        ) -> Result<(), Error> {
             if replica == self.replica {
                 let mut left = self.left.lock().unwrap();
                 if *left == 0 {
@@ -1382,7 +1395,7 @@ async fn a_partial_send_then_a_row_leaving_scope_leaves_no_orphan(pool: crate::D
                 }
                 *left -= 1;
             }
-            self.wire.send(replica, message, id).await
+            self.wire.send(_audience, replica, message, id).await
         }
     }
     let world = world(pool).await;
@@ -1571,7 +1584,7 @@ async fn a_row_set_aside_and_owed_to_no_one_leaves_while_its_namesake_stays(pool
     .await
     .unwrap();
     let mut tx = world.pool.begin().await.unwrap();
-    let engine = Engine::install(
+    let engine = Engine::install_one(
         &mut tx,
         &[&Table::of::<Item>(), &Table::of::<Tag>()],
         REPLICAS,
@@ -1585,7 +1598,7 @@ async fn a_row_set_aside_and_owed_to_no_one_leaves_while_its_namesake_stays(pool
     ];
     let relay = Relay {
         engine: &engine,
-        codecs: &codecs,
+        codecs: vec![&codecs],
         ..world.relay()
     };
     let wire = Fake::default();
@@ -2334,13 +2347,19 @@ async fn replicas_are_sent_to_side_by_side_each_in_order(pool: crate::DbPool) {
         most: std::sync::atomic::AtomicUsize,
     }
     impl Transport for Slow {
-        async fn send(&self, replica: Uuid, message: Vec<u8>, id: &str) -> Result<(), Error> {
+        async fn send(
+            &self,
+            _audience: &str,
+            replica: Uuid,
+            message: Vec<u8>,
+            id: &str,
+        ) -> Result<(), Error> {
             use std::sync::atomic::Ordering::SeqCst;
             let now = self.under_way.fetch_add(1, SeqCst) + 1;
             self.most.fetch_max(now, SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             self.under_way.fetch_sub(1, SeqCst);
-            self.fake.send(replica, message, id).await
+            self.fake.send(_audience, replica, message, id).await
         }
     }
     let world = world(pool).await;
@@ -2395,7 +2414,13 @@ struct Instant {
 }
 
 impl Transport for Instant {
-    async fn send(&self, replica: Uuid, message: Vec<u8>, _id: &str) -> Result<(), Error> {
+    async fn send(
+        &self,
+        _audience: &str,
+        replica: Uuid,
+        message: Vec<u8>,
+        _id: &str,
+    ) -> Result<(), Error> {
         let up = {
             let mut models = self.models.lock().unwrap();
             let model = models.get_mut(&replica).expect("a model");
@@ -2849,7 +2874,7 @@ async fn a_message_taken_is_recorded_sent_as_it_leaves_the_outbox(pool: crate::D
     let mut conn = world.pool.acquire().await.unwrap();
     let shared = tokio::sync::Mutex::new(&mut *conn);
     let (sent, failed) = relay
-        .send(&shared, &Fake::default(), a, epoch)
+        .send(&shared, &Fake::default(), "test", a, epoch)
         .await
         .unwrap();
     assert_eq!((sent, failed.is_none()), (1, true));
@@ -3424,7 +3449,7 @@ async fn an_engine_that_sends_nothing_down_plans_its_notes_to_nothing(pool: crat
         .expect("a replica");
     }
     let mut tx = conn.begin().await.expect("a transaction");
-    let engine = Engine::install(&mut tx, &[&Table::of::<Reading>()], REPLICAS)
+    let engine = Engine::install_one(&mut tx, &[&Table::of::<Reading>()], REPLICAS)
         .await
         .expect("the engine");
     tx.commit().await.expect("installed");

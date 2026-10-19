@@ -101,6 +101,62 @@ impl Replicas {
     }
 }
 
+/// One kind of replica: where the server finds them ([`Replicas`]) and the
+/// tables they hold, each with its codec ([`Codec`]), parents first. A server
+/// serves one audience or several, from one note stream: a table is planned
+/// for every audience that declares it, against that audience's replicas,
+/// and travels as that audience's codec writes it — two audiences may hold
+/// the same table in other shapes, or one a part of what the other holds.
+///
+/// ```
+/// use magic_sync::plan::{Audience, Replicas};
+/// # fn audiences(registers: Vec<magic_sync::wire::Codec<()>>, ledgers: Vec<magic_sync::wire::Codec<()>>) {
+/// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
+/// const LEDGERS: Replicas = Replicas::new("accounting.ledgers", "ledgers");
+///
+/// let audiences = vec![
+///     Audience::new("registers", REGISTERS, registers),
+///     Audience::new("ledgers", LEDGERS, ledgers),
+/// ];
+/// # }
+/// ```
+pub struct Audience<P> {
+    pub(crate) name: &'static str,
+    pub(crate) replicas: Replicas,
+    pub(crate) codecs: Vec<Codec<P>>,
+}
+
+impl<P> std::fmt::Debug for Audience<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Audience")
+            .field("name", &self.name)
+            .field("replicas", &self.replicas)
+            .field("codecs", &self.codecs)
+            .finish()
+    }
+}
+
+impl<P> Audience<P> {
+    /// The audience `name` — what the transport and the status call it, and
+    /// what the engine records each of its replicas under — of the replicas
+    /// `replicas` finds, holding the tables of `codecs`, parents first. A
+    /// replica the relations of two audiences name is the first's.
+    #[must_use]
+    pub fn new(name: &'static str, replicas: Replicas, codecs: Vec<Codec<P>>) -> Self {
+        Audience {
+            name,
+            replicas,
+            codecs,
+        }
+    }
+
+    /// Its name.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
 /// A foreign key from one mirrored table to another, as the child's columns
 /// that hold the parent's key.
 #[derive(Clone, Debug)]
@@ -264,6 +320,7 @@ const INSTALL_LOCK: i64 = 0x5359_4e43_494e_5354;
 const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [
     include_str!("../sql/postgres/1.sql"),
     include_str!("../sql/postgres/2.sql"),
+    include_str!("../sql/postgres/3.sql"),
 ];
 
 /// The engine's step to `version` of its schema on the server, as one SQL
@@ -286,12 +343,31 @@ pub fn migration(version: i32) -> Option<String> {
     ))
 }
 
-/// The server's engine, built once from the codecs and the schema by the
+/// The server's engine, built once from the audiences and the schema by the
 /// [`Server`](crate::run::server::Server), which hands it out for what a host asks of it:
 /// the triggers and indexes it needs ([`Engine::triggers`],
 /// [`Engine::indexes`]), and how far along every
 /// replica is ([`status`](crate::status)).
 pub struct Engine {
+    /// One planner per audience, in the order the host declared them.
+    pub(crate) audiences: Vec<Planner>,
+    /// Every trigger the audiences need, one per table.
+    triggers: Vec<Trigger>,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("audiences", &self.audiences)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What one audience's replicas hold: its tables planned against its
+/// replicas.
+pub(crate) struct Planner {
+    /// The audience's name.
+    pub(crate) name: &'static str,
     pub(crate) plans: Vec<Plan>,
     by_name: HashMap<&'static str, usize>,
     /// Parents before children.
@@ -299,13 +375,37 @@ pub struct Engine {
     pub(crate) replicas: Replicas,
 }
 
-impl std::fmt::Debug for Engine {
+impl std::fmt::Debug for Planner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tables: Vec<_> = self.order.iter().map(|&i| self.plans[i].table).collect();
-        f.debug_struct("Engine")
+        f.debug_struct("Audience")
+            .field("name", &self.name)
             .field("tables", &tables)
             .field("replicas", &self.replicas)
             .finish_non_exhaustive()
+    }
+}
+
+/// An audience as the engine is built from it: its name, its replicas and
+/// its tables.
+#[derive(Clone)]
+pub(crate) struct Declared<'a> {
+    pub(crate) name: &'static str,
+    pub(crate) replicas: Replicas,
+    pub(crate) tables: Vec<&'a Table>,
+}
+
+impl<'a> Declared<'a> {
+    /// What `audiences` declare.
+    pub(crate) fn of<P>(audiences: &'a [Audience<P>]) -> Vec<Self> {
+        audiences
+            .iter()
+            .map(|a| Declared {
+                name: a.name,
+                replicas: a.replicas,
+                tables: a.codecs.iter().map(|c| &c.table).collect(),
+            })
+            .collect()
     }
 }
 
@@ -587,7 +687,7 @@ fn key_of(row: &serde_json::Value, columns: &[String]) -> Option<String> {
 
 /// A trigger the engine needs, as `CREATE TRIGGER` names it and `pg_trigger`
 /// stores it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Trigger {
     on: Relation,
     name: &'static str,
@@ -864,13 +964,9 @@ impl Engine {
     /// `follows` column that is not a key, a group table that does not have
     /// the columns a group needs, a cycle — on a trigger missing or
     /// different, and on an index missing.
-    pub(crate) async fn new(
-        conn: &mut Conn,
-        tables: &[&Table],
-        replicas: Replicas,
-    ) -> Result<Self, Error> {
-        crate::row::parity(conn, tables).await?;
-        let engine = Self::read(conn, tables, replicas).await?;
+    pub(crate) async fn new(conn: &mut Conn, audiences: &[Declared<'_>]) -> Result<Self, Error> {
+        crate::row::parity(conn, &tables_of(audiences)).await?;
+        let engine = Self::read(conn, audiences).await?;
         let temporary: bool =
             sqlx::query_scalar("SELECT has_database_privilege(current_database(), 'TEMPORARY')")
                 .fetch_one(&mut *conn)
@@ -936,12 +1032,11 @@ impl Engine {
     /// the migration that creates it, as it does its indexes; [`Engine::new`] refuses to start while one is missing.
     pub(crate) async fn install(
         conn: &mut Conn,
-        tables: &[&Table],
-        replicas: Replicas,
+        audiences: &[Declared<'_>],
     ) -> Result<Self, Error> {
         migrate(conn).await?;
-        crate::row::parity(conn, tables).await?;
-        let engine = Self::read(conn, tables, replicas).await?;
+        crate::row::parity(conn, &tables_of(audiences)).await?;
+        let engine = Self::read(conn, audiences).await?;
         let live = live_triggers(conn).await?;
         for stray in engine.strays(&live) {
             let drop = format!(
@@ -982,18 +1077,20 @@ impl Engine {
         if unnoted {
             // Rows written while their table was not noted reached no
             // replica: every replica is provisioned again, and gets them.
-            sqlx::query(&resync_sql(&format!(
-                "SELECT s.id, s.partition FROM {}",
-                Self::replicas_of(engine.replicas)
-            )))
-            .execute(&mut *conn)
-            .await?;
+            for planner in &engine.audiences {
+                sqlx::query(&resync_sql(&format!(
+                    "SELECT s.id, s.partition FROM {}",
+                    Planner::replicas_of(planner.replicas)
+                )))
+                .execute(&mut *conn)
+                .await?;
+            }
         }
         Ok(engine)
     }
 
     /// The statements that create every trigger the server needs for
-    /// `codecs`, one per line, read off the database `conn` is on: what a
+    /// `audiences`, one per line, read off the database `conn` is on: what a
     /// host with migrations writes in the migration that creates the tables —
     /// after every step of the engine's schema ([`migration`]) — and what
     /// [`Server::install`](crate::run::server::Server::install) runs. A mirrored table
@@ -1012,11 +1109,12 @@ impl Engine {
     ///
     /// ```no_run
     /// # async fn print(pool: sqlx::PgPool, codecs: Vec<magic_sync::wire::Codec<()>>) -> Result<(), magic_sync::Error> {
-    /// use magic_sync::plan::{Engine, Replicas};
+    /// use magic_sync::plan::{Audience, Engine, Replicas};
     ///
     /// const REGISTERS: Replicas = Replicas::new("shop.registers", "registers").live("active");
+    /// let audiences = [Audience::new("registers", REGISTERS, codecs)];
     /// let mut conn = pool.acquire().await?;
-    /// println!("{}", Engine::triggers(&mut conn, &codecs, REGISTERS).await?);
+    /// println!("{}", Engine::triggers(&mut conn, &audiences).await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -1028,12 +1126,17 @@ impl Engine {
     /// is one the schema cannot honour.
     pub async fn triggers<P: std::marker::Sync + 'static>(
         conn: &mut Conn,
-        codecs: &[Codec<P>],
-        replicas: Replicas,
+        audiences: &[Audience<P>],
     ) -> Result<String, Error> {
-        let wishes = crate::wish::engines(codecs)?;
-        let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
-        let engine = Self::read(conn, &tables, replicas).await?;
+        let wishes = audiences
+            .iter()
+            .map(|a| crate::wish::engines(&a.codecs))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut declared = Declared::of(audiences);
+        for (audience, wishes) in declared.iter_mut().zip(&wishes) {
+            audience.tables.extend(wishes.iter().map(|c| &c.table));
+        }
+        let engine = Self::read(conn, &declared).await?;
         Ok(engine
             .triggers_needed()
             .iter()
@@ -1043,7 +1146,7 @@ impl Engine {
     }
 
     /// The statements that create every index the planner's lookups need
-    /// for `codecs` and the database `conn` is on does not have, one per
+    /// for `audiences` and the database `conn` is on does not have, one per
     /// line: what a host with migrations writes beside the triggers
     /// ([`Engine::triggers`]), and what
     /// [`Server::install`](crate::run::server::Server::install) runs. The
@@ -1059,12 +1162,17 @@ impl Engine {
     /// As [`Engine::triggers`].
     pub async fn indexes<P: std::marker::Sync + 'static>(
         conn: &mut Conn,
-        codecs: &[Codec<P>],
-        replicas: Replicas,
+        audiences: &[Audience<P>],
     ) -> Result<String, Error> {
-        let wishes = crate::wish::engines(codecs)?;
-        let tables: Vec<&Table> = codecs.iter().chain(&wishes).map(|c| &c.table).collect();
-        let engine = Self::read(conn, &tables, replicas).await?;
+        let wishes = audiences
+            .iter()
+            .map(|a| crate::wish::engines(&a.codecs))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut declared = Declared::of(audiences);
+        for (audience, wishes) in declared.iter_mut().zip(&wishes) {
+            audience.tables.extend(wishes.iter().map(|c| &c.table));
+        }
+        let engine = Self::read(conn, &declared).await?;
         Ok(engine
             .indexes_missing(conn)
             .await?
@@ -1081,6 +1189,303 @@ impl Engine {
     /// assignments by their group and by their replica.
     fn indexes_needed(&self) -> BTreeSet<Index> {
         let mut out = BTreeSet::new();
+        for planner in &self.audiences {
+            planner.indexes_needed(&mut out);
+        }
+        out
+    }
+
+    /// The indexes the planner needs that no index of the database serves.
+    async fn indexes_missing(&self, conn: &mut Conn) -> Result<Vec<Index>, Error> {
+        let needed = self.indexes_needed();
+        let relations: BTreeSet<&Relation> = needed.iter().map(|i| &i.on).collect();
+        let live = live_indexes(conn, &relations).await?;
+        Ok(needed.into_iter().filter(|i| !i.served(&live)).collect())
+    }
+
+    /// The engine of `audiences`, read off the schema: the engine's tables at
+    /// this build's version, each audience planned, and what they declare
+    /// of one table together the one trigger can note.
+    async fn read(conn: &mut Conn, audiences: &[Declared<'_>]) -> Result<Self, Error> {
+        let needed = crate::SERVER_SCHEMA_VERSION;
+        match version(conn).await? {
+            Some(v) if v == needed => {}
+            Some(v) if v > needed => {
+                return Err(Error::Misuse(format!(
+                    "the engine's schema is version {v}, from a later build than this one \
+                     ({needed}): run that build, or a later one"
+                )))
+            }
+            v => {
+                if v.is_none() {
+                    refuse_foreign_schema(conn).await?;
+                }
+                return Err(Error::Misuse(format!(
+                    "the engine's schema is {}, and this build needs version {needed}: \
+                     `Server::install` brings it there, or a migration of yours runs the \
+                     engine's steps (the book's \"Upgrading\")",
+                    v.map_or("not installed".to_owned(), |v| format!("version {v}"))
+                )));
+            }
+        }
+        if audiences.is_empty() {
+            return Err(Error::Misuse(
+                "no audience: a server serves one kind of replica at least".to_owned(),
+            ));
+        }
+        let mut names = BTreeSet::new();
+        let mut planners = Vec::with_capacity(audiences.len());
+        for audience in audiences {
+            if audience.name.is_empty() || !names.insert(audience.name) {
+                return Err(Error::Misuse(format!(
+                    "two audiences are named `{}`, or one is named nothing: the engine records \
+                     each replica under its audience's name",
+                    audience.name
+                )));
+            }
+            planners.push(
+                Planner::read(conn, audience.name, &audience.tables, audience.replicas).await?,
+            );
+        }
+        let mut engine = Engine {
+            audiences: planners,
+            triggers: Vec::new(),
+        };
+        engine.triggers = engine.noted_rows()?;
+        Ok(engine)
+    }
+
+    /// The triggers every table the audiences note needs, one per table
+    /// however many audiences declare it: what it points at is every
+    /// mirrored parent of any of them, and an update of the columns every
+    /// one of them leaves to its replicas is no change. Fails when two
+    /// audiences note one table otherwise than one trigger can: by another
+    /// partition column, or a group table in another role.
+    fn noted_rows(&self) -> Result<Vec<Trigger>, Error> {
+        struct Noted {
+            table: &'static str,
+            partition: &'static str,
+            key: Vec<&'static str>,
+            references: Vec<(&'static str, Vec<String>)>,
+            owned: Vec<&'static str>,
+        }
+        let mut rows: Vec<(Relation, Noted)> = Vec::new();
+        let mut groups: BTreeMap<Relation, (String, String, &str, &str)> = BTreeMap::new();
+        for planner in &self.audiences {
+            let partition = planner.replicas.partition.unwrap_or_default();
+            for plan in &planner.plans {
+                let references: Vec<(&'static str, Vec<String>)> = plan
+                    .references
+                    .iter()
+                    .map(|r| (planner.plans[r.parent].table, r.columns.clone()))
+                    .collect();
+                let Some((_, noted)) = rows.iter_mut().find(|(on, _)| *on == plan.relation) else {
+                    rows.push((
+                        plan.relation.clone(),
+                        Noted {
+                            table: plan.table,
+                            partition,
+                            key: plan.key.iter().map(|c| c.name).collect(),
+                            references,
+                            owned: plan.owned.clone(),
+                        },
+                    ));
+                    continue;
+                };
+                if noted.partition != partition {
+                    return Err(Error::Misuse(format!(
+                        "`{}` is held by audiences partitioned by {:?} and by {:?}: one trigger \
+                         notes a row's partition by one column",
+                        plan.table, noted.partition, partition
+                    )));
+                }
+                for reference in references {
+                    if !noted.references.contains(&reference) {
+                        noted.references.push(reference);
+                    }
+                }
+                noted.owned.retain(|c| plan.owned.contains(c));
+            }
+            for plan in &planner.plans {
+                let (Some(g), Route::Grouped { members, assigned }) = (&plan.group, plan.route)
+                else {
+                    continue;
+                };
+                for (on, args) in [
+                    (
+                        &g.members,
+                        (
+                            members.to_owned(),
+                            g.group[0].0.clone(),
+                            "members",
+                            partition,
+                        ),
+                    ),
+                    (
+                        &g.assigned,
+                        (
+                            assigned.to_owned(),
+                            g.assigned_replica.clone(),
+                            "assigned",
+                            partition,
+                        ),
+                    ),
+                ] {
+                    match groups.get(on) {
+                        Some(known) if *known != args => {
+                            return Err(Error::Misuse(format!(
+                                "{} is a group table of two audiences, noted otherwise by each: \
+                                 one trigger notes it",
+                                on.sql()
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            groups.insert(on.clone(), args);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (on, noted) in rows {
+            let mut args = vec![
+                noted.table.to_owned(),
+                noted.partition.to_owned(),
+                noted.key.len().to_string(),
+            ];
+            args.extend(noted.key.iter().map(|c| (*c).to_owned()));
+            args.push(noted.references.len().to_string());
+            for (parent, columns) in &noted.references {
+                args.push((*parent).to_owned());
+                args.push(columns.len().to_string());
+                args.extend(columns.iter().cloned());
+            }
+            args.extend(noted.owned.iter().map(|c| (*c).to_owned()));
+            out.push(Trigger {
+                on: on.clone(),
+                name: "sync_note_row",
+                kind: ROW | INSERT | UPDATE | DELETE,
+                function: "note_row",
+                args,
+            });
+            out.push(Trigger {
+                on,
+                name: "sync_refuse_truncate",
+                kind: BEFORE | TRUNCATE,
+                function: "refuse_truncate",
+                args: Vec::new(),
+            });
+        }
+        for (on, (name, column, role, partition)) in groups {
+            out.push(Trigger {
+                on,
+                name: "sync_note_group",
+                kind: ROW | INSERT | UPDATE | DELETE,
+                function: "note_group",
+                args: vec![name, column, role.to_owned(), partition.to_owned()],
+            });
+        }
+        Ok(out)
+    }
+
+    fn triggers_needed(&self) -> Vec<Trigger> {
+        self.triggers.clone()
+    }
+
+    /// The engine's triggers on tables it does not need them on.
+    fn strays<'a>(&self, live: &'a [LiveTrigger]) -> Vec<&'a LiveTrigger> {
+        let needed = self.triggers_needed();
+        live.iter()
+            .filter(|t| !needed.iter().any(|n| n.on == t.on() && n.name == t.name))
+            .collect()
+    }
+
+    /// The audience `replica` is of — the first whose relation names it,
+    /// live or not — by its place among the audiences; `None` for a
+    /// replica none names.
+    pub(crate) async fn audience_of(
+        &self,
+        conn: &mut Conn,
+        replica: Uuid,
+    ) -> Result<Option<usize>, Error> {
+        for (i, planner) in self.audiences.iter().enumerate() {
+            if planner.is_replica(conn, replica).await? {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Looks at every audience's replicas, as [`Planner::observe`] does;
+    /// once what one declares changed, the pending changes of a table no
+    /// audience notes any more are done.
+    pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
+        let mut redeclared = false;
+        for planner in &self.audiences {
+            redeclared |= planner.observe(conn).await?;
+        }
+        if redeclared {
+            sqlx::query(
+                "UPDATE sync.notes SET done_at = now() \
+                  WHERE done_at IS NULL AND kind IN ('row', 'retry') AND relation <> ALL($1)",
+            )
+            .bind(self.noted_tables())
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `planner`'s audience plans `change`: a change to one of its
+    /// tables, a group of one of them, a replica to provision — and a change
+    /// no audience knows, which fails where it is planned.
+    pub(crate) fn concerns(&self, planner: &Planner, change: &Change) -> bool {
+        let knows = |p: &Planner| match change {
+            Change::Row { table, .. } => p.index(table).is_some(),
+            Change::Members { table, .. } => !p.groups_through(table, |g| &g.members).is_empty(),
+            Change::Assigned { table, .. } => !p.groups_through(table, |g| &g.assigned).is_empty(),
+            Change::Resync { .. } => true,
+        };
+        knows(planner) || !self.audiences.iter().any(knows)
+    }
+
+    /// The name of every table some audience notes.
+    pub(crate) fn noted_tables(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = self
+            .audiences
+            .iter()
+            .flat_map(|a| a.plans.iter().map(|p| p.table))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The live replicas of every audience as the engine last saw them, as
+    /// a subquery `s(id, partition)`.
+    pub(crate) fn replicas_sql(&self) -> String {
+        "(SELECT replica_id AS id, partition_id AS partition FROM sync.replicas WHERE live) AS s"
+            .to_owned()
+    }
+
+    /// The audience `name`, by its place.
+    pub(crate) fn audience(&self, name: &str) -> Option<usize> {
+        self.audiences.iter().position(|a| a.name == name)
+    }
+}
+
+/// Every table `audiences` declare.
+fn tables_of<'a>(audiences: &[Declared<'a>]) -> Vec<&'a Table> {
+    audiences
+        .iter()
+        .flat_map(|a| a.tables.iter().copied())
+        .collect()
+}
+
+impl Planner {
+    /// The indexes this audience's lookups need, added to `out`.
+    fn indexes_needed(&self, out: &mut BTreeSet<Index>) {
         let mut need = |on: &Relation, columns: Vec<String>| {
             out.insert(Index {
                 on: on.clone(),
@@ -1112,102 +1517,17 @@ impl Engine {
                 need(&g.assigned, vec![g.assigned_replica.clone()]);
             }
         }
-        out
     }
 
-    /// The indexes the planner needs that no index of the database serves.
-    async fn indexes_missing(&self, conn: &mut Conn) -> Result<Vec<Index>, Error> {
-        let needed = self.indexes_needed();
-        let relations: BTreeSet<&Relation> = needed.iter().map(|i| &i.on).collect();
-        let live = live_indexes(conn, &relations).await?;
-        Ok(needed.into_iter().filter(|i| !i.served(&live)).collect())
-    }
-
-    fn triggers_needed(&self) -> Vec<Trigger> {
-        let partition = self.replicas.partition.unwrap_or_default().to_owned();
-        let mut out = Vec::new();
-        let mut groups: BTreeMap<Relation, (String, String, &str)> = BTreeMap::new();
-        for plan in &self.plans {
-            let mut args = vec![
-                plan.table.to_owned(),
-                partition.clone(),
-                plan.key.len().to_string(),
-            ];
-            args.extend(plan.key.iter().map(|c| c.name.to_owned()));
-            args.push(plan.references.len().to_string());
-            for reference in &plan.references {
-                args.push(self.plans[reference.parent].table.to_owned());
-                args.push(reference.columns.len().to_string());
-                args.extend(reference.columns.iter().cloned());
-            }
-            args.extend(plan.owned.iter().map(|c| (*c).to_owned()));
-            out.push(Trigger {
-                on: plan.relation.clone(),
-                name: "sync_note_row",
-                kind: ROW | INSERT | UPDATE | DELETE,
-                function: "note_row",
-                args,
-            });
-            out.push(Trigger {
-                on: plan.relation.clone(),
-                name: "sync_refuse_truncate",
-                kind: BEFORE | TRUNCATE,
-                function: "refuse_truncate",
-                args: Vec::new(),
-            });
-            if let (Some(g), Route::Grouped { members, assigned }) = (&plan.group, plan.route) {
-                groups.insert(
-                    g.members.clone(),
-                    (members.to_owned(), g.group[0].0.clone(), "members"),
-                );
-                groups.insert(
-                    g.assigned.clone(),
-                    (assigned.to_owned(), g.assigned_replica.clone(), "assigned"),
-                );
-            }
-        }
-        for (on, (name, column, role)) in groups {
-            out.push(Trigger {
-                on,
-                name: "sync_note_group",
-                kind: ROW | INSERT | UPDATE | DELETE,
-                function: "note_group",
-                args: vec![name, column, role.to_owned(), partition.clone()],
-            });
-        }
-        out
-    }
-
-    /// The engine's triggers on tables it does not need them on.
-    fn strays<'a>(&self, live: &'a [LiveTrigger]) -> Vec<&'a LiveTrigger> {
-        let needed = self.triggers_needed();
-        live.iter()
-            .filter(|t| !needed.iter().any(|n| n.on == t.on() && n.name == t.name))
-            .collect()
-    }
-
-    async fn read(conn: &mut Conn, tables: &[&Table], replicas: Replicas) -> Result<Self, Error> {
-        let needed = crate::SERVER_SCHEMA_VERSION;
-        match version(conn).await? {
-            Some(v) if v == needed => {}
-            Some(v) if v > needed => {
-                return Err(Error::Misuse(format!(
-                    "the engine's schema is version {v}, from a later build than this one \
-                     ({needed}): run that build, or a later one"
-                )))
-            }
-            v => {
-                if v.is_none() {
-                    refuse_foreign_schema(conn).await?;
-                }
-                return Err(Error::Misuse(format!(
-                    "the engine's schema is {}, and this build needs version {needed}: \
-                     `Server::install` brings it there, or a migration of yours runs the \
-                     engine's steps (the book's \"Upgrading\")",
-                    v.map_or("not installed".to_owned(), |v| format!("version {v}"))
-                )));
-            }
-        }
+    /// The audience `name`'s plans: the foreign keys between its tables and
+    /// each grouped table's group tables read from the catalog, every
+    /// declaration checked against the schema.
+    async fn read(
+        conn: &mut Conn,
+        name: &'static str,
+        tables: &[&Table],
+        replicas: Replicas,
+    ) -> Result<Self, Error> {
         let tables: Vec<&Table> = tables
             .iter()
             .copied()
@@ -1476,6 +1796,7 @@ impl Engine {
         }
         let order = topological(&plans)?;
         Ok(Self {
+            name,
             plans,
             by_name,
             order,
@@ -1530,14 +1851,17 @@ impl Engine {
         self.plans[index].table
     }
 
-    /// The live replicas as the engine last saw them ([`Engine::observe`]),
-    /// as a subquery `s(id, partition)`: what a pass sends to and what the
-    /// status counts. A replica the host stops counting as live after the
-    /// relay looked is still sent what that look owed it, and is let go of
-    /// by the next.
+    /// The audience's live replicas as the engine last saw them
+    /// ([`Planner::observe`]), as a subquery `s(id, partition)`: what a pass
+    /// sends to and what the status counts. A replica the host stops
+    /// counting as live after the relay looked is still sent what that look
+    /// owed it, and is let go of by the next.
     pub(crate) fn replicas_sql(&self) -> String {
-        "(SELECT replica_id AS id, partition_id AS partition FROM sync.replicas WHERE live) AS s"
-            .to_owned()
+        format!(
+            "(SELECT replica_id AS id, partition_id AS partition FROM sync.replicas \
+               WHERE live AND audience = {}) AS s",
+            literal(self.name)
+        )
     }
 
     /// The replicas the host counts as live now, as a subquery `s(id,
@@ -1563,18 +1887,26 @@ impl Engine {
         .await?)
     }
 
-    /// Compares the live replicas with what the engine saw of them last time,
-    /// in the caller's transaction: a replica that became live, or moved to
-    /// another partition, is noted for provisioning from scratch; one that is
-    /// no longer live, or gone, is forgotten — nothing is recorded as held by
-    /// it, what waited in its outbox is dropped, and nothing is sent it until
-    /// it is live again. When what places the rows changed since the engine
-    /// last ran, every live replica is provisioned again. The relay runs it
-    /// before every pass.
-    pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<(), Error> {
+    /// Compares the audience's live replicas with what the engine saw of
+    /// them last time, in the caller's transaction: a replica that became
+    /// live, or moved to another partition, is noted for provisioning from
+    /// scratch; one that is no longer live, or gone, is forgotten — nothing
+    /// is recorded as held by it, what waited in its outbox is dropped, and
+    /// nothing is sent it until it is live again. A replica live in an
+    /// audience looked at before this one is that audience's. When what
+    /// places the audience's rows changed since the engine last ran, every
+    /// one of its live replicas is provisioned again: answers whether it
+    /// did. The relay runs it before every pass.
+    pub(crate) async fn observe(&self, conn: &mut Conn) -> Result<bool, Error> {
+        let name = literal(self.name);
         sqlx::query(&format!(
-            "WITH now AS (SELECT s.id, s.partition FROM {}), \
-             seen AS (SELECT replica_id, partition_id FROM sync.replicas WHERE live), \
+            "WITH now AS (SELECT s.id, s.partition FROM {} \
+                           WHERE NOT EXISTS (SELECT 1 FROM sync.replicas o \
+                                              WHERE o.replica_id = s.id AND o.live \
+                                                AND o.audience <> {name})), \
+             seen AS (SELECT replica_id, partition_id FROM sync.replicas \
+                       WHERE live AND (audience = {name} \
+                                       OR audience IS NULL AND replica_id IN (SELECT id FROM now))), \
              arrived AS (SELECT n.id, n.partition FROM now n \
                           WHERE NOT EXISTS (SELECT 1 FROM seen s WHERE s.replica_id = n.id \
                                               AND s.partition_id IS NOT DISTINCT FROM n.partition)), \
@@ -1585,9 +1917,13 @@ impl Engine {
              untaken AS (DELETE FROM sync.gone t USING gone g WHERE t.replica_id = g.replica_id), \
              dropped AS (DELETE FROM sync.outbox o USING gone g WHERE o.replica_id = g.replica_id), \
              unchained AS (DELETE FROM sync.chains c USING gone g WHERE c.replica_id = g.replica_id), \
-             came AS (INSERT INTO sync.replicas AS r (replica_id, live, partition_id) \
-                      SELECT id, true, partition FROM arrived \
-                      ON CONFLICT (replica_id) DO UPDATE SET live = true, partition_id = EXCLUDED.partition_id) \
+             claimed AS (UPDATE sync.replicas r SET audience = {name} FROM seen s \
+                          WHERE r.replica_id = s.replica_id AND r.audience IS NULL \
+                            AND s.replica_id NOT IN (SELECT id FROM arrived)), \
+             came AS (INSERT INTO sync.replicas AS r (replica_id, live, partition_id, audience) \
+                      SELECT id, true, partition, {name} FROM arrived \
+                      ON CONFLICT (replica_id) DO UPDATE SET live = true, \
+                        partition_id = EXCLUDED.partition_id, audience = EXCLUDED.audience) \
              UPDATE sync.replicas r SET live = false, partition_id = NULL \
                FROM gone g WHERE r.replica_id = g.replica_id",
             Self::replicas_of(self.replicas),
@@ -1598,41 +1934,72 @@ impl Engine {
         self.redeclared(conn).await
     }
 
-    /// Compares what decides which rows each replica holds and what a row
-    /// carries with what the engine last ran with: when it changed — a
-    /// deploy that routes a table otherwise, mirrors one more or one less,
-    /// sends another column — every live replica is provisioned again, and
-    /// what the engine kept of a table it no longer mirrors is let go of.
-    async fn redeclared(&self, conn: &mut Conn) -> Result<(), Error> {
+    /// Compares what decides which rows the audience's replicas hold and
+    /// what a row carries with what the engine last ran with: when it
+    /// changed — a deploy that routes a table otherwise, mirrors one more or
+    /// one less, sends another column — every live replica of the audience
+    /// is provisioned again, and what the engine kept for them of a table
+    /// the audience no longer holds is let go of. Answers whether it
+    /// changed. The first run after an engine of one audience learned of
+    /// audiences takes what that engine last ran with as its own.
+    async fn redeclared(&self, conn: &mut Conn) -> Result<bool, Error> {
         let declared = self.declared();
-        let before: Option<Option<String>> = sqlx::query_scalar(
-            "UPDATE sync.version v SET declared = encode(sync.digest($1), 'hex') FROM sync.version was \
-              WHERE v.declared IS DISTINCT FROM encode(sync.digest($1), 'hex') RETURNING was.declared",
-        )
-        .bind(&declared)
-        .fetch_optional(&mut *conn)
-        .await?;
-        let Some(Some(_)) = before else {
-            return Ok(());
+        let now: String = sqlx::query_scalar("SELECT encode(sync.digest($1), 'hex')")
+            .bind(&declared)
+            .fetch_one(&mut *conn)
+            .await?;
+        let own: Option<String> =
+            sqlx::query_scalar("SELECT declared FROM sync.audiences WHERE name = $1")
+                .bind(self.name)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if own.as_deref() == Some(now.as_str()) {
+            return Ok(false);
+        }
+        let before = match own {
+            Some(own) => Some(own),
+            None => sqlx::query_scalar(
+                "UPDATE sync.version v SET declared = NULL FROM sync.version was \
+                  WHERE v.declared IS NOT NULL RETURNING was.declared",
+            )
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten(),
         };
-        tracing::warn!("sync: what places the rows changed since the engine last ran — every replica is provisioned again");
+        sqlx::query(
+            "INSERT INTO sync.audiences (name, declared) VALUES ($1, $2) \
+             ON CONFLICT (name) DO UPDATE SET declared = EXCLUDED.declared",
+        )
+        .bind(self.name)
+        .bind(&now)
+        .execute(&mut *conn)
+        .await?;
+        if before.is_none_or(|before| before == now) {
+            return Ok(false);
+        }
+        tracing::warn!(audience = self.name, "sync: what places the rows changed since the engine last ran — every replica of the audience is provisioned again");
         let tables: Vec<&str> = self.plans.iter().map(|p| p.table).collect();
         for sql in [
-            "DELETE FROM sync.held WHERE relation <> ALL($1)",
-            "DELETE FROM sync.gone WHERE relation <> ALL($1)",
-            "DELETE FROM sync.quarantine WHERE relation <> ALL($1)",
-            "UPDATE sync.notes SET done_at = now() \
-              WHERE done_at IS NULL AND kind IN ('row', 'retry') AND relation <> ALL($1)",
+            "DELETE FROM sync.held WHERE relation <> ALL($1) \
+               AND replica_id IN (SELECT replica_id FROM sync.replicas WHERE audience = $2)",
+            "DELETE FROM sync.gone WHERE relation <> ALL($1) \
+               AND replica_id IN (SELECT replica_id FROM sync.replicas WHERE audience = $2)",
+            "DELETE FROM sync.quarantine WHERE relation <> ALL($1) \
+               AND replica_id IN (SELECT replica_id FROM sync.replicas WHERE audience = $2)",
         ] {
-            sqlx::query(sql).bind(&tables).execute(&mut *conn).await?;
+            sqlx::query(sql)
+                .bind(&tables)
+                .bind(self.name)
+                .execute(&mut *conn)
+                .await?;
         }
         sqlx::query(&resync_sql(&format!(
             "SELECT s.id, s.partition FROM {}",
-            Self::replicas_of(self.replicas)
+            self.replicas_sql()
         )))
         .execute(&mut *conn)
         .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// How a broadcast row meets the replicas of its partition.
@@ -3021,8 +3388,11 @@ impl Engine {
                    JOIN sync_changed c ON q.relation = c.relation AND q.row_key = c.row_key \
                   WHERE c.rel = {i} AND (q.replica_id, q.row_key) NOT IN ({}) \
                     AND NOT EXISTS (SELECT 1 FROM sync_blocked b WHERE b.replica_id = q.replica_id \
-                                       AND b.rel = c.rel AND b.row_key = c.row_key)",
-                sent.join(" UNION ALL ")
+                                       AND b.rel = c.rel AND b.row_key = c.row_key) \
+                    AND NOT EXISTS (SELECT 1 FROM sync.replicas r WHERE r.replica_id = q.replica_id \
+                                       AND r.audience <> {})",
+                sent.join(" UNION ALL "),
+                literal(self.name)
             ))
             .execute(&mut *conn)
             .await?;
@@ -3631,6 +4001,41 @@ mod plan_tests;
 #[cfg(test)]
 #[path = "plan_bench.rs"]
 mod plan_bench;
+
+#[cfg(test)]
+impl Engine {
+    /// [`Engine::install`] of one audience, `test`.
+    pub(crate) async fn install_one(
+        conn: &mut Conn,
+        tables: &[&Table],
+        replicas: Replicas,
+    ) -> Result<Self, Error> {
+        Self::install(conn, &[Self::one(tables, replicas)]).await
+    }
+
+    /// [`Engine::new`] of one audience, `test`.
+    pub(crate) async fn new_one(
+        conn: &mut Conn,
+        tables: &[&Table],
+        replicas: Replicas,
+    ) -> Result<Self, Error> {
+        Self::new(conn, &[Self::one(tables, replicas)]).await
+    }
+
+    fn one<'a>(tables: &[&'a Table], replicas: Replicas) -> Declared<'a> {
+        Declared {
+            name: "test",
+            replicas,
+            tables: tables.to_vec(),
+        }
+    }
+
+    /// The planner of an engine of one audience.
+    pub(crate) fn only(&self) -> &Planner {
+        assert_eq!(self.audiences.len(), 1, "an engine of one audience");
+        &self.audiences[0]
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
