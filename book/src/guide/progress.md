@@ -1,11 +1,13 @@
 # Progress and health
 
 Every read here takes a `Scope` — `Scope::Replicas(&[a, b])`, a whole
-`Scope::Partition(id)`, or `Scope::All` — and counts only live replicas. That
-is how a host shows each audience its own: a customer of a multi-customer
-system gets its partition, an operator gets everything, and a user who may see
-some replicas gets the list of those. The engine knows replicas only by id;
-put your own names on them.
+`Scope::Partition(id)`, every replica of one kind (`Scope::Audience(name)`,
+[Several kinds of replica](audiences.md)), or `Scope::All` — and counts only
+live replicas. That is how a host shows each viewer their own: a customer of
+a multi-customer system gets its partition, an operator gets everything, and
+a user who may see some replicas gets the list of those. The engine knows
+replicas only by id, and by the audience each is of; put your own names on
+them.
 
 Each read is one snapshot: every figure in an answer was true at the same
 moment. Called on a connection outside a transaction, a read opens a

@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+One server, several kinds of replica. Schemas: server 3, replica 2.
+Protocol 1 (unchanged). Dashboard contract 1 (fields added).
+
+- **Audiences.** A server serves one kind of replica or several from one
+  stream of changes: `Audience::new(name, replicas, codecs)`. Each audience
+  holds the tables it declares, each encoded as its own codec says; one may
+  hold a part of what another holds, or a table in a shape of its own. A
+  table two audiences declare has one trigger, which notes what either
+  needs of it, and is planned for each against its own replicas. A replica
+  the relations of two audiences name is the first's. The wire does not
+  change: a replica is the same whatever audience it is of.
+- **A row read from a view of its own.** `#[row(from = "schema.view")]`
+  reads a catalog row's columns from a view over its table — parent columns
+  joined in, rows left out — while the table stays what the row is noted,
+  keyed and placed by. The server holds the row to the view when it starts.
+- **Copied columns: `depends`.** `#[row(depends = "fk_column")]`: a change of
+  the row a foreign key points at is a change of every row pointing at it
+  so, sent again by the audience whose row copies the parent's columns,
+  and by no other. The parent need not be mirrored: the engine notes it all
+  the same.
+- **The status by audience.** `Scope::Audience(name)`; every replica in an
+  answer, and every table, says its audience (`audience`), and a table two
+  audiences hold is listed once for each. The dashboard says the audience
+  of each row when there are several.
+- **The protocol** describes a replica that applies through another
+  system's services (Appendix B): a ledger, apply then record, skip what it
+  holds, adopt. `tests/golden/audiences.txt` is what one server sends a
+  replica of each of two audiences.
+
+### Breaking
+
+- `Server::new` and `Server::install` take `Vec<Audience<P>>` in place of the
+  codecs and the `Replicas`: `vec![Audience::new("registers", REGISTERS,
+  codecs())]` is the server of 0.1.
+- `Engine::triggers` and `Engine::indexes` take `&[Audience<P>]`.
+- `Transport::send` is told the audience: `send(&self, audience, replica,
+  message, id)`. `Senders::known` too: `known(&self, audience, replica)`.
+- `RowPlace` is no longer `Copy` (it carries its audience's name).
+- **Server schema 3.** `Server::install` takes the database there; with
+  migrations of your own, run `plan::migration(3)`. Triggers are printed as
+  before for a server of one audience: nothing to print again. The replicas
+  the engine recorded are taken over by the audience that sees them, and
+  what 0.1 last ran with is that audience's: nothing is provisioned again.
+
 ## 0.1.1 — 2026-10-13
 
 - **A foreign key may carry the partition.** With `partitioned_by(column)`,

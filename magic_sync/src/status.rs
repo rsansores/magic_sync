@@ -1,8 +1,9 @@
 //! What the engine answers about itself, for a dashboard or an alarm: whether
 //! each replica holds what it should, how far along it is, where one row
 //! stands, and what waits for a fix. Every read takes a [`Scope`], so a host
-//! shows each audience its own replicas and nothing else; the engine knows
-//! replicas only by id, and the host puts names on them.
+//! shows each viewer their own replicas and nothing else; the engine knows
+//! replicas only by id and by the audience each is of, and the host puts
+//! names on them.
 //!
 //! Each read is one snapshot: called on a connection outside a transaction,
 //! it opens a `REPEATABLE READ` one of its own; called inside one, that
