@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-10-19
 
 One server, several kinds of replica. Schemas: server 3, replica 2.
 Protocol 1 (unchanged). Dashboard contract 1 (fields added).
