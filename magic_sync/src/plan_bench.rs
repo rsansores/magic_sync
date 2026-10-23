@@ -317,6 +317,49 @@ async fn bench_10k_customers_imported_into_a_list_10_units_hold(pool: crate::DbP
     assert_eq!(drained.upserts, 100_000);
 }
 
+/// A partition of 100 replicas, each at a site of its own, holding the 1k
+/// notices a rule grants every site: 100k pairs. One rule revoked re-routes
+/// the partition — the view asked again for every replica, against all it
+/// holds — and takes back one notice from one replica.
+#[sqlx::test(migrations = false)]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
+async fn bench_a_partition_of_100_units_holding_1k_notices_rerouted(pool: crate::DbPool) {
+    let (mut conn, engine, partition, replicas) = fleet(&pool, 100).await;
+    sqlx::raw_sql(
+        "INSERT INTO fixture.t_sites (id, partition_id) SELECT id, partition_id FROM fixture.t_replicas;
+         INSERT INTO fixture.t_site_replicas (site_id, replica_id, partition_id)
+              SELECT id, id, partition_id FROM fixture.t_replicas;",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("sites");
+    sqlx::query(
+        "WITH made AS (
+             INSERT INTO fixture.t_notices (id, partition_id, name)
+             SELECT uuidv7(), $1, 'n' || n FROM generate_series(1, 1000) n
+             RETURNING id)
+         INSERT INTO fixture.t_rules (notice_id, site_id, partition_id, granted)
+         SELECT m.id, s.id, $1, true FROM made m CROSS JOIN fixture.t_sites s",
+    )
+    .bind(partition)
+    .execute(&mut *conn)
+    .await
+    .expect("notices, granted every site");
+    let drained = drain(&pool, &engine).await;
+    assert_eq!(drained.upserts, 100_000);
+
+    exec(
+        &mut conn,
+        "UPDATE fixture.t_rules SET granted = false \
+          WHERE site_id = $1 AND notice_id = (SELECT id FROM fixture.t_notices ORDER BY id LIMIT 1)",
+        &[replicas[0]],
+    )
+    .await;
+    let drained = drain(&pool, &engine).await;
+    println!("a rule revoked, a partition of 100 replicas holding 1k notices re-routed: {drained}");
+    assert_eq!((drained.upserts, drained.deletes), (0, 1));
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
