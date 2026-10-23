@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-10-23
 
 Rows a view places. Schemas: server 4, replica 2 (unchanged). Protocol 1
 (unchanged). Dashboard contract 1 (a note kind added).
