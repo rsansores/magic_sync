@@ -1,0 +1,5 @@
+error: sync = "routed(view = a.b.c, row = id, replica = r)": `view = a.b.c`: expected a relation, `view` or `schema.view`
+ --> tests/derive/fail/routed_view_with_two_dots.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "routed(view = a.b.c, row = id, replica = r)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

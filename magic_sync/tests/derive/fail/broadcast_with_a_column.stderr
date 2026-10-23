@@ -1,4 +1,4 @@
-error: sync = "broadcast(id)": expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)` or `follows(col)`
+error: sync = "broadcast(id)": expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)`, `routed(view = …, row = …, replica = …)` or `follows(col)`
  --> tests/derive/fail/broadcast_with_a_column.rs:2:52
   |
 2 | #[row(table = "things", mirror = "catalog", sync = "broadcast(id)")]

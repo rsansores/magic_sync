@@ -1,4 +1,4 @@
-error: sync = "everyone": expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)` or `follows(col)`
+error: sync = "everyone": expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)`, `routed(view = …, row = …, replica = …)` or `follows(col)`
  --> tests/derive/fail/unknown_sync.rs:2:52
   |
 2 | #[row(table = "things", mirror = "catalog", sync = "everyone")]

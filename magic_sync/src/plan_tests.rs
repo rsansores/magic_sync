@@ -1,6 +1,8 @@
 //! The engine against a schema that has every strategy, keyed every way a key
 //! can be — a uuid, an integer, several columns — driven by a seeded random
 //! walk of the writes an office makes and of what happens to its replicas.
+//! One table is routed by a view of the office's own, over tables no
+//! replica holds, which the walk writes too.
 //!
 //! Each replica is modelled as what it was sent: every row it holds, as the
 //! bytes that carried it. Passes run as the relay runs them — the notes read
@@ -141,6 +143,26 @@ CREATE TABLE fixture.t_task_lines (
 CREATE TABLE fixture.t_tallies (
     id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
     name TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0);
+-- Routed by a view: a notice goes to the replicas at the sites a rule
+-- grants it, in the rule's partition. The sites, who is at each and the
+-- rules are no table of the replicas'; a rule's note no view reads.
+CREATE TABLE fixture.t_sites (id UUID PRIMARY KEY, partition_id UUID NOT NULL);
+CREATE TABLE fixture.t_site_replicas (
+    site_id UUID NOT NULL REFERENCES fixture.t_sites (id) ON DELETE CASCADE,
+    replica_id UUID NOT NULL REFERENCES fixture.t_replicas (id), partition_id UUID NOT NULL,
+    PRIMARY KEY (site_id, replica_id));
+CREATE TABLE fixture.t_notices (
+    id UUID PRIMARY KEY, partition_id UUID NOT NULL, kind_id UUID REFERENCES fixture.t_kinds (id),
+    name TEXT NOT NULL, rev BIGINT NOT NULL DEFAULT nextval('fixture.revs'), retired_at TIMESTAMPTZ);
+CREATE TABLE fixture.t_rules (
+    notice_id UUID NOT NULL REFERENCES fixture.t_notices (id) ON DELETE CASCADE,
+    site_id UUID NOT NULL REFERENCES fixture.t_sites (id) ON DELETE CASCADE,
+    partition_id UUID NOT NULL, granted BOOLEAN NOT NULL, note TEXT,
+    PRIMARY KEY (notice_id, site_id));
+CREATE VIEW fixture.notice_replicas AS
+    SELECT r.notice_id, s.replica_id, r.partition_id
+      FROM fixture.t_rules r JOIN fixture.t_site_replicas s ON s.site_id = r.site_id
+     WHERE r.granted;
 -- A family gone before its kinds point elsewhere, in one transaction: the
 -- foreign key waits for the commit.
 CREATE FUNCTION fixture.replace_family(gone UUID, by UUID) RETURNS VOID LANGUAGE sql AS $$
@@ -162,9 +184,11 @@ CREATE VIEW t_bins AS SELECT * FROM fixture.t_bins WHERE retired_at IS NULL;
 CREATE VIEW t_accounts AS SELECT * FROM fixture.t_accounts WHERE retired_at IS NULL;
 CREATE VIEW t_tasks AS SELECT * FROM fixture.t_tasks WHERE retired_at IS NULL;
 CREATE VIEW t_task_lines AS SELECT * FROM fixture.t_task_lines WHERE retired_at IS NULL;
+CREATE VIEW t_notices AS SELECT * FROM fixture.t_notices WHERE retired_at IS NULL;
 DO $$ DECLARE t TEXT; BEGIN
   FOREACH t IN ARRAY ARRAY['t_families', 't_kinds', 't_kind_notes', 't_products', 't_customers', 't_emails',
-      't_phones', 't_calls', 't_orders', 't_sizes', 't_bins', 't_accounts', 't_tasks', 't_task_lines'] LOOP
+      't_phones', 't_calls', 't_orders', 't_sizes', 't_bins', 't_accounts', 't_tasks', 't_task_lines',
+      't_notices'] LOOP
     EXECUTE format('CREATE TRIGGER bump BEFORE UPDATE ON fixture.%I FOR EACH ROW EXECUTE FUNCTION fixture.bump()', t);
   END LOOP;
 END $$;
@@ -433,6 +457,21 @@ struct TaskLine {
     retired_at: Option<DateTime<Utc>>,
 }
 
+/// Routed by a view: to the replicas at the sites a rule grants it.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(table = "t_notices", schema = "fixture", mirror = "catalog")]
+#[row(sync = "routed(view = fixture.notice_replicas, row = notice_id, replica = replica_id)")]
+#[row(active = "t_notices", retired = "retired_at")]
+struct Notice {
+    id: Uuid,
+    partition_id: Uuid,
+    kind_id: Option<Uuid>,
+    #[serde(serialize_with = "poisoned")]
+    name: String,
+    rev: i64,
+    retired_at: Option<DateTime<Utc>>,
+}
+
 /// Written on both sides: the replicas own how often each was seen.
 #[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
 #[row(
@@ -467,6 +506,7 @@ pub(super) fn codecs() -> Vec<Codec<()>> {
         Codec::json::<Account>(None),
         Codec::json::<Bin>(None),
         Codec::json::<Size>(None),
+        Codec::json::<Notice>(None),
     ]
 }
 
@@ -496,6 +536,7 @@ const REFERENCES: &[(&str, &[&str], &str)] = &[
     ("t_tasks", &["region", "number"], "t_accounts"),
     ("t_task_lines", &["task_id"], "t_tasks"),
     ("t_task_lines", &["size_code"], "t_sizes"),
+    ("t_notices", &["kind_id"], "t_kinds"),
 ];
 
 /// The tables that follow another: the follower, its column, the parent.
@@ -523,6 +564,7 @@ const KEYS: &[(&str, &[&str])] = &[
     ("t_accounts", &["region", "number"]),
     ("t_tasks", &["id"]),
     ("t_task_lines", &["task_id", "line"]),
+    ("t_notices", &["id"]),
 ];
 
 /// The columns a table's codec cannot encode `POISON` in.
@@ -535,6 +577,7 @@ const POISONED: &[(&str, &str)] = &[
     ("t_sizes", "name"),
     ("t_bins", "name"),
     ("t_tasks", "name"),
+    ("t_notices", "name"),
 ];
 
 /// A key's text from the columns of a row as JSON; `None` when one is NULL.
@@ -1290,6 +1333,9 @@ struct Oracle {
     /// Who each group is given to, and its members, as rows.
     given: Vec<(Uuid, Uuid)>,
     members: Vec<(Uuid, Row)>,
+    /// Each notice with each replica at a site a rule grants it, and the
+    /// rule's partition.
+    granted: BTreeSet<(String, Uuid, Uuid)>,
     /// The rows that cannot go: that do not encode or fit no message, and
     /// every row that points at one.
     dead: BTreeSet<Row>,
@@ -1336,6 +1382,25 @@ impl Oracle {
                 .expect("members");
             members.extend(found.into_iter().map(|(l, k)| (l, (table.to_owned(), k))));
         }
+        let rules: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT notice_id, site_id, partition_id FROM fixture.t_rules WHERE granted",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("rules");
+        let at: Vec<(Uuid, Uuid)> =
+            sqlx::query_as("SELECT site_id, replica_id FROM fixture.t_site_replicas")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("who is at each site");
+        let granted = rules
+            .iter()
+            .flat_map(|(notice, site, partition)| {
+                at.iter()
+                    .filter(move |(s, _)| s == site)
+                    .map(move |(_, replica)| (notice.to_string(), *replica, *partition))
+            })
+            .collect();
         let cannot = |(table, _): &Row, row: &serde_json::Value| {
             POISONED.iter().any(|(t, column)| {
                 t == table && row.get(*column).and_then(|v| v.as_str()) == Some(POISON)
@@ -1369,6 +1434,7 @@ impl Oracle {
             replicas: replicas.into_iter().collect(),
             given,
             members,
+            granted,
             dead,
         }
     }
@@ -1411,6 +1477,9 @@ impl Oracle {
                         }
                         "t_orders" | "t_tasks" | "t_calls" => uuid(row.get("replica_id"), &replica),
                         "t_customers" | "t_accounts" => grouped.contains(r),
+                        // Granted in the replica's partition, wherever the
+                        // notice is.
+                        "t_notices" => self.granted.contains(&(r.1.clone(), replica, *partition)),
                         _ => false,
                     }
             })
@@ -1753,12 +1822,26 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         partition,
     )
     .await;
+    let notices = uuids(conn, "t_notices", partition).await;
+    let sites = uuids(conn, "t_sites", partition).await;
+    let at: Vec<(Uuid, Uuid)> = keys(
+        conn,
+        "SELECT site_id, replica_id FROM fixture.t_site_replicas WHERE partition_id = $1 ORDER BY 1, 2",
+        partition,
+    )
+    .await;
+    let rules: Vec<(Uuid, Uuid)> = keys(
+        conn,
+        "SELECT notice_id, site_id FROM fixture.t_rules WHERE partition_id = $1 ORDER BY 1, 2",
+        partition,
+    )
+    .await;
     let number: i64 = sqlx::query_scalar("SELECT nextval('fixture.numbers')")
         .fetch_one(&mut *conn)
         .await
         .expect("a number");
     let new = walk.uuid();
-    let choice = walk.below(111);
+    let choice = walk.below(131);
     let (family, kind, product, customer, list, email, order) = (
         walk.pick(&families),
         walk.pick(&kinds),
@@ -1783,6 +1866,12 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
         walk.pick(&lists),
         walk.pick(&customers),
         walk.pick(&kind_notes),
+    );
+    let (notice, site, here, rule) = (
+        walk.pick(&notices),
+        walk.pick(&sites),
+        walk.pick(&at),
+        walk.pick(&rules),
     );
     let small = i32::try_from(walk.below(4)).expect("small");
     let other = partitions[walk.below(partitions.len())];
@@ -1932,9 +2021,27 @@ async fn step(conn: &mut Conn, walk: &mut Walk, partitions: &[Uuid]) -> Step {
             write!(conn, "INSERT INTO fixture.t_products (id, partition_id, kind_id, name) SELECT $1, partition_id, kind_id, name FROM fixture.t_products WHERE id = $2 AND name LIKE 'u%'", new, product)
                 && write!(conn, "DELETE FROM fixture.t_products WHERE id = $1", product)
         }
+        // A table routed by a view, and what the view reads: who is at a
+        // site, and which sites a rule grants a notice — moved row by row,
+        // a partition's rules at once, a site and all of it at once; and
+        // what no view reads, which routes nothing again.
+        109 | 110 => write!(conn, "INSERT INTO fixture.t_notices (id, partition_id, kind_id, name) VALUES ($1, $2, $3, 'n')", new, partition, kind),
+        111 => write!(conn, "UPDATE fixture.t_notices SET name = name || '.' WHERE id = $1 AND name <> $2", notice, POISON),
+        112 => write!(conn, &format!("UPDATE fixture.t_notices SET {RETIRE} WHERE id = $1"), notice),
+        113 => write!(conn, "DELETE FROM fixture.t_notices WHERE id = $1", notice),
+        114 | 115 => write!(conn, "INSERT INTO fixture.t_sites (id, partition_id) VALUES ($1, $2)", new, partition),
+        116..=118 => write!(conn, "INSERT INTO fixture.t_site_replicas (site_id, replica_id, partition_id) VALUES ($1, $2, $3)", site, replica, partition),
+        119 => write!(conn, "DELETE FROM fixture.t_site_replicas WHERE site_id = $1 AND replica_id = $2", here.map(|h| h.0), here.map(|h| h.1)),
+        120 => write!(conn, "UPDATE fixture.t_site_replicas SET replica_id = $3 WHERE site_id = $1 AND replica_id = $2", here.map(|h| h.0), here.map(|h| h.1), replica),
+        121..=123 => write!(conn, "INSERT INTO fixture.t_rules (notice_id, site_id, partition_id, granted) VALUES ($1, $2, $3, $4)", notice, site, partition, walk.below(4) > 0),
+        124 => write!(conn, "UPDATE fixture.t_rules SET granted = NOT granted WHERE notice_id = $1 AND site_id = $2", rule.map(|r| r.0), rule.map(|r| r.1)),
+        125 => write!(conn, "UPDATE fixture.t_rules SET note = coalesce(note, '') || '.' WHERE partition_id = $1", partition),
+        126 => write!(conn, "UPDATE fixture.t_rules SET granted = NOT granted WHERE partition_id = $1", partition),
+        127 => write!(conn, "DELETE FROM fixture.t_sites WHERE id = $1", site),
+        128 => write!(conn, "UPDATE fixture.t_notices SET name = $2 WHERE id = $1", notice, POISON),
         // Planning a row's changes fails, until a deploy: the relay parks
         // them.
-        109 => return Step::Park(i64::from(small)),
+        129 => return Step::Park(i64::from(small)),
         _ => return Step::Cured,
     };
     if done {
@@ -2426,6 +2533,7 @@ async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
         0x404b_35fd_cc9a_ab37,
         0xa4c8_9065_538b_9cb5,
         0x64b0_376e_5c2a_ed54,
+        0x8a3d_90b7_c465_07f0,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {

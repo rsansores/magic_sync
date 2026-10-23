@@ -1,0 +1,5 @@
+error: sync = "routed(view = a, row = id, row = id, replica = r)": `row` is given twice
+ --> tests/derive/fail/routed_twice.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "routed(view = a, row = id, row = id, replica = r)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

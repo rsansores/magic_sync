@@ -610,18 +610,50 @@ fn relation(lit: Option<&LitStr>, key: &str) -> syn::Result<Option<String>> {
         return Ok(None);
     };
     let text = lit.value();
+    qualified(&text, lit.span())
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                lit,
+                format!("{key} = \"{text}\": expected `view` or `schema.view`"),
+            )
+        })?
+        .map(Some)
+}
+
+/// `text`, a relation written `view` or `schema.view`, quoted: `None` when it
+/// is written otherwise.
+fn qualified(text: &str, at: Span) -> Option<syn::Result<String>> {
     let parts: Vec<&str> = text.split('.').collect();
     if parts.len() > 2 {
-        return Err(syn::Error::new_spanned(
-            lit,
-            format!("{key} = \"{text}\": expected `view` or `schema.view`"),
-        ));
+        return None;
     }
-    let quoted: Vec<String> = parts
-        .into_iter()
-        .map(|p| identifier(p, lit.span()).map(|p| quoted(&p)))
-        .collect::<syn::Result<_>>()?;
-    Ok(Some(quoted.join(".")))
+    Some(
+        parts
+            .into_iter()
+            .map(|p| identifier(p, at).map(|p| quoted(&p)))
+            .collect::<syn::Result<Vec<_>>>()
+            .map(|parts| parts.join(".")),
+    )
+}
+
+/// `text` split at its commas, but those inside parentheses: the arguments
+/// of a strategy, one of which may be a list.
+fn arguments(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut from) = (0_usize, 0);
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&text[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[from..]);
+    out
 }
 
 /// Refuses `lit`, given on a table that is not sent down.
@@ -696,7 +728,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             ));
         }
     }
-    let (route, mut checks) = route(args.sync.as_ref(), mirror, &direct, &krate)?;
+    let (route, mut checks) = route(args.sync.as_ref(), mirror, &direct, &key, &krate)?;
     only_sent_down(args.active.as_ref(), mirror, "an `active` relation")?;
     if let Some(lit) = &args.from {
         if mirror != Mirror::Catalog {
@@ -934,10 +966,12 @@ fn setting(
 
 /// `sync = "…"`: how a table's rows find the replicas that hold them, and
 /// the checks of the types of the columns it names, which are the row's own.
+/// `key`: the row's key columns, in key order.
 fn route(
     sync: Option<&LitStr>,
     mirror: Mirror,
     direct: &[Direct],
+    key: &[String],
     krate: &syn::Path,
 ) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
     let private = quote!(#krate::__private);
@@ -1029,9 +1063,68 @@ fn route(
                 Vec::new(),
             )
         }
+        "routed" => {
+            let expected = || bad("expected `view = …, row = …, replica = …`");
+            let (mut view, mut row, mut replica) = (None, None, None);
+            for part in arguments(inner.unwrap_or_default()) {
+                let (name, value) = part.split_once('=').ok_or_else(expected)?;
+                let slot = match name.trim() {
+                    "view" => &mut view,
+                    "row" => &mut row,
+                    "replica" => &mut replica,
+                    _ => return Err(expected()),
+                };
+                if slot.replace(value.trim()).is_some() {
+                    return Err(bad(&format!("`{}` is given twice", name.trim())));
+                }
+            }
+            let (Some(view), Some(row), Some(replica)) = (view, row, replica) else {
+                return Err(expected());
+            };
+            let view = qualified(view, lit.span()).ok_or_else(|| {
+                bad(&format!(
+                    "`view = {view}`: expected a relation, `view` or `schema.view`"
+                ))
+            })??;
+            // One column, or a list of them in parentheses: the row's key,
+            // in key order.
+            let row: Vec<String> = match row.strip_prefix('(') {
+                Some(list) => {
+                    let list = list
+                        .strip_suffix(')')
+                        .ok_or_else(|| bad("missing the closing parenthesis of `row`"))?;
+                    list.split(',')
+                        .map(|c| identifier(c.trim(), lit.span()))
+                        .collect::<syn::Result<_>>()?
+                }
+                None => vec![identifier(row, lit.span())?],
+            };
+            if row.len() != key.len() {
+                let columns = |n: usize| match n {
+                    1 => "1 column".to_owned(),
+                    n => format!("{n} columns"),
+                };
+                return Err(bad(&format!(
+                    "the row's key is {}, and `row` names {}: the view's columns that hold the \
+                     key, in key order — `row = (a, b)` for a key of two",
+                    columns(key.len()),
+                    row.len()
+                )));
+            }
+            let replica = identifier(replica, lit.span())?;
+            (
+                quote!(#private::Route::Routed {
+                    view: #view,
+                    row: &[#(#row),*],
+                    replica: #replica,
+                }),
+                Vec::new(),
+            )
+        }
         _ => {
             return Err(bad(
-                "expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)` or `follows(col)`",
+                "expected `broadcast`, `assigned(col)`, `grouped(members = …, assigned = …)`, \
+                 `routed(view = …, row = …, replica = …)` or `follows(col)`",
             ))
         }
     })

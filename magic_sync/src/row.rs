@@ -102,6 +102,14 @@ pub enum Route {
         members: &'static str,
         assigned: &'static str,
     },
+    /// Every replica a relation of the host's pairs the row with. `view` is
+    /// the relation as SQL names it, quoted; `row` its columns that hold the
+    /// row's key, in key order; `replica` its column naming the replica.
+    Routed {
+        view: &'static str,
+        row: &'static [&'static str],
+        replica: &'static str,
+    },
     /// Wherever the row the column points at goes.
     Follows(&'static str),
 }
@@ -1969,6 +1977,29 @@ mod tests {
             ]
         );
         assert!(Table::of::<Order>().contradictions().is_empty());
+    }
+
+    /// Routed by a view whose name a database quotes, keyed by two columns.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(table = "documents", mirror = "catalog", key = "shelf, number")]
+    #[row(
+        sync = "routed(view = Library.document readers, row = (shelf, document_number), replica = reader_id)"
+    )]
+    struct Document {
+        shelf: i32,
+        number: i64,
+    }
+
+    #[test]
+    fn a_routed_row_names_its_view_quoted_and_its_key_in_key_order() {
+        assert_eq!(
+            Document::ROUTE,
+            Route::Routed {
+                view: r#""Library"."document readers""#,
+                row: &["shelf", "document_number"],
+                replica: "reader_id",
+            }
+        );
     }
 
     /// Nullable is read off the standard `Option`, by any of its paths.

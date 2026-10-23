@@ -393,6 +393,7 @@ pub mod magic_sync::status
 #[non_exhaustive] pub enum magic_sync::status::NoteKind
 pub magic_sync::status::NoteKind::Assigned
 pub magic_sync::status::NoteKind::Members
+pub magic_sync::status::NoteKind::Rerouted
 pub magic_sync::status::NoteKind::Resync
 pub magic_sync::status::NoteKind::Row
 impl core::clone::Clone for magic_sync::status::NoteKind

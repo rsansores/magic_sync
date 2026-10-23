@@ -24,7 +24,7 @@ const rowStates = {
   leaving: 1,
   quarantined: 1,
 } satisfies Record<RowState, 1>
-const noteKinds = { row: 1, members: 1, assigned: 1, resync: 1 } satisfies Record<NoteKind, 1>
+const noteKinds = { row: 1, members: 1, assigned: 1, rerouted: 1, resync: 1 } satisfies Record<NoteKind, 1>
 const wishStates = { pending: 1, waiting: 1, applied: 1, refused: 1, superseded: 1 } satisfies Record<
   WishState,
   1

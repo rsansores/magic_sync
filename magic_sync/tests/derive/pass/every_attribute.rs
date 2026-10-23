@@ -94,6 +94,22 @@ pub struct Screen {
     pub stamps: Stamps,
 }
 
+/// A row held where a view pairs it with replicas, by its key of two
+/// columns, in key order.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(
+    table = "documents",
+    schema = "library",
+    mirror = "catalog",
+    key = "shelf, number",
+    sync = "routed(view = library.document_readers, row = (shelf, document_number), replica = reader_id)"
+)]
+pub struct Document {
+    pub shelf: i32,
+    pub number: i64,
+    pub title: String,
+}
+
 /// A row that goes wherever its parent goes.
 #[derive(sqlx::FromRow, Clone, magic_sync::Row)]
 #[row(table = "task_notes", mirror = "catalog", key = "task_id", sync = "follows(task_id)")]

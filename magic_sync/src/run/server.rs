@@ -1053,3 +1053,7 @@ mod tests;
 #[cfg(test)]
 #[path = "audience_tests.rs"]
 mod audience_tests;
+
+#[cfg(test)]
+#[path = "routed_tests.rs"]
+pub(crate) mod routed_tests;
