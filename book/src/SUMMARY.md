@@ -13,6 +13,7 @@
 - [A replica](guide/replica.md)
 - [Settings and wishes](guide/settings.md)
 - [Several kinds of replica](guide/audiences.md)
+- [Rows a view places](guide/routed.md)
 - [Provisioning a replica](guide/provisioning.md)
 - [Progress and health](guide/progress.md)
 - [The dashboard](guide/dashboard.md)

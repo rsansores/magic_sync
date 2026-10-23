@@ -28,6 +28,7 @@ For a table that goes down:
 | `assigned(col)` | `col` names the replica |
 | `follows(col)` | the row `col` points at goes to the replica |
 | `grouped(members = t, assigned = t)` | the row is in a group the replica is given ([Recipes](recipes.md)) |
+| `routed(view = v, row = col, replica = col)` | a view of yours pairs the row with the replica ([Rows a view places](routed.md)) |
 | left out | no rule of its own: it goes wherever a row that travels points at it |
 
 > **What happens:** you never declared that a receipt needs its product. The

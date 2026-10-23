@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+Rows a view places. Schemas: server 4, replica 2 (unchanged). Protocol 1
+(unchanged). Dashboard contract 1 (a note kind added).
+
+- **Routed tables.** `sync = "routed(view = v, row = col, replica = col)"`:
+  a replica holds a row where a view of the host's pairs the two — in its
+  partition, when the replicas are partitioned, which the view says too.
+  The view decides who holds a row, and `active` still which rows travel at
+  all; a pair answered twice is owed once. `row = (a, b)` names the view's
+  columns of a key of two, in key order. `assigned` and `grouped` are such
+  views, and the engine's tests hold the two ways to sending alike.
+- **What the view reads, read off the catalog.** When the server starts, it
+  reads what the view reads where PostgreSQL keeps it (`pg_depend`), column
+  by column, through the views it reads and the functions with a
+  SQL-standard body (`BEGIN ATOMIC … END`, `RETURN …`) it calls, an
+  operator's too. What PostgreSQL ships, and what an extension installed,
+  reads no table of the host's. A view that calls any other function, or
+  reads a materialized view or a foreign table, is refused, naming it; so is
+  one that lacks a column the route names, or holds the key in another type.
+- **Re-routes.** Every table the view reads, but the routed table itself,
+  gets four statement-level triggers (`sync_reroute_insert`, `_update`,
+  `_delete` and `_truncate`), each noting every partition its statement
+  touched once — an update only where what the views read changed, a
+  truncate every partition — as a note of the kind `rerouted`. The planner
+  asks the view again for every replica of the partition, and sends the
+  difference. A change of the routed row is planned by its key, as any
+  row's. A view written otherwise provisions every replica of its audience
+  again, as a declaration changed. The status lists a parked re-route as
+  `NoteKind::Rerouted`.
+
+### Breaking
+
+- **Server schema 4.** `Server::install` takes the database there; with
+  migrations of your own, run `plan::migration(4)`, which admits the new
+  kind of note and adds `sync.note_reroute()`. The triggers an earlier build
+  printed are printed alike: print them again once a table is routed by a
+  view.
+
 ## 0.2.0 — 2026-10-19
 
 One server, several kinds of replica. Schemas: server 3, replica 2.

@@ -89,8 +89,10 @@ Built on that:
 
 - **Partial replication by rules.** A row goes to every replica of its
   partition (`broadcast`), to the replica a column names (`assigned(col)`), to
-  the replicas a group of rows is given to (`grouped`), or wherever its parent
-  goes (`follows(col)`).
+  the replicas a group of rows is given to (`grouped`), to the replicas a view
+  of yours pairs it with (`routed`), or wherever its parent goes
+  (`follows(col)`). A view's rule is noted as it changes: the engine reads
+  what the view reads off the catalog, and you declare nothing more.
 - **Referential closure, read from your schema.** A replica sent an order is
   sent its customer too, and keeps the customer while anything of its own
   points at it. The engine reads the foreign keys; you declare nothing.

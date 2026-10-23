@@ -51,6 +51,22 @@ pub struct Customer {
 }
 // ANCHOR_END: grouped
 
+// ANCHOR: routed
+/// A notice: to the registers of every store a rule grants it.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(
+    table = "notices",
+    schema = "shop",
+    mirror = "catalog",
+    sync = "routed(view = shop.notice_registers, row = notice_id, replica = register_id)"
+)]
+pub struct Notice {
+    pub id: Uuid,
+    pub title: String,
+    pub body: String,
+}
+// ANCHOR_END: routed
+
 // ANCHOR: both
 /// A register's state: the head office writes its label, the register its
 /// battery.
