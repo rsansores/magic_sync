@@ -1532,9 +1532,12 @@ impl Engine {
     /// however many rows. PostgreSQL gives a trigger its statement's rows
     /// only for one event, and with no column list: an update is told
     /// apart by the columns the views read of the table, which its trigger
-    /// compares. A truncate takes every row, of every partition. Tables in
-    /// one order, columns in one order: printed twice, they are the same
-    /// text.
+    /// compares. A truncate takes every row, of every partition. A trigger
+    /// of statements fires for the table a statement names, and is not
+    /// cloned to its partitions or its children: a view that reads a table
+    /// of a partitioned or an inheritance tree is refused when it is read
+    /// (`routing`). Tables in one order, columns in one order: printed
+    /// twice, they are the same text.
     fn reroutes(&self) -> Vec<Trigger> {
         let mut reads: BTreeMap<&Relation, (&str, BTreeSet<&str>)> = BTreeMap::new();
         for planner in &self.audiences {
@@ -2090,6 +2093,7 @@ impl Planner {
                             conn,
                             &plan.relation,
                             &key,
+                            &plan.owned,
                             (view, row, replica),
                             replicas.partition,
                         )
@@ -2488,13 +2492,16 @@ impl Planner {
                 )
             }
             // The view decides the pairs, and may answer one twice; the
-            // active rows decide what travels at all.
+            // active rows decide what travels at all, and a row's partition
+            // which replicas may hold it.
             Route::Routed { .. } => {
                 let names: Vec<&str> = plan.key.iter().map(|c| c.name).collect();
                 format!(
                     "SELECT DISTINCT s.id AS replica_id, {key} AS key FROM {view} t {} \
                      WHERE {filter}",
-                    plan.routing.as_ref()?.join(&names, &replicas),
+                    plan.routing
+                        .as_ref()?
+                        .join(&names, &replicas, plan.has_partition),
                 )
             }
         })

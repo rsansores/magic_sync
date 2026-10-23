@@ -281,6 +281,252 @@ async fn what_the_catalog_cannot_see_into_is_refused_naming_it(pool: crate::DbPo
     assert!(why.contains("BEGIN ATOMIC"), "says what to write: {why}");
 }
 
+/// A view that calls a function of PostgreSQL's or of an extension's that
+/// is not immutable — directly, through an operator, as a SQL value, or in
+/// the body of a SQL-standard function — is refused when the server
+/// starts, naming it: what it answers changes with no write. What a view
+/// compares, casts and tests uuids, integers, text and booleans with is
+/// immutable, and starts.
+#[sqlx::test(migrations = false)]
+async fn a_function_that_is_not_immutable_is_refused_naming_it(pool: crate::DbPool) {
+    let mut conn = fixture(&pool).await;
+    sqlx::raw_sql(
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto; \
+         ALTER TABLE fixture.rules ADD COLUMN until TIMESTAMPTZ, ADD COLUMN rank INTEGER; \
+         CREATE FUNCTION fixture.current(at TIMESTAMPTZ) RETURNS BOOLEAN LANGUAGE sql STABLE \
+             RETURN at > now(); \
+         CREATE VIEW fixture.by_now AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) WHERE r.until > now(); \
+         CREATE VIEW fixture.by_date AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) \
+            WHERE current_date > '2026-01-01'; \
+         CREATE VIEW fixture.by_setting AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) \
+            WHERE current_setting('app.company', true) IS NULL; \
+         CREATE VIEW fixture.by_chance AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) WHERE random() < 2; \
+         CREATE VIEW fixture.by_operator AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) \
+            WHERE r.until > '2026-01-01'::date; \
+         CREATE VIEW fixture.by_extension AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) \
+            WHERE length(gen_random_bytes(1)) = 1; \
+         CREATE VIEW fixture.by_function AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d USING (site_id) WHERE fixture.current(r.until);",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("views");
+    for (table, refusal) in [
+        (
+            routed_by(r#""fixture"."by_now""#, &["document_id"], "device_id"),
+            "whose the view fixture.by_now calls now(), a function that is not immutable: what \
+             it answers changes with no write a trigger sees",
+        ),
+        (
+            routed_by(r#""fixture"."by_date""#, &["document_id"], "device_id"),
+            "calls current_date, a function that is not immutable",
+        ),
+        (
+            routed_by(r#""fixture"."by_setting""#, &["document_id"], "device_id"),
+            "calls current_setting(text,boolean), a function that is not immutable",
+        ),
+        (
+            routed_by(r#""fixture"."by_chance""#, &["document_id"], "device_id"),
+            "calls random(), a function that is not immutable",
+        ),
+        (
+            routed_by(r#""fixture"."by_operator""#, &["document_id"], "device_id"),
+            "calls timestamptz_gt_date(timestamp with time zone,date), a function that is not \
+             immutable",
+        ),
+        (
+            routed_by(r#""fixture"."by_extension""#, &["document_id"], "device_id"),
+            "gen_random_bytes(integer), a function that is not immutable",
+        ),
+        (
+            routed_by(r#""fixture"."by_function""#, &["document_id"], "device_id"),
+            "whose the function fixture.current(timestamp with time zone) calls now()",
+        ),
+    ] {
+        let why = refused(&mut conn, &[&table]).await;
+        assert!(why.contains(refusal), "{why}");
+    }
+
+    sqlx::raw_sql(
+        "CREATE OR REPLACE VIEW fixture.document_devices AS \
+             SELECT r.document_id, d.id AS device_id, r.company_id \
+               FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id \
+              WHERE r.granted AND NOT (d.live IS FALSE) AND r.site_id::text <> '' \
+                AND coalesce(r.rank, 0)::bigint < 10 AND r.rank IS DISTINCT FROM -1 \
+                AND r.note || '' >= '' AND r.company_id IN (d.company_id) \
+                AND (r.until IS NULL OR r.until = r.until);",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("a view of comparisons and casts");
+    let table = Table::of::<Document>();
+    engine(&mut conn, &[&table]).await;
+}
+
+/// A view that reads a partitioned table, a partition, or a table that
+/// inherits or is inherited is refused when the server starts, naming it: a
+/// trigger of statements fires on the table a statement names, and a write
+/// of one table of the tree changes the rows of another.
+#[sqlx::test(migrations = false)]
+async fn a_table_of_a_partitioned_or_inheritance_tree_is_refused_naming_it(pool: crate::DbPool) {
+    let mut conn = fixture(&pool).await;
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE fixture.zones (site_id UUID NOT NULL, company_id UUID NOT NULL) \
+             PARTITION BY LIST (company_id); \
+         CREATE TABLE fixture.zones_a PARTITION OF fixture.zones FOR VALUES IN ('{A}'); \
+         CREATE TABLE fixture.places (site_id UUID NOT NULL, company_id UUID NOT NULL); \
+         CREATE TABLE fixture.kiosks (kind TEXT) INHERITS (fixture.places); \
+         CREATE VIEW fixture.by_zone AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id \
+             JOIN fixture.zones z ON z.site_id = r.site_id; \
+         CREATE VIEW fixture.by_zone_a AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id \
+             JOIN fixture.zones_a z ON z.site_id = r.site_id; \
+         CREATE VIEW fixture.by_place AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id \
+             JOIN fixture.places p ON p.site_id = r.site_id; \
+         CREATE VIEW fixture.by_kiosk AS SELECT r.document_id, d.id AS device_id, r.company_id \
+             FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id \
+             JOIN fixture.kiosks k ON k.site_id = r.site_id;"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("trees");
+    for (table, refusal) in [
+        (
+            routed_by(r#""fixture"."by_zone""#, &["document_id"], "device_id"),
+            r#"whose the view fixture.by_zone reads "fixture"."zones", a partitioned table"#,
+        ),
+        (
+            routed_by(r#""fixture"."by_zone_a""#, &["document_id"], "device_id"),
+            r#"reads "fixture"."zones_a", a table of an inheritance tree"#,
+        ),
+        (
+            routed_by(r#""fixture"."by_place""#, &["document_id"], "device_id"),
+            r#"reads "fixture"."places", a table of an inheritance tree"#,
+        ),
+        (
+            routed_by(r#""fixture"."by_kiosk""#, &["document_id"], "device_id"),
+            r#"reads "fixture"."kiosks", a table of an inheritance tree"#,
+        ),
+    ] {
+        let why = refused(&mut conn, &[&table]).await;
+        assert!(why.contains(refusal), "{why}");
+    }
+}
+
+/// The routed table's own rows are planned by their key, off a trigger
+/// that notes no write of the columns its replicas write alone: a view that
+/// reads one of those is refused when the server starts, naming it, and a
+/// view that reads none starts.
+#[sqlx::test(migrations = false)]
+async fn a_view_that_reads_a_column_the_replicas_write_is_refused(pool: crate::DbPool) {
+    let mut conn = fixture(&pool).await;
+    let mut table = Table::of::<Document>();
+    table.mirror = crate::row::Mirror::Both;
+    table
+        .columns
+        .iter_mut()
+        .find(|c| c.name == "title")
+        .expect("the title")
+        .replica_owned = true;
+    engine(&mut conn, &[&table]).await;
+
+    sqlx::raw_sql(
+        "CREATE OR REPLACE VIEW fixture.document_devices AS \
+             SELECT r.document_id, d.id AS device_id, r.company_id \
+               FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id \
+               JOIN fixture.documents doc ON doc.id = r.document_id \
+              WHERE r.granted AND doc.title <> '';",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("a view that reads the title");
+    let why = refused(&mut conn, &[&table]).await;
+    assert!(
+        why.contains(
+            "which reads `title` of `documents` itself, a column its replicas write \
+             (`replica_owned`)"
+        ),
+        "{why}"
+    );
+}
+
+/// A view named alone — `view`, not `schema.view` — is the one the
+/// connection's search path finds, and routes as one named whole.
+#[sqlx::test(migrations = false)]
+async fn a_view_named_alone_is_the_one_the_search_path_finds(pool: crate::DbPool) {
+    let mut conn = fixture(&pool).await;
+    sqlx::raw_sql(&format!(
+        "CREATE VIEW public.devices_of AS \
+             SELECT r.document_id, d.id AS device_id, r.company_id \
+               FROM fixture.rules r JOIN fixture.devices d ON d.site_id = r.site_id; \
+         INSERT INTO fixture.documents (id, company_id, title) VALUES ('{SAFETY}', '{A}', 'safety'); \
+         INSERT INTO fixture.rules (document_id, site_id, company_id) VALUES ('{SAFETY}', '{NORTH}', '{A}');"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("a view on the search path");
+    let table = routed_by(r#""devices_of""#, &["document_id"], "device_id");
+    let engine = engine(&mut conn, &[&table]).await;
+    assert_eq!(
+        reads(&engine),
+        BTreeMap::from([
+            (
+                r#""fixture"."devices""#.to_owned(),
+                columns(&["id", "site_id"])
+            ),
+            (
+                r#""fixture"."rules""#.to_owned(),
+                columns(&["company_id", "document_id", "site_id"])
+            ),
+        ])
+    );
+    let planner = engine.only();
+    let i = planner.index("documents").expect("the documents");
+    assert_eq!(
+        planner.wanted(&mut conn, i, None, None).await.unwrap(),
+        BTreeSet::from([(uuid(A1), SAFETY.to_owned())])
+    );
+}
+
+/// A row with the partition column goes to the replicas of its partition
+/// alone, as a broadcast row does: a view that pairs a row of one company
+/// with a device of another sends that device nothing.
+#[sqlx::test(migrations = false)]
+async fn a_row_is_wanted_only_in_its_own_partition(pool: crate::DbPool) {
+    let mut conn = fixture(&pool).await;
+    sqlx::raw_sql(&format!(
+        "CREATE VIEW fixture.everywhere AS \
+             SELECT doc.id AS document_id, d.id AS device_id, d.company_id \
+               FROM fixture.documents doc CROSS JOIN fixture.devices d; \
+         INSERT INTO fixture.documents (id, company_id, title) \
+              VALUES ('{SAFETY}', '{A}', 'safety'), ('{ROTA}', '{B}', 'rota');"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("a view across companies");
+    let table = routed_by(r#""fixture"."everywhere""#, &["document_id"], "device_id");
+    let engine = engine(&mut conn, &[&table]).await;
+    let planner = engine.only();
+    let i = planner.index("documents").expect("the documents");
+    assert_eq!(
+        planner.wanted(&mut conn, i, None, None).await.unwrap(),
+        BTreeSet::from([
+            (uuid(A1), SAFETY.to_owned()),
+            (uuid(A2), SAFETY.to_owned()),
+            (uuid(B1), ROTA.to_owned()),
+        ]),
+        "no document of A to B1, nor of B to A1 or A2"
+    );
+}
+
 /// A function written SQL-standard — `BEGIN ATOMIC … END`, or `RETURN …` —
 /// is read through, as a view is: what its body reads is what the view
 /// reads.
@@ -319,7 +565,7 @@ async fn what_a_sql_standard_function_reads_is_read_through(pool: crate::DbPool)
 }
 
 /// What PostgreSQL ships, and what an extension installed, reads no table
-/// of the host's: a view may call either.
+/// of the host's: a view may call either, immutable.
 #[sqlx::test(migrations = false)]
 async fn what_postgres_and_its_extensions_ship_is_no_dependency(pool: crate::DbPool) {
     let mut conn = fixture(&pool).await;

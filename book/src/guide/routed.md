@@ -49,7 +49,8 @@ CREATE VIEW shop.notice_registers AS
 {{#include ../../snippets/src/rows.rs:routed}}
 ```
 
-`view` is the relation, `view` or `schema.view`; `row` its columns that
+`view` is the relation, `view` or `schema.view` — named alone, the one the
+server's search path finds; `row` its columns that
 hold the row's key — `row = (shelf_id, number)` for a key of two, in key
 order; `replica` its uuid column naming the replica. With replicas
 partitioned ([Recipes](recipes.md#several-companies-on-one-server)), the view
@@ -57,7 +58,11 @@ has the partition column too, by the same name, and says which partition
 each pair is of.
 
 > **What happens:** a replica should hold a row when the view pairs the two,
-> in the replica's partition. The view decides who holds a row; `active`, if
+> in the replica's partition — and in the row's, when the row has the
+> partition column, as a broadcast row is: a view that pairs one company's
+> notice with another's register sends that register nothing. A row without
+> the column, a table of every company's, goes where the view's partition
+> column says. The view decides who holds a row; `active`, if
 > the row has it, still decides which rows travel at all: an archived notice
 > the view pairs with a register is not sent. A view may answer a pair more
 > than once, and the row is owed once. What the row points at goes with it,
@@ -85,21 +90,34 @@ nothing would say so.
 
 What PostgreSQL ships reads no table of yours: the catalog records no
 dependency on it at all. A function an extension installed is taken to read
-none either. Any other function's body is text the catalog does not look
-into — PL/pgSQL, or SQL written as a string (`AS $$ … $$`) — so what it reads
-cannot be known, nor noted.
+none either. Neither is read through, so each has to be **immutable** — to
+answer the same for the same arguments: `now()`, `current_date`,
+`current_setting()` and `random()` answer otherwise with no write, and no
+trigger would see the rows they place move. What compares, casts and tests
+uuids, integers, text and booleans is immutable. Any other function's body
+is text the catalog does not look into — PL/pgSQL, or SQL written as a
+string (`AS $$ … $$`) — so what it reads cannot be known, nor noted.
 
 > **What happens:** the server refuses to start on a view that calls such a
 > function, behind an operator too, naming the function and the view that
-> calls it — as it refuses a view that reads a materialized view or a foreign
-> table, whose rows change where no trigger sees. Write the function's body
-> SQL-standard, or read its tables in the view.
+> calls it: write the function's body SQL-standard, or read its tables in
+> the view. It refuses one that calls, anywhere it reads through, a function
+> of PostgreSQL's or an extension's that is not immutable, naming it: keep
+> what it answers in a column a write sets — a flag a job raises when a
+> notice expires — and read that. And it refuses a view that reads a
+> materialized view or a foreign table, whose rows change where no trigger
+> sees, or a partitioned table, a partition, or a table that inherits or is
+> inherited: a statement fires the triggers of the table it names, and
+> changes the rows of another.
 
 > **Mind:** the routed table itself is not something the view reads, for this
 > purpose: a change of a notice is planned by its key, as a change of any
 > row is — sent again to whoever holds it, and the view asked about that
 > notice alone. A view in which a change of one notice moves *another* notice
-> is not one this route follows. A whole row read anywhere — a row passed to
+> is not one this route follows. Nor is a replica's write of a column it owns
+> a change of the row ([`mirror = "both"`](rows.md#which-way-it-travels-mirror)):
+> the server refuses to start on a view that reads a `replica_owned` column
+> of the routed table, naming it. A whole row read anywhere — a row passed to
 > a function, `r IS NULL` — names no column of its own: every column of the
 > tables read there counts.
 

@@ -7,19 +7,26 @@ Rows a view places. Schemas: server 4, replica 2 (unchanged). Protocol 1
 
 - **Routed tables.** `sync = "routed(view = v, row = col, replica = col)"`:
   a replica holds a row where a view of the host's pairs the two — in its
-  partition, when the replicas are partitioned, which the view says too.
-  The view decides who holds a row, and `active` still which rows travel at
-  all; a pair answered twice is owed once. `row = (a, b)` names the view's
-  columns of a key of two, in key order. `assigned` and `grouped` are such
-  views, and the engine's tests hold the two ways to sending alike.
+  partition, when the replicas are partitioned, which the view says too,
+  and which a row with the partition column is of as well. The view decides
+  who holds a row, and `active` still which rows travel at all; a pair
+  answered twice is owed once. `view` named alone is the one the search
+  path finds. `row = (a, b)` names the view's columns of a key of two, in
+  key order. `assigned` and `grouped` are such views, and the engine's tests
+  hold the two ways to sending alike.
 - **What the view reads, read off the catalog.** When the server starts, it
   reads what the view reads where PostgreSQL keeps it (`pg_depend`), column
   by column, through the views it reads and the functions with a
   SQL-standard body (`BEGIN ATOMIC … END`, `RETURN …`) it calls, an
   operator's too. What PostgreSQL ships, and what an extension installed,
-  reads no table of the host's. A view that calls any other function, or
-  reads a materialized view or a foreign table, is refused, naming it; so is
-  one that lacks a column the route names, or holds the key in another type.
+  reads no table of the host's, and has to be immutable: `now()`,
+  `current_date` or `current_setting()` answer otherwise with no write. A
+  view that calls any other function, or one of those that is not
+  immutable, or reads a materialized view, a foreign table, a partitioned
+  table or a table of an inheritance tree, is refused, naming it; so is one
+  that reads a `replica_owned` column of the routed table, whose writes note
+  no change of the row, lacks a column the route names, or holds the key in
+  another type.
 - **Re-routes.** Every table the view reads, but the routed table itself,
   gets four statement-level triggers (`sync_reroute_insert`, `_update`,
   `_delete` and `_truncate`), each noting every partition its statement
