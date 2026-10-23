@@ -489,6 +489,17 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
     .await
     .unwrap();
     world.pass(&wire).await;
+    // And a re-route of a partition no replica belongs to, set aside since
+    // that pass: one through a table no view reads, as this one, is done
+    // by the next.
+    sqlx::query(
+        "INSERT INTO sync.notes (kind, relation, partition_id, parked_at, attempts, last_error) \
+         VALUES ('rerouted', '\"fixture\".\"grants\"', $1, now(), 1, 'a bug')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(&world.pool)
+    .await
+    .unwrap();
     for replica in [synced, refusing] {
         world
             .acknowledge(replica, world.last_sent(replica).await)
@@ -557,7 +568,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
         .iter()
         .map(|p| format!("{:?}", p.kind))
         .collect();
-    assert_eq!(kinds.len(), 4, "every kind of note: {:?}", overview.health);
+    assert_eq!(kinds.len(), 5, "every kind of note: {:?}", overview.health);
     let listing = world
         .engine
         .listing(

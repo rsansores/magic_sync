@@ -119,9 +119,10 @@ describe('summarize', () => {
       ['parked', null, 'list_members'],
       ['parked', 'Refusing', 'replica_lists'],
       ['parked', 'Refusing', null],
+      ['parked', null, '"fixture"."grants"'],
       ['unreachable', 'Away', null],
     ])
-    expect([summary.fixes, summary.more]).toEqual([6, 0])
+    expect([summary.fixes, summary.more]).toEqual([7, 0])
     const cut = {
       ...overview,
       health: { ...overview.health, quarantine: { ...overview.health.quarantine, total: 40 } },
@@ -136,6 +137,7 @@ describe('summarize', () => {
     })
     expect(summary.tables.map((t) => [t.label, t.synced])).toEqual([
       ['Products', false],
+      ['"fixture"."grants"', false],
       ['from_a_newer_build', false],
       ['list_members', false],
       ['replica_lists', false],

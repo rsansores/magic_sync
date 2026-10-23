@@ -47,7 +47,8 @@ that is: a fleet is never upgraded at once, and does not need to be.
 What decides which rows each replica holds is yours: per audience, the
 replicas' relation, and per table its key, its `sync` rule, the tables it
 points at, its groups, its columns, the view it is read `from` and the
-columns it `depends` on. The relay remembers a digest of them per audience
+columns it `depends` on — and for a table routed by a view, what the view
+reads, and how it and every view and function it reads through are written. The relay remembers a digest of them per audience
 (`sync.audiences`); the first pass of a build whose declarations of an
 audience differ — a table routed otherwise, held for the first time or no
 more, a column added — provisions every live replica of that audience again,

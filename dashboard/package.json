@@ -1,6 +1,6 @@
 {
   "name": "magic_sync_dashboard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "The magic_sync dashboard for Vue 3: is every replica holding what it should, which tables are on their way, and what waits for a fix — headless, or ready-made.",
   "type": "module",
   "license": "MIT OR Apache-2.0",

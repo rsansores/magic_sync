@@ -17,7 +17,7 @@ export type RowState = "holds" | "outdated" | "on_its_way" | "missing" | "leavin
 /**
  * What a note asks for.
  */
-export type NoteKind = "row" | "members" | "assigned" | "resync";
+export type NoteKind = "row" | "members" | "assigned" | "rerouted" | "resync";
 
 /**
  * How far this replica is from having sent the server what it wrote, per
@@ -229,7 +229,8 @@ id: number,
  */
 kind: NoteKind, 
 /**
- * The table it is of, for a row or a group.
+ * The table it is of, for a row or a group — for a re-route, as SQL
+ * names it.
  */
 table: string | null, 
 /**

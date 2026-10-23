@@ -72,9 +72,19 @@ export default {
           "parked_at": "2026-01-01T00:00:00.123456Z",
           "replica": "00000000-0000-7000-8000-000000000002",
           "table": null
+        },
+        {
+          "attempts": 1,
+          "id": 12,
+          "key": null,
+          "kind": "rerouted",
+          "last_error": "a bug",
+          "parked_at": "2026-01-01T00:00:00.123456Z",
+          "replica": null,
+          "table": "\"fixture\".\"grants\""
         }
       ],
-      "total": 4
+      "total": 5
     },
     "pending": 0,
     "quarantine": {
@@ -220,6 +230,17 @@ export default {
       "replicas": 3,
       "synced": false,
       "table": "items",
+      "unfiled": 0
+    },
+    {
+      "audience": "test",
+      "in_flight": 0,
+      "parked": 1,
+      "pending": 0,
+      "quarantined": 0,
+      "replicas": 0,
+      "synced": false,
+      "table": "\"fixture\".\"grants\"",
       "unfiled": 0
     },
     {

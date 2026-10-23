@@ -1,0 +1,5 @@
+error: sync = "routed(view = a, row = id, replica = r)": the row's key is 2 columns, and `row` names 1: the view's columns that hold the key, in key order — `row = (a, b)` for a key of two
+ --> tests/derive/fail/routed_row_not_the_key.rs:6:12
+  |
+6 |     sync = "routed(view = a, row = id, replica = r)"
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

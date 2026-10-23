@@ -90,6 +90,7 @@ A table is declared once, as the Rust struct that is its row, implementing
 | `Broadcast` | the row is in the replica's partition |
 | `Assigned(column)` | `column` names the replica |
 | `Grouped { members, assigned }` | the row is a member of a group (`members` is a `(group, row)` table) that is given to the replica (`assigned` is a `(group, replica)` table) |
+| `Routed { view, row, replica }` | a view of the host's pairs the row with the replica (`view` answers `(row, replica)`, and the partition) |
 | `Follows(column)` | the row `column` points at goes to the replica (a table that extends another one) |
 | `Referenced` | no rule of its own: it goes wherever a row that travels points at it |
 
@@ -165,9 +166,13 @@ forget to note**, and a rolled-back change leaves no note. `TRUNCATE` is
 refused on a mirrored table, because it would remove rows without a note.
 
 Group tables get a trigger too: a member joining or leaving a group, or a
-group given to or taken from a replica, is noted the same way. The server
-refuses to start while a trigger is missing, disabled, or not as it would
-write it.
+group given to or taken from a replica, is noted the same way. So does every
+table a routed table's view reads — found in the catalog, through the views
+and SQL-standard functions it reads — once a statement, once each partition
+the statement touched, and only for the columns the view reads; the planner
+then asks the view again for every replica of that partition
+([Rows a view places](guide/routed.md)). The server refuses to start while a
+trigger is missing, disabled, or not as it would write it.
 
 ### 4.2 Planning
 

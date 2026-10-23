@@ -505,6 +505,9 @@ pub enum NoteKind {
     Members,
     /// A group was given to or taken from `replica`.
     Assigned,
+    /// What a routed table's view reads of `table` changed: the view is
+    /// asked again for every replica of a partition.
+    Rerouted,
     /// `replica` is provisioned again.
     Resync,
 }
@@ -518,7 +521,8 @@ pub struct Parked {
     pub id: i64,
     /// What it asks for.
     pub kind: NoteKind,
-    /// The table it is of, for a row or a group.
+    /// The table it is of, for a row or a group — for a re-route, as SQL
+    /// names it.
     pub table: Option<String>,
     /// The row's key, for a row.
     pub key: Option<String>,
@@ -606,6 +610,7 @@ mod stored {
             "row" | "retry" => NoteKind::Row,
             "members" => NoteKind::Members,
             "assigned" => NoteKind::Assigned,
+            "rerouted" => NoteKind::Rerouted,
             "resync" => NoteKind::Resync,
             _ => return Ok(None),
         };
@@ -1345,13 +1350,13 @@ impl Engine {
     }
 
     /// Whether the audience `a` plans the pending notes `note` counts: of
-    /// one of its tables, a group of one, a parent one copies, or of a
-    /// replica.
+    /// one of its tables, a group of one, a parent one copies, a table a
+    /// view routing one reads, or of a replica.
     fn plans_note(&self, a: usize, note: &NoteGroup) -> bool {
         let planner = &self.audiences[a];
         note.table
             .as_deref()
-            .is_none_or(|t| planner.knows(t) || planner.depends_on(t))
+            .is_none_or(|t| planner.knows(t) || planner.depends_on(t) || planner.routes_through(t))
     }
 
     /// Whether no audience knows the table of `note`: every audience plans

@@ -1,0 +1,5 @@
+error: sync = "routed(view = a, row = id)": expected `view = …, row = …, replica = …`
+ --> tests/derive/fail/routed_without_a_replica.rs:2:52
+  |
+2 | #[row(table = "things", mirror = "catalog", sync = "routed(view = a, row = id)")]
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

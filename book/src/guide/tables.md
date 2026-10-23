@@ -83,7 +83,8 @@ database does not have — write them in the migration beside the triggers.
 > what such a session writes reaches no replica. If one writes your mirrored
 > tables, enable their triggers always
 > (`ALTER TABLE … ENABLE ALWAYS TRIGGER sync_note_row`, and the same for
-> `sync_refuse_truncate` and `sync_note_group`): the server takes a trigger
+> `sync_refuse_truncate`, `sync_note_group` and the `sync_reroute_…` triggers
+> of a table a routed table's view reads): the server takes a trigger
 > enabled always, and refuses one enabled for replication sessions only.
 
 > **You write**, if you have no migrations — the shop's way — nothing: build

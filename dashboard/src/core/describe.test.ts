@@ -28,12 +28,12 @@ describe('bannerOf', () => {
     expect(banner.lines).toEqual([
       '1 of 4 replicas has changes on their way.',
       '1 replica cannot be reached; it gets what it is owed once it can.',
-      '6 problems wait for a fix.',
+      '7 problems wait for a fix.',
     ])
   })
 
   it('says so in the locale asked for', () => {
-    expect(bannerOf(summary(), speech(AT, 'es')).lines[2]).toBe('6 problemas esperan una corrección.')
+    expect(bannerOf(summary(), speech(AT, 'es')).lines[2]).toBe('7 problemas esperan una corrección.')
   })
 })
 

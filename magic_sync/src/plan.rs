@@ -32,6 +32,7 @@ use crate::dialect::{ident, literal};
 use crate::row::{key_text, Column, Key, KeyPart, Route, Table};
 use crate::wire::Codec;
 use crate::Error;
+use routing::Routing;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -227,6 +228,8 @@ pub(crate) struct Plan {
     /// The table has the replicas' partition column, which its notes say.
     has_partition: bool,
     group: Option<Group>,
+    /// How a routed table reaches replicas.
+    routing: Option<Routing>,
     /// The columns the replicas own: a write of only these is no change here.
     owned: Vec<&'static str>,
     /// Every column a row of it carries.
@@ -257,8 +260,9 @@ pub(crate) struct Delta {
 }
 
 /// What a batch asks about: the tables with rows changed, members moved and
-/// groups given or taken; whether a changed row released a parent, and
-/// whether a replica is provisioned.
+/// groups given or taken — or routed again, every replica of a partition
+/// asked about as one given a group; whether a changed row released a
+/// parent, and whether a replica is provisioned.
 #[derive(Default)]
 struct Asked {
     changed: BTreeSet<usize>,
@@ -295,6 +299,13 @@ pub(crate) enum Change {
     },
     /// A group was given to or taken from a replica.
     Assigned { table: String, replica: Uuid },
+    /// What a routed table's view reads of `table` — as SQL names it —
+    /// changed in `partition`, or in every partition (`None`): the view is
+    /// asked again for every replica of it.
+    Rerouted {
+        table: String,
+        partition: Option<Uuid>,
+    },
     /// A replica is provisioned again, from scratch.
     Resync { replica: Uuid },
 }
@@ -346,6 +357,7 @@ const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [
     include_str!("../sql/postgres/1.sql"),
     include_str!("../sql/postgres/2.sql"),
     include_str!("../sql/postgres/3.sql"),
+    include_str!("../sql/postgres/4.sql"),
 ];
 
 /// The engine's step to `version` of its schema on the server, as one SQL
@@ -720,6 +732,10 @@ struct Trigger {
     kind: i16,
     function: &'static str,
     args: Vec<String>,
+    /// The statement's rows before and after it, as the transition tables
+    /// `sync_old` and `sync_new`, for a trigger of each statement.
+    old_table: bool,
+    new_table: bool,
 }
 
 /// `tgtype` bits.
@@ -753,8 +769,21 @@ impl Trigger {
             "STATEMENT"
         };
         let args: Vec<String> = self.args.iter().map(|a| literal(a)).collect();
+        let tables: Vec<&str> = [
+            (self.old_table, " OLD TABLE AS sync_old"),
+            (self.new_table, " NEW TABLE AS sync_new"),
+        ]
+        .into_iter()
+        .filter(|(named, _)| *named)
+        .map(|(_, table)| table)
+        .collect();
+        let referencing = if tables.is_empty() {
+            String::new()
+        } else {
+            format!(" REFERENCING{}", tables.concat())
+        };
         format!(
-            "CREATE TRIGGER {} {timing} {} ON {} FOR EACH {each} EXECUTE FUNCTION sync.{}({});",
+            "CREATE TRIGGER {} {timing} {} ON {}{referencing} FOR EACH {each} EXECUTE FUNCTION sync.{}({});",
             self.name,
             events.join(" OR "),
             self.on.sql(),
@@ -778,6 +807,9 @@ struct LiveTrigger {
     /// replication one, or for every session — not disabled, not for
     /// replication sessions only — with no `WHEN` and no column list.
     plain: bool,
+    /// The names of its transition tables, if any.
+    old_table: Option<String>,
+    new_table: Option<String>,
 }
 
 impl LiveTrigger {
@@ -795,10 +827,13 @@ impl LiveTrigger {
             .take(usize::try_from(self.nargs).unwrap_or_default())
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
+        let named = |name: &str, expected: bool| expected.then(|| name.to_owned());
         self.plain
             && self.kind == expected.kind
             && self.function == expected.function
             && args == expected.args
+            && self.old_table == named("sync_old", expected.old_table)
+            && self.new_table == named("sync_new", expected.new_table)
     }
 }
 
@@ -808,7 +843,8 @@ async fn live_triggers(conn: &mut Conn) -> Result<Vec<LiveTrigger>, Error> {
     Ok(sqlx::query_as(
         "SELECT n.nspname::text AS schema, c.relname::text AS table, t.tgname::text AS name, \
                 t.tgtype AS kind, p.proname::text AS function, t.tgnargs AS nargs, t.tgargs AS args, \
-                t.tgenabled IN ('O', 'A') AND t.tgqual IS NULL AND t.tgattr::text = '' AS plain \
+                t.tgenabled IN ('O', 'A') AND t.tgqual IS NULL AND t.tgattr::text = '' AS plain, \
+                t.tgoldtable::text AS old_table, t.tgnewtable::text AS new_table \
            FROM pg_trigger t \
            JOIN pg_class c ON c.oid = t.tgrelid \
            JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1462,6 +1498,8 @@ impl Engine {
                 kind: ROW | INSERT | UPDATE | DELETE,
                 function: "note_row",
                 args,
+                old_table: false,
+                new_table: false,
             });
             out.push(Trigger {
                 on,
@@ -1469,6 +1507,8 @@ impl Engine {
                 kind: BEFORE | TRUNCATE,
                 function: "refuse_truncate",
                 args: Vec::new(),
+                old_table: false,
+                new_table: false,
             });
         }
         for (on, (name, column, role, partition)) in groups {
@@ -1478,9 +1518,76 @@ impl Engine {
                 kind: ROW | INSERT | UPDATE | DELETE,
                 function: "note_group",
                 args: vec![name, column, role.to_owned(), partition.to_owned()],
+                old_table: false,
+                new_table: false,
             });
         }
+        out.extend(self.reroutes());
         Ok(out)
+    }
+
+    /// The triggers of every table a routed table's view reads, by the
+    /// table: one per statement that can change what a view reads of it,
+    /// each noting the partitions the statement touched — once each,
+    /// however many rows. PostgreSQL gives a trigger its statement's rows
+    /// only for one event, and with no column list: an update is told
+    /// apart by the columns the views read of the table, which its trigger
+    /// compares. A truncate takes every row, of every partition. A trigger
+    /// of statements fires for the table a statement names, and is not
+    /// cloned to its partitions or its children: a view that reads a table
+    /// of a partitioned or an inheritance tree is refused when it is read
+    /// (`routing`). Tables in one order, columns in one order: printed
+    /// twice, they are the same text.
+    fn reroutes(&self) -> Vec<Trigger> {
+        let mut reads: BTreeMap<&Relation, (&str, BTreeSet<&str>)> = BTreeMap::new();
+        for planner in &self.audiences {
+            let partition = planner.replicas.partition.unwrap_or_default();
+            for routing in planner.plans.iter().filter_map(|p| p.routing.as_ref()) {
+                for (on, columns) in &routing.reads {
+                    let partition = if routing.partitioned.contains(on) {
+                        partition
+                    } else {
+                        ""
+                    };
+                    let (noted, read) = reads.entry(on).or_insert((partition, BTreeSet::new()));
+                    // Partitioned otherwise by two audiences, a write notes
+                    // every partition.
+                    if *noted != partition {
+                        *noted = "";
+                    }
+                    read.extend(columns.iter().map(String::as_str));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (on, (partition, read)) in reads {
+            let args = vec![on.sql(), partition.to_owned()];
+            let mut update = args.clone();
+            update.extend(read.iter().map(|c| (*c).to_owned()));
+            for (name, kind, args, old_table, new_table) in [
+                ("sync_reroute_insert", INSERT, args.clone(), false, true),
+                ("sync_reroute_update", UPDATE, update, true, true),
+                ("sync_reroute_delete", DELETE, args.clone(), true, false),
+                (
+                    "sync_reroute_truncate",
+                    TRUNCATE,
+                    args.clone(),
+                    false,
+                    false,
+                ),
+            ] {
+                out.push(Trigger {
+                    on: on.clone(),
+                    name,
+                    kind,
+                    function: "note_reroute",
+                    args,
+                    old_table,
+                    new_table,
+                });
+            }
+        }
+        out
     }
 
     fn triggers_needed(&self) -> Vec<Trigger> {
@@ -1562,20 +1669,46 @@ impl Engine {
         .bind(self.noted_tables())
         .execute(&mut *conn)
         .await?;
+        // And so is a change of a table no view routing a table reads any
+        // more.
+        sqlx::query(
+            "UPDATE sync.notes SET done_at = now() \
+              WHERE done_at IS NULL AND kind = 'rerouted' AND relation <> ALL($1)",
+        )
+        .bind(self.routed_tables())
+        .execute(&mut *conn)
+        .await?;
         Ok(())
     }
 
     /// Whether `planner`'s audience plans `change`: a change to one of its
-    /// tables, a group of one of them, a replica to provision — and a change
-    /// no audience knows, which fails where it is planned.
+    /// tables, a group of one of them, what a view routing one of them
+    /// reads, a replica to provision — and a change no audience knows,
+    /// which fails where it is planned.
     pub(crate) fn concerns(&self, planner: &Planner, change: &Change) -> bool {
         let knows = |p: &Planner| match change {
             Change::Row { table, .. } => p.index(table).is_some() || p.depends_on(table),
             Change::Members { table, .. } => !p.groups_through(table, |g| &g.members).is_empty(),
             Change::Assigned { table, .. } => !p.groups_through(table, |g| &g.assigned).is_empty(),
+            Change::Rerouted { table, .. } => p.routes_through(table),
             Change::Resync { .. } => true,
         };
         knows(planner) || !self.audiences.iter().any(knows)
+    }
+
+    /// Every table a view routing a table of some audience reads, as SQL
+    /// names it.
+    fn routed_tables(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .audiences
+            .iter()
+            .flat_map(|a| &a.plans)
+            .filter_map(|p| p.routing.as_ref())
+            .flat_map(|r| r.reads.keys().map(Relation::sql))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// The name of every table some audience notes.
@@ -1643,7 +1776,9 @@ impl Planner {
                 Route::Assigned(column) | Route::Follows(column) => {
                     need(&plan.relation, vec![column.to_owned()]);
                 }
-                Route::Referenced | Route::Grouped { .. } => {}
+                // A view has no index of its own: what it reads is the
+                // host's to index for its own questions.
+                Route::Referenced | Route::Grouped { .. } | Route::Routed { .. } => {}
             }
             if let Some(g) = &plan.group {
                 need(&g.members, g.member_row.clone());
@@ -1804,6 +1939,7 @@ impl Planner {
                 depends: Vec::new(),
                 has_partition: false,
                 group: None,
+                routing: None,
                 owned: t
                     .columns
                     .iter()
@@ -1943,6 +2079,27 @@ impl Planner {
                         replicas.table,
                     )?);
                 }
+                Route::Routed { view, row, replica } => {
+                    let typed = typed_columns(conn, &plan.relation.sql()).await?;
+                    let key_types: Vec<(&str, String)> = plan
+                        .key
+                        .iter()
+                        .map(|k| (k.name, type_of(&typed, k.name).unwrap_or_default()))
+                        .collect();
+                    let key: Vec<(&str, &str)> =
+                        key_types.iter().map(|(k, t)| (*k, t.as_str())).collect();
+                    plan.routing = Some(
+                        Routing::read(
+                            conn,
+                            &plan.relation,
+                            &key,
+                            &plan.owned,
+                            (view, row, replica),
+                            replicas.partition,
+                        )
+                        .await?,
+                    );
+                }
                 _ => {}
             }
         }
@@ -2050,6 +2207,11 @@ impl Planner {
             for d in &p.depends {
                 let _ = write!(read, " depends {} {:?}", d.parent.sql(), d.columns);
             }
+            // What the view reads and how it reads it: a view written
+            // otherwise routes rows otherwise.
+            if let Some(routing) = &p.routing {
+                read.push_str(&routing.declared());
+            }
             let _ = writeln!(
                 out,
                 "{} {} active {} key {key:?} {:?} references {references:?} group {:?} columns {:?} \
@@ -2072,6 +2234,27 @@ impl Planner {
             .iter()
             .flat_map(|p| &p.depends)
             .any(|d| d.parent.name == table)
+    }
+
+    /// The tables of the audience routed by a view that reads `table`, as
+    /// SQL names it.
+    fn routed_through(&self, table: &str) -> Vec<usize> {
+        self.plans
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.routing
+                    .as_ref()
+                    .is_some_and(|r| r.reads.keys().any(|on| on.sql() == table))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Whether a view routing a table of the audience reads `table`, as SQL
+    /// names it.
+    pub(crate) fn routes_through(&self, table: &str) -> bool {
+        !self.routed_through(table).is_empty()
     }
 
     /// Whether a change of `table` is the audience's to plan: one of its
@@ -2308,6 +2491,19 @@ impl Planner {
                     ident(&g.assigned_replica),
                 )
             }
+            // The view decides the pairs, and may answer one twice; the
+            // active rows decide what travels at all, and a row's partition
+            // which replicas may hold it.
+            Route::Routed { .. } => {
+                let names: Vec<&str> = plan.key.iter().map(|c| c.name).collect();
+                format!(
+                    "SELECT DISTINCT s.id AS replica_id, {key} AS key FROM {view} t {} \
+                     WHERE {filter}",
+                    plan.routing
+                        .as_ref()?
+                        .join(&names, &replicas, plan.has_partition),
+                )
+            }
         })
     }
 
@@ -2495,6 +2691,9 @@ impl Planner {
         // Parents changed whose columns rows of the audience copy, by key,
         // with their note.
         let mut copied: Vec<(&str, &str, i64)> = Vec::new();
+        // Routed tables whose views read what changed, with the partitions
+        // it changed in: `None`, every one.
+        let mut rerouted: BTreeMap<usize, Option<BTreeSet<Uuid>>> = BTreeMap::new();
         for note in notes {
             match &note.change {
                 Change::Row { table, key, retry } => {
@@ -2545,8 +2744,42 @@ impl Planner {
                         reassigned.insert((i, *replica));
                     }
                 }
+                Change::Rerouted { table, partition } => {
+                    let routed = self.routed_through(table);
+                    if routed.is_empty() {
+                        return Err(Error::Misuse(format!(
+                            "a change to {table}, which no routed table's view reads: its \
+                             trigger outlived its declaration"
+                        )));
+                    }
+                    for i in routed {
+                        let partitions = rerouted.entry(i).or_insert_with(|| Some(BTreeSet::new()));
+                        match (partitions.as_mut(), partition) {
+                            (Some(partitions), Some(partition)) => {
+                                partitions.insert(*partition);
+                            }
+                            _ => *partitions = None,
+                        }
+                    }
+                }
                 Change::Resync { .. } => {}
             }
+        }
+        // A view asked again for a partition is asked for every replica
+        // of it, as if each were given a group: what the view answers for
+        // it is compared with all it holds of the table.
+        for (i, partitions) in rerouted {
+            let every = partitions.is_none();
+            let partitions: Vec<Uuid> = partitions.into_iter().flatten().collect();
+            let replicas: Vec<Uuid> = sqlx::query_scalar(&format!(
+                "SELECT s.id FROM {} WHERE $1 OR s.partition = ANY($2)",
+                self.replicas_sql()
+            ))
+            .bind(every)
+            .bind(&partitions)
+            .fetch_all(&mut *conn)
+            .await?;
+            reassigned.extend(replicas.into_iter().map(|replica| (i, replica)));
         }
         // A row that copies a changed parent's columns changed with it, as
         // of the parent's note.
@@ -3633,7 +3866,7 @@ impl Planner {
                 ));
             } else if let Some(wanted) = self.wanted_sql(i, &fresh).filter(|_| asked.fresh) {
                 let by = match plan.route {
-                    Route::Grouped { .. } => "2".to_owned(),
+                    Route::Grouped { .. } | Route::Routed { .. } => "2".to_owned(),
                     _ => plan
                         .key
                         .iter()
@@ -3959,6 +4192,7 @@ struct Noted {
     relation: Option<String>,
     row_key: Option<String>,
     replica_id: Option<Uuid>,
+    partition_id: Option<Uuid>,
     previous: Option<serde_json::Value>,
 }
 
@@ -3983,6 +4217,10 @@ impl Noted {
                 table: self.relation?,
                 replica: self.replica_id?,
             },
+            "rerouted" => Change::Rerouted {
+                table: self.relation?,
+                partition: self.partition_id,
+            },
             _ => return None,
         })
     }
@@ -3994,6 +4232,7 @@ pub(crate) const READABLE: &str =
     "((kind IN ('row', 'retry') AND relation IS NOT NULL AND row_key IS NOT NULL) \
      OR (kind = 'members' AND relation IS NOT NULL AND previous IS NOT NULL) \
      OR (kind = 'assigned' AND relation IS NOT NULL AND replica_id IS NOT NULL) \
+     OR (kind = 'rerouted' AND relation IS NOT NULL) \
      OR (kind = 'resync' AND replica_id IS NOT NULL))";
 
 /// The pending notes, oldest first: not parked, and of a kind this build
@@ -4011,7 +4250,7 @@ pub(crate) async fn pending(conn: &mut Conn, limit: i64) -> Result<Vec<Note>, Er
         )));
     }
     let rows: Vec<Noted> = sqlx::query_as(&format!(
-        "SELECT id, kind, relation, row_key, replica_id, previous \
+        "SELECT id, kind, relation, row_key, replica_id, partition_id, previous \
            FROM sync.notes WHERE done_at IS NULL AND parked_at IS NULL AND {READABLE} \
             AND noted_at <= now() \
           ORDER BY id LIMIT $1"
@@ -4297,9 +4536,16 @@ fn within_partition(
         .collect()
 }
 
+#[path = "routing.rs"]
+mod routing;
+
 #[cfg(test)]
 #[path = "plan_tests.rs"]
 mod plan_tests;
+
+#[cfg(test)]
+#[path = "routing_tests.rs"]
+mod routing_tests;
 
 #[cfg(test)]
 #[path = "plan_bench.rs"]
