@@ -4859,6 +4859,34 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
     assert!(told.up.backlog.is_some());
 }
 
+/// The backlog an upload says is what is owed once it is filed: the rows it
+/// carries are not, and an upload of everything says nothing is owed.
+#[sqlx::test(migrations = false)]
+async fn an_upload_of_everything_says_nothing_is_owed(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["one", "two", "three"]).await;
+    let up = w.up(0, false).await.expect("the rows");
+    assert_eq!(up.tables[0].upserts.len(), 3);
+    assert_eq!(up.backlog.expect("said").tables, vec![]);
+    let mut conn = w.pool.acquire().await.unwrap();
+    let unfiled: Vec<i64> = progress(&mut conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.unfiled)
+        .collect();
+    assert_eq!(unfiled, [3], "on their way until the server files them");
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
+    assert!(w.up(0, false).await.is_none(), "nothing changed to say");
+}
+
 /// What the replica stored of the backlog it last told, it reads in a shape
 /// of its own: one it cannot read — another build's — it never told, and
 /// tells now, rather than fail every message up.
@@ -4872,7 +4900,8 @@ async fn a_backlog_told_in_a_shape_it_cannot_read_is_told_again(pool: SqlitePool
         .unwrap();
     events(&w, &["y"]).await;
     let up = w.up(0, false).await.expect("sent");
-    assert_eq!(up.backlog.expect("told").tables[0].unsent, 1);
+    let told = up.backlog.expect("told");
+    assert_eq!((told.tables[0].unsent, told.tables[0].unfiled), (0, 1));
 }
 
 /// A clock set back makes nothing wait for it to come round again: an upload

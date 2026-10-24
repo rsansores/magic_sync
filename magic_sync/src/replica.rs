@@ -2192,13 +2192,23 @@ struct Told {
 /// [`Error::Database`] when the database fails.
 #[cfg(feature = "sqlite")]
 pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
+    owed(conn, 0).await
+}
+
+/// [`UpProgress`] once the server files the upload numbered `upload` (0:
+/// none): what it carries as noted is done then, and is no longer owed. A
+/// backlog said in an upload counts what is owed after it, or it would count
+/// the very rows it travels with.
+#[cfg(feature = "sqlite")]
+async fn owed(conn: &mut Conn, upload: i64) -> Result<Vec<UpProgress>, Error> {
     let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
         "SELECT relation, \
                 sum(set_aside IS NULL AND (sent_at IS NULL OR writes > sent)), \
                 sum(set_aside IS NULL AND sent_at IS NOT NULL AND writes = sent), \
                 sum(set_aside IS NOT NULL) \
-           FROM sync_notes GROUP BY relation ORDER BY relation",
+           FROM sync_notes WHERE upload IS NOT $1 GROUP BY relation ORDER BY relation",
     )
+    .bind(upload)
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows
@@ -2214,7 +2224,8 @@ pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
 
 /// The backlog to tell the server, `now` being what it is: when it changed
 /// since it was last told — with a message going anyway, when it empties or
-/// starts, or when the last time is `backlog_every` ago — and, while it is
+/// starts (rows wait to be sent where none did), or when the last time is
+/// `backlog_every` ago — and, while it is
 /// not empty, every `backlog_every` even unchanged. A clock set back since
 /// it was last told counts as that long ago.
 #[cfg(feature = "sqlite")]
@@ -2247,7 +2258,10 @@ async fn backlog_due(
         // server have lost it.
         !now.tables.is_empty() && stale
     } else {
-        let edge = now.tables.is_empty() || before.as_ref().is_none_or(Vec::is_empty);
+        // Rows only on their way start nothing: the upload that carries
+        // them said what was owed besides.
+        let starts = now.tables.iter().any(|t| t.unsent + t.set_aside > 0);
+        let edge = now.tables.is_empty() || (starts && before.as_ref().is_none_or(Vec::is_empty));
         sending || edge || stale
     };
     Ok(due.then_some(now))
@@ -2596,6 +2610,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     let notes = unsent(conn, lanes, this, settings, items, skip).await?;
     let gathered = gather(conn, codecs, notes, largest, budget).await?;
     up.tables = gathered.tables;
+    let mut carried = 0;
     if !gathered.carried.is_empty() {
         // A random number, a fresh one on every send: no answer meant for
         // another replica, or for this one before a restore, names its notes.
@@ -2614,6 +2629,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         .execute(&mut *conn)
         .await?;
         up.uploads = vec![u64::try_from(number).unwrap_or_default()];
+        carried = number;
     }
     let sending = !up.tables.is_empty()
         || !up.rejected.is_empty()
@@ -2621,7 +2637,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         || news
         || untold_gap;
     if backlog.is_some() {
-        let now = progress(conn).await?;
+        let now = owed(conn, carried).await?;
         up.backlog = backlog_due(conn, now, settings, sending).await?;
     }
     Ok((sending || up.backlog.is_some()).then_some(Outgoing {
