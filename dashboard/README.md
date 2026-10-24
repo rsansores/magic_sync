@@ -8,7 +8,8 @@ which is most of the time.
 ![The dashboard, with something to fix](https://rsansores.github.io/magic_sync/images/dashboard.png)
 
 It fetches nothing. Your server asks the engine (`Engine::overview`,
-`Engine::listing`, `Engine::progress`, `Engine::row_progress`) from its own
+`Engine::states`, `Engine::listing`, `Engine::progress`,
+`Engine::row_progress`) from its own
 handlers, behind its own authentication, over the replicas the caller may
 see, and returns the answers as they are. The dashboard draws them.
 
@@ -30,16 +31,18 @@ import {
   type Overview,
   type Progress,
   type ReplicaState,
+  type States,
 } from 'magic_sync_dashboard'
 import 'magic_sync_dashboard/styles.css'
 
 const overview = ref<Overview | null>(null)
+const states = ref<States | null>(null)
 const listing = ref<Listing | null>(null)
 const progress = ref<Progress | null>(null)
 const selected = ref<string | null>(null)
 const filter = ref<ReplicaState | null>(null)
 const offset = ref(0)
-// Fetch `overview` every few seconds, `listing` for `filter` and `offset`,
+// Fetch `overview` and `states` every few seconds, `listing` for `filter` and `offset`,
 // and `progress` for `selected`, from your own endpoints.
 </script>
 
@@ -49,6 +52,7 @@ const offset = ref(0)
     v-model:filter="filter"
     v-model:offset="offset"
     :overview="overview"
+    :states="states"
     :listing="listing"
     :progress="progress"
     :names="{ '0190a1b2-…': 'Register 1' }"
@@ -57,22 +61,55 @@ const offset = ref(0)
 </template>
 ```
 
-| Prop                         | What it is                                                                                         |
-| ---------------------------- | -------------------------------------------------------------------------------------------------- |
-| `overview`                   | `Engine::overview`'s answer; `null` while loading                                                  |
-| `listing`                    | `Engine::listing`'s answer for `filter` and `offset`; without it, the overview's worst are listed  |
-| `progress`                   | `Engine::progress`'s answer for the selected replica                                               |
-| `names`, `labels`            | your names for replicas and tables: a map, or a function                                           |
-| `v-model:selected`           | the replica being looked at; keep it in your URL if you like                                       |
-| `v-model:filter`             | the state the replicas are listed in (`null`: all of them)                                         |
-| `v-model:offset`, `pageSize` | where the page of the listing begins, and the `limit` you ask it for (50)                          |
-| `locale`, `messages`         | see below                                                                                          |
-| `silentAfter`, `stuckAfter`  | when a replica is "not answering" (15 min) and when waiting changes need attention (15 min), in ms |
+| Prop                              | What it is                                                                                             |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `overview`                        | `Engine::overview`'s answer; `null` while loading                                                      |
+| `states`                          | `Engine::states`'s answer: a tile of every replica; without it, a tile of each of the overview's worst |
+| `listing`                         | `Engine::listing`'s answer for `filter` and `offset`; without it, the overview's worst are listed      |
+| `progress`                        | `Engine::progress`'s answer for the selected replica                                                   |
+| `names`, `labels`                 | your names for replicas and tables: a map, or a function                                               |
+| `v-model:selected`                | the replica being looked at; keep it in your URL if you like                                           |
+| `v-model:filter`                  | the state the replicas are listed in (`null`: all of them)                                             |
+| `v-model:offset`, `pageSize`      | where the page of the listing begins, and the `limit` you ask it for (50)                              |
+| `levels`, `placeOf`               | where your replicas are: the tiles gather in a cluster per place (see below)                           |
+| `v-model:level`, `v-model:within` | the level the tiles are clustered by, and the places they are narrowed to                              |
+| `group`                           | the group you gather each table in: `(table) => ({ key, label, order })`                               |
+| `checks`                          | what you check of a replica, shown before the engine's own check                                       |
+| `locale`, `messages`              | see below                                                                                              |
+| `silentAfter`, `stuckAfter`       | when a replica is "not answering" (15 min) and when waiting changes need attention (15 min), in ms     |
+| `behindAfter`                     | your server's `Settings::behind_after` (2 min), in ms: when a table going up is stalled                |
+
+The slot `replica-extra` (given `{ replica }`) goes under a replica's
+tables: whatever else your system shows of it.
 
 An answer carries the version of its JSON (`contract`): one this dashboard
 does not read is refused, with a message that says so, rather than drawn
 wrong. Every time is measured against the server's `now` in the answer, moved
 on by the time passed in the page — never against the browser's clock.
+
+## What only your system knows
+
+The engine knows whether each replica holds what it should and when it
+last heard from it. Your system knows more, and says it as functions:
+
+```ts
+// Where each replica is, the widest level first: a cluster of tiles per
+// place, and a cluster's header leads a level down.
+const levels = [
+  { key: 'region', label: 'Region' },
+  { key: 'store', label: 'Store' },
+]
+const placeOf = (replica: string, level: string) => places[replica]?.[level] ?? null // { key, label }
+// The group of each table: a replica's tables roll up in them.
+const group = (table: string) => groups[table] // { key, label, order }
+// What you check of a replica, read before the engine's own check.
+const checks = (replica: string) => [
+  { key: 'link', label: 'Link', status: online[replica] ? 'ok' : 'failing', line: '…' },
+]
+```
+
+A passing check stays quiet; one that fails is drawn in its `tone`, or the
+attention colour.
 
 ## Where one row is
 
@@ -103,8 +140,9 @@ out, waiting, refused and changed there first.
 Every colour and size is a CSS variable; set them on `.msd` or any ancestor:
 `--msd-font` (a font family), `--msd-fg`, `--msd-muted`, `--msd-bg`, `--msd-card`,
 `--msd-border`, `--msd-accent`, `--msd-ok`, `--msd-warn`,
-`--msd-danger`, `--msd-ok-soft`, `--msd-warn-soft`, `--msd-danger-soft`,
-`--msd-radius`, `--msd-gap`. The defaults keep every text at a contrast of
+`--msd-danger`, `--msd-quiet`, `--msd-off`, `--msd-ok-soft`, `--msd-warn-soft`,
+`--msd-danger-soft`, `--msd-quiet-soft`, `--msd-off-soft`, `--msd-accent-soft`,
+`--msd-ok-tile`, `--msd-tile` (a tile's size), `--msd-radius`, `--msd-gap`. The defaults keep every text at a contrast of
 4.5:1 or more against what it is drawn on. They are a light scheme and do not
 follow `prefers-color-scheme`: a host with a dark theme sets the variables for
 it, which is also what keeps the contrast.
@@ -118,13 +156,18 @@ sentence functions of the core:
 ```ts
 import { describeReplica, describeTable, describeProblem, useSyncDashboard } from 'magic_sync_dashboard'
 
-const dash = useSyncDashboard({ overview, listing, filter, selected, progress, names, labels })
+const dash = useSyncDashboard({ overview, states, listing, filter, selected, progress, names, labels })
 dash.error.value // why the answer cannot be shown (another contract), or null
 dash.speech.value // how to say things; null until an answer that reads has come
 dash.banner.value // { mood: 'healthy' | 'catching_up' | 'attention' | 'empty', title, lines }
 dash.summary.value // counts per state, the worst replicas, tables, problems
+dash.tally.value // [{ state, tone, label, n }], worst first: the counters
+dash.grid.value // the tiles in clusters: { level, deeper, trail, clusters, total, tones }
+dash.attention.value // [{ id, name, standing, line }]: the replicas not settled, worst first
 dash.page.value // the replicas to list: rows, offset, total
+dash.tables.value // the tables over the fleet: lagging groups, settled groups
 dash.progress.value // the selected replica, per table: upToDate of should
+dash.detail.value // the selected replica: standing, checks, heard, totals, down, up, problems
 const speech = dash.speech.value
 if (speech) {
   describeReplica(row, speech) // ["Last answered 3 hr. ago.", "2 rows set aside."]
@@ -133,13 +176,21 @@ if (speech) {
 }
 ```
 
+It also takes `levels`, `placeOf`, `level`, `within`, `group`, `checks`,
+`behindAfter` and `combine`: a state of your own made from the engine's and
+your checks, `(state, checks) => ({ state, tone, label }) | null`, which the
+tiles, the counters and the replicas that need attention all take. A
+`Tone` — `attention`, `off`, `silent`, `unknown`, `moving`, `ok`, worst first
+— is what your design system colours a state by.
+
 `useSyncDashboard` keeps the server's time moving while it is called in a
 component's `setup` or an effect scope; called anywhere else it has nothing to
 tie a timer to, and the times it says stay as of the last answer.
 
 Everything that does not need Vue — the types, `summarize`, `pageOf`,
-`progressOf`, the sentence functions and `translator` — is also in
-`magic_sync_dashboard/core`.
+`progressOf`, `tilesOf`, `gridOf`, `downOf`, `upOf`, `attentionOf`,
+`checksOf`, the sentence functions and `translator` — is also in
+`magic_sync_dashboard/core`, as pure functions of the answers.
 
 ## Languages
 

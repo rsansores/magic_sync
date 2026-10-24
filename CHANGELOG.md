@@ -37,6 +37,32 @@ Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
 - **Every replica's state at once.** `Engine::states(scope)`: each replica
   of a scope with its audience and its state, worst first, for a map of the
   fleet — a few milliseconds over 200 replicas.
+- **The dashboard shows only what waits.** The ready-made `SyncDashboard`
+  has counters that filter, a tile per replica worst first (from
+  `Engine::states`, passed as `states`), and the replicas that need
+  attention, a sentence each; a replica's page says when it was last heard
+  and whether what it writes goes up live, its three numbers (to send, to
+  confirm, set aside), its checks, and only the tables that wait, both ways,
+  the settled folded into one line ("2 more tables up to date"). A host
+  places its replicas (`levels`, `placeOf`: the tiles gather in a cluster
+  per place, a cluster's header leads a level down, `v-model:level` and
+  `v-model:within`), groups its tables (`group`), adds checks of its own
+  (`checks`) and more under them (the slot `replica-extra`). The Tables tab
+  is called Data.
+- **The dashboard's core, for a host's own design system.** Pure functions
+  of the answers: a `Tone` per state; `syncCheck` and `checksOf`, the
+  engine's check after the host's; `standingOf` with a host's `Combine`,
+  for states of its own made from the engine's and its checks; `tallyOf`;
+  `attentionOf` and `lineOf`; `tilesOf`, `gridOf`, `into` and `levelUnder`
+  for the tiles in clusters; `downOf`, `upOf`, `fleetOf` and `totalsOf` for
+  the tables both ways, live or stalled, in the host's groups; `downChips`,
+  `upChips`, `describeFlow`, `describeSettled`, `describeHeard` and
+  `lasting` to say them. `useSyncDashboard` takes `states`, `levels`,
+  `placeOf`, `level`, `within`, `group`, `checks`, `combine` and
+  `behindAfter`, and answers `tiles`, `grid`, `tally`, `attention`,
+  `tables` and `detail`. Every new sentence is in English and Spanish, and
+  every new look a variable (`--msd-quiet`, `--msd-off`, their `-soft`
+  tints, `--msd-accent-soft`, `--msd-ok-tile`, `--msd-tile`).
 
 Upgrading: the replica first or the server first, either way. An earlier
 replica says no age and no keepalive, and is judged as before but for
@@ -46,7 +72,9 @@ silence; an earlier server ignores both.
 
 - **Server schema 5.** `Server::install` takes the database there; with
   migrations of your own, run `plan::migration(5)`, which adds
-  `sync.replicas.last_heard_at`, `keepalive` and `filed`.
+  `sync.replicas.last_heard_at`, `keepalive` and `filed`. Stop the server's
+  processes of the earlier build before the upgrade (*Upgrading*, in the
+  book).
 - **Replica schema 3.** `replica::install` takes the database there; with
   migrations of your own, run `replica::migration(3)`, which adds
   `sync_notes.noted_at`, the trigger `sync_notes_noted` that stamps it, and
@@ -56,6 +84,10 @@ silence; an earlier server ignores both.
   its way; `silent` is a state; `ReplicaOverview` says `last_heard_at` and
   `filed`, `UpProgress` `oldest_at`, `Health` `silent`, and `States` is the
   answer of `Engine::states`. The dashboard reads contract 2, and refuses 1.
+- **The ready-made dashboard's filters are counters,** drawn by
+  `.msd-counter` where they were `.msd-chip`, and a state's colour is its
+  tone (`data-tone`) where it was its state (`data-state`): a stylesheet of
+  a host's that styled those is restyled.
 - The public API adds `Engine::states`, `States`, `StateEntry`, `Silent`,
   `TableFiled`, `ReplicaState::Silent`, `ReplicaCounts::silent`,
   `Health::silent`, `ReplicaOverview::{last_heard_at, filed}`,

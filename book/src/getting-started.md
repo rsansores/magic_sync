@@ -85,9 +85,11 @@ Ctrl-C stops either one, and loses nothing it was doing.
   second, and the dashboard stays green: *everything is in sync*.
 - **Take Register 2 offline** (its *Go offline* button). Sell a few things on it: it
   keeps selling, and says how many receipts are not at the head office yet.
-  Change a price and add a product at the head office: the dashboard turns
-  amber, *catching up*, and after half a minute says Register 2 is not
-  answering. Click it to see how far along it is, table by table.
+  Change a price and add a product at the head office: the head office stops
+  hearing from Register 2, and within 15 s its tile turns grey, *silent* — it
+  has said nothing for three of the keepalives it said it would send. Click
+  it to see when it was last heard, and how far along it is, table by table.
+  Stopping a register (Ctrl-C) does the same.
 - **Bring it back online.** Its receipts reach the head office, it catches up
   with the catalog, in order, and the dashboard turns green again.
 - **Restart the head office** while a register is offline and a product
