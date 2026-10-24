@@ -196,7 +196,7 @@ pub type Conn = sqlx::SqliteConnection;
 /// refuses to run against a database that installed another. It counts the
 /// server's own steps, independent of the replicas' version.
 #[cfg(feature = "postgres")]
-pub const SERVER_SCHEMA_VERSION: i32 = 4;
+pub const SERVER_SCHEMA_VERSION: i32 = 5;
 
 /// The version of the engine's tables on a replica: the replica refuses to
 /// run against a database that installed another. It counts the replica's own

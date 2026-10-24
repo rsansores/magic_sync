@@ -2250,15 +2250,18 @@ async fn owed(conn: &mut Conn, upload: i64) -> Result<Vec<UpProgress>, Error> {
 /// The backlog to tell the server, `now` being what it is, and what to store
 /// of it once it went: when it changed since it was last told — with a
 /// message going anyway, when it empties or starts (rows wait to be sent
-/// where none did), or when the last time is `backlog_every` ago — and, while
-/// it is not empty, every `backlog_every` even unchanged. A clock set back
-/// since it was last told counts as that long ago.
+/// where none did), or when the last time is `keepalive_every` ago — and,
+/// while it is not empty, every `keepalive_every` even unchanged; and
+/// whatever it says when the replica has been `quiet` that long, which it
+/// says in place of nothing. A clock set back since it was last told counts
+/// as that long ago.
 #[cfg(feature = "sqlite")]
 async fn backlog_due(
     conn: &mut Conn,
     now: Vec<UpProgress>,
     settings: &Outbox,
     sending: bool,
+    quiet: bool,
 ) -> Result<Option<(envelope::Backlog, Vec<Told>)>, Error> {
     let stored: Option<(String, i64)> =
         sqlx::query_as("SELECT backlog, reported_at FROM sync_backlog WHERE id = 1")
@@ -2274,20 +2277,20 @@ async fn backlog_due(
         None => (None, 0),
     };
     let told: Vec<Told> = now.iter().map(Told::of).collect();
-    let every = i64::try_from(settings.backlog_every.as_millis()).unwrap_or(i64::MAX);
     let clock = chrono::Utc::now().timestamp_millis();
-    let stale = clock < at || clock - at >= every;
-    let due = if before.as_ref() == Some(&told) {
-        // Unchanged: said again now and then while not empty, should the
-        // server have lost it.
-        !told.is_empty() && stale
-    } else {
-        // Rows only on their way start nothing: the upload that carries
-        // them said what was owed besides.
-        let starts = told.iter().any(|t| t.unsent + t.set_aside > 0);
-        let edge = told.is_empty() || (starts && before.as_ref().is_none_or(Vec::is_empty));
-        sending || edge || stale
-    };
+    let stale = settings.quiet_since(at, clock);
+    let due = quiet
+        || if before.as_ref() == Some(&told) {
+            // Unchanged: said again now and then while not empty, should the
+            // server have lost it.
+            !told.is_empty() && stale
+        } else {
+            // Rows only on their way start nothing: the upload that carries
+            // them said what was owed besides.
+            let starts = told.iter().any(|t| t.unsent + t.set_aside > 0);
+            let edge = told.is_empty() || (starts && before.as_ref().is_none_or(Vec::is_empty));
+            sending || edge || stale
+        };
     Ok(due.then(|| (backlog_of(&told, clock), told)))
 }
 
@@ -2349,10 +2352,24 @@ pub struct Outbox {
     /// How long an upload the server has not answered waits before it goes
     /// again.
     pub resend_after: std::time::Duration,
-    /// How often, at most, the replica tells the server its backlog while it
-    /// grows — and how often it says it again, unchanged, while it is not
-    /// empty; it says at once when it empties, or starts.
-    pub backlog_every: std::time::Duration,
+    /// How long the replica stays quiet at most: once nothing has gone up on
+    /// any lane for so long, it sends a message on the first, its backlog in
+    /// it, with nothing else to say if it has nothing — and the server, which
+    /// is told this, takes a replica quiet for several of them for one that
+    /// stopped. Also how often, at most, it tells its backlog while it grows,
+    /// and says it again, unchanged, while it is not empty; it says at once
+    /// when it empties, or starts.
+    pub keepalive_every: std::time::Duration,
+}
+
+#[cfg(feature = "sqlite")]
+impl Outbox {
+    /// Whether `keepalive_every` has gone by since `at`, at `clock` (unix
+    /// milliseconds both): a clock set back since counts as that long ago.
+    fn quiet_since(&self, at: i64, clock: i64) -> bool {
+        let every = i64::try_from(self.keepalive_every.as_millis()).unwrap_or(i64::MAX);
+        clock < at || clock - at >= every
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -2361,7 +2378,7 @@ impl Default for Outbox {
         Outbox {
             limits: envelope::Limits::default(),
             resend_after: std::time::Duration::from_secs(600),
-            backlog_every: std::time::Duration::from_secs(60),
+            keepalive_every: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -2463,7 +2480,9 @@ pub(crate) struct Window {
 /// message within the outbox's limits: `None` when it has nothing. Rows it
 /// wrote (as they are now), on every lane; on the first lane — the main one
 /// — also the rows it could not take, the last message it applied when the
-/// server has not heard of it, the backlog when it is due, and the
+/// server has not heard of it, the backlog when it is due — or when nothing
+/// has gone up on any lane for `keepalive_every`, which it says with nothing
+/// else to say if need be — and the
 /// `digests` of what it holds, when given ([`held`]) — but of a table
 /// written since they were read. Run it in a transaction begun with
 /// `BEGIN IMMEDIATE`, and commit before the message goes: it reads all of
@@ -2500,6 +2519,7 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     let main = lane == 0;
     let mut up = Up {
         protocol: envelope::PROTOCOL,
+        keepalive_ms: u64::try_from(settings.keepalive_every.as_millis()).unwrap_or(u64::MAX),
         ..Up::default()
     };
     let limit = settings.limits.bytes;
@@ -2625,7 +2645,8 @@ pub(crate) async fn outbox<P: Sync + 'static>(
     // A row larger than a message with nothing else in it can carry never
     // goes; one that does not fit this one waits for the next.
     let bare = Up {
-        protocol: envelope::PROTOCOL,
+        protocol: up.protocol,
+        keepalive_ms: up.keepalive_ms,
         ..Up::default()
     };
     let largest = limit.saturating_sub(bare.encoded_len() + reserved);
@@ -2659,21 +2680,30 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         || !up.digests.is_empty()
         || news
         || untold_gap;
+    // Said nothing for its keepalive, on any lane: it says it is there.
+    let quiet = main && {
+        let spoken: Option<i64> = sqlx::query_scalar("SELECT at FROM sync_spoken WHERE id = 1")
+            .fetch_optional(&mut *conn)
+            .await?;
+        spoken.is_none_or(|at| settings.quiet_since(at, chrono::Utc::now().timestamp_millis()))
+    };
     let mut told = None;
     if backlog.is_some() {
         let now = owed(conn, carried).await?;
-        if let Some((said, stored)) = backlog_due(conn, now, settings, sending).await? {
+        if let Some((said, stored)) = backlog_due(conn, now, settings, sending, quiet).await? {
             up.backlog = Some(said);
             told = Some(stored);
         }
     }
-    Ok((sending || up.backlog.is_some()).then_some(Outgoing {
-        lane: this.name,
-        up,
-        notes: gathered.carried,
-        rejected,
-        told,
-    }))
+    Ok(
+        (sending || quiet || up.backlog.is_some()).then_some(Outgoing {
+            lane: this.name,
+            up,
+            notes: gathered.carried,
+            rejected,
+            told,
+        }),
+    )
 }
 
 /// A note of a row the replica wrote.
@@ -2946,11 +2976,18 @@ async fn unreported(
 /// The transport took `outgoing`: its notes — the ones still under its
 /// number, the server's answer may have come first — wait for the server's
 /// [`Filed`](envelope::Filed), its rejections are reported (unless refused
-/// again since; those of a row the replica holds no copy of forgotten), and
-/// the server of its epoch knows
-/// what was applied. Run it in one transaction.
+/// again since; those of a row the replica holds no copy of forgotten), the
+/// server of its epoch knows
+/// what was applied, and the replica has spoken. Run it in one transaction.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
+    sqlx::query(
+        "INSERT INTO sync_spoken (id, at) VALUES (1, $1) \
+         ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at",
+    )
+    .bind(chrono::Utc::now().timestamp_millis())
+    .execute(&mut *conn)
+    .await?;
     if let Some(number) = outgoing.up.uploads.first() {
         sqlx::query(&format!(
             "UPDATE sync_notes SET sent_at = {} \

@@ -217,6 +217,12 @@ pub(crate) async fn file<P: Sync + 'static>(
         }
     };
     said_apart(conn, codecs, sender, &standing, confirmed, upload).await?;
+    let tables: Vec<&str> = filed
+        .iter()
+        .filter(|f| !f.written.is_empty() || !f.gone.is_empty())
+        .map(|f| f.table.as_str())
+        .collect();
+    heard(conn, sender, upload, &tables).await?;
     Ok(filed)
 }
 
@@ -234,7 +240,35 @@ pub(crate) async fn file_failed<P: Sync + 'static>(
     let standing = standing(conn, sender).await?;
     keep_whole(conn, codecs, sender, upload, reason, inbox).await?;
     let confirmed = confirmation(sender, &standing, upload);
-    said_apart(conn, codecs, sender, &standing, confirmed, upload).await
+    said_apart(conn, codecs, sender, &standing, confirmed, upload).await?;
+    heard(conn, sender, upload, &[]).await
+}
+
+/// The longest a replica may say it stays quiet: past a day, it says
+/// nothing a dashboard waits on, and is taken as saying nothing.
+const KEEPALIVE: u64 = 24 * 60 * 60 * 1000;
+
+/// The server heard from `sender`: `upload` came, on whatever lane, saying
+/// how long it stays quiet at most, and rows of `tables` were filed from it.
+async fn heard(conn: &mut Conn, sender: Uuid, upload: &Up, tables: &[&str]) -> Result<(), Error> {
+    let keepalive = Some(upload.keepalive_ms)
+        .filter(|ms| (1..=KEEPALIVE).contains(ms))
+        .and_then(|ms| i64::try_from(ms).ok());
+    sqlx::query(
+        "UPDATE sync.replicas SET last_heard_at = now(), \
+                keepalive = $2::int8 * interval '1 millisecond', \
+                filed = CASE WHEN cardinality($3::text[]) = 0 THEN filed \
+                             ELSE coalesce(filed, '{}') \
+                                  || (SELECT jsonb_object_agg(t, now()) FROM unnest($3::text[]) AS t) \
+                        END \
+          WHERE replica_id = $1",
+    )
+    .bind(sender)
+    .bind(keepalive)
+    .bind(tables)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// What `upload` says of `sender`, filed apart from its rows: a failure of

@@ -9,8 +9,9 @@ use crate::row::Table;
 use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use crate::wire::MapError;
+use chrono::{DateTime, Utc};
 use prost::Message as _;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 const SCHEMA: &str = "
@@ -434,6 +435,62 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
     );
 }
 
+/// Every upload filed from a replica is when it was last heard, whatever it
+/// carries, with how long it says it stays quiet — none when it says none,
+/// or more than a day; and each table it uploaded rows of was filed then.
+#[sqlx::test(migrations = false)]
+async fn every_upload_is_when_its_replica_was_last_heard(pool: PgPool) {
+    let (_, [a, _]) = world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the server");
+    type Heard = (
+        Option<DateTime<Utc>>,
+        Option<i64>,
+        Option<sqlx::types::Json<BTreeMap<String, DateTime<Utc>>>>,
+    );
+    let heard = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, Heard>(
+                "SELECT last_heard_at, (extract(epoch FROM keepalive) * 1000)::int8, filed \
+                   FROM sync.replicas WHERE replica_id = $1",
+            )
+            .bind(a)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let mut up = Up::decode(upload(3, "readings", vec![reading(a, "one")]).as_slice()).unwrap();
+    up.keepalive_ms = 60_000;
+    server.receive(a, &up.encode_to_vec()).await.unwrap();
+    let (first, keepalive, filed) = heard().await;
+    let filed = filed.expect("a table filed").0;
+    assert_eq!(keepalive, Some(60_000));
+    assert_eq!(filed.keys().collect::<Vec<_>>(), ["readings"]);
+    assert_eq!(Some(filed["readings"]), first);
+
+    for (keepalive_ms, kept) in [(0, None), (u64::MAX, None), (90_000, Some(90_000))] {
+        let quiet = Up {
+            protocol: envelope::PROTOCOL,
+            keepalive_ms,
+            ..Up::default()
+        };
+        server.receive(a, &quiet.encode_to_vec()).await.unwrap();
+        let (last, keepalive, again) = heard().await;
+        assert!(last > first, "heard again");
+        assert_eq!(keepalive, kept, "{keepalive_ms}");
+        assert_eq!(again.expect("still").0, filed, "nothing filed");
+    }
+}
+
 /// Two processes run the server; one of them runs the relay, so nothing is
 /// planned or sent twice.
 #[sqlx::test(migrations = false)]
@@ -846,6 +903,15 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
         2
     );
     assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM sync.replicas WHERE last_heard_at IS NOT NULL AND filed IS NULL"
+        )
+        .await,
+        2,
+        "heard, and nothing of theirs filed"
+    );
+    assert_eq!(
         count(&pool, "SELECT count(*) FROM fixture.readings").await,
         0
     );
@@ -1149,6 +1215,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                 nonce: [0, 1, walk.next(), u64::MAX][walk.below(4)],
                 mac: (0..walk.below(20)).map(|_| walk.below(256) as u8).collect(),
                 gap: [0, 0, 1, walk.next(), u64::MAX][walk.below(5)],
+                keepalive_ms: [0, 60_000, u64::MAX][walk.below(3)],
             };
             came += up
                 .tables

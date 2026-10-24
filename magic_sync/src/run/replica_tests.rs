@@ -179,8 +179,8 @@ async fn a_replica_refuses_settings_it_cannot_run_with(pool_: SqlitePool) {
         ("outbox.resend_after", |s| {
             s.outbox.resend_after = Duration::ZERO
         }),
-        ("outbox.backlog_every", |s| {
-            s.outbox.backlog_every = Duration::ZERO
+        ("outbox.keepalive_every", |s| {
+            s.outbox.keepalive_every = Duration::ZERO
         }),
     ] {
         let mut settings = settings();

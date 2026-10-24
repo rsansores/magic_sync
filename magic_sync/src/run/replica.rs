@@ -235,7 +235,7 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             ("wishes_every", settings.wishes_every),
             ("wishes_timeout", settings.wishes_timeout),
             ("outbox.resend_after", settings.outbox.resend_after),
-            ("outbox.backlog_every", settings.outbox.backlog_every),
+            ("outbox.keepalive_every", settings.outbox.keepalive_every),
         ];
         if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
             return Err(Error::Misuse(format!(

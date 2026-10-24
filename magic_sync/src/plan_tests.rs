@@ -2534,6 +2534,7 @@ async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
         0xa4c8_9065_538b_9cb5,
         0x64b0_376e_5c2a_ed54,
         0x8a3d_90b7_c465_07f0,
+        0x95d2_8ad6_e207_1754,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -2561,6 +2562,42 @@ async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
     }
     assert_eq!(migration(0), None);
     assert_eq!(migration(crate::SERVER_SCHEMA_VERSION + 1), None);
+}
+
+/// A database of version 4 is brought to 5 keeping what it records of its
+/// replicas: none of them heard yet, and none taken for one that stopped.
+#[sqlx::test(migrations = false)]
+async fn a_schema_of_version_4_is_upgraded_keeping_its_replicas(pool: crate::DbPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS sync CASCADE")
+        .execute(&mut *conn)
+        .await
+        .expect("drop the schema");
+    for step in 1..=4 {
+        sqlx::raw_sql(&migration(step).expect("a released step"))
+            .execute(&mut *conn)
+            .await
+            .expect("the step");
+    }
+    let replica = Uuid::now_v7();
+    sqlx::query("INSERT INTO sync.replicas (replica_id, live, backlog, backlog_at) VALUES ($1, true, '[]', now())")
+        .bind(replica)
+        .execute(&mut *conn)
+        .await
+        .expect("a replica of version 4");
+    let mut tx = conn.begin().await.expect("a transaction");
+    migrate(&mut tx).await.expect("upgraded");
+    tx.commit().await.expect("upgraded");
+    assert_eq!(version(&mut conn).await.unwrap(), Some(5));
+    let kept: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT live, last_heard_at IS NULL, keepalive IS NULL, filed IS NULL \
+           FROM sync.replicas WHERE replica_id = $1",
+    )
+    .bind(replica)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("kept");
+    assert_eq!(kept, (true, true, true, true));
 }
 
 #[sqlx::test(migrations = false)]

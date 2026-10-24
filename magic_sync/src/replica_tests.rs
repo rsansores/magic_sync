@@ -4047,6 +4047,7 @@ async fn a_message_up_is_full_to_the_byte(pool: SqlitePool) {
     let part = |rows: &[usize]| framed(6) + rows.iter().map(|r| framed(*r) + key).sum::<usize>();
     let bare = Up {
         protocol: envelope::PROTOCOL,
+        keepalive_ms: 60_000,
         ..Up::default()
     }
     .encoded_len();
@@ -4826,7 +4827,7 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         turn(0, settings.clone()).await.is_none(),
         "it grows, said a moment ago"
     );
-    settings.backlog_every = std::time::Duration::ZERO;
+    settings.keepalive_every = std::time::Duration::ZERO;
     let main = turn(0, settings.clone()).await;
     assert_eq!(said(&main), Some(vec![("events".into(), 2, 0)]), "when due");
     let again = turn(0, settings.clone()).await;
@@ -4841,17 +4842,19 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         .encoded(),
     )
     .await;
-    settings.backlog_every = std::time::Duration::from_secs(3600);
+    settings.keepalive_every = std::time::Duration::from_secs(3600);
     let main = turn(0, settings.clone()).await;
     assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
     assert!(turn(0, settings.clone()).await.is_none());
     let zero = Outbox {
-        backlog_every: std::time::Duration::ZERO,
+        keepalive_every: std::time::Duration::ZERO,
         ..settings.clone()
     };
-    assert!(
-        turn(0, zero).await.is_none(),
-        "empty, said: not said again however due"
+    let keepalive = turn(0, zero).await;
+    assert_eq!(
+        said(&keepalive),
+        Some(vec![]),
+        "empty, said: said again only as it says it is there"
     );
 
     write().execute(&w.pool).await.unwrap();
@@ -4897,6 +4900,44 @@ async fn an_upload_of_everything_says_nothing_is_owed(pool: SqlitePool) {
     )
     .await;
     assert!(w.up(0, false).await.is_none(), "nothing changed to say");
+}
+
+/// A replica that has said everything stays quiet for its keepalive, then
+/// says it is there on its first lane — its backlog in it, nothing else to
+/// say — and every message it sends says how long it stays quiet. What goes
+/// on another lane is heard as well, and puts the keepalive off.
+#[sqlx::test(migrations = false)]
+async fn a_quiet_replica_says_it_is_there_every_keepalive(pool: SqlitePool) {
+    let settings = Settings {
+        lanes: vec![Lane::new("main", &[]), Lane::new("fast", &["events"])],
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    for _ in 0..3 {
+        w.up(0, false).await;
+    }
+    assert!(w.up(0, false).await.is_none(), "it spoke a moment ago");
+    events(&w, &["x"]).await;
+    let fast = w.up(1, false).await.expect("the row");
+    assert_eq!(fast.keepalive_ms, 60_000);
+
+    w.exec("UPDATE sync_spoken SET at = at - 60000")
+        .await
+        .unwrap();
+    let main = w.up(0, false).await.expect("it says it is there");
+    assert!(main.tables.is_empty() && main.rejected.is_empty() && main.sequence == 0);
+    assert_eq!(main.keepalive_ms, 60_000);
+    let backlog = main.backlog.expect("its backlog");
+    assert_eq!(backlog.tables[0].unfiled, 1);
+    assert!(w.up(0, false).await.is_none(), "and is quiet again");
+
+    w.exec("UPDATE sync_spoken SET at = at - 60000")
+        .await
+        .unwrap();
+    events(&w, &["y"]).await;
+    w.up(1, false).await.expect("the row");
+    assert!(w.up(0, false).await.is_none(), "heard on the other lane");
 }
 
 /// What the replica stored of the backlog it last told, it reads in a shape
@@ -5298,7 +5339,7 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [
         0xe5dd_b8ea_c465_953a,
         0x3663_5d6b_eb53_4f77,
-        0x697c_9ad2_6f3c_b227,
+        0x4536_c926_1b82_f5cb,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
