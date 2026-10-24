@@ -4,6 +4,7 @@ import overview from './contract/fixtures/overview.js'
 import listing from './contract/fixtures/listing.js'
 import progress from './contract/fixtures/progress.js'
 import rows from './contract/fixtures/rows.js'
+import states from './contract/fixtures/states.js'
 import wishes from './contract/fixtures/wishes.js'
 import { parseTimestamp } from './time.js'
 
@@ -50,12 +51,18 @@ describe('the contract fixtures', () => {
     expect(new Set(overview.health.parked.first.map((p) => p.kind))).toEqual(new Set(Object.keys(noteKinds)))
   })
 
+  it('hold every replica of the overview in its state, in its order', () => {
+    expect(states.replicas.map((r) => [r.replica, r.state])).toEqual(
+      overview.replicas.first.map((r) => [r.replica, r.state]),
+    )
+  })
+
   it('hold every state of a wish', () => {
     expect(new Set(wishes.wishes.first.map((w) => w.state))).toEqual(new Set(Object.keys(wishStates)))
   })
 
   it('write every time as the engine does, and every one reads', () => {
-    const all = [overview, listing, progress, rows, wishes].flatMap((answer) => times(answer))
+    const all = [overview, listing, progress, rows, states, wishes].flatMap((answer) => times(answer))
     expect(all.length).toBeGreaterThan(10)
     for (const [field, time] of all)
       expect([field, parseTimestamp(String(time))]).toEqual([field, expect.any(Number)])

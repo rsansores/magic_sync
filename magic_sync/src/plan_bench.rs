@@ -378,7 +378,8 @@ async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
 }
 
 /// What a dashboard costs over a partition of 200 replicas holding 3M rows
-/// between them: the overview, against counting what each should hold.
+/// between them: the overview and every replica's state, against counting
+/// what each should hold.
 #[sqlx::test(migrations = false)]
 #[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool) {
@@ -445,6 +446,12 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
             .await
             .expect("health");
         time(&format!("{round}: health"), started);
+        let started = Instant::now();
+        engine
+            .states(&mut conn, Scope::Partition(partition))
+            .await
+            .expect("states");
+        time(&format!("{round}: states of 200"), started);
         let started = Instant::now();
         engine
             .progress(&mut conn, Scope::Replicas(&replicas[..1]))

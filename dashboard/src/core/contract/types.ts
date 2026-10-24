@@ -487,6 +487,42 @@ offset: number,
 replicas: Listed<ReplicaOverview>, };
 
 /**
+ * Where one replica stands, in one word.
+ */
+export type StateEntry = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * The audience it is of.
+ */
+audience: string, 
+/**
+ * Where it stands.
+ */
+state: ReplicaState, };
+
+/**
+ * `Engine::states`: where every replica of a scope stands, in one word
+ * each, worst first — what a map of the fleet colours it by, with no
+ * figure beside.
+ */
+export type States = { 
+/**
+ * The contract this answer serializes as: `CONTRACT`.
+ */
+contract: number, 
+/**
+ * The server's time when the answer was read.
+ */
+now: string, 
+/**
+ * Every replica of the scope.
+ */
+replicas: Array<StateEntry>, };
+
+/**
  * One table on one replica, counted from what the replica acknowledged
  * applying. `holds - outdated` of `should` is how far along it is; the
  * numbers never count a row as held that the replica has not confirmed.

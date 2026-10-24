@@ -536,6 +536,61 @@ async fn a_replica_quiet_for_longer_than_it_said_is_silent(pool: crate::DbPool) 
     assert_eq!(fix.replicas.first[0].state, ReplicaState::AwaitingFix);
 }
 
+/// Every replica's state at once is the one the overview gives it, in the
+/// same order, for the replicas of the scope and no other.
+#[sqlx::test(migrations = false)]
+async fn every_replicas_state_is_read_at_once_within_its_scope(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, b] = world.replicas;
+    let theirs = Uuid::now_v7();
+    sqlx::query("INSERT INTO fixture.t_replicas VALUES ($1, $2, true)")
+        .bind(theirs)
+        .bind(Uuid::now_v7())
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let wire = Fake::default();
+    world.item("one").await;
+    world.pass(&wire).await;
+    world.acknowledge(a, world.last_sent(a).await).await;
+
+    let mut conn = world.pool.acquire().await.unwrap();
+    let all = world.engine.states(&mut conn, Scope::All).await.unwrap();
+    let overview = world.overview(Scope::All).await;
+    let pairs = |states: &crate::status::States| -> Vec<(Uuid, ReplicaState)> {
+        states
+            .replicas
+            .iter()
+            .map(|r| (r.replica, r.state))
+            .collect()
+    };
+    assert_eq!(
+        pairs(&all),
+        overview
+            .replicas
+            .first
+            .iter()
+            .map(|r| (r.replica, r.state))
+            .collect::<Vec<_>>()
+    );
+    assert!(all.replicas.iter().all(|r| r.audience == "test"));
+    let ours = world
+        .engine
+        .states(&mut conn, Scope::Partition(world.partition))
+        .await
+        .unwrap();
+    assert_eq!(
+        pairs(&ours).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([(a, ReplicaState::Synced), (b, ReplicaState::CatchingUp)])
+    );
+    let one = world
+        .engine
+        .states(&mut conn, Scope::Replicas(&[b, Uuid::now_v7()]))
+        .await
+        .unwrap();
+    assert_eq!(pairs(&one), [(b, ReplicaState::CatchingUp)]);
+}
+
 /// What the overview says of what a replica uploaded: when it was last
 /// heard, and when a row of each table was last filed from it.
 #[sqlx::test(migrations = false)]
@@ -784,6 +839,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
         .progress(&mut conn, Scope::Replicas(&[synced, writing]))
         .await
         .unwrap();
+    let states = world.engine.states(&mut conn, Scope::All).await.unwrap();
 
     // Then `one` changes, `two` retires and `four` is written, for every
     // state of a row.
@@ -830,6 +886,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
             "Listing",
             serde_json::to_value(&listing).unwrap(),
         ),
+        ("states", "States", serde_json::to_value(&states).unwrap()),
         (
             "progress",
             "Progress",

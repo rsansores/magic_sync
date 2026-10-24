@@ -805,6 +805,34 @@ pub struct Overview {
     pub tables: Vec<TableOverview>,
 }
 
+/// [`Engine::states`]: where every replica of a scope stands, in one word
+/// each, worst first — what a map of the fleet colours it by, with no
+/// figure beside.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
+pub struct States {
+    /// The contract this answer serializes as: `CONTRACT`.
+    pub contract: u32,
+    /// The server's time when the answer was read.
+    pub now: DateTime<Utc>,
+    /// Every replica of the scope.
+    pub replicas: Vec<StateEntry>,
+}
+
+/// Where one replica stands, in one word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
+pub struct StateEntry {
+    /// The replica.
+    pub replica: Uuid,
+    /// The audience it is of.
+    pub audience: String,
+    /// Where it stands.
+    pub state: ReplicaState,
+}
+
 /// [`Engine::listing`]: one page of the replicas, worst first.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -1286,6 +1314,35 @@ impl Engine {
             state,
             offset,
             replicas: fleet.page(state, offset, limit),
+        })
+    }
+
+    /// Where every replica of `scope` stands, in one word each, worst first
+    /// as [`Engine::listing`] orders them: the state the overview counts,
+    /// for every replica at once, and nothing else of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::progress`].
+    pub async fn states(&self, conn: &mut Conn, scope: Scope<'_>) -> Result<States, Error> {
+        let mut tx = snapshot(conn).await?;
+        let now = Self::now(&mut tx).await?;
+        let scoped = self.scoped(&mut tx, scope).await?;
+        let notes = self.notes(&mut tx, &scoped).await?;
+        let fleet = self.fleet(&mut tx, &scoped, &notes, now).await?;
+        tx.commit().await?;
+        Ok(States {
+            contract: CONTRACT,
+            now,
+            replicas: fleet
+                .replicas
+                .into_iter()
+                .map(|r| StateEntry {
+                    replica: r.replica,
+                    audience: r.audience,
+                    state: r.state,
+                })
+                .collect(),
         })
     }
 
@@ -1938,6 +1995,8 @@ pub(crate) mod tests {
             (Health::docs(), Health::decl(&cfg)),
             (Overview::docs(), Overview::decl(&cfg)),
             (Listing::docs(), Listing::decl(&cfg)),
+            (StateEntry::docs(), StateEntry::decl(&cfg)),
+            (States::docs(), States::decl(&cfg)),
             (TableProgress::docs(), TableProgress::decl(&cfg)),
             (ReplicaProgress::docs(), ReplicaProgress::decl(&cfg)),
             (Progress::docs(), Progress::decl(&cfg)),
