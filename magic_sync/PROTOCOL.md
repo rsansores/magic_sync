@@ -587,8 +587,8 @@ A replica **may** say how long it stays quiet at most, in `keepalive_ms`
 on every `Up`: once it has sent nothing on any lane for so long, it sends an
 `Up` on its first lane, with its backlog, or with nothing else to say. The
 server takes one that has said nothing for several times that for one that
-stopped — off, or cut off (A.3). A replica that does not say (0) is never
-taken for one that stopped.
+stopped — off, or cut off (A.3). A replica that does not say (0), or says
+more than a day (86 400 000), is never taken for one that stopped.
 
 A replica may send its writes on several **lanes** — streams of `Up`s the
 transport keeps apart, each carrying the writes of some of its tables, so a

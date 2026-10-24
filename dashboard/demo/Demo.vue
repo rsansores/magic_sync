@@ -164,7 +164,12 @@ const overview = computed<Overview>(() => {
             ]
           : [],
       },
-      silent: { total: 0, first: [] },
+      silent: {
+        total: states.silent,
+        first: replicas
+          .filter((r) => r.state === 'silent')
+          .map((r) => ({ replica: r.replica, last_heard_at: r.last_heard_at! })),
+      },
     },
     tables: Object.keys(labels).map((name) => table(name, s)),
   }
@@ -289,6 +294,8 @@ body {
   --msd-quiet-soft: #262b36;
   --msd-off: #b197fc;
   --msd-off-soft: #251f3a;
+  --msd-unknown: #66d9e8;
+  --msd-unknown-soft: #142a2e;
   --msd-accent-soft: #1c2440;
   --msd-ok-tile: #2f6b3d;
   background: #151821;

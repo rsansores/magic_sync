@@ -31,8 +31,8 @@ version it refuses, saying so, rather than draw it wrong.
 > fifth of a second at worst, while a whole fleet has rows on their way — and
 > the page can ask every few seconds. It counts every replica but lists only
 > the worst twenty; the listing pages through the rest, in one state or all.
-> The states are every replica's state in a word, and nothing else — a few
-> milliseconds over 200 — for a tile of each. Progress counts what one
+> The states are every replica's state in a word, and nothing else — some
+> 15 ms over 4000 — for a tile of each. Progress counts what one
 > replica should hold: ask it for the one being looked at, not for the fleet.
 
 ## The page
@@ -65,7 +65,8 @@ import 'magic_sync_dashboard/styles.css'
 > it, a counter per state, each a filter; a tile per replica, coloured by its
 > state, worst first; and the replicas that need attention, each in one
 > sentence — *1 row set aside*, *last heard 6 min. ago*, *14 changes on their
-> way*. The tables and the problems, each with its reason, are a tab away.
+> way* — every one of them, from the states, the sentence of each whose row
+> is at hand. The tables and the problems, each with its reason, are a tab away.
 > Picking a state, or turning a page, sets `filter` or `offset`; you fetch
 > that page of the listing. Without a listing, the dashboard shows the
 > overview's worst and says how many there are in all. Clicking a tile or a
@@ -75,7 +76,8 @@ import 'magic_sync_dashboard/styles.css'
 > live, what it has to send, to confirm and set aside, and only the tables
 > that wait — to it, with how far along each is and what is on its way; from
 > it, with how long its oldest row has waited, and whether the server judges
-> that its rows wait — the settled folded into one line. How long ago
+> that its rows wait — every other table, up one whose rows go up live,
+> folded into one line. How long ago
 > something happened is measured from the server's `now` in the answer,
 > moved on by the time passed in the page — the browser's clock is never
 > compared with the server's.
@@ -104,8 +106,8 @@ dashboard as functions:
   `v-model:level` and `v-model:within` are the level and the trail, for your
   URL.
 - **Groups.** `group(table)` → `{ key, label, order }`: a replica's tables
-  roll up in your groups, a group with nothing waiting folded with the
-  others.
+  roll up in your groups; a group that waits shows its tables that wait
+  under its name, and every settled table is folded into one line.
 - **Checks.** `checks(replica)` → `[{ key, label, status, line }]`, read
   before the engine's own: a passing check stays quiet, one that fails says
   why in its colour. The slot `replica-extra` takes whatever else you show
@@ -115,8 +117,10 @@ A system with a design system of its own draws the same with its own parts,
 through `useSyncDashboard` and the functions of `magic_sync_dashboard/core`
 — and may combine its checks and the engine's state into states of its own
 (`combine`, which the ready-made dashboard takes too): *offline* when its
-link is down, before anything the engine says. Its counters count those
-states, and filter the tiles and the replicas that need attention by them.
+link is down, before anything the engine says. Those states filter the
+tiles and the replicas that need attention (`v-model:state`), and the
+counters count them once you pass the states, which hold every replica:
+without them, the counters are the engine's counts.
 
 ## Where one row is
 

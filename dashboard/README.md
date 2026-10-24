@@ -73,17 +73,18 @@ const offset = ref(0)
 | `names`, `labels`                 | your names for replicas and tables: a map, or a function                                                    |
 | `v-model:selected`                | the replica being looked at; keep it in your URL if you like                                                |
 | `v-model:filter`                  | the state the replicas are listed in (`null`: all of them)                                                  |
+| `v-model:state`                   | the counter picked: the tiles and the replicas that need attention narrowed to it, the engine's or yours    |
 | `v-model:offset`, `pageSize`      | where the page of the listing begins, and the `limit` you ask it for (50)                                   |
 | `levels`, `placeOf`               | where your replicas are: the tiles gather in a cluster per place (see below)                                |
 | `v-model:level`, `v-model:within` | the level the tiles are clustered by, and the places they are narrowed to                                   |
 | `group`                           | the group you gather each table in: `(table) => ({ key, label, order })`                                    |
 | `checks`                          | what you check of a replica, shown before the engine's own check                                            |
-| `combine`                         | a state of your own from the engine's and your checks (see below): counted, and filtered by                 |
+| `combine`                         | a state of your own from the engine's and your checks (see below): filtered by, and counted with `states`   |
 | `locale`, `messages`              | see below                                                                                                   |
 | `unansweringAfter`, `stuckAfter`  | when a replica is "not answering" (15 min) and when waiting changes need attention (15 min), in ms          |
 
 The slot `replica-extra` (given `{ replica }`) goes under a replica's
-tables: whatever else your system shows of it.
+checks: whatever else your system shows of it.
 
 An answer carries the version of its JSON (`contract`): one this dashboard
 does not read is refused, with a message that says so, rather than drawn
@@ -143,8 +144,8 @@ out, waiting, refused and changed there first.
 Every colour and size is a CSS variable; set them on `.msd` or any ancestor:
 `--msd-font` (a font family), `--msd-fg`, `--msd-muted`, `--msd-bg`, `--msd-card`,
 `--msd-border`, `--msd-accent`, `--msd-ok`, `--msd-warn`,
-`--msd-danger`, `--msd-quiet`, `--msd-off`, `--msd-ok-soft`, `--msd-warn-soft`,
-`--msd-danger-soft`, `--msd-quiet-soft`, `--msd-off-soft`, `--msd-accent-soft`,
+`--msd-danger`, `--msd-quiet`, `--msd-off`, `--msd-unknown`, `--msd-ok-soft`, `--msd-warn-soft`,
+`--msd-danger-soft`, `--msd-quiet-soft`, `--msd-off-soft`, `--msd-unknown-soft`, `--msd-accent-soft`,
 `--msd-ok-tile`, `--msd-tile` (a tile's size), `--msd-radius`, `--msd-gap`. The defaults keep every text at a contrast of
 4.5:1 or more against what it is drawn on. They are a light scheme and do not
 follow `prefers-color-scheme`: a host with a dark theme sets the variables for
@@ -166,7 +167,8 @@ dash.banner.value // { mood: 'healthy' | 'catching_up' | 'attention' | 'empty', 
 dash.summary.value // counts per state, the worst replicas, tables, problems
 dash.tally.value // [{ state, tone, label, n }], worst first: the counters
 dash.grid.value // the tiles in clusters: { level, deeper, trail, clusters, total, tones }
-dash.attention.value // [{ id, name, standing, line }]: the replicas not settled, worst first
+dash.attention.value // [{ id, name, standing, line }]: the replicas not settled, worst first — of every
+// replica with `states` (`line` null for one whose row is on no page at hand), else the page's
 dash.page.value // the replicas to list: rows, offset, total
 dash.tables.value // the tables over the fleet: lagging groups, settled groups
 dash.progress.value // the selected replica, per table: upToDate of should
@@ -182,8 +184,10 @@ if (speech) {
 It also takes `replica`, `levels`, `placeOf`, `level`, `within`, `group`,
 `checks`, `combine` and `state`. `combine` is a state of your own made from
 the engine's and your checks, `(state, checks) => ({ state, tone, label }) |
-null`, which the tiles, the counters and the replicas that need attention
-all take; `state` narrows the tiles and the replicas that need attention to
+null`, which the tiles and the replicas that need attention take, and the
+counters too once you pass `states`: counting a state of your own needs
+every replica, so without `states` the counters are the engine's counts;
+`state` narrows the tiles and the replicas that need attention to
 one state, yours or the engine's, while `filter` stays the engine's state
 you list by. Whether a replica's rows going up wait is the engine's
 judgement, by your server's `Settings::behind_after`, so the dashboard has
@@ -196,8 +200,8 @@ component's `setup` or an effect scope; called anywhere else it has nothing to
 tie a timer to, and the times it says stay as of the last answer.
 
 Everything that does not need Vue — the types, `summarize`, `pageOf`,
-`progressOf`, `tilesOf`, `gridOf`, `downOf`, `upOf`, `attentionOf`,
-`checksOf`, the sentence functions and `translator` — is also in
+`progressOf`, `tilesOf`, `gridOf`, `downOf`, `upOf`, `drawnOf`, `attentionOf`,
+`countersOf`, `checksOf`, the sentence functions and `translator` — is also in
 `magic_sync_dashboard/core`, as pure functions of the answers.
 
 ## Languages

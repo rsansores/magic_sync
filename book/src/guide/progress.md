@@ -107,7 +107,8 @@ replica is catching up while a row of it has waited longer than the
 server's `Settings::behind_after` (two minutes), or cannot go as it is:
 rows that flow are not waiting. Each table says whether its rows wait
 (`waits`); of a replica of an earlier build, which says no age, they wait
-while any has not gone.
+while any has not gone. Keep `keepalive_every` well under `behind_after`:
+a replica that writes nothing else says what waits only that often.
 
 ## A replica that says nothing
 
@@ -119,6 +120,15 @@ it (`filed`); one that has said nothing for
 `Settings::silent_after_keepalives` (three) of its keepalives is `silent` —
 off, or cut off, which nothing on the server's side tells apart — and is
 listed in the health's `silent`, which leaves it healthy. A replica of an
-earlier build says no keepalive, and is never silent.
+earlier build says no keepalive, and is never silent. A replica refuses a
+keepalive over a day, which the server would take for none, and one its
+`idle` would sleep past.
+
+The server keeps `behind_after` and `silent_after_keepalives` in its
+database (`sync.settings`) when it starts, and every status reads them
+there: a process that only reads a status judges as the server does,
+whatever settings it was built with.
+
 `engine().states(&mut conn, scope)` answers every replica's state at once,
-and nothing else of them: what a map of the fleet colours its tiles by.
+and nothing else of them: what a map of the fleet colours its tiles by —
+some 15 ms over 4000 replicas.

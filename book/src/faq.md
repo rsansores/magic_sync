@@ -59,6 +59,7 @@ rows. Every number the engine reports means *wait* or *deploy a fix*.
 The planner works on sets in SQL, not row by row: giving a list of 10,000
 customers to a register is one row written, and one plan. The engine's
 benchmarks measure the operations that move many rows at once, and the
-dashboard's reads over 200 replicas holding 3 million rows;
+dashboard's reads over 200 replicas holding 3 million rows, and every
+state of 4000 replicas;
 [CONTRIBUTING.md](https://github.com/rsansores/magic_sync/blob/main/CONTRIBUTING.md#the-benchmarks)
 says how to run them on your own hardware.

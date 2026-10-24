@@ -20,7 +20,7 @@ Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
   and over is not taken for one that waits.
 - **Behind is what waits.** A replica is catching up from its side while a
   row it wrote has waited longer than `Settings::behind_after` (two
-  minutes), or cannot go as it is: rows that flow are younger. A replica of
+  minutes; not zero), or cannot go as it is: rows that flow are younger. A replica of
   an earlier build, which says no age, is judged as before: catching up
   while it says any row has not gone. The answer says which tables wait
   (`UpTable::waits`, each table of `Backlog::tables`), so a dashboard keeps
@@ -31,47 +31,61 @@ Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
   nothing else to say if need be, and every message says the cadence
   (`Up.keepalive_ms`). The server keeps when it last heard from each
   replica, on any lane (`ReplicaOverview::last_heard_at`), and when it last
-  filed a row of each table from it (`ReplicaOverview::filed`).
+  filed a row of each table from it (`ReplicaOverview::filed`) — rows filed
+  again out of the inbox too, which are not hearing from it. A replica
+  refuses a keepalive over a day, which the server takes for none, and an
+  `idle` it would sleep past its keepalive by; keep the keepalive well
+  under `behind_after`.
 - **Silent.** `ReplicaState::Silent`: a replica that said its keepalive and
   has said nothing for `Settings::silent_after_keepalives` (three) times
   that — off, or cut off. After a fix and an unreachable one, before
   catching up; counted (`ReplicaCounts::silent`), listed, and named in
   `Health::silent` — the replicas in that state, as the counts count them
-  — which leaves the health healthy. A replica that says no
+  — which leaves the health healthy, and which the health reads without
+  settling every replica's state. A replica that says no
   keepalive, as one of an earlier build, never is: a fleet upgrades over
-  days.
+  days. The server keeps `behind_after` and `silent_after_keepalives` in
+  its database when it starts (`sync.settings`), and every status judges
+  by them there: a process that only reads a status judges as the server
+  does. Its watch warns of a replica as it falls silent, not on every pass.
 - **Every replica's state at once.** `Engine::states(scope)`: each replica
   of a scope with its audience and its state, worst first, for a map of the
-  fleet — a few milliseconds over 200 replicas.
+  fleet — some 15 ms over 4000 replicas.
 - **The dashboard shows only what waits.** The ready-made `SyncDashboard`
   has counters that filter, a tile per replica worst first (from
   `Engine::states`, passed as `states`), and the replicas that need
   attention, a sentence each; a replica's page says when it was last heard
   and whether what it writes goes up live, its three numbers (to send, to
-  confirm, set aside), its checks, and only the tables that wait, both ways,
-  the settled folded into one line ("2 more tables up to date"). Its row
+  confirm, set aside), its checks, and only the tables that wait, both ways
+  — under their group's name when the host groups them — every other one,
+  up a table whose rows go up live, folded into one line ("2 more tables up
+  to date"). With `states`, the replicas that need attention are of every
+  replica, not of one page. Its row
   comes from a listing over it alone (`replica`), so a tile of a replica
   on no page at hand opens it all the same. A host places its replicas (`levels`, `placeOf`: the tiles gather in a cluster
   per place, a cluster's header leads a level down, `v-model:level` and
   `v-model:within`), groups its tables (`group`), adds checks of its own
   (`checks`) and more under them (the slot `replica-extra`), and states of
-  its own (`combine`), which the counters count and filter the tiles by.
-  The Tables tab is called Data.
+  its own (`combine`), which filter the tiles and, given `states`, which
+  holds every replica, the counters count; the counter picked is
+  `v-model:state`. The Tables tab is called Data.
 - **The dashboard's core, for a host's own design system.** Pure functions
   of the answers: a `Tone` per state; `syncCheck` and `checksOf`, the
   engine's check after the host's; `standingOf` with a host's `Combine`,
-  for states of its own made from the engine's and its checks; `tallyOf`;
-  `attentionOf` and `lineOf`; `selectedRow`; `tilesOf`, `gridOf`, `into` and `levelUnder`
-  for the tiles in clusters; `downOf`, `upOf`, `fleetOf` and `totalsOf` for
-  the tables both ways, live or stalled, in the host's groups; `downChips`,
+  for states of its own made from the engine's and its checks; `tallyOf`
+  and `countersOf`; `attentionOf` and `lineOf`; `selectedRow`; `tilesOf`,
+  `gridOf`, `into` and `levelUnder` for the tiles in clusters; `downOf`,
+  `upOf`, `fleetOf`, `drawnOf` and `totalsOf` for the tables both ways
+  (`DownFlow`, `UpFlow`, `FleetFlow`), live or stalled, in the host's
+  groups; `downChips`,
   `upChips`, `describeFlow`, `describeSettled`, `describeHeard` and
   `lasting` to say them. `useSyncDashboard` takes `states`, `replica`,
   `levels`, `placeOf`, `level`, `within`, `group`, `checks`, `combine` and
   `state` (the state the tiles and the replicas that need attention are
   narrowed to, the host's or the engine's), and answers `tiles`, `grid`,
   `tally`, `attention`, `tables` and `detail`. Every new sentence is in English and Spanish, and
-  every new look a variable (`--msd-quiet`, `--msd-off`, their `-soft`
-  tints, `--msd-accent-soft`, `--msd-ok-tile`, `--msd-tile`).
+  every new look a variable (`--msd-quiet`, `--msd-off`, `--msd-unknown`,
+  their `-soft` tints, `--msd-accent-soft`, `--msd-ok-tile`, `--msd-tile`).
 
 Upgrading: the replica first or the server first, either way. An earlier
 replica says no age and no keepalive, and is judged as before but for
@@ -81,14 +95,17 @@ silence; an earlier server ignores both.
 
 - **Server schema 5.** `Server::install` takes the database there; with
   migrations of your own, run `plan::migration(5)`, which adds
-  `sync.replicas.last_heard_at`, `keepalive` and `filed`. Stop the server's
+  `sync.replicas.last_heard_at`, `keepalive` and `filed`, and
+  `sync.settings`. Stop the server's
   processes of the earlier build before the upgrade (*Upgrading*, in the
   book).
 - **Replica schema 3.** `replica::install` takes the database there; with
   migrations of your own, run `replica::migration(3)`, which adds
   `sync_notes.noted_at`, the trigger `sync_notes_noted` that stamps it, and
   `sync_spoken`. The triggers `replica::triggers` prints are printed alike.
-- **`Outbox::backlog_every` is `Outbox::keepalive_every`.**
+- **`Outbox::backlog_every` is `Outbox::keepalive_every`,** and
+  `Replica::new` refuses one over a day, or not over `idle`.
+- **`Settings::behind_after` may not be zero,** which `Server::new` refuses.
 - **Dashboard contract 2.** `catching_up` means what waits, not what is on
   its way; `silent` is a state; `ReplicaOverview` says `last_heard_at` and
   `filed`, `UpProgress` `oldest_at`, each table of a `Backlog` is an
@@ -104,9 +121,9 @@ silence; an earlier server ignores both.
   `unansweringAfter`, `ReplicaRow::silentFor` is `unansweringFor`,
   `Summary::silent` is `unanswering`, and the messages `mood.silent` and
   `replica.silent` are `mood.unanswering` and `replica.unanswering`; the
-  silent state's are `mood.silent` and `replica.silent`, where they were
-  `mood.quiet` and `replica.quiet`. A silent replica is said to be silent,
-  not unanswering too.
+  silent state's are new keys, `mood.unheard` and `replica.unheard`, so an
+  override written for the old meaning lands on neither. A silent replica
+  is said to be silent, not unanswering too.
 - The public API adds `Engine::states`, `States`, `StateEntry`, `Silent`,
   `TableFiled`, `UpTable`, `ReplicaState::Silent`, `ReplicaCounts::silent`,
   `Health::silent`, `ReplicaOverview::{last_heard_at, filed}`,
