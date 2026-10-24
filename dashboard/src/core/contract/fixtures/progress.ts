@@ -2,11 +2,11 @@
 import type { Progress } from '../types.js'
 
 export default {
-  "contract": 1,
+  "contract": 2,
   "replicas": [
     {
       "audience": "test",
-      "replica": "00000000-0000-7000-8000-000000000005",
+      "replica": "00000000-0000-7000-8000-000000000006",
       "tables": [
         {
           "holds": 3,
@@ -21,7 +21,7 @@ export default {
     },
     {
       "audience": "test",
-      "replica": "00000000-0000-7000-8000-000000000004",
+      "replica": "00000000-0000-7000-8000-000000000005",
       "tables": [
         {
           "holds": 0,

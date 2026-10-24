@@ -1,13 +1,13 @@
 // Generated from magic_sync::status by its test `the_dashboards_types_are_generated_from_these`: UPDATE_CONTRACT=1 rewrites it.
 
 /** The contract these types describe: an answer of another is refused. */
-export const CONTRACT = 1
+export const CONTRACT = 2
 
 /**
  * Where a replica stands, in one word: the first of these that applies.
  * Ordered worst first.
  */
-export type ReplicaState = "awaiting_fix" | "unreachable" | "catching_up" | "synced";
+export type ReplicaState = "awaiting_fix" | "unreachable" | "silent" | "catching_up" | "synced";
 
 /**
  * What one row is to one replica.
@@ -133,10 +133,18 @@ applied_at: string | null,
  */
 waiting_since: string | null, 
 /**
+ * When the server last heard from it: an upload of any kind.
+ */
+last_heard_at: string | null, 
+/**
  * What it last said it wrote and the server has not filed, per table:
  * `None` until it says.
  */
 backlog: Backlog | null, 
+/**
+ * When the server last filed a row of each table from it, by table.
+ */
+filed: Array<TableFiled>, 
 /**
  * Its settings' wishes, by where they stand.
  */
@@ -154,6 +162,10 @@ awaiting_fix: number,
  * Replicas whose state is `unreachable`.
  */
 unreachable: number, 
+/**
+ * Replicas whose state is `silent`.
+ */
+silent: number, 
 /**
  * Replicas whose state is `catching_up`.
  */
@@ -348,6 +360,33 @@ last_error: string | null,
 retry_at: string | null, };
 
 /**
+ * A replica that has said nothing for longer than it said it would.
+ */
+export type Silent = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * When the server last heard from it.
+ */
+last_heard_at: string, };
+
+/**
+ * When the server last filed a row of one table from a replica: a table
+ * whose rows flow was filed a moment ago.
+ */
+export type TableFiled = { 
+/**
+ * The table.
+ */
+table: string, 
+/**
+ * When a row of it was last filed.
+ */
+last_filed_at: string, };
+
+/**
  * What the engine is waiting on, over a scope: each entry is either the
  * infrastructure (wait) or a bug (deploy a fix) — never data to repair by
  * hand. Lists are cut at the limit the read was given; `total` is uncut.
@@ -382,7 +421,12 @@ inbox: Listed<Unfiled>,
 /**
  * Replicas that sends keep failing to.
  */
-failing: Listed<Failing>, };
+failing: Listed<Failing>, 
+/**
+ * Replicas that have said nothing for longer than they said they would:
+ * off, or cut off — not unhealthy, as one out of reach is not.
+ */
+silent: Listed<Silent>, };
 
 /**
  * `Engine::overview`: everything a dashboard shows first, in one read.

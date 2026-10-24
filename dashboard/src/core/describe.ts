@@ -49,6 +49,8 @@ export function bannerOf(s: Summary, speech: Speech): Banner {
   if (s.counts.catching_up > 0)
     lines.push(t('mood.catching_up.detail', { n: s.counts.catching_up, total: s.total }))
   if (s.counts.unreachable > 0) lines.push(t('mood.unreachable', { n: s.counts.unreachable }))
+  // An engine that predates silence counts none.
+  if ((s.counts.silent ?? 0) > 0) lines.push(t('mood.quiet', { n: s.counts.silent }))
   if (s.fixes > 0) lines.push(t('mood.attention.detail', { n: s.fixes }))
   if (s.stuck && s.waitingSince != null) lines.push(t('mood.stuck', { since: ago(s.waitingSince, speech) }))
   if (s.silent > 0) lines.push(t('mood.silent', { n: s.silent }))
@@ -63,6 +65,8 @@ export function describeReplica(r: ReplicaRow, speech: Speech): string[] {
     out.push(t('replica.unreachable'))
     if (r.retryAt != null) out.push(t('replica.retry', { until: ahead(r.retryAt, speech) }))
   }
+  if (r.state === 'silent' && r.lastHeardAt != null)
+    out.push(t('replica.quiet', { since: ago(r.lastHeardAt, speech) }))
   if (r.quarantined > 0) out.push(t('replica.quarantined', { n: r.quarantined }))
   if (r.unfiled > 0) out.push(t('replica.unfiled', { n: r.unfiled }))
   if (r.parked > 0) out.push(t('replica.parked', { n: r.parked }))

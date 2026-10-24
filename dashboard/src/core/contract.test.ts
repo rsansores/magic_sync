@@ -12,10 +12,13 @@ import { parseTimestamp } from './time.js'
 
 // Exhaustive by type: a variant added on the engine's side fails to compile
 // here until it is named.
-const replicaStates = { awaiting_fix: 1, unreachable: 1, catching_up: 1, synced: 1 } satisfies Record<
-  ReplicaState,
-  1
->
+const replicaStates = {
+  awaiting_fix: 1,
+  unreachable: 1,
+  silent: 1,
+  catching_up: 1,
+  synced: 1,
+} satisfies Record<ReplicaState, 1>
 const rowStates = {
   holds: 1,
   outdated: 1,

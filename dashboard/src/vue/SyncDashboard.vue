@@ -71,7 +71,7 @@ const {
 const n = (value: number) => count(value, locale.value)
 // One audience goes without saying; several, each row says its own.
 const several = computed(() => (summary.value?.audiences.length ?? 0) > 1)
-const states: ReplicaState[] = ['awaiting_fix', 'unreachable', 'catching_up', 'synced']
+const states: ReplicaState[] = ['awaiting_fix', 'unreachable', 'silent', 'catching_up', 'synced']
 
 type Tab = 'replicas' | 'tables' | 'problems'
 const tabs: Tab[] = ['replicas', 'tables', 'problems']

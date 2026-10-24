@@ -55,7 +55,9 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     sent_at: ago(3 + i),
     applied_at: ago(3 + i),
     waiting_since: null,
+    last_heard_at: ago(i % 4),
     backlog: null,
+    filed: [{ table: 'receipts', last_filed_at: ago(2 + i) }],
     wishes: { pending: 0, waiting: 0, refused: 0, superseded: 0 },
   }
   if (scenario === 'healthy') return base
@@ -105,11 +107,11 @@ function table(name: string, scenario: Scenario): TableOverview {
 const overview = computed<Overview>(() => {
   const s = scenario.value
   const attention = s === 'attention'
-  const severity: ReplicaState[] = ['awaiting_fix', 'unreachable', 'catching_up', 'synced']
+  const severity: ReplicaState[] = ['awaiting_fix', 'unreachable', 'silent', 'catching_up', 'synced']
   const replicas = Array.from({ length: FLEET }, (_, i) => replica(i, s)).sort(
     (a, b) => severity.indexOf(a.state) - severity.indexOf(b.state),
   )
-  const states = { awaiting_fix: 0, unreachable: 0, catching_up: 0, synced: 0 }
+  const states = { awaiting_fix: 0, unreachable: 0, silent: 0, catching_up: 0, synced: 0 }
   for (const r of replicas) states[r.state] += 1
   return {
     contract: CONTRACT,
@@ -149,6 +151,7 @@ const overview = computed<Overview>(() => {
             ]
           : [],
       },
+      silent: { total: 0, first: [] },
     },
     tables: Object.keys(labels).map((name) => table(name, s)),
   }

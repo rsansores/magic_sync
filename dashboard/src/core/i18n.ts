@@ -30,6 +30,10 @@ const en: MessageTable = {
     one: '{n} replica cannot be reached; it gets what it is owed once it can.',
     other: '{n} replicas cannot be reached; each gets what it is owed once it can.',
   },
+  'mood.quiet': {
+    one: '{n} replica has said nothing for longer than it said it would.',
+    other: '{n} replicas have said nothing for longer than they said they would.',
+  },
   'mood.attention': 'Needs attention',
   'mood.attention.detail': {
     one: '{n} problem waits for a fix.',
@@ -54,6 +58,7 @@ const en: MessageTable = {
   'filter.all': 'All',
   'state.awaiting_fix': 'Needs a fix',
   'state.unreachable': 'Unreachable',
+  'state.silent': 'Silent',
   'state.catching_up': 'Catching up',
   'state.synced': 'Synced',
   'state.unknown': 'Unknown ({state})',
@@ -81,6 +86,7 @@ const en: MessageTable = {
   'replica.heard': 'Last confirmed {since}.',
   'replica.never': 'Nothing confirmed yet.',
   'replica.unreachable': 'Cannot be reached.',
+  'replica.quiet': 'Last heard {since}.',
   'replica.retry': 'Tried again {until}.',
   'replica.quarantined': {
     one: '{n} row set aside.',
@@ -207,6 +213,10 @@ const es: MessageTable = {
     one: '{n} réplica no se puede alcanzar; recibe lo que se le debe en cuanto se pueda.',
     other: '{n} réplicas no se pueden alcanzar; cada una recibe lo que se le debe en cuanto se pueda.',
   },
+  'mood.quiet': {
+    one: '{n} réplica lleva más tiempo sin señales del que dijo.',
+    other: '{n} réplicas llevan más tiempo sin señales del que dijeron.',
+  },
   'mood.attention': 'Requiere atención',
   'mood.attention.detail': {
     one: '{n} problema espera una corrección.',
@@ -231,6 +241,7 @@ const es: MessageTable = {
   'filter.all': 'Todas',
   'state.awaiting_fix': 'Requiere corrección',
   'state.unreachable': 'Inalcanzable',
+  'state.silent': 'Sin señales',
   'state.catching_up': 'Poniéndose al día',
   'state.synced': 'Sincronizada',
   'state.unknown': 'Desconocido ({state})',
@@ -258,6 +269,7 @@ const es: MessageTable = {
   'replica.heard': 'Última confirmación {since}.',
   'replica.never': 'Aún no confirma nada.',
   'replica.unreachable': 'No se puede alcanzar.',
+  'replica.quiet': 'Última señal {since}.',
   'replica.retry': 'Se reintenta {until}.',
   'replica.quarantined': {
     one: '{n} registro apartado.',

@@ -44,6 +44,8 @@ export interface ReplicaRow {
   silentFor: number | null
   /** When it last said it applied a message. */
   heardAt: number | null
+  /** When the server last heard from it at all: an upload of any kind. */
+  lastHeardAt: number | null
   pending: number
   /** Messages written for it that the transport has not taken yet. */
   owed: number
@@ -169,6 +171,7 @@ export function placeMoodOf(state: string): PlaceMood {
 const replicaStates: Record<ReplicaState, true> = {
   awaiting_fix: true,
   unreachable: true,
+  silent: true,
   catching_up: true,
   synced: true,
 }
@@ -207,6 +210,8 @@ function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
     state: r.state,
     silentFor,
     heardAt: timeOf(r.applied_at),
+    // An engine that predates hearing says nothing of it.
+    lastHeardAt: timeOf(r.last_heard_at ?? null),
     pending: r.pending,
     owed: r.owed,
     unconfirmed: r.unconfirmed,

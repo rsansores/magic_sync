@@ -159,6 +159,13 @@ pub struct Settings {
     pub watch_every: Duration,
     /// How long the oldest pending note may wait before that is an alarm.
     pub stuck_after: Duration,
+    /// How long a row a replica wrote may wait to be filed before a status
+    /// calls the replica behind (catching up): rows that flow are younger.
+    pub behind_after: Duration,
+    /// How many times the cadence a replica says it keeps
+    /// (`Outbox::keepalive_every`) it may say nothing for before a status
+    /// calls it silent. A replica that says none never is.
+    pub silent_after_keepalives: NonZeroU32,
 }
 
 impl Default for Settings {
@@ -181,6 +188,8 @@ impl Default for Settings {
             prune_after: Duration::from_secs(30 * 24 * 60 * 60),
             watch_every: Duration::from_secs(5 * 60),
             stuck_after: Duration::from_secs(15 * 60),
+            behind_after: Duration::from_secs(2 * 60),
+            silent_after_keepalives: NonZeroU32::new(3).expect("not zero"),
         }
     }
 }
@@ -333,12 +342,17 @@ impl<S: Senders, T: Transport> Server<S, T> {
 
     fn with(
         pool: PgPool,
-        engine: Engine,
+        mut engine: Engine,
         audiences: Vec<Audience<S::Known>>,
         transport: T,
         senders: S,
         settings: Settings,
     ) -> Self {
+        engine.judging = crate::status::Judging {
+            behind_after: chrono::TimeDelta::from_std(settings.behind_after)
+                .unwrap_or(chrono::TimeDelta::MAX),
+            silent_after: settings.silent_after_keepalives.get(),
+        };
         Server {
             pool,
             engine,
@@ -938,6 +952,13 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 failures = replica.failures,
                 error = replica.last_error,
                 "sync: a replica keeps failing to be reached — it waits, the others carry on"
+            );
+        }
+        for replica in &health.silent.first {
+            tracing::warn!(
+                replica = %replica.replica,
+                last_heard_at = %replica.last_heard_at,
+                "sync: a replica has said nothing for longer than it said it would — off, or cut off"
             );
         }
     }

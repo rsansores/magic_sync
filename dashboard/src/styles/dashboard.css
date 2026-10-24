@@ -232,6 +232,7 @@ button.msd-item:hover {
   color: var(--_warn);
 }
 .msd-state[data-state='unreachable'],
+.msd-state[data-state='silent'],
 .msd-state[data-state='awaiting_fix'] {
   color: var(--_danger);
 }

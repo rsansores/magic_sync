@@ -2,7 +2,7 @@
 import type { Overview } from '../types.js'
 
 export default {
-  "contract": 1,
+  "contract": 2,
   "health": {
     "failing": {
       "first": [
@@ -75,7 +75,7 @@ export default {
         },
         {
           "attempts": 1,
-          "id": 12,
+          "id": 13,
           "key": null,
           "kind": "rerouted",
           "last_error": "a bug",
@@ -100,6 +100,15 @@ export default {
         }
       ],
       "total": 1
+    },
+    "silent": {
+      "first": [
+        {
+          "last_heard_at": "2026-01-01T00:00:00.123456Z",
+          "replica": "00000000-0000-7000-8000-000000000004"
+        }
+      ],
+      "total": 1
     }
   },
   "now": "2026-01-01T00:00:00.123456Z",
@@ -110,7 +119,9 @@ export default {
         "audience": "test",
         "backlog": null,
         "failures": 0,
+        "filed": [],
         "last_error": null,
+        "last_heard_at": "2026-01-01T00:00:00.123456Z",
         "owed": 0,
         "parked": 2,
         "pending": 0,
@@ -134,7 +145,9 @@ export default {
         "audience": "test",
         "backlog": null,
         "failures": 1,
+        "filed": [],
         "last_error": "00000000-0000-7000-8000-000000000001 unreachable",
+        "last_heard_at": null,
         "owed": 2,
         "parked": 0,
         "pending": 0,
@@ -144,6 +157,37 @@ export default {
         "sent_at": null,
         "state": "unreachable",
         "unconfirmed": true,
+        "unfiled": 0,
+        "waiting_since": null,
+        "wishes": {
+          "pending": 0,
+          "refused": 0,
+          "superseded": 0,
+          "waiting": 0
+        }
+      },
+      {
+        "applied_at": "2026-01-01T00:00:00.123456Z",
+        "audience": "test",
+        "backlog": null,
+        "failures": 0,
+        "filed": [
+          {
+            "last_filed_at": "2026-01-01T00:00:00.123456Z",
+            "table": "receipts"
+          }
+        ],
+        "last_error": null,
+        "last_heard_at": "2026-01-01T00:00:00.123456Z",
+        "owed": 0,
+        "parked": 0,
+        "pending": 0,
+        "quarantined": 0,
+        "replica": "00000000-0000-7000-8000-000000000004",
+        "retry_at": null,
+        "sent_at": "2026-01-01T00:00:00.123456Z",
+        "state": "silent",
+        "unconfirmed": false,
         "unfiled": 0,
         "waiting_since": null,
         "wishes": {
@@ -169,12 +213,14 @@ export default {
           ]
         },
         "failures": 0,
+        "filed": [],
         "last_error": null,
+        "last_heard_at": "2026-01-01T00:00:00.123456Z",
         "owed": 0,
         "parked": 0,
         "pending": 0,
         "quarantined": 0,
-        "replica": "00000000-0000-7000-8000-000000000004",
+        "replica": "00000000-0000-7000-8000-000000000005",
         "retry_at": null,
         "sent_at": "2026-01-01T00:00:00.123456Z",
         "state": "catching_up",
@@ -193,12 +239,14 @@ export default {
         "audience": "test",
         "backlog": null,
         "failures": 0,
+        "filed": [],
         "last_error": null,
+        "last_heard_at": "2026-01-01T00:00:00.123456Z",
         "owed": 0,
         "parked": 0,
         "pending": 0,
         "quarantined": 0,
-        "replica": "00000000-0000-7000-8000-000000000005",
+        "replica": "00000000-0000-7000-8000-000000000006",
         "retry_at": null,
         "sent_at": "2026-01-01T00:00:00.123456Z",
         "state": "synced",
@@ -213,11 +261,12 @@ export default {
         }
       }
     ],
-    "total": 4
+    "total": 5
   },
   "states": {
     "awaiting_fix": 1,
     "catching_up": 1,
+    "silent": 1,
     "synced": 1,
     "unreachable": 1
   },
