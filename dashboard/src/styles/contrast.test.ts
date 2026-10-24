@@ -24,14 +24,26 @@ function contrast(a: string, b: string): number {
   return (hi! + 0.05) / (lo! + 0.05)
 }
 
-// [text, surface]: the card under every list and chip, and each banner's
-// tint under the title and the lines.
+// [text, surface]: the card under every list and chip, each tint under the
+// title and the lines drawn on it, and each tone on its own tint.
 const pairs: [string, string][] = [
-  ...['fg', 'muted', 'accent', 'ok', 'warn', 'danger'].map((text): [string, string] => [text, 'card']),
-  ...['ok-soft', 'warn-soft', 'danger-soft'].flatMap((surface): [string, string][] => [
-    ['fg', surface],
-    ['muted', surface],
+  ...['fg', 'muted', 'accent', 'ok', 'warn', 'danger', 'quiet', 'off'].map((text): [string, string] => [
+    text,
+    'card',
   ]),
+  ...['ok-soft', 'warn-soft', 'danger-soft', 'quiet-soft', 'off-soft', 'accent-soft'].flatMap(
+    (surface): [string, string][] => [
+      ['fg', surface],
+      ['muted', surface],
+    ],
+  ),
+  // Each tone's badge, chip and counter: its colour on its own tint.
+  ['ok', 'ok-soft'],
+  ['warn', 'warn-soft'],
+  ['danger', 'danger-soft'],
+  ['quiet', 'quiet-soft'],
+  ['off', 'off-soft'],
+  ['accent', 'accent-soft'],
 ]
 
 describe('the default colours', () => {
