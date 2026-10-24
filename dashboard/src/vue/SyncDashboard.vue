@@ -390,7 +390,7 @@ watch(selected, async (now, before) => {
           </button>
         </div>
 
-        <section
+        <div
           v-if="tab === 'replicas'"
           :id="`${id}-panel-replicas`"
           class="msd-panel"
@@ -501,9 +501,9 @@ watch(selected, async (now, before) => {
               </button>
             </nav>
           </div>
-        </section>
+        </div>
 
-        <section
+        <div
           v-else-if="tab === 'tables' && tables"
           :id="`${id}-panel-tables`"
           class="msd-panel"
@@ -532,9 +532,9 @@ watch(selected, async (now, before) => {
           <p v-if="tables.settled.length" class="msd-settled">
             {{ describeSettled(tables.settled.length, speech, !!group) }}
           </p>
-        </section>
+        </div>
 
-        <section
+        <div
           v-else
           :id="`${id}-panel-problems`"
           class="msd-panel"
@@ -557,7 +557,7 @@ watch(selected, async (now, before) => {
           </ul>
           <p v-if="summary.more > 0" class="msd-muted">{{ t('problem.more', { n: summary.more }) }}</p>
           <p v-if="tabCount.problems > 0" class="msd-note">{{ t('problem.contract') }}</p>
-        </section>
+        </div>
       </template>
     </template>
   </div>

@@ -182,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut settings = Settings::default();
     settings.idle = Duration::from_millis(300);
+    // It says it is there every 5 s when it has nothing else to say, not
+    // every minute: a register unplugged is silent within 15 s.
+    settings.outbox.keepalive_every = Duration::from_secs(5);
     // What carries out the head office's wishes of its footer.
     settings.wishes = Wishes::new().on::<Footer>(printer.clone());
     let replica = Arc::new(

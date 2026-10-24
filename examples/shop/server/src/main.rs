@@ -18,7 +18,7 @@ use magic_sync::plan::Audience;
 use magic_sync::row::KeyPart;
 use magic_sync::run::server::{Anyone, Server, Settings, Transport};
 use magic_sync::status::{
-    Listing, Overview, Progress, ReplicaState, RowProgress, Scope, WishListing, WishState,
+    Listing, Overview, Progress, ReplicaState, RowProgress, Scope, States, WishListing, WishState,
 };
 use magic_sync::Error;
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A fix deployed (a register restarted without its bug) gets through
     // within seconds, not the hour a real server waits.
     settings.retry_every = Duration::from_secs(10);
+    // A register's oldest receipt is late after 30 s, not 2 min; and one
+    // that says nothing for three of its keepalives is silent.
+    settings.behind_after = Duration::from_secs(30);
     // No migrations of its own: the engine sets up what the database lacks.
     let server = Arc::new(
         Server::install(
@@ -149,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/state", get(state))
         .route("/api/sync/overview", get(overview))
         .route("/api/sync/replicas", get(listing))
+        .route("/api/sync/states", get(states))
         .route("/api/sync/progress/{register}", get(progress))
         .route("/api/sync/rows/{table}/{key}", get(row))
         .route("/api/sync/wishes", get(wishes))
@@ -348,6 +352,13 @@ async fn overview(State(app): State<App>) -> Result<Json<Overview>, Failure> {
         .overview(&mut conn, Scope::All, 20)
         .await?;
     Ok(Json(overview))
+}
+
+// Every register's state, in a word each: a tile of each on the dashboard.
+async fn states(State(app): State<App>) -> Result<Json<States>, Failure> {
+    let mut conn = app.pool.acquire().await?;
+    let states = app.server.engine().states(&mut conn, Scope::All).await?;
+    Ok(Json(states))
 }
 
 #[derive(Deserialize)]
