@@ -2534,7 +2534,7 @@ async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
         0xa4c8_9065_538b_9cb5,
         0x64b0_376e_5c2a_ed54,
         0x8a3d_90b7_c465_07f0,
-        0x95d2_8ad6_e207_1754,
+        0x7c26_08ec_c3b3_691d,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -2565,7 +2565,8 @@ async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
 }
 
 /// A database of version 4 is brought to 5 keeping what it records of its
-/// replicas: none of them heard yet, and none taken for one that stopped.
+/// replicas: none of them heard yet, and none taken for one that stopped;
+/// and a status judges by the defaults until a server starts.
 #[sqlx::test(migrations = false)]
 async fn a_schema_of_version_4_is_upgraded_keeping_its_replicas(pool: crate::DbPool) {
     let mut conn = pool.acquire().await.expect("a connection");
@@ -2598,6 +2599,16 @@ async fn a_schema_of_version_4_is_upgraded_keeping_its_replicas(pool: crate::DbP
     .await
     .expect("kept");
     assert_eq!(kept, (true, true, true, true));
+    let judging: (String, i32) =
+        sqlx::query_as("SELECT behind_after::text, silent_after_keepalives FROM sync.settings")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("what a status judges by");
+    assert_eq!(
+        judging,
+        ("00:02:00".to_owned(), 3),
+        "the defaults until a server starts"
+    );
 }
 
 #[sqlx::test(migrations = false)]

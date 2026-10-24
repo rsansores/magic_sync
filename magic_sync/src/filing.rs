@@ -217,13 +217,17 @@ pub(crate) async fn file<P: Sync + 'static>(
         }
     };
     said_apart(conn, codecs, sender, &standing, confirmed, upload).await?;
-    let tables: Vec<&str> = filed
+    heard(conn, sender, upload, &tables_of(&filed)).await?;
+    Ok(filed)
+}
+
+/// The tables `filed` wrote or removed rows of.
+fn tables_of(filed: &[Filed]) -> Vec<&str> {
+    filed
         .iter()
         .filter(|f| !f.written.is_empty() || !f.gone.is_empty())
         .map(|f| f.table.as_str())
-        .collect();
-    heard(conn, sender, upload, &tables).await?;
-    Ok(filed)
+        .collect()
 }
 
 /// What [`file`] does with an upload from `sender` whose filing failed as a
@@ -254,17 +258,43 @@ async fn heard(conn: &mut Conn, sender: Uuid, upload: &Up, tables: &[&str]) -> R
     let keepalive = Some(upload.keepalive_ms)
         .filter(|ms| (1..=KEEPALIVE).contains(ms))
         .and_then(|ms| i64::try_from(ms).ok());
-    sqlx::query(
+    sqlx::query(&format!(
         "UPDATE sync.replicas SET last_heard_at = now(), \
-                keepalive = $2::int8 * interval '1 millisecond', \
-                filed = CASE WHEN cardinality($3::text[]) = 0 THEN filed \
-                             ELSE coalesce(filed, '{}') \
-                                  || (SELECT jsonb_object_agg(t, now()) FROM unnest($3::text[]) AS t) \
-                        END \
+                keepalive = $2::int8 * interval '1 millisecond', {} \
           WHERE replica_id = $1",
-    )
+        filed_now("$3")
+    ))
     .bind(sender)
     .bind(keepalive)
+    .bind(tables)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The assignment that says a row of each table of the `tables` parameter
+/// was last filed from the replica now.
+fn filed_now(tables: &str) -> String {
+    format!(
+        "filed = CASE WHEN cardinality({tables}::text[]) = 0 THEN filed \
+                      ELSE coalesce(filed, '{{}}') \
+                           || (SELECT jsonb_object_agg(t, now()) FROM unnest({tables}::text[]) AS t) \
+                 END"
+    )
+}
+
+/// Rows of `tables` were filed from `sender` again, out of the inbox: when
+/// each was last filed moves, and when the replica was last heard does not —
+/// filing what it sent long ago is not hearing from it.
+async fn refiled(conn: &mut Conn, sender: Uuid, tables: &[&str]) -> Result<(), Error> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(&format!(
+        "UPDATE sync.replicas SET {} WHERE replica_id = $1",
+        filed_now("$2")
+    ))
+    .bind(sender)
     .bind(tables)
     .execute(&mut *conn)
     .await?;
@@ -1442,7 +1472,8 @@ pub(crate) async fn refile<P: Sync + 'static>(
             ours: envelope::PROTOCOL,
         });
     }
-    let (_, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known, None).await?;
+    let (filed, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known, None).await?;
+    refiled(conn, kept.replica_id, &tables_of(&filed)).await?;
     keep(conn, kept.replica_id, &unfiled, &mut Keeping::Again(&kept)).await?;
     Ok(unfiled.is_empty())
 }

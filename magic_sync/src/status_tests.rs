@@ -548,6 +548,98 @@ async fn a_replica_quiet_for_longer_than_it_said_is_silent(pool: crate::DbPool) 
         "the health lists as silent what the counts count so"
     );
     assert!(fix.health.silent.first.is_empty());
+    sqlx::query("DELETE FROM sync.quarantine")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+
+    // Whatever comes before silence, the health alone says as the counts do.
+    for (what, set, undo) in [
+        (
+            "out of reach",
+            "UPDATE sync.replicas SET failures = 1 WHERE replica_id = $1",
+            "UPDATE sync.replicas SET failures = 0",
+        ),
+        (
+            "an upload it could not file",
+            "INSERT INTO sync.inbox (replica_id, relation, row_key, upload, reason) \
+             VALUES ($1, 'items', 'k', '\\x00', 'a bug')",
+            "DELETE FROM sync.inbox",
+        ),
+        (
+            "a change of its own set aside",
+            "INSERT INTO sync.notes (kind, replica_id, partition_id, parked_at, attempts) \
+             SELECT 'resync', $1, partition_id, now(), 1 FROM fixture.t_replicas WHERE id = $1",
+            "DELETE FROM sync.notes WHERE kind = 'resync'",
+        ),
+        ("nothing else", "SELECT $1", "SELECT 1"),
+    ] {
+        sqlx::query(set).bind(a).execute(&world.pool).await.unwrap();
+        let overview = world.overview(Scope::All).await;
+        let health = world
+            .engine
+            .health(&mut conn, Scope::All, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            (health.silent.total, health.silent.first.len()),
+            (
+                overview.states.silent,
+                usize::try_from(overview.states.silent).unwrap()
+            ),
+            "{what}"
+        );
+        assert_eq!(
+            overview.states.silent,
+            i64::from(what == "nothing else"),
+            "{what}"
+        );
+        sqlx::raw_sql(undo).execute(&world.pool).await.unwrap();
+    }
+}
+
+/// Every process judges a replica alike: by what the server kept when it
+/// last started, whatever the engine reading a status was built with.
+#[sqlx::test(migrations = false)]
+async fn a_status_judges_by_what_the_server_kept(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Fake::default();
+    world.pass(&wire).await;
+    world.acknowledge(a, world.last_sent(a).await).await;
+    let up = envelope::Up {
+        keepalive_ms: 60_000,
+        backlog: Some(envelope::Backlog {
+            tables: vec![envelope::TableBacklog {
+                table: "sales".into(),
+                unsent: 5,
+                unfiled: 0,
+                set_aside: 0,
+                oldest_ms: 180_000,
+            }],
+        }),
+        ..envelope::Up::default()
+    };
+    crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+    sqlx::query(
+        "UPDATE sync.replicas SET last_heard_at = now() - interval '200 seconds' WHERE replica_id = $1",
+    )
+    .bind(a)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let state = || async { world.overview(Scope::Replicas(&[a])).await.replicas.first[0].state };
+    assert_eq!(state().await, ReplicaState::Silent, "as the schema has it");
+
+    let mut conn = world.pool.acquire().await.unwrap();
+    crate::status::Judging {
+        behind_after: chrono::TimeDelta::hours(1),
+        silent_after: 10,
+    }
+    .keep(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(state().await, ReplicaState::Synced, "as a server kept it");
 }
 
 /// Every replica's state at once is the one the overview gives it, in the

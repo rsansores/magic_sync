@@ -2364,6 +2364,12 @@ pub struct Outbox {
     /// stopped. Also how often, at most, it tells its backlog while it grows,
     /// and says it again, unchanged, while it is not empty; it says at once
     /// when it empties, or starts.
+    ///
+    /// At most a day, and over the replica's `idle`, which it would sleep
+    /// past: `Replica::new` refuses either. Keep it well under the server's
+    /// `Settings::behind_after`, which judges a row by the backlog that says
+    /// it waits, said no more often than this when the replica writes
+    /// nothing else.
     pub keepalive_every: std::time::Duration,
 }
 

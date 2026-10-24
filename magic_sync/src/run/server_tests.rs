@@ -835,7 +835,8 @@ async fn count(pool: &PgPool, sql: &str) -> i64 {
 /// An upload whose filing fails for a reason no resend cures is kept whole,
 /// answered so the replica stops sending it, and filed after a fix; an
 /// upload that fails again holds back no other. What it says of its sender
-/// is filed all the same: what it applied is recorded.
+/// is filed all the same: what it applied is recorded. Filed after the fix,
+/// its tables say they were filed then, and the replica is not heard again.
 #[sqlx::test(migrations = false)]
 async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool: PgPool) {
     let (partition, [a, b]) = world(&pool).await;
@@ -917,12 +918,32 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
     );
 
     // b's sender is fixed, a's is not: a fails again, and b is filed.
+    sqlx::query("UPDATE sync.replicas SET last_heard_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
     senders.failing.lock().unwrap().remove(&b);
     let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
     refile(&server, &mut lock).await;
     assert_eq!(
         count(&pool, "SELECT count(*) FROM fixture.readings").await,
         1
+    );
+    let heard: Vec<(Uuid, bool, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT replica_id, last_heard_at < now() - interval '59 minutes', filed -> 'readings' \
+           FROM sync.replicas ORDER BY replica_id = $1 DESC",
+    )
+    .bind(b)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        heard
+            .iter()
+            .map(|(r, old, f)| (*r, *old, f.is_some()))
+            .collect::<Vec<_>>(),
+        [(b, true, true), (a, true, false)],
+        "b's readings filed now, and neither heard again"
     );
     let left: (Uuid, i32) = sqlx::query_as("SELECT replica_id, attempts FROM sync.inbox")
         .fetch_one(&pool)
@@ -1373,7 +1394,7 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
     world(&pool).await;
     /// A setting made zero.
     type Zeroed = (&'static str, fn(&mut Settings));
-    let cases: [Zeroed; 8] = [
+    let cases: [Zeroed; 9] = [
         ("idle", |s| s.idle = Duration::ZERO),
         ("send_timeout", |s| s.send_timeout = Duration::ZERO),
         ("unconfirmed_after", |s| {
@@ -1384,6 +1405,7 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
         ("prune_after", |s| s.prune_after = Duration::ZERO),
         ("watch_every", |s| s.watch_every = Duration::ZERO),
         ("stuck_after", |s| s.stuck_after = Duration::ZERO),
+        ("behind_after", |s| s.behind_after = Duration::ZERO),
     ];
     for (what, set) in cases {
         let mut wrong = settings();
@@ -1402,6 +1424,30 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
             Ok(_) => panic!("{what}: not refused"),
         }
     }
+}
+
+/// A server keeps what a status judges by where every process reads it.
+#[sqlx::test(migrations = false)]
+async fn a_server_keeps_what_a_status_judges_by(pool: PgPool) {
+    world(&pool).await;
+    let mut set = settings();
+    set.behind_after = Duration::from_secs(7 * 60);
+    set.silent_after_keepalives = std::num::NonZeroU32::new(5).unwrap();
+    Server::new(
+        pool.clone(),
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        set,
+    )
+    .await
+    .unwrap();
+    let kept: (String, i32) =
+        sqlx::query_as("SELECT behind_after::text, silent_after_keepalives FROM sync.settings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, ("00:07:00".to_owned(), 5));
 }
 
 /// An upload beyond the server's limits — more bytes, or more rows and
@@ -1692,4 +1738,44 @@ async fn a_transaction_on_a_connection_without_the_lock_is_refused(pool: PgPool)
     );
     assert!(!elsewhere.still_held().await, "nor counts as held");
     held.release(LOCK_KEY).await;
+}
+
+/// The watch warns of a replica as it falls silent, not on every pass for as
+/// long as it stays so; and of how many are, when more are than it names and
+/// that changes.
+#[test]
+fn the_watch_warns_of_a_replica_as_it_falls_silent() {
+    use crate::status::{Listed, Silent};
+    let [a, b, c] = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+    let at = Utc::now();
+    let listed = |total: i64, named: &[Uuid]| Listed {
+        total,
+        first: named
+            .iter()
+            .map(|&replica| Silent {
+                replica,
+                last_heard_at: at,
+            })
+            .collect(),
+    };
+    let fell = |silenced: &mut Silenced, listed: &Listed<Silent>| {
+        let (fell, total) = silenced.since(listed);
+        (fell.iter().map(|s| s.replica).collect::<Vec<_>>(), total)
+    };
+    let mut silenced = Silenced::default();
+    assert_eq!(fell(&mut silenced, &listed(1, &[a])), (vec![a], None));
+    assert_eq!(
+        fell(&mut silenced, &listed(1, &[a])),
+        (vec![], None),
+        "still silent"
+    );
+    assert_eq!(fell(&mut silenced, &listed(2, &[a, b])), (vec![b], None));
+    assert_eq!(fell(&mut silenced, &listed(9, &[a, b])), (vec![], Some(9)));
+    assert_eq!(fell(&mut silenced, &listed(9, &[a, b])), (vec![], None));
+    assert_eq!(fell(&mut silenced, &listed(0, &[])), (vec![], None));
+    assert_eq!(
+        fell(&mut silenced, &listed(2, &[a, c])),
+        (vec![a, c], None),
+        "silent again"
+    );
 }

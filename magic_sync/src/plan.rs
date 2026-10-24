@@ -391,8 +391,6 @@ pub struct Engine {
     pub(crate) audiences: Vec<Planner>,
     /// Every trigger the audiences need, one per table.
     triggers: Vec<Trigger>,
-    /// What a status judges a replica by.
-    pub(crate) judging: crate::status::Judging,
 }
 
 impl std::fmt::Debug for Engine {
@@ -1314,7 +1312,6 @@ impl Engine {
         let mut engine = Engine {
             audiences: planners,
             triggers: Vec::new(),
-            judging: crate::status::Judging::default(),
         };
         engine.triggers = engine.noted_rows()?;
         Ok(engine)

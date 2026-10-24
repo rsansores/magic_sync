@@ -35,14 +35,45 @@ pub const CONTRACT: u32 = 2;
 
 /// What a status judges a replica by: how long a row it wrote may wait to be
 /// filed before it is behind, and how many of the keepalives it says it keeps
-/// it may be quiet for before it is silent. The server's settings say.
+/// it may be quiet for before it is silent. The server's settings say, and
+/// it keeps them in the database (`sync.settings`) when it starts, so that
+/// every process that reads a status judges alike, whatever settings it was
+/// built with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Judging {
     pub(crate) behind_after: chrono::TimeDelta,
-    pub(crate) silent_after: u32,
+    pub(crate) silent_after: i32,
 }
 
 impl Judging {
+    /// The judging the database keeps.
+    async fn kept(conn: &mut Conn) -> Result<Self, Error> {
+        let (micros, silent_after): (i64, i32) = sqlx::query_as(
+            "SELECT (extract(epoch FROM behind_after) * 1000000)::int8, silent_after_keepalives \
+               FROM sync.settings",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(Judging {
+            behind_after: chrono::TimeDelta::microseconds(micros),
+            silent_after,
+        })
+    }
+
+    /// Keeps the server's settings for every process to judge by, writing
+    /// only what changed.
+    pub(crate) async fn keep(self, conn: &mut Conn) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE sync.settings SET behind_after = $1, silent_after_keepalives = $2 \
+              WHERE (behind_after, silent_after_keepalives) IS DISTINCT FROM ($1, $2)",
+        )
+        .bind(self.behind_after)
+        .bind(self.silent_after)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Whether the replica `r` (an alias of `sync.replicas`) has been quiet
     /// for longer than it said it would, as SQL: never one that said no
     /// keepalive.
@@ -51,15 +82,6 @@ impl Judging {
             "coalesce({r}.last_heard_at + {r}.keepalive * {} < now(), false)",
             self.silent_after
         )
-    }
-}
-
-impl Default for Judging {
-    fn default() -> Self {
-        Judging {
-            behind_after: chrono::TimeDelta::minutes(2),
-            silent_after: 3,
-        }
     }
 }
 
@@ -1281,9 +1303,7 @@ impl Engine {
         let scoped = self.scoped(&mut tx, scope).await?;
         let notes = self.notes(&mut tx, &scoped).await?;
         let fleet = self.fleet(&mut tx, &scoped, &notes, now).await?;
-        let health = self
-            .health_of(&mut tx, &scoped, &notes, &fleet, limit)
-            .await?;
+        let health = self.health_of(&mut tx, &scoped, &notes, limit).await?;
         let tables = self.tables_of(&mut tx, &scoped, &notes, &fleet).await?;
         tx.commit().await?;
         Ok(Overview {
@@ -1328,7 +1348,10 @@ impl Engine {
 
     /// Where every replica of `scope` stands, in one word each, worst first
     /// as [`Engine::listing`] orders them: the state the overview counts,
-    /// for every replica at once, and nothing else of them.
+    /// for every replica at once, and nothing else of them. It settles every
+    /// replica's state as the overview does: some 15 ms over 4000 replicas,
+    /// each with a backlog, while 2000 changes wait to be planned (a release
+    /// build on PostgreSQL 18; `bench_every_state_of_4000_units`).
     ///
     /// # Errors
     ///
@@ -1436,13 +1459,9 @@ impl Engine {
         limit: u32,
     ) -> Result<Health, Error> {
         let mut tx = snapshot(conn).await?;
-        let now = Self::now(&mut tx).await?;
         let scoped = self.scoped(&mut tx, scope).await?;
         let notes = self.notes(&mut tx, &scoped).await?;
-        let fleet = self.fleet(&mut tx, &scoped, &notes, now).await?;
-        let health = self
-            .health_of(&mut tx, &scoped, &notes, &fleet, limit)
-            .await?;
+        let health = self.health_of(&mut tx, &scoped, &notes, limit).await?;
         tx.commit().await?;
         Ok(health)
     }
@@ -1556,12 +1575,31 @@ impl Engine {
         Ok(notes)
     }
 
+    /// The changes parked for `replica` alone, of those its audience plans:
+    /// what makes a replica wait for a fix, as [`Engine::fleet`] counts them.
+    fn own_parked(&self, scoped: &Scoped, notes: &[NoteGroup], replica: Uuid) -> i64 {
+        let Some(&a) = scoped.of.get(&replica) else {
+            return 0;
+        };
+        let partition = scoped
+            .replicas
+            .iter()
+            .find(|(r, _)| *r == replica)
+            .and_then(|(_, p)| *p);
+        notes
+            .iter()
+            .filter(|n| n.parked && n.replica == Some(replica))
+            .filter(|n| n.partition.is_none_or(|p| Some(p) == partition))
+            .filter(|n| self.plans_note(a, n) || self.nobodys(n))
+            .map(|n| n.count)
+            .sum()
+    }
+
     async fn health_of(
         &self,
         conn: &mut Conn,
         scoped: &Scoped,
         notes: &[NoteGroup],
-        fleet: &Fleet,
         limit: u32,
     ) -> Result<Health, Error> {
         let limit = i64::from(limit);
@@ -1646,22 +1684,32 @@ impl Engine {
             .fetch_all(&mut *conn)
             .await?,
         };
-        // The replicas whose state is silent: what a fix waits for, or a
-        // replica out of reach, is listed as that.
-        let mut quiet: Vec<Silent> = fleet
-            .replicas
-            .iter()
-            .filter(|r| r.state == ReplicaState::Silent)
-            .filter_map(|r| {
-                r.last_heard_at.map(|last_heard_at| Silent {
-                    replica: r.replica,
-                    last_heard_at,
-                })
+        // The replicas whose state is silent: quiet for longer than they
+        // said, and neither waiting for a fix nor out of reach, which come
+        // first — the states' order, without settling every replica's.
+        let judging = Judging::kept(conn).await?;
+        let quiet: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(&format!(
+            "SELECT r.replica_id, r.last_heard_at FROM sync.replicas r \
+              WHERE r.replica_id = ANY($1) AND {} AND r.failures = 0 \
+                AND NOT EXISTS (SELECT 1 FROM sync.quarantine q \
+                                 WHERE q.replica_id = r.replica_id AND {AWAITING_FIX}) \
+                AND NOT EXISTS (SELECT 1 FROM sync.inbox i WHERE i.replica_id = r.replica_id) \
+              ORDER BY r.last_heard_at, r.replica_id",
+            judging.silent("r"),
+        ))
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let quiet: Vec<Silent> = quiet
+            .into_iter()
+            .filter(|&(replica, _)| self.own_parked(scoped, notes, replica) == 0)
+            .map(|(replica, last_heard_at)| Silent {
+                replica,
+                last_heard_at,
             })
             .collect();
-        quiet.sort_by_key(|s| (s.last_heard_at, s.replica));
         let silent = Listed {
-            total: fleet.states.silent,
+            total: i64::try_from(quiet.len()).unwrap_or(i64::MAX),
             first: quiet
                 .into_iter()
                 .take(usize::try_from(limit).unwrap_or(usize::MAX))
@@ -1688,6 +1736,7 @@ impl Engine {
         notes: &[NoteGroup],
         now: DateTime<Utc>,
     ) -> Result<Fleet, Error> {
+        let judging = Judging::kept(conn).await?;
         let recorded: Vec<Recorded> = sqlx::query_as(&format!(
             "SELECT s.id AS replica, r.failures, coalesce(r.last_error, c.dropped) AS last_error, \
                     r.retry_after AS retry_at, \
@@ -1722,7 +1771,7 @@ impl Engine {
                                    WHERE w.replica_id = ANY($1)) ws \
                            GROUP BY 1) w ON w.replica_id = s.id",
             crate::relay::UNCONFIRMED,
-            self.judging.silent("r"),
+            judging.silent("r"),
             crate::wish::STATE,
         ))
         .bind(scoped.ids())
@@ -1751,7 +1800,7 @@ impl Engine {
                     .map(|f| f.count(r.replica, partitions.get(&r.replica).copied().flatten()))
                     .unwrap_or_default();
                 let failures = r.failures.unwrap_or(0);
-                let since = now.checked_sub_signed(self.judging.behind_after);
+                let since = now.checked_sub_signed(judging.behind_after);
                 let backlog = r.backlog.zip(r.backlog_at).map(|(tables, at)| Backlog {
                     tables: tables
                         .0

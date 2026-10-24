@@ -163,8 +163,9 @@ async fn a_replica_does_not_start_over_a_database_it_cannot_run_against(pool: Sq
 }
 
 /// Settings a replica cannot run with are refused when it is built: a wait
-/// of nothing, which would spin or say the same thing without end, and two
-/// lanes of one name.
+/// of nothing, which would spin or say the same thing without end; a
+/// keepalive the server would take for none, or one the replica would sleep
+/// past; and two lanes of one name.
 #[sqlx::test(migrations = false)]
 async fn a_replica_refuses_settings_it_cannot_run_with(pool_: SqlitePool) {
     let pool = pool(pool_).await;
@@ -182,6 +183,10 @@ async fn a_replica_refuses_settings_it_cannot_run_with(pool_: SqlitePool) {
         ("outbox.keepalive_every", |s| {
             s.outbox.keepalive_every = Duration::ZERO
         }),
+        ("over a day", |s| {
+            s.outbox.keepalive_every = Duration::from_secs(24 * 60 * 60 + 1)
+        }),
+        ("`idle` is not under", |s| s.idle = s.outbox.keepalive_every),
     ] {
         let mut settings = settings();
         set(&mut settings);
@@ -260,7 +265,7 @@ async fn a_nudge_sends_what_was_written_at_once(pool_: SqlitePool) {
     let pool = pool(pool_).await;
     let uplink = Uplinked::default();
     let settings = Settings {
-        idle: Duration::from_secs(60),
+        idle: Duration::from_secs(30),
         ..settings()
     };
     let me = Uuid::now_v7();

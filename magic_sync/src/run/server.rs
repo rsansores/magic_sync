@@ -161,6 +161,13 @@ pub struct Settings {
     pub stuck_after: Duration,
     /// How long a row a replica wrote may wait to be filed before a status
     /// calls the replica behind (catching up): rows that flow are younger.
+    /// Not zero. A replica's `Outbox::keepalive_every` stays well under it:
+    /// a replica that writes nothing else says what waits only that often,
+    /// so a row of it may be judged by a backlog that old.
+    ///
+    /// The server keeps this and `silent_after_keepalives` in the database
+    /// when it starts (`sync.settings`), and every status reads them there:
+    /// every process judges alike, as the server last started says.
     pub behind_after: Duration,
     /// How many times the cadence a replica says it keeps
     /// (`Outbox::keepalive_every`) it may say nothing for before a status
@@ -208,6 +215,7 @@ impl Settings {
             ("prune_after", self.prune_after),
             ("watch_every", self.watch_every),
             ("stuck_after", self.stuck_after),
+            ("behind_after", self.behind_after),
         ];
         if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
             return Err(Error::Misuse(format!(
@@ -215,6 +223,17 @@ impl Settings {
             )));
         }
         Ok(())
+    }
+
+    /// What a status judges a replica by: past a century, `behind_after`
+    /// is a century, which no row waits for.
+    fn judging(&self) -> crate::status::Judging {
+        let century = chrono::TimeDelta::days(36_525);
+        crate::status::Judging {
+            behind_after: chrono::TimeDelta::from_std(self.behind_after)
+                .map_or(century, |d| d.min(century)),
+            silent_after: i32::try_from(self.silent_after_keepalives.get()).unwrap_or(i32::MAX),
+        }
     }
 }
 
@@ -281,7 +300,9 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// the kinds of replica it serves — where it finds each kind, and the
     /// tables they hold, parents first; `transport` how a message reaches a
     /// replica; `senders` what the host knows of a replica that sends
-    /// something up.
+    /// something up. It writes nothing of the host's, and of the engine's
+    /// only what a status judges by (`Settings::behind_after`), when it
+    /// changed.
     ///
     /// # Errors
     ///
@@ -302,7 +323,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
         let audiences = with_wishes(audiences)?;
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::new(&mut tx, &Declared::of(&audiences)).await?;
-        tx.rollback().await?;
+        settings.judging().keep(&mut tx).await?;
+        tx.commit().await?;
         Ok(Self::with(
             pool, engine, audiences, transport, senders, settings,
         ))
@@ -334,6 +356,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         let audiences = with_wishes(audiences)?;
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::install(&mut tx, &Declared::of(&audiences)).await?;
+        settings.judging().keep(&mut tx).await?;
         tx.commit().await?;
         Ok(Self::with(
             pool, engine, audiences, transport, senders, settings,
@@ -342,17 +365,12 @@ impl<S: Senders, T: Transport> Server<S, T> {
 
     fn with(
         pool: PgPool,
-        mut engine: Engine,
+        engine: Engine,
         audiences: Vec<Audience<S::Known>>,
         transport: T,
         senders: S,
         settings: Settings,
     ) -> Self {
-        engine.judging = crate::status::Judging {
-            behind_after: chrono::TimeDelta::from_std(settings.behind_after)
-                .unwrap_or(chrono::TimeDelta::MAX),
-            silent_after: settings.silent_after_keepalives.get(),
-        };
         Server {
             pool,
             engine,
@@ -687,6 +705,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         let now = Instant::now();
         let (mut retry_at, mut prune_at, mut watch_at) = (now, now, now);
         let mut refiling = None;
+        let mut silenced = Silenced::default();
         loop {
             if !lock.still_held().await {
                 tracing::error!("sync: the relay's lock is gone — standing by");
@@ -711,7 +730,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
                     Instant::now() + self.settings.prune_after.min(Duration::from_secs(60 * 60));
             }
             if Instant::now() >= watch_at {
-                self.watch(&mut lock).await;
+                self.watch(&mut lock, &mut silenced).await;
                 watch_at = Instant::now() + self.settings.watch_every;
             }
             if let Some(walk) = refiling {
@@ -879,7 +898,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// too long ([`relay::heal`]), and logs whatever in the engine's health
     /// needs someone: each one means wait (the network) or deploy a fix (a
     /// bug), never repair data.
-    async fn watch(&self, lock: &mut Lock) {
+    async fn watch(&self, lock: &mut Lock, silenced: &mut Silenced) {
         let healed = async {
             let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
             let healed =
@@ -954,13 +973,46 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 "sync: a replica keeps failing to be reached — it waits, the others carry on"
             );
         }
-        for replica in &health.silent.first {
+        let (fell, total) = silenced.since(&health.silent);
+        for replica in fell {
             tracing::warn!(
                 replica = %replica.replica,
                 last_heard_at = %replica.last_heard_at,
                 "sync: a replica has said nothing for longer than it said it would — off, or cut off"
             );
         }
+        if let Some(total) = total {
+            tracing::warn!(total, "sync: replicas silent, more than are named");
+        }
+    }
+}
+
+/// The silent replicas the watch has warned of, so that it warns of each as
+/// it falls silent, not on every pass for as long as it stays so.
+#[derive(Debug, Default)]
+struct Silenced {
+    named: std::collections::BTreeSet<Uuid>,
+    total: i64,
+}
+
+impl Silenced {
+    /// Of the silent replicas the health names, the ones not named the last
+    /// time; and how many are silent, when more are than it names and that
+    /// changed since.
+    fn since<'a>(
+        &mut self,
+        silent: &'a crate::status::Listed<crate::status::Silent>,
+    ) -> (Vec<&'a crate::status::Silent>, Option<i64>) {
+        let fell = silent
+            .first
+            .iter()
+            .filter(|s| !self.named.contains(&s.replica))
+            .collect();
+        let more = usize::try_from(silent.total).unwrap_or(usize::MAX) > silent.first.len();
+        let total = (more && silent.total != self.total).then_some(silent.total);
+        self.named = silent.first.iter().map(|s| s.replica).collect();
+        self.total = silent.total;
+        (fell, total)
     }
 }
 

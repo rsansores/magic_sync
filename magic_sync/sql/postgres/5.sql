@@ -23,3 +23,20 @@ COMMENT ON COLUMN sync.replicas.backlog IS
     'What the replica last said it wrote and the server has not filed, per table '
     '([{table, unsent, unfiled, set_aside, oldest_ms}]: oldest_ms how long its oldest row had '
     'waited, as backlog_at), as of backlog_at. NULL until it says.';
+
+-- What a status judges a replica by, kept here so that every process reading
+-- a status judges alike: the server writes its settings when it starts.
+CREATE TABLE sync.settings (
+    id                      INTEGER  PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    behind_after            INTERVAL NOT NULL DEFAULT '2 minutes' CHECK (behind_after > '0'),
+    silent_after_keepalives INTEGER  NOT NULL DEFAULT 3 CHECK (silent_after_keepalives > 0)
+);
+INSERT INTO sync.settings DEFAULT VALUES;
+
+COMMENT ON TABLE sync.settings IS
+    'What a status judges a replica by, as the server last started with: one row.';
+COMMENT ON COLUMN sync.settings.behind_after IS
+    'How long a row a replica wrote may wait to be filed before the replica is behind.';
+COMMENT ON COLUMN sync.settings.silent_after_keepalives IS
+    'How many times the keepalive a replica says it keeps it may say nothing for before it '
+    'is silent.';
