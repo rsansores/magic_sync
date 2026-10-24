@@ -379,11 +379,14 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
     let writing = world.overview(Scope::Replicas(&[a])).await;
     let backlog = writing.replicas.first[0].backlog.as_ref().expect("said");
     assert_eq!(
-        (writing.replicas.first[0].state, backlog.tables[0].unsent),
+        (
+            writing.replicas.first[0].state,
+            backlog.tables[0].progress.unsent
+        ),
         (ReplicaState::CatchingUp, 3)
     );
     assert_eq!(
-        backlog.tables[0].oldest_at,
+        backlog.tables[0].progress.oldest_at,
         Some(backlog.at - chrono::TimeDelta::seconds(180)),
         "the age it said, from when it said it"
     );
@@ -394,8 +397,8 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
 
 /// What a replica wrote holds it back only once it waits: rows written a
 /// moment ago flow, rows it could not send wait at once, and of a replica
-/// that says no age, rows it has said it had for longer than the server lets
-/// them wait.
+/// that says no age — whose backlog it says again every keepalive, so when
+/// it said it tells nothing — any row not gone. The table says so itself.
 #[sqlx::test(migrations = false)]
 async fn a_replica_is_behind_only_on_what_waits(pool: crate::DbPool) {
     let world = world(pool).await;
@@ -403,12 +406,11 @@ async fn a_replica_is_behind_only_on_what_waits(pool: crate::DbPool) {
     let wire = Fake::default();
     world.pass(&wire).await;
     world.acknowledge(a, world.last_sent(a).await).await;
-    let state = || async { world.overview(Scope::Replicas(&[a])).await.replicas.first[0].state };
     for (unsent, set_aside, oldest_ms, said_ago, expected) in [
         (5, 0, 1_000, 0, ReplicaState::Synced),
         (5, 0, 180_000, 0, ReplicaState::CatchingUp),
         (0, 1, 1_000, 0, ReplicaState::CatchingUp),
-        (5, 0, 0, 0, ReplicaState::Synced),
+        (5, 0, 0, 0, ReplicaState::CatchingUp),
         (5, 0, 0, 180, ReplicaState::CatchingUp),
         (5, 0, 1_000, 180, ReplicaState::CatchingUp),
         (0, 0, 0, 180, ReplicaState::Synced),
@@ -435,9 +437,15 @@ async fn a_replica_is_behind_only_on_what_waits(pool: crate::DbPool) {
         .execute(&world.pool)
         .await
         .unwrap();
+        let overview = world.overview(Scope::Replicas(&[a])).await;
+        let replica = &overview.replicas.first[0];
+        let waits = replica
+            .backlog
+            .as_ref()
+            .is_some_and(|b| b.tables.iter().any(|t| t.waits));
         assert_eq!(
-            state().await,
-            expected,
+            (replica.state, waits),
+            (expected, expected == ReplicaState::CatchingUp),
             "{unsent} unsent, {set_aside} set aside, oldest {oldest_ms} ms, said {said_ago} s ago"
         );
     }
@@ -534,6 +542,12 @@ async fn a_replica_quiet_for_longer_than_it_said_is_silent(pool: crate::DbPool) 
     .unwrap();
     let fix = world.overview(Scope::Replicas(&[a])).await;
     assert_eq!(fix.replicas.first[0].state, ReplicaState::AwaitingFix);
+    assert_eq!(
+        (fix.states.silent, fix.health.silent.total),
+        (0, 0),
+        "the health lists as silent what the counts count so"
+    );
+    assert!(fix.health.silent.first.is_empty());
 }
 
 /// Every replica's state at once is the one the overview gives it, in the

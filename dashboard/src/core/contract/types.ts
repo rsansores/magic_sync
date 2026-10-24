@@ -49,13 +49,47 @@ set_aside: number,
 oldest_at: string | null, };
 
 /**
+ * One table of a replica's backlog, and whether its rows wait.
+ */
+export type UpTable = { 
+/**
+ * Its rows wait, and hold the replica back: some cannot go as they
+ * are, or the oldest was written longer than the server's
+ * `Settings::behind_after` ago — or, of a replica that says no age,
+ * some have not gone. Rows written a moment ago flow.
+ */
+waits: boolean, 
+/**
+ * The table.
+ */
+table: string, 
+/**
+ * Rows written and not sent yet.
+ */
+unsent: number, 
+/**
+ * Rows sent that the server has not said it filed.
+ */
+unfiled: number, 
+/**
+ * Rows that cannot go up as they are, until a build that can send them.
+ */
+set_aside: number, 
+/**
+ * When the oldest of these rows was written: by the replica's clock on
+ * the replica, and on the server as it reckons it from the age the
+ * replica said. `None` from a replica that does not say.
+ */
+oldest_at: string | null, };
+
+/**
  * What a replica wrote and the server has not filed, as of when it said so.
  */
 export type Backlog = { 
 /**
  * Each table with something on its way.
  */
-tables: Array<UpProgress>, 
+tables: Array<UpTable>, 
 /**
  * When the replica said so.
  */
@@ -423,8 +457,9 @@ inbox: Listed<Unfiled>,
  */
 failing: Listed<Failing>, 
 /**
- * Replicas that have said nothing for longer than they said they would:
- * off, or cut off — not unhealthy, as one out of reach is not.
+ * Replicas whose state is `silent` — they have said nothing for longer
+ * than they said they would: off, or cut off — the longest quiet first.
+ * Not unhealthy, as one out of reach is not.
  */
 silent: Listed<Silent>, };
 

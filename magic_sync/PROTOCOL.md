@@ -899,9 +899,10 @@ is no replica of the server's.
 
 The server keeps the last backlog it was told, with the time, and shows the
 replica as catching up while a row of it has waited longer than the server
-lets one wait — reckoned from the age the replica said, or, from a replica
-that says none, from when it said it — or cannot go as it is: rows that
-flow are not waiting. It keeps when it last filed an upload from the
+lets one wait, reckoned from the age the replica said, or cannot go as it
+is: rows that flow are not waiting. A replica that says no age is caught up
+only once its backlog is empty — it says its backlog again every keepalive,
+so when it said it tells nothing of how long a row has waited. It keeps when it last filed an upload from the
 replica, on any lane, and when it last filed a row of each table; a replica
 that said its keepalive and has said nothing for several times that is
 shown as silent.

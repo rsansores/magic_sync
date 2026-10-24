@@ -441,23 +441,36 @@ pub struct ReplicaOverview {
 #[non_exhaustive]
 pub struct Backlog {
     /// Each table with something on its way.
-    pub tables: Vec<UpProgress>,
+    pub tables: Vec<UpTable>,
     /// When the replica said so.
     pub at: DateTime<Utc>,
 }
 
-impl Backlog {
-    /// Whether what it says waits, at `now`: rows that cannot go as they
-    /// are, or rows whose oldest was written longer than `after` ago — of a
-    /// replica that says no age, rows it said it had `after` ago and has not
-    /// said otherwise since. Rows written a moment ago flow.
-    fn waits(&self, now: DateTime<Utc>, after: chrono::TimeDelta) -> bool {
-        let since = now.checked_sub_signed(after);
-        self.tables.iter().any(|t| {
-            t.set_aside > 0
-                || (t.unsent + t.unfiled > 0
-                    && since.is_some_and(|since| t.oldest_at.unwrap_or(self.at) < since))
-        })
+/// One table of a replica's backlog, and whether its rows wait.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[non_exhaustive]
+pub struct UpTable {
+    /// What the replica said of it.
+    #[serde(flatten)]
+    pub progress: UpProgress,
+    /// Its rows wait, and hold the replica back: some cannot go as they
+    /// are, or the oldest was written longer than the server's
+    /// `Settings::behind_after` ago — or, of a replica that says no age,
+    /// some have not gone. Rows written a moment ago flow.
+    pub waits: bool,
+}
+
+impl UpTable {
+    /// The table as said, judged against `since`: rows written before it
+    /// wait.
+    fn judged(progress: UpProgress, since: Option<DateTime<Utc>>) -> Self {
+        let waits = progress.set_aside > 0
+            || (progress.unsent + progress.unfiled > 0
+                && progress
+                    .oldest_at
+                    .is_none_or(|oldest| since.is_some_and(|since| oldest < since)));
+        UpTable { progress, waits }
     }
 }
 
@@ -526,8 +539,9 @@ pub struct Health {
     pub inbox: Listed<Unfiled>,
     /// Replicas that sends keep failing to.
     pub failing: Listed<Failing>,
-    /// Replicas that have said nothing for longer than they said they would:
-    /// off, or cut off — not unhealthy, as one out of reach is not.
+    /// Replicas whose state is `silent` — they have said nothing for longer
+    /// than they said they would: off, or cut off — the longest quiet first.
+    /// Not unhealthy, as one out of reach is not.
     pub silent: Listed<Silent>,
 }
 
@@ -681,7 +695,7 @@ pub struct Silent {
 /// The stored forms of the answers' entries: the types are the contract's,
 /// and how a table's row becomes one stays out of the API.
 mod stored {
-    use super::{Failing, NoteKind, Parked, Quarantined, Silent, Unfiled};
+    use super::{Failing, NoteKind, Parked, Quarantined, Unfiled};
     use sqlx::postgres::PgRow;
     use sqlx::Row as _;
 
@@ -763,13 +777,6 @@ mod stored {
                 answered_at: self.answered_at,
             }
         }
-    }
-
-    pub(super) fn silent(row: PgRow) -> sqlx::Result<Silent> {
-        Ok(Silent {
-            replica: row.try_get("replica")?,
-            last_heard_at: row.try_get("last_heard_at")?,
-        })
     }
 
     pub(super) fn failing(row: PgRow) -> sqlx::Result<Failing> {
@@ -1273,8 +1280,10 @@ impl Engine {
         let now = Self::now(&mut tx).await?;
         let scoped = self.scoped(&mut tx, scope).await?;
         let notes = self.notes(&mut tx, &scoped).await?;
-        let health = self.health_of(&mut tx, &scoped, &notes, limit).await?;
         let fleet = self.fleet(&mut tx, &scoped, &notes, now).await?;
+        let health = self
+            .health_of(&mut tx, &scoped, &notes, &fleet, limit)
+            .await?;
         let tables = self.tables_of(&mut tx, &scoped, &notes, &fleet).await?;
         tx.commit().await?;
         Ok(Overview {
@@ -1427,9 +1436,13 @@ impl Engine {
         limit: u32,
     ) -> Result<Health, Error> {
         let mut tx = snapshot(conn).await?;
+        let now = Self::now(&mut tx).await?;
         let scoped = self.scoped(&mut tx, scope).await?;
         let notes = self.notes(&mut tx, &scoped).await?;
-        let health = self.health_of(&mut tx, &scoped, &notes, limit).await?;
+        let fleet = self.fleet(&mut tx, &scoped, &notes, now).await?;
+        let health = self
+            .health_of(&mut tx, &scoped, &notes, &fleet, limit)
+            .await?;
         tx.commit().await?;
         Ok(health)
     }
@@ -1548,6 +1561,7 @@ impl Engine {
         conn: &mut Conn,
         scoped: &Scoped,
         notes: &[NoteGroup],
+        fleet: &Fleet,
         limit: u32,
     ) -> Result<Health, Error> {
         let limit = i64::from(limit);
@@ -1632,23 +1646,26 @@ impl Engine {
             .fetch_all(&mut *conn)
             .await?,
         };
-        let quiet = self.judging.silent("r");
+        // The replicas whose state is silent: what a fix waits for, or a
+        // replica out of reach, is listed as that.
+        let mut quiet: Vec<Silent> = fleet
+            .replicas
+            .iter()
+            .filter(|r| r.state == ReplicaState::Silent)
+            .filter_map(|r| {
+                r.last_heard_at.map(|last_heard_at| Silent {
+                    replica: r.replica,
+                    last_heard_at,
+                })
+            })
+            .collect();
+        quiet.sort_by_key(|s| (s.last_heard_at, s.replica));
         let silent = Listed {
-            total: sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM sync.replicas r WHERE {quiet} AND r.{mine}"
-            ))
-            .bind(&ids)
-            .fetch_one(&mut *conn)
-            .await?,
-            first: sqlx::query(&format!(
-                "SELECT replica_id AS replica, last_heard_at FROM sync.replicas r \
-                  WHERE {quiet} AND r.{mine} ORDER BY last_heard_at, replica_id LIMIT $2"
-            ))
-            .bind(&ids)
-            .bind(limit)
-            .try_map(stored::silent)
-            .fetch_all(&mut *conn)
-            .await?,
+            total: fleet.states.silent,
+            first: quiet
+                .into_iter()
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .collect(),
         };
         Ok(Health {
             healthy: parked.total == 0 && quarantine.total == 0 && inbox.total == 0,
@@ -1734,13 +1751,18 @@ impl Engine {
                     .map(|f| f.count(r.replica, partitions.get(&r.replica).copied().flatten()))
                     .unwrap_or_default();
                 let failures = r.failures.unwrap_or(0);
+                let since = now.checked_sub_signed(self.judging.behind_after);
                 let backlog = r.backlog.zip(r.backlog_at).map(|(tables, at)| Backlog {
-                    tables: tables.0.into_iter().map(|t| t.progress(at)).collect(),
+                    tables: tables
+                        .0
+                        .into_iter()
+                        .map(|t| UpTable::judged(t.progress(at), since))
+                        .collect(),
                     at,
                 });
                 let behind = backlog
                     .as_ref()
-                    .is_some_and(|b| b.waits(now, self.judging.behind_after));
+                    .is_some_and(|b| b.tables.iter().any(|t| t.waits));
                 let state = if r.awaiting > 0 || r.unfiled > 0 || notes.own_parked > 0 {
                     ReplicaState::AwaitingFix
                 } else if failures > 0 {
@@ -1981,6 +2003,7 @@ pub(crate) mod tests {
             (RowState::docs(), RowState::decl(&cfg)),
             (NoteKind::docs(), NoteKind::decl(&cfg)),
             (UpProgress::docs(), UpProgress::decl(&cfg)),
+            (UpTable::docs(), UpTable::decl(&cfg)),
             (Backlog::docs(), Backlog::decl(&cfg)),
             (ReplicaOverview::docs(), ReplicaOverview::decl(&cfg)),
             (ReplicaCounts::docs(), ReplicaCounts::decl(&cfg)),

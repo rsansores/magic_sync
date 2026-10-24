@@ -18,7 +18,8 @@ export default {
               "set_aside": 0,
               "table": "receipts",
               "unfiled": 1,
-              "unsent": 2
+              "unsent": 2,
+              "waits": true
             }
           ]
         },

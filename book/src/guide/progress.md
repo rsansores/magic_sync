@@ -105,7 +105,9 @@ oldest row was written. The server shows it as the replica's `backlog`, as
 of when it was said, each table's `oldest_at` reckoned from that age; a
 replica is catching up while a row of it has waited longer than the
 server's `Settings::behind_after` (two minutes), or cannot go as it is:
-rows that flow are not waiting.
+rows that flow are not waiting. Each table says whether its rows wait
+(`waits`); of a replica of an earlier build, which says no age, they wait
+while any has not gone.
 
 ## A replica that says nothing
 
