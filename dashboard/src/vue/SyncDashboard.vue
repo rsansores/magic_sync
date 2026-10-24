@@ -6,7 +6,8 @@
 // stands, its checks, and only the tables that wait, both ways.
 //
 // It fetches nothing. The host passes the engine's answers in, and answers
-// `update:selected` (a replica picked: pass its progress back) and, when it
+// `update:selected` (a replica picked: pass its progress and its own
+// listing back) and, when it
 // pages through the replicas, `update:filter` and `update:offset` (pass the
 // listing back). Where one row is belongs next to the row, in the host's own
 // listing: `RowPlaces`. Its look is in `magic_sync_dashboard/styles.css`.
@@ -27,7 +28,7 @@ import type { GroupOf } from '../core/flow.js'
 import { count } from '../core/format.js'
 import { into, levelUnder, type Cluster, type Crumb, type Level, type Place } from '../core/grid.js'
 import type { Messages } from '../core/i18n.js'
-import type { HostChecks } from '../core/standing.js'
+import type { Combine, HostChecks } from '../core/standing.js'
 import { tabAfter } from '../core/tabs.js'
 import { lookup, useSyncDashboard, type Names } from './useSyncDashboard.js'
 
@@ -35,16 +36,17 @@ const props = defineProps<{
   overview: Overview | null | undefined
   listing?: Listing | null
   progress?: Progress | null
+  /** `Engine::listing` over the selected replica alone: its row, wherever
+   * it is in the fleet. */
+  replica?: Listing | null
   /** `Engine::states`, for a tile of every replica; the overview's worst otherwise. */
   states?: States | null
   names?: Names
   labels?: Names
   locale?: string
   messages?: Messages
-  silentAfter?: number
+  unansweringAfter?: number
   stuckAfter?: number
-  /** The server's `Settings::behind_after`, in ms: when a table going up is stalled. */
-  behindAfter?: number
   /** The replicas a page holds: the `limit` the host asks `Engine::listing`
    * for. Default 50. */
   pageSize?: number
@@ -56,6 +58,8 @@ const props = defineProps<{
   group?: GroupOf
   /** The checks the host knows of a replica, shown before the engine's own. */
   checks?: HostChecks
+  /** A state of the host's own from the engine's and the host's checks. */
+  combine?: Combine
 }>()
 
 defineSlots<{
@@ -69,6 +73,14 @@ const offset = defineModel<number>('offset', { default: 0 })
 /** The level the tiles are clustered by, and the places they are narrowed to. */
 const level = defineModel<string | null>('level', { default: null })
 const within = defineModel<Crumb[]>('within', { default: () => [] })
+/** A counter picked that is no state of the engine's — one of `combine`'s, or
+ * a word this dashboard does not know: the tiles are narrowed to it, and the
+ * listing is of every state. */
+const other = ref<string | null>(null)
+watch(filter, (state) => {
+  if (state != null) other.value = null
+})
+const shown = computed(() => other.value ?? filter.value)
 
 const {
   summary,
@@ -89,21 +101,23 @@ const {
   listing: () => props.listing,
   states: () => props.states,
   filter,
+  state: shown,
   selected,
   progress: () => props.progress,
+  replica: () => props.replica,
   names: () => props.names,
   labels: () => props.labels,
   locale: () => props.locale,
   messages: () => props.messages,
-  silentAfter: () => props.silentAfter,
+  unansweringAfter: () => props.unansweringAfter,
   stuckAfter: () => props.stuckAfter,
-  behindAfter: () => props.behindAfter,
   levels: () => props.levels,
   placeOf: () => props.placeOf,
   level,
   within,
   group: () => props.group,
   checks: () => props.checks,
+  combine: () => props.combine,
 })
 
 const n = (value: number) => count(value, locale.value)
@@ -133,7 +147,9 @@ const tabCount = computed(() => {
 })
 
 function show(state: string | null) {
-  filter.value = state != null && knowsReplicaState(state) ? state : null
+  const engine = state != null && knowsReplicaState(state)
+  filter.value = engine ? state : null
+  other.value = engine ? null : state
   offset.value = 0
 }
 const pageEnd = computed(() => (page.value ? page.value.offset + page.value.rows.length : 0))
@@ -163,6 +179,14 @@ const current = computed(() => {
 })
 const flat = <T,>(groups: { lagging: T[]; settled: T[] }[]) =>
   groups.flatMap((g) => [...g.lagging, ...g.settled])
+/** The selected replica's tables going up, each with its chips. */
+const upRows = computed(() => {
+  const d = detail.value
+  const sp = speech.value
+  if (!d || !sp) return []
+  return [...flat(d.up.lagging), ...flat(d.up.settled)].map((tb) => ({ tb, chips: upChips(tb, sp) }))
+})
+const total = (value: number | null) => (value == null ? '–' : n(value))
 
 // Focus follows the view: into the replica opened, and back to what opened it.
 const detailHeading = ref<HTMLElement | null>(null)
@@ -209,11 +233,11 @@ watch(selected, async (now, before) => {
 
           <div class="msd-totals">
             <div class="msd-total">
-              <strong>{{ n(detail.totals.toSend) }}</strong>
+              <strong>{{ total(detail.totals.toSend) }}</strong>
               <span>{{ t('detail.to_send') }}</span>
             </div>
             <div class="msd-total">
-              <strong>{{ n(detail.totals.toConfirm) }}</strong>
+              <strong>{{ total(detail.totals.toConfirm) }}</strong>
               <span>{{ t('detail.to_confirm') }}</span>
             </div>
             <div class="msd-total" :data-tone="detail.totals.setAside > 0 ? 'attention' : undefined">
@@ -295,14 +319,10 @@ watch(selected, async (now, before) => {
             </p>
           </template>
 
-          <template v-if="flat(detail.up.lagging).length + flat(detail.up.settled).length > 0">
+          <template v-if="upRows.length > 0">
             <h4 class="msd-section">{{ t('detail.up') }}</h4>
             <ul class="msd-tables">
-              <li
-                v-for="tb in [...flat(detail.up.lagging), ...flat(detail.up.settled)]"
-                :key="tb.table"
-                class="msd-table"
-              >
+              <li v-for="{ tb, chips } in upRows" :key="tb.table" class="msd-table">
                 <div class="msd-row-head msd-spread">
                   <span class="msd-row-head">
                     <span class="msd-dot msd-dot-small" :data-tone="tb.tone" aria-hidden="true" />
@@ -310,13 +330,8 @@ watch(selected, async (now, before) => {
                   </span>
                   <span class="msd-muted">{{ describeFlow(tb, speech) }}</span>
                 </div>
-                <span v-if="upChips(tb, speech).length" class="msd-chips">
-                  <span
-                    v-for="chip in upChips(tb, speech)"
-                    :key="chip.kind"
-                    class="msd-chip-count"
-                    :data-kind="chip.kind"
-                  >
+                <span v-if="chips.length" class="msd-chips">
+                  <span v-for="chip in chips" :key="chip.kind" class="msd-chip-count" :data-kind="chip.kind">
                     {{ chip.text }}
                   </span>
                 </span>
@@ -351,7 +366,7 @@ watch(selected, async (now, before) => {
 
       <template v-else>
         <div class="msd-counters" role="group" :aria-label="t('filter.label')">
-          <button type="button" class="msd-counter" :aria-pressed="filter == null" @click="show(null)">
+          <button type="button" class="msd-counter" :aria-pressed="shown == null" @click="show(null)">
             <strong>{{ n(all) }}</strong>
             <span>{{ t('filter.all') }}</span>
           </button>
@@ -361,7 +376,7 @@ watch(selected, async (now, before) => {
             type="button"
             class="msd-counter"
             :data-tone="x.tone"
-            :aria-pressed="filter === x.state"
+            :aria-pressed="shown === x.state"
             @click="show(x.state)"
           >
             <strong>{{ n(x.n) }}</strong>
@@ -470,7 +485,7 @@ watch(selected, async (now, before) => {
               <span class="msd-muted">{{ t('grid.order') }}</span>
             </div>
             <p v-if="attention.length === 0" class="msd-muted">
-              {{ filter == null ? t('attention.none') : t('replica.none') }}
+              {{ shown == null ? t('attention.none') : t('replica.none') }}
             </p>
             <ul class="msd-attention">
               <li v-for="a in attention" :key="a.id">

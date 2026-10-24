@@ -5,6 +5,7 @@ export * from './contract/types.js'
 export {
   summarize,
   pageOf,
+  selectedRow,
   progressOf,
   nameOf,
   readsContract,

@@ -41,9 +41,8 @@ export interface UpTable {
   oldestAt: number | null
   /** When the server last filed a row of it from this replica. */
   lastFiledAt: number | null
-  /** Rows of it reach the server as they are written (`live`), or the
-   * oldest waiting has waited too long, or the replica says nothing
-   * (`stalled`). */
+  /** Rows of it reach the server as they are written (`live`), or they
+   * wait, as the server judges, or the replica is silent (`stalled`). */
   flow: 'live' | 'stalled'
   tone: Tone
 }
@@ -121,38 +120,29 @@ export function downOf(shares: TableShare[], group?: GroupOf): Direction<DownTab
 export interface UpOptions {
   /** The host's name for a table; the table's own otherwise. */
   label?: (table: string) => string | undefined
-  /** The server's time now, in milliseconds. */
-  now: number
-  /** How long the oldest row may wait before its table is stalled, in ms:
-   * the server's `Settings::behind_after`. Default 2 minutes. */
-  behindAfter?: number
 }
 
 /** The tables a replica sends the server: each it said waits, and each the
- * server has filed rows of. */
-export function upOf(r: ReplicaRow, options: UpOptions, group?: GroupOf): Direction<UpTable> {
-  const behindAfter = options.behindAfter ?? 2 * 60_000
-  // An engine that predates filing says nothing of it.
-  const filed = new Map((r.source.filed ?? []).map((f) => [f.table, timeOf(f.last_filed_at)]))
+ * server has filed rows of. Whether a table's rows wait is the server's
+ * judgement (`waits`); of a silent replica, every table is stalled. */
+export function upOf(r: ReplicaRow, options: UpOptions = {}, group?: GroupOf): Direction<UpTable> {
+  const filed = new Map(r.source.filed.map((f) => [f.table, timeOf(f.last_filed_at)]))
   const said = new Map((r.source.backlog?.tables ?? []).map((b) => [b.table, b]))
-  const quiet = r.state === 'silent' || r.state === 'unreachable'
+  const silent = r.state === 'silent'
   const tables = [...new Set([...said.keys(), ...filed.keys()])].map((table): UpTable => {
     const b = said.get(table)
     const unsent = b?.unsent ?? 0
     const unfiled = b?.unfiled ?? 0
     const setAside = b?.set_aside ?? 0
-    const oldestAt = unsent + unfiled > 0 ? timeOf(b?.oldest_at ?? null) : null
-    // A replica that does not say how old a row is: as old as what it said.
-    const waitedSince = oldestAt ?? (unsent + unfiled > 0 ? (r.backlog?.at ?? null) : null)
-    const stalled = quiet || (waitedSince != null && options.now - waitedSince > behindAfter)
-    const tone: Tone = setAside > 0 ? 'attention' : stalled ? (quiet ? 'silent' : 'moving') : 'ok'
+    const stalled = silent || (b?.waits ?? false)
+    const tone: Tone = setAside > 0 ? 'attention' : silent ? 'silent' : stalled ? 'moving' : 'ok'
     return {
       table,
       label: options.label?.(table) ?? table,
       unsent,
       unfiled,
       setAside,
-      oldestAt,
+      oldestAt: unsent + unfiled > 0 ? timeOf(b?.oldest_at ?? null) : null,
       lastFiledAt: filed.get(table) ?? null,
       flow: stalled ? 'stalled' : 'live',
       tone,
@@ -163,25 +153,29 @@ export function upOf(r: ReplicaRow, options: UpOptions, group?: GroupOf): Direct
 
 /** What one replica has on its way, both ways, in three numbers. */
 export interface Totals {
-  /** Rows still to be sent: to it, and by it. */
-  toSend: number
-  /** Rows sent and not confirmed yet: to it, and by it. */
-  toConfirm: number
+  /** Rows still to be sent: to it, and by it; `null` until its tables down
+   * are known. */
+  toSend: number | null
+  /** Rows sent and not confirmed yet: to it, and by it; `null` until its
+   * tables down are known. */
+  toConfirm: number | null
   /** Rows and changes set aside until a fix. */
   setAside: number
 }
 
 /** The three numbers of one replica, from its row and, once fetched, its
- * tables down. */
+ * tables down: rows both ways are counted once both are known. */
 export function totalsOf(r: ReplicaRow, down?: Direction<DownTable> | null): Totals {
-  const tables = down ? [...down.lagging, ...down.settled].flatMap((g) => [...g.lagging, ...g.settled]) : []
-  const sum = (f: (t: DownTable) => number) => tables.reduce((n, t) => n + f(t), 0)
   const backlog = r.source.backlog?.tables ?? []
   const up = (f: (t: (typeof backlog)[number]) => number) => backlog.reduce((n, t) => n + f(t), 0)
+  const setAside = r.quarantined + r.unfiled + r.parked + up((t) => t.set_aside)
+  if (!down) return { toSend: null, toConfirm: null, setAside }
+  const tables = [...down.lagging, ...down.settled].flatMap((g) => [...g.lagging, ...g.settled])
+  const sum = (f: (t: DownTable) => number) => tables.reduce((n, t) => n + f(t), 0)
   return {
-    toSend: (down ? sum((t) => t.toSend) : r.owed) + up((t) => t.unsent),
+    toSend: sum((t) => t.toSend) + up((t) => t.unsent),
     toConfirm: sum((t) => t.inFlight) + up((t) => t.unfiled),
-    setAside: r.quarantined + r.unfiled + r.parked + up((t) => t.set_aside),
+    setAside,
   }
 }
 

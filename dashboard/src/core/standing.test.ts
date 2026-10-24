@@ -65,6 +65,25 @@ describe('syncCheck', () => {
     ])
   })
 
+  it('says what a replica catching up of its own accord waits on: its rows going up, or set aside', () => {
+    const backlog = (unsent: number, set_aside: number) => ({
+      at: at(1_000),
+      tables: [{ table: 'receipts', unsent, unfiled: 0, set_aside, oldest_at: at(5 * MINUTE), waits: true }],
+    })
+    const uploading = rowOf({ state: 'catching_up', last_heard_at: at(2_000), backlog: backlog(4, 0) })
+    expect(syncCheck(uploading, speech()).line).toBe('Rows of its own wait to go up · last heard 2 sec. ago')
+    expect(syncCheck(uploading, speech('es')).line).toBe(
+      'Tiene registros propios por subir · última señal hace 2 s',
+    )
+    const stuck = rowOf({ state: 'catching_up', last_heard_at: at(2_000), backlog: backlog(0, 2) })
+    expect([syncCheck(stuck, speech()).status, syncCheck(stuck, speech()).line]).toEqual([
+      'working',
+      '2 rows of its own cannot go up as they are',
+    ])
+    const both = rowOf({ ...uploading.source, unconfirmed: true })
+    expect(syncCheck(both, speech()).line).toBe('Applying changes · last heard 2 sec. ago')
+  })
+
   it('fails for a replica that has said nothing, saying for how long', () => {
     const check = syncCheck(rowOf({ state: 'silent', last_heard_at: at(6 * MINUTE) }), speech())
     expect([check.status, check.tone, check.line]).toEqual([
@@ -162,6 +181,22 @@ describe('lineOf', () => {
       'Aplicando lo que se le envió',
     )
   })
+
+  it('says rows of its own that wait to go up, and rows that cannot go as they are', () => {
+    const backlog = (unsent: number, set_aside: number, waits: boolean) => ({
+      at: at(1_000),
+      tables: [{ table: 'receipts', unsent, unfiled: 1, set_aside, oldest_at: at(5 * MINUTE), waits }],
+    })
+    expect(lineOf(rowOf({ state: 'catching_up', backlog: backlog(4, 0, true) }), speech())).toBe(
+      '5 rows of its own wait to go up',
+    )
+    expect(lineOf(rowOf({ state: 'catching_up', backlog: backlog(0, 1, true) }), speech('es'))).toBe(
+      '1 registro propio no puede subir como está',
+    )
+    expect(lineOf(rowOf({ backlog: backlog(4, 0, false), last_heard_at: at(3_000) }), speech())).toBe(
+      'Last heard 3 sec. ago',
+    )
+  })
 })
 
 describe('attentionOf', () => {
@@ -189,5 +224,16 @@ describe('attentionOf', () => {
     expect(listed.map((a) => [a.standing.state, a.name])).toContainEqual(['offline', '6'])
     expect(listed.find((a) => a.standing.state === 'offline')!.line).toBe('Offline for 3 hr.')
     expect(listed.map((a) => a.standing.tone)).toEqual(['attention', 'off', 'off', 'silent', 'moving'])
+  })
+
+  it('narrows to one state, the host’s as well as the engine’s', () => {
+    const offline = (r: { state: string }) =>
+      r.state === 'synced'
+        ? { state: 'offline', tone: 'off' as const, label: 'Offline' }
+        : engineStanding(r.state, t)
+    expect(attentionOf(rows, speech(), { standing: offline, state: 'offline' }).map((a) => a.name)).toEqual([
+      '6',
+    ])
+    expect(attentionOf(rows, speech(), { state: 'silent' }).map((a) => a.standing.state)).toEqual(['silent'])
   })
 })

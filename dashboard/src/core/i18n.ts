@@ -30,7 +30,7 @@ const en: MessageTable = {
     one: '{n} replica cannot be reached; it gets what it is owed once it can.',
     other: '{n} replicas cannot be reached; each gets what it is owed once it can.',
   },
-  'mood.quiet': {
+  'mood.silent': {
     one: '{n} replica has said nothing for longer than it said it would.',
     other: '{n} replicas have said nothing for longer than they said they would.',
   },
@@ -40,7 +40,7 @@ const en: MessageTable = {
     other: '{n} problems wait for a fix.',
   },
   'mood.stuck': 'The oldest change waiting to be sent was made {since}.',
-  'mood.silent': {
+  'mood.unanswering': {
     one: '{n} replica listed is not answering.',
     other: '{n} replicas listed are not answering.',
   },
@@ -69,7 +69,7 @@ const en: MessageTable = {
   'replicas.page': '{from}–{to} of {total}',
   'replicas.previous': 'Previous',
   'replicas.next': 'Next',
-  'replica.silent': 'Last answered {since}.',
+  'replica.unanswering': 'Last answered {since}.',
   'replica.pending': {
     one: '{n} change on its way.',
     other: '{n} changes on their way.',
@@ -86,7 +86,7 @@ const en: MessageTable = {
   'replica.heard': 'Last confirmed {since}.',
   'replica.never': 'Nothing confirmed yet.',
   'replica.unreachable': 'Cannot be reached.',
-  'replica.quiet': 'Last heard {since}.',
+  'replica.silent': 'Last heard {since}.',
   'replica.retry': 'Tried again {until}.',
   'replica.quarantined': {
     one: '{n} row set aside.',
@@ -199,6 +199,11 @@ const en: MessageTable = {
   'check.sync': 'Sync',
   'check.sync.heard': 'Last heard {since}',
   'check.sync.applying': 'Applying changes · last heard {since}',
+  'check.sync.uploading': 'Rows of its own wait to go up · last heard {since}',
+  'check.sync.set_aside': {
+    one: '{n} row of its own cannot go up as it is',
+    other: '{n} rows of its own cannot go up as they are',
+  },
   'check.sync.silent': 'Has said nothing for {for}',
   'check.sync.unreachable': 'Cannot be reached',
   'check.sync.retry': 'Cannot be reached · tried again {until}',
@@ -227,6 +232,14 @@ const en: MessageTable = {
     other: '{n} changes on their way',
   },
   'line.applying': 'Applying what it was sent',
+  'line.uploading': {
+    one: '{n} row of its own waits to go up',
+    other: '{n} rows of its own wait to go up',
+  },
+  'line.set_aside': {
+    one: '{n} row of its own cannot go up as it is',
+    other: '{n} rows of its own cannot go up as they are',
+  },
   'line.heard': 'Last heard {since}',
   'line.never': 'Nothing heard yet',
   'flow.live': 'Live · last {since}',
@@ -290,7 +303,7 @@ const es: MessageTable = {
     one: '{n} réplica no se puede alcanzar; recibe lo que se le debe en cuanto se pueda.',
     other: '{n} réplicas no se pueden alcanzar; cada una recibe lo que se le debe en cuanto se pueda.',
   },
-  'mood.quiet': {
+  'mood.silent': {
     one: '{n} réplica lleva más tiempo sin señales del que dijo.',
     other: '{n} réplicas llevan más tiempo sin señales del que dijeron.',
   },
@@ -300,7 +313,7 @@ const es: MessageTable = {
     other: '{n} problemas esperan una corrección.',
   },
   'mood.stuck': 'El cambio más antiguo por enviar se hizo {since}.',
-  'mood.silent': {
+  'mood.unanswering': {
     one: '{n} réplica de la lista no responde.',
     other: '{n} réplicas de la lista no responden.',
   },
@@ -329,7 +342,7 @@ const es: MessageTable = {
   'replicas.page': '{from}–{to} de {total}',
   'replicas.previous': 'Anterior',
   'replicas.next': 'Siguiente',
-  'replica.silent': 'Última respuesta {since}.',
+  'replica.unanswering': 'Última respuesta {since}.',
   'replica.pending': {
     one: '{n} cambio en camino.',
     other: '{n} cambios en camino.',
@@ -346,7 +359,7 @@ const es: MessageTable = {
   'replica.heard': 'Última confirmación {since}.',
   'replica.never': 'Aún no confirma nada.',
   'replica.unreachable': 'No se puede alcanzar.',
-  'replica.quiet': 'Última señal {since}.',
+  'replica.silent': 'Última señal {since}.',
   'replica.retry': 'Se reintenta {until}.',
   'replica.quarantined': {
     one: '{n} registro apartado.',
@@ -459,6 +472,11 @@ const es: MessageTable = {
   'check.sync': 'Sincronización',
   'check.sync.heard': 'Última señal {since}',
   'check.sync.applying': 'Aplicando cambios · última señal {since}',
+  'check.sync.uploading': 'Tiene registros propios por subir · última señal {since}',
+  'check.sync.set_aside': {
+    one: '{n} registro propio no puede subir como está',
+    other: '{n} registros propios no pueden subir como están',
+  },
   'check.sync.silent': 'Sin señales desde hace {for}',
   'check.sync.unreachable': 'No se puede alcanzar',
   'check.sync.retry': 'No se puede alcanzar · se reintenta {until}',
@@ -487,6 +505,14 @@ const es: MessageTable = {
     other: '{n} cambios en camino',
   },
   'line.applying': 'Aplicando lo que se le envió',
+  'line.uploading': {
+    one: '{n} registro propio espera subir',
+    other: '{n} registros propios esperan subir',
+  },
+  'line.set_aside': {
+    one: '{n} registro propio no puede subir como está',
+    other: '{n} registros propios no pueden subir como están',
+  },
   'line.heard': 'Última señal {since}',
   'line.never': 'Aún sin señales',
   'flow.live': 'En vivo · último {since}',

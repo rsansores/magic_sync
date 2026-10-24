@@ -36,6 +36,27 @@ describe('bannerOf', () => {
   it('says so in the locale asked for', () => {
     expect(bannerOf(summary(), speech(AT, 'es')).lines[3]).toBe('7 problemas esperan una corrección.')
   })
+
+  it('names a silent replica once, as silent, even when it has not answered either', () => {
+    const quiet = {
+      ...overview,
+      states: { awaiting_fix: 0, unreachable: 0, silent: 1, catching_up: 0, synced: 0 },
+      replicas: {
+        total: 1,
+        first: [
+          {
+            ...overview.replicas.first.find((r) => r.state === 'silent')!,
+            unconfirmed: true,
+            waiting_since: new Date(AT - 30 * MINUTE).toISOString(),
+          },
+        ],
+      },
+    }
+    const lines = bannerOf(summarize(quiet, { now: AT }), speech()).lines
+    expect(lines.filter((l) => l.includes('said nothing') || l.includes('not answering'))).toEqual([
+      '1 replica has said nothing for longer than it said it would.',
+    ])
+  })
 })
 
 describe('describeReplica', () => {

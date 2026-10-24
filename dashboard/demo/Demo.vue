@@ -73,7 +73,9 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
       state: 'catching_up',
       backlog: {
         at: ago(1),
-        tables: [{ table: 'receipts', unsent: 3, unfiled: 1, set_aside: 0, oldest_at: ago(200) }],
+        tables: [
+          { table: 'receipts', unsent: 3, unfiled: 1, set_aside: 0, oldest_at: ago(200), waits: true },
+        ],
       },
     }
   if (i === 13)

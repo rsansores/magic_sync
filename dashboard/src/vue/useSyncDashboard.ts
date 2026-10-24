@@ -9,7 +9,7 @@
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
 import type { Listing, Overview, Progress, ReplicaState, States } from '../core/contract/types.js'
 import { bannerOf, describeHeard, engineTableLabel, mismatchOf, type Speech } from '../core/describe.js'
-import { pageOf, progressOf, readsContract, summarize, type ReplicaRow } from '../core/derive.js'
+import { pageOf, progressOf, readsContract, selectedRow, summarize, type ReplicaRow } from '../core/derive.js'
 import { downOf, fleetOf, totalsOf, upOf, type GroupOf } from '../core/flow.js'
 import { gridOf, tilesOf, type Crumb, type GridOptions, type Level, type Tile } from '../core/grid.js'
 import type { Messages } from '../core/i18n.js'
@@ -35,11 +35,18 @@ export interface SyncDashboardOptions {
   overview: MaybeRefOrGetter<Overview | null | undefined>
   /** `Engine::listing` for `filter`, when the host pages through the replicas. */
   listing?: MaybeRefOrGetter<Listing | null | undefined>
-  /** The state the replicas are listed in; every state when `null`. */
+  /** The engine's state the replicas are listed in; every state when `null`. */
   filter?: MaybeRefOrGetter<ReplicaState | null | undefined>
+  /** The state the tiles and the replicas that need attention are narrowed
+   * to, the engine's word or one of `combine`'s; `filter` when not given. */
+  state?: MaybeRefOrGetter<string | null | undefined>
   /** The replica being looked at, and `Engine::progress` for it. */
   selected?: MaybeRefOrGetter<string | null | undefined>
   progress?: MaybeRefOrGetter<Progress | null | undefined>
+  /** `Engine::listing` over the selected replica alone
+   * (`Scope::Replicas(&[selected])`): its row, wherever it is in the fleet.
+   * Without it, the row is looked for in the page and the overview's worst. */
+  replica?: MaybeRefOrGetter<Listing | null | undefined>
   /** The host's names for its replicas. */
   names?: MaybeRefOrGetter<Names | undefined>
   /** The host's names for the tables. */
@@ -50,7 +57,7 @@ export interface SyncDashboardOptions {
   messages?: MaybeRefOrGetter<Messages | undefined>
   /** How long a replica may leave what it was sent unconfirmed before it is
    * "not answering", in ms. Default 15 minutes. */
-  silentAfter?: MaybeRefOrGetter<number | undefined>
+  unansweringAfter?: MaybeRefOrGetter<number | undefined>
   /** How long a change may wait to be sent before the page asks for
    * attention, in ms. Default 15 minutes, the server's own alarm. */
   stuckAfter?: MaybeRefOrGetter<number | undefined>
@@ -71,9 +78,6 @@ export interface SyncDashboardOptions {
   checks?: MaybeRefOrGetter<HostChecks | undefined>
   /** A state of the host's own from the engine's and the host's checks. */
   combine?: MaybeRefOrGetter<Combine | undefined>
-  /** How long a replica's oldest row may wait to go up before its table is
-   * stalled, in ms: the server's `Settings::behind_after`. Default 2 minutes. */
-  behindAfter?: MaybeRefOrGetter<number | undefined>
 }
 
 export const lookup = (names: Names | undefined, key: string) =>
@@ -100,7 +104,7 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
           name: (replica: string) => lookup(toValue(options.names), replica),
           label: (table: string) => lookup(toValue(options.labels), table) ?? engineTableLabel(table, t),
           now: now.value,
-          silentAfter: toValue(options.silentAfter),
+          unansweringAfter: toValue(options.unansweringAfter),
           stuckAfter: toValue(options.stuckAfter),
         },
   )
@@ -144,14 +148,16 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
       standing: standing(r.id, r.state),
     }))
   })
-  /** The tiles in clusters, narrowed to the state filtered by. */
+  /** The state the tiles and the replicas that need attention are narrowed to. */
+  const shown = () => toValue(options.state) ?? toValue(options.filter) ?? null
+  /** The tiles in clusters, narrowed to the state shown. */
   const grid = computed(() =>
     gridOf(tiles.value, {
       levels: toValue(options.levels),
       placeOf: toValue(options.placeOf),
       level: toValue(options.level),
       within: toValue(options.within),
-      state: toValue(options.filter),
+      state: shown(),
       nowhere: t('grid.nowhere'),
       locale: locale.value,
     }),
@@ -170,10 +176,12 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
       .sort((a, b) => rankOf(a.tone) - rankOf(b.tone))
   })
   const rowStanding = (r: ReplicaRow) => standing(r.id, r.state)
-  /** The replicas listed that are not settled, worst first, a sentence each. */
-  const attention = computed(() =>
-    page.value && speech.value ? attentionOf(page.value.rows, speech.value, { standing: rowStanding }) : [],
-  )
+  /** The replicas listed that are not settled, worst first, a sentence each:
+   * of the state shown, when one is. */
+  const attention = computed(() => {
+    if (!page.value || !speech.value) return []
+    return attentionOf(page.value.rows, speech.value, { standing: rowStanding, state: shown() })
+  })
   /** The tables over the fleet, the settled folded. */
   const tables = computed(() =>
     summary.value ? fleetOf(summary.value.tables, toValue(options.group)) : null,
@@ -184,15 +192,16 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
     const id = toValue(options.selected)
     const sp = speech.value
     if (id == null || !sp || !derive.value) return null
-    const row = page.value?.rows.find((r) => r.id === id) ?? summary.value?.worst.find((r) => r.id === id)
+    const row = selectedRow(
+      id,
+      toValue(options.replica),
+      [...(page.value?.rows ?? []), ...(summary.value?.worst ?? [])],
+      derive.value,
+    )
     if (!row) return null
     const group = toValue(options.group)
     const down = progress.value ? downOf(progress.value.tables, group) : null
-    const up = upOf(
-      row,
-      { label: derive.value.label, now: sp.now, behindAfter: toValue(options.behindAfter) },
-      group,
-    )
+    const up = upOf(row, { label: derive.value.label }, group)
     return {
       row,
       standing: rowStanding(row),

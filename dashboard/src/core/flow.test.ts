@@ -85,8 +85,8 @@ describe('upOf', () => {
     backlog: {
       at: at(SECOND),
       tables: [
-        { table: 'receipts', unsent: 0, unfiled: 1, set_aside: 0, oldest_at: at(4 * SECOND) },
-        { table: 'cuts', unsent: 3, unfiled: 0, set_aside: 0, oldest_at: at(5 * MINUTE) },
+        { table: 'receipts', unsent: 0, unfiled: 1, set_aside: 0, oldest_at: at(4 * SECOND), waits: false },
+        { table: 'cuts', unsent: 3, unfiled: 0, set_aside: 0, oldest_at: at(5 * MINUTE), waits: true },
       ],
     },
     filed: [
@@ -94,38 +94,48 @@ describe('upOf', () => {
       { table: 'path_points', last_filed_at: at(2 * SECOND) },
     ],
   })
+  const all = (r: ReturnType<typeof rowOf>) => {
+    const up = upOf(r)
+    return [...up.lagging, ...up.settled].flatMap((g) => [...g.lagging, ...g.settled])
+  }
 
-  it('is live while what waits is young, and stalled once the oldest has waited too long', () => {
-    const up = upOf(writing, { now: AT })
-    const all = [...up.lagging, ...up.settled].flatMap((g) => [...g.lagging, ...g.settled])
-    expect(all.map((x) => [x.table, x.flow, x.tone])).toEqual([
+  it('is live while what it sends flows, and stalled where the server says rows wait', () => {
+    expect(all(writing).map((x) => [x.table, x.flow, x.tone])).toEqual([
       ['cuts', 'stalled', 'moving'],
       ['receipts', 'live', 'ok'],
       ['path_points', 'live', 'ok'],
     ])
-    expect(up.lagging.map((g) => g.label)).toEqual(['cuts'])
-    expect(upOf(writing, { now: AT, behindAfter: 10 * MINUTE }).lagging).toEqual([])
+    expect(upOf(writing).lagging.map((g) => g.label)).toEqual(['cuts'])
   })
 
   it('stalls every table of a replica that has said nothing', () => {
     const quiet = rowOf({ state: 'silent', filed: [{ table: 'receipts', last_filed_at: at(41 * MINUTE) }] })
-    const up = upOf(quiet, { now: AT })
+    const up = upOf(quiet)
     expect(up.lagging[0]!.lagging[0]).toMatchObject({ flow: 'stalled', tone: 'silent' })
     expect(describeFlow(up.lagging[0]!.lagging[0]!, speech('es'))).toBe('Último hace 41 min')
   })
 
-  it('takes a replica that does not say a row’s age to have waited since it said so', () => {
+  it('leaves what a replica out of reach sends as it flows: only the way to it is cut', () => {
+    const cut = rowOf({ ...writing.source, state: 'unreachable', failures: 2 })
+    expect(all(cut).map((x) => [x.table, x.flow])).toEqual([
+      ['cuts', 'stalled'],
+      ['receipts', 'live'],
+      ['path_points', 'live'],
+    ])
+  })
+
+  it('takes the server’s word for a replica that does not say a row’s age', () => {
     const old = rowOf({
       backlog: {
-        at: at(3 * MINUTE),
-        tables: [{ table: 'receipts', unsent: 2, unfiled: 0, set_aside: 0, oldest_at: null }],
+        at: at(SECOND),
+        tables: [{ table: 'receipts', unsent: 2, unfiled: 0, set_aside: 0, oldest_at: null, waits: true }],
       },
     })
-    expect(upOf(old, { now: AT }).lagging[0]!.lagging[0]).toMatchObject({ flow: 'stalled', oldestAt: null })
+    expect(upOf(old).lagging[0]!.lagging[0]).toMatchObject({ flow: 'stalled', oldestAt: null })
   })
 
   it('says how a table flows, its chips, and when the replica was last heard', () => {
-    const up = upOf(writing, { now: AT })
+    const up = upOf(writing)
     const receipts = up.settled[0]!.settled[0]!
     expect(describeFlow(receipts, speech())).toBe('Live · last 4 sec. ago')
     expect(upChips(receipts, speech())).toEqual([
@@ -133,25 +143,34 @@ describe('upOf', () => {
       { kind: 'oldest', text: 'oldest 4 sec' },
     ])
     expect(describeHeard(writing, up, speech())).toEqual(['Last heard 9 sec. ago', 'uploading stalled'])
-    expect(
-      describeHeard(writing, upOf(writing, { now: AT, behindAfter: 10 * MINUTE }), speech('es')),
-    ).toEqual(['Última señal hace 9 s', 'subiendo en vivo'])
+    const flowing = rowOf({
+      ...writing.source,
+      backlog: { ...writing.source.backlog!, tables: writing.source.backlog!.tables.slice(0, 1) },
+    })
+    expect(describeHeard(flowing, upOf(flowing), speech('es'))).toEqual([
+      'Última señal hace 9 s',
+      'subiendo en vivo',
+    ])
   })
 })
 
 describe('totalsOf', () => {
+  const r = rowOf({
+    owed: 7,
+    unfiled: 1,
+    backlog: {
+      at: at(SECOND),
+      tables: [{ table: 'receipts', unsent: 2, unfiled: 3, set_aside: 1, oldest_at: null, waits: true }],
+    },
+  })
+
   it('sums what is to send, to confirm and set aside, both ways', () => {
-    const r = rowOf({
-      owed: 7,
-      unfiled: 1,
-      backlog: {
-        at: at(SECOND),
-        tables: [{ table: 'receipts', unsent: 2, unfiled: 3, set_aside: 1, oldest_at: null }],
-      },
-    })
-    expect(totalsOf(r)).toEqual({ toSend: 9, toConfirm: 3, setAside: 2 })
     const down = downOf(shares(table('products', { should: 20, holds: 10, in_flight: 4 })))
     expect(totalsOf(r, down)).toEqual({ toSend: 8, toConfirm: 7, setAside: 2 })
+  })
+
+  it('knows rows to send and to confirm only once the tables down are known', () => {
+    expect(totalsOf(r)).toEqual({ toSend: null, toConfirm: null, setAside: 2 })
   })
 })
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { knowsReplicaState, pageOf, placeMoodOf, progressOf, summarize } from './derive.js'
+import { knowsReplicaState, pageOf, placeMoodOf, progressOf, selectedRow, summarize } from './derive.js'
 import type { Overview } from './contract/types.js'
 import overview from './contract/fixtures/overview.js'
 import listing from './contract/fixtures/listing.js'
@@ -95,18 +95,31 @@ describe('summarize', () => {
   })
 
   it('says a replica is not answering once it has not moved for long, by the server’s clock', () => {
-    const silent = (now: number) =>
+    const writing = (now: number) =>
       summarize(overview, { ...options, now }).worst.find((r) => r.name === 'Writing')!
-    expect(silent(AT + 5 * MINUTE).silentFor).toBeNull()
-    expect(silent(AT + 20 * MINUTE).silentFor).toBe(20 * MINUTE)
-    expect(summarize(overview, { ...options, now: AT + 20 * MINUTE, silentAfter: 30 * MINUTE }).silent).toBe(
-      0,
-    )
+    expect(writing(AT + 5 * MINUTE).unansweringFor).toBeNull()
+    expect(writing(AT + 20 * MINUTE).unansweringFor).toBe(20 * MINUTE)
+    expect(
+      summarize(overview, { ...options, now: AT + 20 * MINUTE, unansweringAfter: 30 * MINUTE }).unanswering,
+    ).toBe(0)
+  })
+
+  it('leaves a silent replica to its state, rather than saying it is not answering too', () => {
+    const quiet: Overview = {
+      ...overview,
+      replicas: {
+        total: 1,
+        first: overview.replicas.first.filter((r) => r.unconfirmed).map((r) => ({ ...r, state: 'silent' })),
+      },
+    }
+    const s = summarize(quiet, { ...options, now: AT + 20 * MINUTE })
+    expect(s.worst.length).toBeGreaterThan(0)
+    expect([s.worst[0]!.unansweringFor, s.unanswering]).toEqual([null, 0])
   })
 
   it('sums what a replica said it wrote and the server has not filed', () => {
     const silent = summarize(overview, options).worst.find((r) => r.name === 'Writing')!
-    expect(silent.backlog).toEqual({ unsent: 2, unfiled: 1, at: AT })
+    expect(silent.backlog).toEqual({ unsent: 2, unfiled: 1, setAside: 0, waits: true, at: AT })
   })
 
   it('lists every problem with the names of what it is about, and counts the rest', () => {
@@ -171,6 +184,22 @@ describe('pageOf', () => {
     expect([page.rows.map((r) => r.name), page.total, page.worst]).toEqual([['Synced'], 1, true])
     const all = pageOf(overview, null, null, options)
     expect([all.rows.length, all.total]).toEqual([5, 5])
+  })
+})
+
+describe('selectedRow', () => {
+  const own = listing.replicas.first[0]!
+
+  it('takes the replica’s own listing, so a replica on no page at hand still has its row', () => {
+    const row = selectedRow(own.replica, listing, [], options)
+    expect([row?.id, row?.state]).toEqual([own.replica, own.state])
+  })
+
+  it('falls back to the rows at hand, and has none for a replica nowhere', () => {
+    const rows = summarize(overview, options).worst
+    expect(selectedRow(id(6), null, rows, options)?.name).toBe('Synced')
+    expect(selectedRow(id(6), { ...listing, contract: 1 }, rows, options)?.name).toBe('Synced')
+    expect(selectedRow(id(99), listing, rows, options)).toBeNull()
   })
 })
 

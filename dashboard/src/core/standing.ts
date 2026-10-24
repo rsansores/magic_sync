@@ -79,6 +79,11 @@ export function standingOf(state: string, checks: Check[], t: Translate, combine
 
 const fixes = (r: ReplicaRow) => r.quarantined + r.unfiled + r.parked
 
+/** Whether the server has something on its way to a replica: what a replica
+ * catching up for no reason of its own waits on. */
+const owedDown = (r: ReplicaRow) =>
+  r.pending + r.owed + r.parked + r.quarantined + r.wishes.pending > 0 || r.unconfirmed
+
 /** The engine's own check: whether the replica applies what it is sent and
  * says it is there. */
 export function syncCheck(r: ReplicaRow, speech: Speech): Check {
@@ -106,8 +111,14 @@ export function syncCheck(r: ReplicaRow, speech: Speech): Check {
     }
   if (heard == null) return { ...base, status: 'unknown', line: t('check.sync.never') }
   const ago = since(heard, now, locale)
-  if (r.state === 'catching_up')
-    return { ...base, status: 'working', line: t('check.sync.applying', { since: ago }) }
+  if (r.state === 'catching_up') {
+    const working = { ...base, status: 'working' as const }
+    if (r.backlog && r.backlog.setAside > 0)
+      return { ...working, line: t('check.sync.set_aside', { n: r.backlog.setAside }) }
+    if (r.backlog?.waits && !owedDown(r))
+      return { ...working, line: t('check.sync.uploading', { since: ago }) }
+    return { ...working, line: t('check.sync.applying', { since: ago }) }
+  }
   return {
     ...base,
     status: knowsReplicaState(r.state) ? 'ok' : 'unknown',
@@ -151,14 +162,16 @@ export function lineOf(r: ReplicaRow, speech: Speech): string {
   if (r.unfiled > 0) return t('line.unfiled', { n: r.unfiled })
   if (r.quarantined > 0) return t('line.quarantined', { n: r.quarantined })
   if (r.parked > 0) return t('line.parked', { n: r.parked })
+  if (r.backlog && r.backlog.setAside > 0) return t('line.set_aside', { n: r.backlog.setAside })
   if (r.state === 'unreachable')
     return r.retryAt == null
       ? t('line.unreachable')
       : t('line.retry', { until: until(r.retryAt, now, locale) })
   if (r.state === 'silent' && heard != null) return t('line.silent', { since: since(heard, now, locale) })
-  const moving = r.pending + r.owed + (r.backlog ? r.backlog.unsent + r.backlog.unfiled : 0)
+  const moving = r.pending + r.owed
   if (moving > 0) return t('line.moving', { n: moving })
   if (r.unconfirmed) return t('line.applying')
+  if (r.backlog?.waits) return t('line.uploading', { n: r.backlog.unsent + r.backlog.unfiled })
   return heard == null ? t('line.never') : t('line.heard', { since: since(heard, now, locale) })
 }
 
@@ -167,10 +180,12 @@ export interface AttentionOptions {
   standing?: (r: ReplicaRow) => Standing
   /** The host's sentence for one, when it has a better one. */
   line?: (r: ReplicaRow) => string | null | undefined
+  /** Only those in this state — the engine's word, or the host's. */
+  state?: string | null
 }
 
 /** The replicas that need attention, worst first, each with one sentence:
- * every one not settled. */
+ * every one not settled, of the state asked for when one is. */
 export function attentionOf(rows: ReplicaRow[], speech: Speech, options: AttentionOptions = {}): Attention[] {
   return rows
     .map((r) => ({
@@ -179,6 +194,6 @@ export function attentionOf(rows: ReplicaRow[], speech: Speech, options: Attenti
       standing: options.standing?.(r) ?? engineStanding(r.state, speech.t),
       line: options.line?.(r) ?? lineOf(r, speech),
     }))
-    .filter((a) => a.standing.tone !== 'ok')
+    .filter((a) => a.standing.tone !== 'ok' && (options.state == null || a.standing.state === options.state))
     .sort((a, b) => rankOf(a.standing.tone) - rankOf(b.standing.tone))
 }
