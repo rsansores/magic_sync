@@ -65,7 +65,10 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     return {
       ...base,
       state: 'catching_up',
-      backlog: { at: ago(1), tables: [{ table: 'receipts', unsent: 3, unfiled: 1, set_aside: 0 }] },
+      backlog: {
+        at: ago(1),
+        tables: [{ table: 'receipts', unsent: 3, unfiled: 1, set_aside: 0, oldest_at: ago(200) }],
+      },
     }
   if (i === 11)
     return { ...base, state: 'catching_up', wishes: { pending: 1, waiting: 1, refused: 1, superseded: 0 } }

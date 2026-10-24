@@ -191,6 +191,12 @@ pub struct TableBacklog {
     /// the replica runs again.
     #[prost(uint64, tag = "4")]
     pub set_aside: u64,
+    /// How long ago the oldest of these rows was written, in milliseconds, as
+    /// the replica measured it when it made the message: an age, not a time, so
+    /// the two clocks need not agree. At least 1 from a replica that says it; 0
+    /// from one that does not.
+    #[prost(uint64, tag = "5")]
+    pub oldest_ms: u64,
 }
 /// A row a replica could not take, or could not let go of, and why. The key
 /// is required.

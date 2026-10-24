@@ -877,7 +877,7 @@ struct Recorded {
     sent_at: Option<DateTime<Utc>>,
     applied_at: Option<DateTime<Utc>>,
     unconfirmed: bool,
-    backlog: Option<sqlx::types::Json<Vec<UpProgress>>>,
+    backlog: Option<sqlx::types::Json<Vec<crate::filing::Said>>>,
     backlog_at: Option<DateTime<Utc>>,
     waiting_since: Option<DateTime<Utc>>,
     quarantined: i64,
@@ -1555,7 +1555,7 @@ impl Engine {
                     .unwrap_or_default();
                 let failures = r.failures.unwrap_or(0);
                 let backlog = r.backlog.zip(r.backlog_at).map(|(tables, at)| Backlog {
-                    tables: tables.0,
+                    tables: tables.0.into_iter().map(|t| t.progress(at)).collect(),
                     at,
                 });
                 let behind = backlog.as_ref().is_some_and(|b| !b.tables.is_empty());

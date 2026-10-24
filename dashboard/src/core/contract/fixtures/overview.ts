@@ -160,6 +160,7 @@ export default {
           "at": "2026-01-01T00:00:00.123456Z",
           "tables": [
             {
+              "oldest_at": "2026-01-01T00:00:00.123456Z",
               "set_aside": 0,
               "table": "receipts",
               "unfiled": 1,

@@ -1156,17 +1156,50 @@ const COMPARED: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// Tables a backlog may name: more than any server mirrors.
 const BACKLOG_TABLES: usize = 1024;
 
+/// A table of a replica's backlog as the server stores it: what it said,
+/// its oldest row as the age it said — read against when it said it, by the
+/// server's clock alone.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Said {
+    table: String,
+    unsent: i64,
+    unfiled: i64,
+    #[serde(default)]
+    set_aside: i64,
+    #[serde(default)]
+    oldest_ms: Option<i64>,
+}
+
+impl Said {
+    /// The table as a status reads it, said at `at`.
+    pub(crate) fn progress(self, at: DateTime<Utc>) -> UpProgress {
+        UpProgress {
+            table: self.table,
+            unsent: self.unsent,
+            unfiled: self.unfiled,
+            set_aside: self.set_aside,
+            oldest_at: self
+                .oldest_ms
+                .and_then(|ms| at.checked_sub_signed(chrono::TimeDelta::try_milliseconds(ms)?)),
+        }
+    }
+}
+
 /// What `replica` says it wrote and the server has not filed.
 async fn backlog(conn: &mut Conn, replica: Uuid, told: &envelope::Backlog) -> Result<(), Error> {
-    let tables: Option<Vec<UpProgress>> = told
+    let tables: Option<Vec<Said>> = told
         .tables
         .iter()
         .map(|t| {
-            Some(UpProgress {
+            Some(Said {
                 table: stored(&t.table),
                 unsent: i64::try_from(t.unsent).ok()?,
                 unfiled: i64::try_from(t.unfiled).ok()?,
                 set_aside: i64::try_from(t.set_aside).ok()?,
+                oldest_ms: match t.oldest_ms {
+                    0 => None,
+                    ms => Some(i64::try_from(ms).ok()?),
+                },
             })
         })
         .collect();

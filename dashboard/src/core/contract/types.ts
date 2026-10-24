@@ -40,7 +40,13 @@ unfiled: number,
 /**
  * Rows that cannot go up as they are, until a build that can send them.
  */
-set_aside: number, };
+set_aside: number, 
+/**
+ * When the oldest of these rows was written: by the replica's clock on
+ * the replica, and on the server as it reckons it from the age the
+ * replica said. `None` from a replica that does not say.
+ */
+oldest_at: string | null, };
 
 /**
  * What a replica wrote and the server has not filed, as of when it said so.

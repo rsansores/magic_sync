@@ -202,7 +202,7 @@ pub const SERVER_SCHEMA_VERSION: i32 = 4;
 /// run against a database that installed another. It counts the replica's own
 /// steps (`replica::migration`), independent of the server's version.
 #[cfg(feature = "sqlite")]
-pub const REPLICA_SCHEMA_VERSION: i32 = 2;
+pub const REPLICA_SCHEMA_VERSION: i32 = 3;
 
 use __private::Db;
 

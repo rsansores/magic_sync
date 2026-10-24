@@ -64,6 +64,7 @@ pub(crate) fn parsed<P: Sync + 'static>(
 const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [
     include_str!("../sql/sqlite/1.sql"),
     include_str!("../sql/sqlite/2.sql"),
+    include_str!("../sql/sqlite/3.sql"),
 ];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
@@ -2171,11 +2172,17 @@ pub struct UpProgress {
     /// Rows that cannot go up as they are, until a build that can send them.
     #[serde(default)]
     pub set_aside: i64,
+    /// When the oldest of these rows was written: by the replica's clock on
+    /// the replica, and on the server as it reckons it from the age the
+    /// replica said. `None` from a replica that does not say.
+    #[serde(default)]
+    pub oldest_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A table's backlog as the replica stores what it last told the server
 /// — its own shape, apart from [`UpProgress`]'s, which a host reads and a
-/// later release may change.
+/// later release may change. `oldest`: when its oldest row was written
+/// (unix milliseconds), absent from what an earlier build stored.
 #[cfg(feature = "sqlite")]
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Told {
@@ -2183,6 +2190,22 @@ struct Told {
     unsent: u64,
     unfiled: u64,
     set_aside: u64,
+    #[serde(default)]
+    oldest: Option<i64>,
+}
+
+#[cfg(feature = "sqlite")]
+impl Told {
+    fn of(table: &UpProgress) -> Self {
+        let count = |n: i64| u64::try_from(n).unwrap_or_default();
+        Told {
+            table: table.table.clone(),
+            unsent: count(table.unsent),
+            unfiled: count(table.unfiled),
+            set_aside: count(table.set_aside),
+            oldest: table.oldest_at.map(|at| at.timestamp_millis()),
+        }
+    }
 }
 
 /// [`UpProgress`] for every table with something on its way.
@@ -2201,11 +2224,12 @@ pub async fn progress(conn: &mut Conn) -> Result<Vec<UpProgress>, Error> {
 /// the very rows it travels with.
 #[cfg(feature = "sqlite")]
 async fn owed(conn: &mut Conn, upload: i64) -> Result<Vec<UpProgress>, Error> {
-    let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64, i64, i64, Option<i64>)> = sqlx::query_as(
         "SELECT relation, \
                 sum(set_aside IS NULL AND (sent_at IS NULL OR writes > sent)), \
                 sum(set_aside IS NULL AND sent_at IS NOT NULL AND writes = sent), \
-                sum(set_aside IS NOT NULL) \
+                sum(set_aside IS NOT NULL), \
+                min(noted_at) \
            FROM sync_notes WHERE upload IS NOT $1 GROUP BY relation ORDER BY relation",
     )
     .bind(upload)
@@ -2213,28 +2237,29 @@ async fn owed(conn: &mut Conn, upload: i64) -> Result<Vec<UpProgress>, Error> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(table, unsent, unfiled, set_aside)| UpProgress {
+        .map(|(table, unsent, unfiled, set_aside, oldest)| UpProgress {
             table,
             unsent,
             unfiled,
             set_aside,
+            oldest_at: oldest.and_then(chrono::DateTime::from_timestamp_millis),
         })
         .collect())
 }
 
-/// The backlog to tell the server, `now` being what it is: when it changed
-/// since it was last told — with a message going anyway, when it empties or
-/// starts (rows wait to be sent where none did), or when the last time is
-/// `backlog_every` ago — and, while it is
-/// not empty, every `backlog_every` even unchanged. A clock set back since
-/// it was last told counts as that long ago.
+/// The backlog to tell the server, `now` being what it is, and what to store
+/// of it once it went: when it changed since it was last told — with a
+/// message going anyway, when it empties or starts (rows wait to be sent
+/// where none did), or when the last time is `backlog_every` ago — and, while
+/// it is not empty, every `backlog_every` even unchanged. A clock set back
+/// since it was last told counts as that long ago.
 #[cfg(feature = "sqlite")]
 async fn backlog_due(
     conn: &mut Conn,
     now: Vec<UpProgress>,
     settings: &Outbox,
     sending: bool,
-) -> Result<Option<envelope::Backlog>, Error> {
+) -> Result<Option<(envelope::Backlog, Vec<Told>)>, Error> {
     let stored: Option<(String, i64)> =
         sqlx::query_as("SELECT backlog, reported_at FROM sync_backlog WHERE id = 1")
             .fetch_optional(&mut *conn)
@@ -2248,46 +2273,42 @@ async fn backlog_due(
         },
         None => (None, 0),
     };
-    let now = backlog_of(now);
+    let told: Vec<Told> = now.iter().map(Told::of).collect();
     let every = i64::try_from(settings.backlog_every.as_millis()).unwrap_or(i64::MAX);
     let clock = chrono::Utc::now().timestamp_millis();
     let stale = clock < at || clock - at >= every;
-    let unchanged = before.as_ref() == Some(&now.tables.iter().map(told).collect());
-    let due = if unchanged {
+    let due = if before.as_ref() == Some(&told) {
         // Unchanged: said again now and then while not empty, should the
         // server have lost it.
-        !now.tables.is_empty() && stale
+        !told.is_empty() && stale
     } else {
         // Rows only on their way start nothing: the upload that carries
         // them said what was owed besides.
-        let starts = now.tables.iter().any(|t| t.unsent + t.set_aside > 0);
-        let edge = now.tables.is_empty() || (starts && before.as_ref().is_none_or(Vec::is_empty));
+        let starts = told.iter().any(|t| t.unsent + t.set_aside > 0);
+        let edge = told.is_empty() || (starts && before.as_ref().is_none_or(Vec::is_empty));
         sending || edge || stale
     };
-    Ok(due.then_some(now))
+    Ok(due.then(|| (backlog_of(&told, clock), told)))
 }
 
+/// What the replica tells of `told` at `clock`: each table's oldest row as
+/// its age — at least 1, a clock set back since it was written
+/// notwithstanding.
 #[cfg(feature = "sqlite")]
-fn told(table: &envelope::TableBacklog) -> Told {
-    Told {
-        table: table.table.clone(),
-        unsent: table.unsent,
-        unfiled: table.unfiled,
-        set_aside: table.set_aside,
-    }
-}
-
-#[cfg(feature = "sqlite")]
-fn backlog_of(progress: Vec<UpProgress>) -> envelope::Backlog {
-    let count = |n: i64| u64::try_from(n).unwrap_or_default();
+fn backlog_of(told: &[Told], clock: i64) -> envelope::Backlog {
     envelope::Backlog {
-        tables: progress
-            .into_iter()
+        tables: told
+            .iter()
             .map(|t| envelope::TableBacklog {
-                table: t.table,
-                unsent: count(t.unsent),
-                unfiled: count(t.unfiled),
-                set_aside: count(t.set_aside),
+                table: t.table.clone(),
+                unsent: t.unsent,
+                unfiled: t.unfiled,
+                set_aside: t.set_aside,
+                oldest_ms: t.oldest.map_or(0, |at| {
+                    u64::try_from(clock.saturating_sub(at))
+                        .unwrap_or_default()
+                        .max(1)
+                }),
             })
             .collect(),
     }
@@ -2410,6 +2431,8 @@ pub(crate) struct Outgoing {
     /// whether the replica keeps it once reported — of a row it holds a copy
     /// of, which a snapshot clears — or forgets it then.
     rejected: Vec<(String, String, i64, bool)>,
+    /// The backlog it says, as the replica stores what it told.
+    told: Option<Vec<Told>>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -2508,11 +2531,11 @@ pub(crate) async fn outbox<P: Sync + 'static>(
             .as_ref()
             .map_or(0, |a| framed(a.epoch.len()) + framed(a.mac.len()) + 3 * 11);
         // The backlog, whatever it says by the end — per table, its name
-        // and three numbers — unless it could not go even alone.
+        // and four numbers — unless it could not go even alone.
         let tables: usize = progress(conn)
             .await?
             .iter()
-            .map(|t| framed(framed(t.table.len()) + 3 * 11))
+            .map(|t| framed(framed(t.table.len()) + 4 * 11))
             .sum();
         if up.encoded_len() + reserved + framed(tables) <= limit {
             reserved += framed(tables);
@@ -2636,15 +2659,20 @@ pub(crate) async fn outbox<P: Sync + 'static>(
         || !up.digests.is_empty()
         || news
         || untold_gap;
+    let mut told = None;
     if backlog.is_some() {
         let now = owed(conn, carried).await?;
-        up.backlog = backlog_due(conn, now, settings, sending).await?;
+        if let Some((said, stored)) = backlog_due(conn, now, settings, sending).await? {
+            up.backlog = Some(said);
+            told = Some(stored);
+        }
     }
     Ok((sending || up.backlog.is_some()).then_some(Outgoing {
         lane: this.name,
         up,
         notes: gathered.carried,
         rejected,
+        told,
     }))
 }
 
@@ -2952,8 +2980,7 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
         .execute(&mut *conn)
         .await?;
     }
-    if let Some(backlog) = &outgoing.up.backlog {
-        let tables: Vec<Told> = backlog.tables.iter().map(told).collect();
+    if let Some(tables) = &outgoing.told {
         sqlx::query(
             "INSERT INTO sync_backlog (id, backlog, reported_at) VALUES (1, $1, $2) \
              ON CONFLICT (id) DO UPDATE SET backlog = EXCLUDED.backlog, reported_at = EXCLUDED.reported_at",

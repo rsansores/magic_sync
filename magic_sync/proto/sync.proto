@@ -149,6 +149,11 @@ message TableBacklog {
   // the transport, of a table or a key this build cannot read — kept until
   // the replica runs again.
   uint64 set_aside = 4;
+  // How long ago the oldest of these rows was written, in milliseconds, as
+  // the replica measured it when it made the message: an age, not a time, so
+  // the two clocks need not agree. At least 1 from a replica that says it; 0
+  // from one that does not.
+  uint64 oldest_ms = 5;
 }
 
 // A row a replica could not take, or could not let go of, and why. The key

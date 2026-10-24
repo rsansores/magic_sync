@@ -3518,19 +3518,31 @@ async fn what_the_replica_wrote_is_pending_until_the_server_filed_it(pool: Sqlit
             .await
             .unwrap();
     }
-    let pending = |unsent, unfiled| {
-        vec![UpProgress {
-            table: "events".to_owned(),
-            unsent,
-            unfiled,
-            set_aside: 0,
-        }]
+    let pending = |progress: Vec<UpProgress>| {
+        progress
+            .into_iter()
+            .map(|t| {
+                (
+                    t.table,
+                    t.unsent,
+                    t.unfiled,
+                    t.set_aside,
+                    t.oldest_at.is_some(),
+                )
+            })
+            .collect::<Vec<_>>()
     };
     let mut conn = w.pool.acquire().await.unwrap();
-    assert_eq!(progress(&mut conn).await.unwrap(), pending(2, 0));
+    assert_eq!(
+        pending(progress(&mut conn).await.unwrap()),
+        [("events".to_owned(), 2, 0, 0, true)]
+    );
     let up = w.up(0, false).await.expect("the rows");
     assert_eq!(up.tables[0].upserts.len(), 2);
-    assert_eq!(progress(&mut conn).await.unwrap(), pending(0, 2));
+    assert_eq!(
+        pending(progress(&mut conn).await.unwrap()),
+        [("events".to_owned(), 0, 2, 0, true)]
+    );
     assert!(
         w.up(0, false)
             .await
@@ -5283,8 +5295,11 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] =
-        [0xe5dd_b8ea_c465_953a, 0x3663_5d6b_eb53_4f77];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [
+        0xe5dd_b8ea_c465_953a,
+        0x3663_5d6b_eb53_4f77,
+        0x697c_9ad2_6f3c_b227,
+    ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -5308,6 +5323,83 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     install(&mut conn, &codecs())
         .await
         .expect("nothing left to migrate");
+}
+
+/// A database of version 2 is brought to 3 keeping its notes, each stamped
+/// as the step runs; a note made after is stamped as it is made, and a note
+/// written again keeps the time it was first made.
+#[sqlx::test(migrations = false)]
+async fn a_replica_of_version_2_stamps_the_notes_it_has(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    for step in 1..=2 {
+        let step = migration(step).expect("a released step");
+        sqlx::raw_sql(&step).execute(&mut *conn).await.unwrap();
+    }
+    sqlx::raw_sql(TABLES).execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql("INSERT INTO sync_notes (relation, row_key) VALUES ('events', 'before')")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    install(&mut conn, &codecs()).await.expect("upgraded");
+    assert_eq!(schema_version(&mut conn).await.unwrap(), 3);
+    let noted = |key: &'static str| {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT noted_at FROM sync_notes WHERE row_key = $1")
+            .bind(key)
+    };
+    let clock = chrono::Utc::now().timestamp_millis();
+    let before = noted("before").fetch_one(&mut *conn).await.unwrap();
+    assert!(
+        before.is_some_and(|at| (clock - at).abs() < 60_000),
+        "{before:?}"
+    );
+    sqlx::raw_sql(
+        "INSERT INTO sync_notes (relation, row_key) VALUES ('events', 'after'); \
+         UPDATE sync_notes SET noted_at = 1 WHERE row_key = 'before'; \
+         INSERT INTO sync_notes (relation, row_key) VALUES ('events', 'before') \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let after = noted("after").fetch_one(&mut *conn).await.unwrap();
+    assert!(
+        after.is_some_and(|at| (clock - at).abs() < 60_000),
+        "{after:?}"
+    );
+    assert_eq!(
+        noted("before").fetch_one(&mut *conn).await.unwrap(),
+        Some(1)
+    );
+}
+
+/// The backlog says how long ago each table's oldest row was written, as an
+/// age: of a row noted five minutes ago, five minutes; of one noted "in the
+/// future", by a clock set back since, the least age there is.
+#[sqlx::test(migrations = false)]
+async fn the_backlog_says_how_long_its_oldest_row_has_waited(pool: SqlitePool) {
+    let settings = Settings {
+        lanes: vec![Lane::new("main", &[]), Lane::new("fast", &["events"])],
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["waited"]).await;
+    w.exec(
+        "UPDATE sync_notes SET noted_at = \
+             CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 300000",
+    )
+    .await
+    .unwrap();
+    let up = w.up(0, false).await.expect("the backlog");
+    let age = up.backlog.expect("said").tables[0].oldest_ms;
+    assert!((300_000..360_000).contains(&age), "{age}");
+
+    w.exec("DELETE FROM sync_backlog; UPDATE sync_notes SET noted_at = 32503680000000")
+        .await
+        .unwrap();
+    let up = w.up(0, false).await.expect("the backlog");
+    assert_eq!(up.backlog.expect("said").tables[0].oldest_ms, 1);
 }
 
 /// A database whose engine tables are of another version is refused, with

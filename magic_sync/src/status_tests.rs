@@ -373,6 +373,7 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
         unsent: 3,
         unfiled: 1,
         set_aside: 0,
+        oldest_ms: 90_000,
     }])
     .await;
     let writing = world.overview(Scope::Replicas(&[a])).await;
@@ -380,6 +381,11 @@ async fn the_overview_says_what_each_replica_and_table_waits_on(pool: crate::DbP
     assert_eq!(
         (writing.replicas.first[0].state, backlog.tables[0].unsent),
         (ReplicaState::CatchingUp, 3)
+    );
+    assert_eq!(
+        backlog.tables[0].oldest_at,
+        Some(backlog.at - chrono::TimeDelta::seconds(90)),
+        "the age it said, from when it said it"
     );
     say(vec![]).await;
     let written = world.overview(Scope::Replicas(&[a])).await;
@@ -546,6 +552,7 @@ async fn the_json_a_dashboard_reads_is_the_contract(pool: crate::DbPool) {
                     unsent: 2,
                     unfiled: 1,
                     set_aside: 0,
+                    oldest_ms: 30_000,
                 }],
             }),
             ..Up::default()

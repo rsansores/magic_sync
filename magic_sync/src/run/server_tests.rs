@@ -1143,6 +1143,7 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         unsent: [0, 5, u64::MAX][walk.below(3)],
                         unfiled: 1,
                         set_aside: 0,
+                        oldest_ms: [0, 1, u64::MAX][walk.below(3)],
                     }],
                 }),
                 nonce: [0, 1, walk.next(), u64::MAX][walk.below(4)],
