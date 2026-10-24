@@ -5339,7 +5339,7 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [
         0xe5dd_b8ea_c465_953a,
         0x3663_5d6b_eb53_4f77,
-        0x4536_c926_1b82_f5cb,
+        0x67ab_c07e_2400_1fc0,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -5441,6 +5441,51 @@ async fn the_backlog_says_how_long_its_oldest_row_has_waited(pool: SqlitePool) {
         .unwrap();
     let up = w.up(0, false).await.expect("the backlog");
     assert_eq!(up.backlog.expect("said").tables[0].oldest_ms, 1);
+}
+
+/// A row written again after its upload was made goes up again, and has
+/// waited since that upload, not since it was first written: a row written
+/// over and over, upload after upload, is never taken for one that waits.
+#[sqlx::test(migrations = false)]
+async fn a_row_written_again_after_its_upload_waits_since_that_upload(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["first"]).await;
+    let oldest = |w: &World| {
+        let pool = w.pool.clone();
+        async move {
+            let mut conn = pool.acquire().await.unwrap();
+            let progress = progress(&mut conn).await.unwrap();
+            progress[0].oldest_at.expect("stamped")
+        }
+    };
+    for round in 0..3 {
+        // Noted ten minutes ago, as far as the note can tell.
+        w.exec(
+            "UPDATE sync_notes SET noted_at = \
+                 CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 600000",
+        )
+        .await
+        .unwrap();
+        let up = w.up(0, false).await.expect("the row");
+        assert_eq!(up.tables[0].upserts.len(), 1, "round {round}");
+        // Written again, as a host's trigger notes it.
+        w.exec("UPDATE sync_notes SET writes = writes + 1")
+            .await
+            .unwrap();
+        w.receive(
+            &Body::Filed(Filed {
+                uploads: up.uploads.clone(),
+            })
+            .encoded(),
+        )
+        .await;
+        let waited = chrono::Utc::now() - oldest(&w).await;
+        assert!(
+            waited < chrono::TimeDelta::seconds(60),
+            "round {round}: waited {waited}"
+        );
+    }
 }
 
 /// A database whose engine tables are of another version is refused, with

@@ -2107,11 +2107,16 @@ async fn filed<P: Sync + 'static>(
         .filter_map(|u| i64::try_from(*u).ok())
         .collect();
     // A row written again since goes again, re-stated no more: the server
-    // took it as it was re-stated, and its later writes are newer (7).
+    // took it as it was re-stated, and its later writes are newer (7). What
+    // is left of it was written after the upload was made, so it has waited
+    // since about then: since the transport took it, or now.
     for sql in [
         "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) \
             AND writes = sent",
-        "UPDATE sync_notes SET restated = 0 WHERE upload IN (SELECT value FROM json_each($1))",
+        "UPDATE sync_notes SET restated = 0, \
+                noted_at = CAST((coalesce(julianday(sent_at), julianday('now')) - 2440587.5) \
+                                * 86400000 AS INTEGER) \
+          WHERE upload IN (SELECT value FROM json_each($1))",
     ] {
         sqlx::query(sql)
             .bind(json(&uploads))
