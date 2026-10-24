@@ -205,12 +205,14 @@ export function upChips(table: UpFlow, speech: Speech): Chip[] {
 }
 
 /** Whether a table's rows reach the server as they are written, and when
- * the last one did: "Live · last 4 sec. ago". */
+ * the last one did: "Live · last 4 sec. ago" while rows of it are on their
+ * way and flow, "Nothing waiting · last 3 days ago" once none is. */
 export function describeFlow(table: UpFlow, speech: Speech): string {
   const { t } = speech
   if (table.lastFiledAt == null) return t('flow.never')
   const ago = since(table.lastFiledAt, speech.now, speech.locale)
-  return table.flow === 'live' ? t('flow.live', { since: ago }) : t('flow.stalled', { since: ago })
+  if (table.flow === 'stalled') return t('flow.stalled', { since: ago })
+  return table.unsent + table.unfiled > 0 ? t('flow.live', { since: ago }) : t('flow.idle', { since: ago })
 }
 
 /** The line the settled are folded into: "3 more tables up to date", or,

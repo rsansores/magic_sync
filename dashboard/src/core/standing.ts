@@ -77,8 +77,6 @@ export function standingOf(state: string, checks: Check[], t: Translate, combine
   return combine?.(state, checks) ?? engineStanding(state, t)
 }
 
-const fixes = (r: ReplicaRow) => r.quarantined + r.unfiled + r.parked
-
 /** Whether the server has something on its way to a replica: what a replica
  * catching up for no reason of its own waits on. */
 const owedDown = (r: ReplicaRow) =>
@@ -91,7 +89,7 @@ export function syncCheck(r: ReplicaRow, speech: Speech): Check {
   const base = { key: 'sync', label: t('check.sync') }
   const heard = r.lastHeardAt ?? r.heardAt
   if (r.state === 'awaiting_fix')
-    return { ...base, status: 'failing', tone: 'attention', line: t('check.sync.fix', { n: fixes(r) }) }
+    return { ...base, status: 'failing', tone: 'attention', line: t('check.sync.fix', { n: r.awaitingFix }) }
   if (r.state === 'unreachable')
     return {
       ...base,
@@ -168,24 +166,37 @@ export interface Attention {
   line: string | null
 }
 
-/** What a replica waits on, in one short sentence. */
+/** What a replica waits on, in one short sentence: its state decides, in
+ * the engine's order, and a cause is said only within the state it
+ * explains. */
 export function lineOf(r: ReplicaRow, speech: Speech): string {
   const { t, locale, now } = speech
   const heard = r.lastHeardAt ?? r.heardAt
-  if (r.unfiled > 0) return t('line.unfiled', { n: r.unfiled })
-  if (r.quarantined > 0) return t('line.quarantined', { n: r.quarantined })
-  if (r.parked > 0) return t('line.parked', { n: r.parked })
-  if (r.backlog && r.backlog.setAside > 0) return t('line.set_aside', { n: r.backlog.setAside })
-  if (r.state === 'unreachable')
-    return r.retryAt == null
-      ? t('line.unreachable')
-      : t('line.retry', { until: until(r.retryAt, now, locale) })
-  if (r.state === 'silent' && heard != null) return t('line.silent', { since: since(heard, now, locale) })
-  const moving = r.pending + r.owed
-  if (moving > 0) return t('line.moving', { n: moving })
-  if (r.unconfirmed) return t('line.applying')
-  if (r.backlog?.waits) return t('line.uploading', { n: r.backlog.unsent + r.backlog.unfiled })
-  return heard == null ? t('line.never') : t('line.heard', { since: since(heard, now, locale) })
+  const lastHeard = () =>
+    heard == null ? t('line.never') : t('line.heard', { since: since(heard, now, locale) })
+  switch (r.state) {
+    case 'awaiting_fix':
+      if (r.unfiled > 0) return t('line.unfiled', { n: r.unfiled })
+      if (r.quarantined > 0) return t('line.quarantined', { n: r.quarantined })
+      if (r.parked > 0) return t('line.parked', { n: r.parked })
+      return t('check.sync.fix', { n: r.awaitingFix })
+    case 'unreachable':
+      return r.retryAt == null
+        ? t('line.unreachable')
+        : t('line.retry', { until: until(r.retryAt, now, locale) })
+    case 'silent':
+      return heard == null ? t('line.never') : t('line.silent', { since: since(heard, now, locale) })
+    case 'catching_up': {
+      if (r.backlog && r.backlog.setAside > 0) return t('line.set_aside', { n: r.backlog.setAside })
+      const moving = r.pending + r.owed
+      if (moving > 0) return t('line.moving', { n: moving })
+      if (r.unconfirmed) return t('line.applying')
+      if (r.backlog?.waits) return t('line.uploading', { n: r.backlog.unsent + r.backlog.unfiled })
+      return lastHeard()
+    }
+    default:
+      return lastHeard()
+  }
 }
 
 export interface AttentionOptions {

@@ -98,9 +98,16 @@ describe('syncCheck', () => {
   })
 
   it('fails for what waits for a fix, and for a replica out of reach', () => {
-    expect(syncCheck(rowOf({ state: 'awaiting_fix', quarantined: 2, unfiled: 1 }), speech()).line).toBe(
-      '3 changes wait for a fix',
-    )
+    expect(
+      syncCheck(rowOf({ state: 'awaiting_fix', quarantined: 2, unfiled: 1, awaiting_fix: 3 }), speech()).line,
+    ).toBe('3 changes wait for a fix')
+    expect(
+      syncCheck(
+        rowOf({ state: 'awaiting_fix', quarantined: 5, parked: 4, unfiled: 0, awaiting_fix: 1 }),
+        speech(),
+      ).line,
+      'the engine’s figure: rows held back behind a fix, and changes shared with others, are not its own',
+    ).toBe('1 change waits for a fix')
     const away = syncCheck(
       rowOf({ state: 'unreachable', retry_at: new Date(AT + MINUTE).toISOString() }),
       speech(),
@@ -201,6 +208,19 @@ describe('lineOf', () => {
     )
     expect(lineOf(rowOf({ state: 'catching_up', unconfirmed: true }), speech('es'))).toBe(
       'Aplicando lo que se le envió',
+    )
+  })
+
+  it('says a cause only within the state it explains', () => {
+    expect(
+      lineOf(rowOf({ state: 'unreachable', quarantined: 3, retry_at: null }), speech()),
+      'rows held back are not why it cannot be reached',
+    ).toBe('Cannot be reached')
+    expect(lineOf(rowOf({ state: 'catching_up', quarantined: 3, parked: 2, pending: 5 }), speech())).toBe(
+      '5 changes on their way',
+    )
+    expect(lineOf(rowOf({ state: 'silent', parked: 2, last_heard_at: at(6 * MINUTE) }), speech())).toBe(
+      'Last heard 6 min. ago',
     )
   })
 

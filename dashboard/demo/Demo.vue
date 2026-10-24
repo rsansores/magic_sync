@@ -53,6 +53,7 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     unconfirmed: false,
     quarantined: 0,
     unfiled: 0,
+    awaiting_fix: 0,
     failures: 0,
     last_error: null,
     retry_at: null,
@@ -87,7 +88,8 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     }
   if (i === 11)
     return { ...base, state: 'catching_up', wishes: { pending: 1, waiting: 1, refused: 1, superseded: 0 } }
-  if (scenario === 'attention' && i === 2) return { ...base, state: 'awaiting_fix', quarantined: 2 }
+  if (scenario === 'attention' && i === 2)
+    return { ...base, state: 'awaiting_fix', quarantined: 2, awaiting_fix: 2 }
   if (scenario === 'attention' && i === 9)
     return {
       ...base,

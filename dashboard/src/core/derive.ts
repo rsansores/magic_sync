@@ -54,6 +54,9 @@ export interface ReplicaRow {
   quarantined: number
   parked: number
   unfiled: number
+  /** What of its own waits for a fix, as the engine counts it: what makes
+   * it `awaiting_fix`. */
+  awaitingFix: number
   failures: number
   lastError: string | null
   retryAt: number | null
@@ -223,6 +226,7 @@ function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
     quarantined: r.quarantined,
     parked: r.parked,
     unfiled: r.unfiled,
+    awaitingFix: r.awaiting_fix,
     failures: r.failures,
     lastError: r.last_error,
     retryAt: timeOf(r.retry_at),

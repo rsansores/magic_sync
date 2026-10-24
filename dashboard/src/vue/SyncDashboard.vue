@@ -182,23 +182,55 @@ const current = computed(() => {
 /** What the selected replica's tables wait on, each way: only the tables
  * that wait, under their group's label when the host groups them. */
 const down = computed(() => (detail.value?.down ? drawnOf(detail.value.down) : null))
-const up = computed(() => (detail.value ? drawnOf(detail.value.up) : null))
+const up = computed(() => {
+  const sp = speech.value
+  if (!detail.value || !sp) return null
+  const drawn = drawnOf(detail.value.up)
+  return {
+    ...drawn,
+    groups: drawn.groups.map((g) => ({
+      ...g,
+      tables: g.tables.map((tb) => ({ ...tb, chips: upChips(tb, sp) })),
+    })),
+  }
+})
 const total = (value: number | null) => (value == null ? '–' : n(value))
 
-// Focus follows the view: into the replica opened, and back to what opened it.
+// With `states`, the replicas that need attention are of the whole fleet:
+// a page of them at first, and a page more at a time.
+const step = computed(() => props.pageSize ?? 50)
+const attentionLimit = ref(step.value)
+watch([shown, step], () => (attentionLimit.value = step.value))
+const attentionShown = computed(() =>
+  fleet.value ? attention.value.slice(0, attentionLimit.value) : attention.value,
+)
+const attentionRest = computed(() => attention.value.length - attentionShown.value.length)
+
+// A tile or a row opens its replica (`data-replica`), through one handler;
+// focus follows the view: into the replica opened, and back to what opened
+// it (`data-opens`), drawn anew when the view comes back.
+const root = ref<HTMLElement | null>(null)
 const detailHeading = ref<HTMLElement | null>(null)
-const openers = new Map<string, HTMLElement>()
-const opener = (key: string) => (el: unknown) =>
-  el ? openers.set(key, el as HTMLElement) : openers.delete(key)
+let openedBy: string | null = null
+function open(event: MouseEvent) {
+  const el = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-replica]')
+  if (!el?.dataset.replica) return
+  openedBy = el.dataset.opens ?? null
+  selected.value = el.dataset.replica
+}
 watch(selected, async (now, before) => {
   await nextTick()
   if (now != null) detailHeading.value?.focus()
-  else if (before != null) (openers.get(before) ?? tabButtons.value.replicas)?.focus()
+  else if (before != null) {
+    const by = [openedBy, `tile:${before}`].find((key) => key?.endsWith(`:${before}`))
+    const back = by ? root.value?.querySelector<HTMLElement>(`[data-opens="${CSS.escape(by)}"]`) : null
+    ;(back ?? tabButtons.value.replicas)?.focus()
+  }
 })
 </script>
 
 <template>
-  <div class="msd" :lang="locale">
+  <div ref="root" class="msd" :lang="locale">
     <p v-if="error" class="msd-error" role="alert">{{ error }}</p>
     <p v-else-if="!summary || !banner || !speech || !page" class="msd-muted">{{ t('loading') }}</p>
     <template v-else>
@@ -333,9 +365,9 @@ watch(selected, async (now, before) => {
                     </span>
                     <span class="msd-muted">{{ describeFlow(tb, speech) }}</span>
                   </div>
-                  <span v-if="upChips(tb, speech).length" class="msd-chips">
+                  <span v-if="tb.chips.length" class="msd-chips">
                     <span
-                      v-for="chip in upChips(tb, speech)"
+                      v-for="chip in tb.chips"
                       :key="chip.kind"
                       class="msd-chip-count"
                       :data-kind="chip.kind"
@@ -424,6 +456,7 @@ watch(selected, async (now, before) => {
           role="tabpanel"
           :aria-labelledby="`${id}-tab-replicas`"
           tabindex="0"
+          @click="open"
         >
           <div class="msd-card">
             <div class="msd-row-head msd-spread">
@@ -475,13 +508,13 @@ watch(selected, async (now, before) => {
                   <button
                     v-for="tile in cluster.tiles"
                     :key="tile.replica"
-                    :ref="opener(tile.replica)"
                     type="button"
                     class="msd-tile"
+                    :data-replica="tile.replica"
+                    :data-opens="`tile:${tile.replica}`"
                     :data-tone="tile.standing.tone"
                     :title="t('grid.tile', { name: tile.name, state: tile.standing.label })"
                     :aria-label="t('grid.tile', { name: tile.name, state: tile.standing.label })"
-                    @click="selected = tile.replica"
                   />
                 </div>
               </div>
@@ -506,12 +539,12 @@ watch(selected, async (now, before) => {
               }}
             </p>
             <ul class="msd-attention">
-              <li v-for="a in attention" :key="a.id">
+              <li v-for="a in attentionShown" :key="a.id">
                 <button
-                  :ref="opener(`row:${a.id}`)"
                   type="button"
                   class="msd-attention-row"
-                  @click="selected = a.id"
+                  :data-replica="a.id"
+                  :data-opens="`row:${a.id}`"
                 >
                   <span class="msd-state" :data-tone="a.standing.tone">{{ a.standing.label }}</span>
                   <span class="msd-name">{{ a.name }}</span>
@@ -519,7 +552,15 @@ watch(selected, async (now, before) => {
                 </button>
               </li>
             </ul>
-            <p v-if="!fleet && page.worst && page.total > page.rows.length" class="msd-muted">
+            <nav v-if="attentionRest > 0" class="msd-pager">
+              <span class="msd-muted">
+                {{ t('replicas.page', { from: 1, to: attentionShown.length, total: attention.length }) }}
+              </span>
+              <button type="button" class="msd-chip" @click="attentionLimit += step">
+                {{ t('attention.more', { n: Math.min(step, attentionRest) }) }}
+              </button>
+            </nav>
+            <p v-else-if="!fleet && page.worst && page.total > page.rows.length" class="msd-muted">
               {{ t('replicas.worst', { n: page.rows.length, total: page.total }) }}
             </p>
             <nav v-else-if="!fleet && !page.worst && page.total > page.rows.length" class="msd-pager">

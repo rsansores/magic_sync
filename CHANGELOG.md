@@ -78,7 +78,14 @@ Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
   (`checks`) and more under them (the slot `replica-extra`), and states of
   its own (`combine`), which filter the tiles and, given `states`, which
   holds every replica, the counters count; the counter picked is
-  `v-model:state`. The Tables tab is called Data.
+  `v-model:state`. With `states`, the replicas that need attention are
+  shown a page (`pageSize`) at a time, and the listing only lends them
+  their sentences. A replica's sentence follows its state, in the engine's
+  order, and says a cause only within the state it explains; "N changes
+  wait for a fix" is the engine's figure (`ReplicaRow::awaitingFix`). A
+  table up with nothing on its way says *Nothing waiting · last …*, not
+  *Live*. Every tile reaches 3:1 against the card, so the default
+  `--msd-ok-tile` is a darker green. The Tables tab is called Data.
 - **The dashboard's core, for a host's own design system.** Pure functions
   of the answers: a `Tone` per state; `syncCheck` and `checksOf`, the
   engine's check after the host's; `standingOf` with a host's `Combine`,

@@ -65,8 +65,8 @@ import 'magic_sync_dashboard/styles.css'
 > it, a counter per state, each a filter; a tile per replica, coloured by its
 > state, worst first; and the replicas that need attention, each in one
 > sentence — *1 row set aside*, *last heard 6 min. ago*, *14 changes on their
-> way* — every one of them, from the states, the sentence of each whose row
-> is at hand. The tables and the problems, each with its reason, are a tab away.
+> way* — every one of them, from the states, a page at a time, the sentence
+> of each whose row is at hand. The tables and the problems, each with its reason, are a tab away.
 > Picking a state, or turning a page, sets `filter` or `offset`; you fetch
 > that page of the listing. Without a listing, the dashboard shows the
 > overview's worst and says how many there are in all. Clicking a tile or a

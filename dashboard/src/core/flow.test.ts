@@ -151,6 +151,10 @@ describe('upOf', () => {
     const up = upOf(writing)
     const receipts = up.settled[0]!.settled[0]!
     expect(describeFlow(receipts, speech())).toBe('Live · last 4 sec. ago')
+    const idle = rowOf({ filed: [{ table: 'receipts', last_filed_at: at(3 * 24 * 60 * MINUTE) }] })
+    expect(describeFlow(upOf(idle).settled[0]!.settled[0]!, speech())).toBe(
+      'Nothing waiting · last 3 days ago',
+    )
     expect(upChips(receipts, speech())).toEqual([
       { kind: 'to_confirm', text: '1 to confirm' },
       { kind: 'oldest', text: 'oldest 4 sec' },

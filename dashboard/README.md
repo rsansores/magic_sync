@@ -63,25 +63,25 @@ const offset = ref(0)
 </template>
 ```
 
-| Prop                              | What it is                                                                                                  |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `overview`                        | `Engine::overview`'s answer; `null` while loading                                                           |
-| `states`                          | `Engine::states`'s answer: a tile of every replica; without it, a tile of each of the overview's worst      |
-| `listing`                         | `Engine::listing`'s answer for `filter` and `offset`; without it, the overview's worst are listed           |
-| `progress`                        | `Engine::progress`'s answer for the selected replica                                                        |
-| `replica`                         | `Engine::listing`'s answer over the selected replica alone (`Scope::Replicas(&[id])`): its row, on any page |
-| `names`, `labels`                 | your names for replicas and tables: a map, or a function                                                    |
-| `v-model:selected`                | the replica being looked at; keep it in your URL if you like                                                |
-| `v-model:filter`                  | the state the replicas are listed in (`null`: all of them)                                                  |
-| `v-model:state`                   | the counter picked: the tiles and the replicas that need attention narrowed to it, the engine's or yours    |
-| `v-model:offset`, `pageSize`      | where the page of the listing begins, and the `limit` you ask it for (50)                                   |
-| `levels`, `placeOf`               | where your replicas are: the tiles gather in a cluster per place (see below)                                |
-| `v-model:level`, `v-model:within` | the level the tiles are clustered by, and the places they are narrowed to                                   |
-| `group`                           | the group you gather each table in: `(table) => ({ key, label, order })`                                    |
-| `checks`                          | what you check of a replica, shown before the engine's own check                                            |
-| `combine`                         | a state of your own from the engine's and your checks (see below): filtered by, and counted with `states`   |
-| `locale`, `messages`              | see below                                                                                                   |
-| `unansweringAfter`, `stuckAfter`  | when a replica is "not answering" (15 min) and when waiting changes need attention (15 min), in ms          |
+| Prop                              | What it is                                                                                                    |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `overview`                        | `Engine::overview`'s answer; `null` while loading                                                             |
+| `states`                          | `Engine::states`'s answer: a tile of every replica; without it, a tile of each of the overview's worst        |
+| `listing`                         | `Engine::listing`'s answer for `filter` and `offset`; without it, the overview's worst are listed (see below) |
+| `progress`                        | `Engine::progress`'s answer for the selected replica                                                          |
+| `replica`                         | `Engine::listing`'s answer over the selected replica alone (`Scope::Replicas(&[id])`): its row, on any page   |
+| `names`, `labels`                 | your names for replicas and tables: a map, or a function                                                      |
+| `v-model:selected`                | the replica being looked at; keep it in your URL if you like                                                  |
+| `v-model:filter`                  | the state the replicas are listed in (`null`: all of them)                                                    |
+| `v-model:state`                   | the counter picked: the tiles and the replicas that need attention narrowed to it, the engine's or yours      |
+| `v-model:offset`, `pageSize`      | where the page of the listing begins, and the `limit` you ask it for (50)                                     |
+| `levels`, `placeOf`               | where your replicas are: the tiles gather in a cluster per place (see below)                                  |
+| `v-model:level`, `v-model:within` | the level the tiles are clustered by, and the places they are narrowed to                                     |
+| `group`                           | the group you gather each table in: `(table) => ({ key, label, order })`                                      |
+| `checks`                          | what you check of a replica, shown before the engine's own check                                              |
+| `combine`                         | a state of your own from the engine's and your checks (see below): filtered by, and counted with `states`     |
+| `locale`, `messages`              | see below                                                                                                     |
+| `unansweringAfter`, `stuckAfter`  | when a replica is "not answering" (15 min) and when waiting changes need attention (15 min), in ms            |
 
 The slot `replica-extra` (given `{ replica }`) goes under a replica's
 checks: whatever else your system shows of it.
@@ -168,7 +168,8 @@ dash.summary.value // counts per state, the worst replicas, tables, problems
 dash.tally.value // [{ state, tone, label, n }], worst first: the counters
 dash.grid.value // the tiles in clusters: { level, deeper, trail, clusters, total, tones }
 dash.attention.value // [{ id, name, standing, line }]: the replicas not settled, worst first — of every
-// replica with `states` (`line` null for one whose row is on no page at hand), else the page's
+// replica with `states` (`line` null for one whose row is on no page at hand), else the page's;
+// with `states` the whole list, which the ready-made view shows a page (`pageSize`) at a time
 dash.page.value // the replicas to list: rows, offset, total
 dash.tables.value // the tables over the fleet: lagging groups, settled groups
 dash.progress.value // the selected replica, per table: upToDate of should
@@ -180,6 +181,12 @@ if (speech) {
   describeProblem(problem, speech) // { title, about, reason, facts }
 }
 ```
+
+Once you pass `states`, the replicas that need attention are of every
+replica, and `listing` only lends them their sentences: its rows say what
+each waits on, and a replica on no page at hand is listed without one. The
+ready-made view then shows them `pageSize` at a time, a button showing the
+next ones, and no pager of the listing.
 
 It also takes `replica`, `levels`, `placeOf`, `level`, `within`, `group`,
 `checks`, `combine` and `state`. `combine` is a state of your own made from

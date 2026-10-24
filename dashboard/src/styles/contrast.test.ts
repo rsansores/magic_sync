@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 // Every text the default look draws, against the surface it is drawn on,
-// must reach WCAG's 4.5:1.
+// must reach WCAG's 4.5:1; every tile, which says a state by its colour
+// alone, 3:1 against the card it sits on (WCAG 1.4.11).
 
 const css = readFileSync(new URL('./dashboard.css', import.meta.url), 'utf8')
 
@@ -46,13 +47,22 @@ const pairs: [string, string][] = [
   ['accent', 'accent-soft'],
 ]
 
+// [tile, card]: the colour of each tone's tile.
+const tiles: [string, string][] = ['ok-tile', 'warn', 'quiet', 'unknown', 'off', 'danger'].map(
+  (tile): [string, string] => [tile, 'card'],
+)
+
 describe('the default colours', () => {
   it('are all read from the stylesheet', () => {
-    for (const [text, surface] of pairs)
+    for (const [text, surface] of [...pairs, ...tiles])
       expect([text, surface].map((k) => defaults[k])).not.toContain(undefined)
   })
 
   it.each(pairs)('draw %s on %s at 4.5:1 or more', (text, surface) => {
     expect(contrast(defaults[text]!, defaults[surface]!)).toBeGreaterThanOrEqual(4.5)
+  })
+
+  it.each(tiles)('draw the %s tile on %s at 3:1 or more', (tile, card) => {
+    expect(contrast(defaults[tile]!, defaults[card]!)).toBeGreaterThanOrEqual(3)
   })
 })

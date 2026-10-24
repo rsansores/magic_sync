@@ -243,6 +243,7 @@ const en: MessageTable = {
   'line.heard': 'Last heard {since}',
   'line.never': 'Nothing heard yet',
   'flow.live': 'Live · last {since}',
+  'flow.idle': 'Nothing waiting · last {since}',
   'flow.stalled': 'Last {since}',
   'flow.never': 'Nothing filed yet',
   'settled.tables': {
@@ -287,6 +288,10 @@ const en: MessageTable = {
   'attention.title': 'Need attention',
   'attention.none': 'Nothing needs attention.',
   'attention.none_here': 'Nothing on this page needs attention.',
+  'attention.more': {
+    one: 'Show {n} more',
+    other: 'Show {n} more',
+  },
 }
 
 const es: MessageTable = {
@@ -517,6 +522,7 @@ const es: MessageTable = {
   'line.heard': 'Última señal {since}',
   'line.never': 'Aún sin señales',
   'flow.live': 'En vivo · último {since}',
+  'flow.idle': 'Nada en espera · último {since}',
   'flow.stalled': 'Último {since}',
   'flow.never': 'Aún no se recibe nada',
   'settled.tables': {
@@ -561,6 +567,10 @@ const es: MessageTable = {
   'attention.title': 'Piden atención',
   'attention.none': 'Nada pide atención.',
   'attention.none_here': 'Nada en esta página pide atención.',
+  'attention.more': {
+    one: 'Mostrar {n} más',
+    other: 'Mostrar {n} más',
+  },
 }
 
 export const builtinMessages: Messages = { en, es }

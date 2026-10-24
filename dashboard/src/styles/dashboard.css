@@ -25,7 +25,7 @@
   --_unknown: var(--msd-unknown, #0b7285);
   --_unknown-soft: var(--msd-unknown-soft, #e3fafc);
   --_accent-soft: var(--msd-accent-soft, #edf2ff);
-  --_ok-tile: var(--msd-ok-tile, #b2e2bf);
+  --_ok-tile: var(--msd-ok-tile, #40a05a);
   --_tile: var(--msd-tile, 14px);
   --_radius: var(--msd-radius, 10px);
   --_gap: var(--msd-gap, 12px);
