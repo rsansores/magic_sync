@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
+(unchanged: fields added). Dashboard contract 2.
+
+- **A backlog is what is owed once its upload is filed.** An upload counted
+  the rows it carried as unsent, and the server stored, once it had filed
+  them, a backlog that still held them. A backlog now leaves them out, and
+  rows only on their way start nothing: the upload that carries them said
+  what was owed besides.
+- **How long a row has waited.** A replica stamps each note as it is made
+  (`sync_notes.noted_at`, by an engine trigger: the host's triggers do not
+  change), and its backlog says how long ago each table's oldest row was
+  written, as an age (`TableBacklog.oldest_ms`), so the two clocks need not
+  agree. A status reads it as `UpProgress::oldest_at`.
+- **Behind is what waits.** A replica is catching up from its side while a
+  row it wrote has waited longer than `Settings::behind_after` (two
+  minutes), or cannot go as it is: rows that flow are younger. A replica of
+  an earlier build, which says no age, is judged by when it said its
+  backlog.
+- **Keepalive.** `Outbox::keepalive_every` (a minute) takes the place of
+  `Outbox::backlog_every`: once nothing has gone up on any lane for so long,
+  the replica sends a message on its first lane, its backlog in it, with
+  nothing else to say if need be, and every message says the cadence
+  (`Up.keepalive_ms`). The server keeps when it last heard from each
+  replica, on any lane (`ReplicaOverview::last_heard_at`), and when it last
+  filed a row of each table from it (`ReplicaOverview::filed`).
+- **Silent.** `ReplicaState::Silent`: a replica that said its keepalive and
+  has said nothing for `Settings::silent_after_keepalives` (three) times
+  that — off, or cut off. After a fix and an unreachable one, before
+  catching up; counted (`ReplicaCounts::silent`), listed, and named in
+  `Health::silent`, which leaves the health healthy. A replica that says no
+  keepalive, as one of an earlier build, never is: a fleet upgrades over
+  days.
+- **Every replica's state at once.** `Engine::states(scope)`: each replica
+  of a scope with its audience and its state, worst first, for a map of the
+  fleet — a few milliseconds over 200 replicas.
+
+Upgrading: the replica first or the server first, either way. An earlier
+replica says no age and no keepalive, and is judged as before but for
+silence; an earlier server ignores both.
+
+### Breaking
+
+- **Server schema 5.** `Server::install` takes the database there; with
+  migrations of your own, run `plan::migration(5)`, which adds
+  `sync.replicas.last_heard_at`, `keepalive` and `filed`.
+- **Replica schema 3.** `replica::install` takes the database there; with
+  migrations of your own, run `replica::migration(3)`, which adds
+  `sync_notes.noted_at`, the trigger `sync_notes_noted` that stamps it, and
+  `sync_spoken`. The triggers `replica::triggers` prints are printed alike.
+- **`Outbox::backlog_every` is `Outbox::keepalive_every`.**
+- **Dashboard contract 2.** `catching_up` means what waits, not what is on
+  its way; `silent` is a state; `ReplicaOverview` says `last_heard_at` and
+  `filed`, `UpProgress` `oldest_at`, `Health` `silent`, and `States` is the
+  answer of `Engine::states`. The dashboard reads contract 2, and refuses 1.
+- The public API adds `Engine::states`, `States`, `StateEntry`, `Silent`,
+  `TableFiled`, `ReplicaState::Silent`, `ReplicaCounts::silent`,
+  `Health::silent`, `ReplicaOverview::{last_heard_at, filed}`,
+  `UpProgress::oldest_at` and server `Settings::{behind_after,
+  silent_after_keepalives}`; it renames `Outbox::backlog_every` to
+  `Outbox::keepalive_every`.
+
 ## 0.3.0 — 2026-10-23
 
 Rows a view places. Schemas: server 4, replica 2 (unchanged). Protocol 1

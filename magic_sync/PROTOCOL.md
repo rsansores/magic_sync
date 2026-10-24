@@ -572,12 +572,23 @@ For a table the replica writes and the server mirrors:
 
 A replica **may** say what it wrote and the server has not filed yet, in
 `Up.backlog`: per table, rows not sent yet (`unsent`), rows sent and not
-yet `Filed` (`unfiled`), and rows set aside (`set_aside`). Say it
-when it changes — at once when it empties — and not on every write; say it
-again now and then while it is not empty, and to a server whose epoch
-changed, either of which may have lost it. An `Up` without `backlog` leaves
-the last one standing (A.3). A replica that never says leaves the server with
-nothing to show, and nothing breaks.
+yet `Filed` (`unfiled`), and rows set aside (`set_aside`), and how long ago
+the oldest of them was written (`oldest_ms`, in milliseconds, at least 1;
+0 says nothing of it) — an age, as the replica measures it when it makes
+the message, so the two clocks need not agree. A backlog is what is owed
+once the `Up` that carries it is filed: the rows that `Up` carries are not
+in it. Say it when it changes — at once when it empties — and not on every
+write; say it again now and then while it is not empty, and to a server
+whose epoch changed, either of which may have lost it. An `Up` without
+`backlog` leaves the last one standing (A.3). A replica that never says
+leaves the server with nothing to show, and nothing breaks.
+
+A replica **may** say how long it stays quiet at most, in `keepalive_ms`
+on every `Up`: once it has sent nothing on any lane for so long, it sends an
+`Up` on its first lane, with its backlog, or with nothing else to say. The
+server takes one that has said nothing for several times that for one that
+stopped — off, or cut off (A.3). A replica that does not say (0) is never
+taken for one that stopped.
 
 A replica may send its writes on several **lanes** — streams of `Up`s the
 transport keeps apart, each carrying the writes of some of its tables, so a
@@ -755,7 +766,9 @@ A replica implementation is complete when:
       number, and forgets on `Filed` only the notes that send carried, as it
       carried them;
 - [ ] it reports digests with the fingerprint above (optional, recommended);
-- [ ] it says its backlog when it changes (optional, recommended);
+- [ ] it says its backlog when it changes, what the `Up` carries left out,
+      with the age of each table's oldest row (optional, recommended);
+- [ ] it says its keepalive, and keeps it (optional, recommended);
 - [ ] if it holds settings: it holds their wishes as a two-way table, takes
       no answer from the server, carries each out after the message that
       brought it is committed — superseded, unread or applied as 4.5 says —
@@ -885,7 +898,13 @@ replica's limits are the server's, or less. So is an upload from a sender that
 is no replica of the server's.
 
 The server keeps the last backlog it was told, with the time, and shows the
-replica as catching up while it is not empty.
+replica as catching up while a row of it has waited longer than the server
+lets one wait — reckoned from the age the replica said, or, from a replica
+that says none, from when it said it — or cannot go as it is: rows that
+flow are not waiting. It keeps when it last filed an upload from the
+replica, on any lane, and when it last filed a row of each table; a replica
+that said its keepalive and has said nothing for several times that is
+shown as silent.
 
 ### A.4 How the server records a rejection (section 6)
 

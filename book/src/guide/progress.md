@@ -100,5 +100,23 @@ On a replica:
 That is the shop register's "2 receipts not at the head office yet". The
 replica tells the server the same, on its main lane, whenever it changes —
 with the rows it sends, at once when it starts or empties, and at most every
-`Outbox::backlog_every` while it grows. The server shows it as the replica's
-`backlog`, as of when it was said; a replica with one is still catching up.
+`Outbox::keepalive_every` while it grows — and how long ago each table's
+oldest row was written. The server shows it as the replica's `backlog`, as
+of when it was said, each table's `oldest_at` reckoned from that age; a
+replica is catching up while a row of it has waited longer than the
+server's `Settings::behind_after` (two minutes), or cannot go as it is:
+rows that flow are not waiting.
+
+## A replica that says nothing
+
+A replica that has sent nothing on any lane for `Outbox::keepalive_every`
+(a minute) says it is there, on its main lane, and every message it sends
+says how long that is. The server keeps when it last heard from each
+replica (`last_heard_at`) and when it last filed a row of each table from
+it (`filed`); one that has said nothing for
+`Settings::silent_after_keepalives` (three) of its keepalives is `silent` —
+off, or cut off, which nothing on the server's side tells apart — and is
+listed in the health's `silent`, which leaves it healthy. A replica of an
+earlier build says no keepalive, and is never silent.
+`engine().states(&mut conn, scope)` answers every replica's state at once,
+and nothing else of them: what a map of the fleet colours its tiles by.
