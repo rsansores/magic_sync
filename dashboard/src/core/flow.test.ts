@@ -3,7 +3,7 @@ import type { ReplicaOverview, TableProgress } from './contract/types.js'
 import overview from './contract/fixtures/overview.js'
 import { progressOf, summarize } from './derive.js'
 import { describeFlow, describeHeard, describeSettled, downChips, upChips, type Speech } from './describe.js'
-import { downOf, fleetOf, totalsOf, upOf, type GroupOf } from './flow.js'
+import { downOf, drawnOf, fleetOf, totalsOf, upOf, type GroupOf } from './flow.js'
 import { translator } from './i18n.js'
 import { parseTimestamp } from './time.js'
 
@@ -63,6 +63,17 @@ describe('downOf', () => {
     expect([d.settled.length, d.settledTables]).toEqual([0, 2])
   })
 
+  it('draws only the tables that wait, and folds every other one into the line, once', () => {
+    for (const d of [downOf(down), downOf(down, group)]) {
+      const drawn = drawnOf(d)
+      const tables = drawn.groups.flatMap((g) => g.tables.map((t) => t.table))
+      expect(tables).toEqual(['prices', 'customers'])
+      expect(drawn.groups.flatMap((g) => g.tables).every((t) => t.tone !== 'ok')).toBe(true)
+      expect(tables.length + drawn.folded).toBe(down.length)
+    }
+    expect(drawnOf(downOf(down, group)).groups.map((g) => g.label)).toEqual(['Catalogue', 'People'])
+  })
+
   it('says a table’s counts as chips', () => {
     const prices = downOf(down).lagging[0]!.lagging[0]!
     expect(downChips(prices, speech())).toEqual([
@@ -106,6 +117,8 @@ describe('upOf', () => {
       ['path_points', 'live', 'ok'],
     ])
     expect(upOf(writing).lagging.map((g) => g.label)).toEqual(['cuts'])
+    const drawn = drawnOf(upOf(writing, {}, () => ({ key: 'all', label: 'All' })))
+    expect([drawn.groups.flatMap((g) => g.tables.map((t) => t.table)), drawn.folded]).toEqual([['cuts'], 2])
   })
 
   it('stalls every table of a replica that has said nothing', () => {

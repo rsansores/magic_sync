@@ -27,11 +27,10 @@ function contrast(a: string, b: string): number {
 // [text, surface]: the card under every list and chip, each tint under the
 // title and the lines drawn on it, and each tone on its own tint.
 const pairs: [string, string][] = [
-  ...['fg', 'muted', 'accent', 'ok', 'warn', 'danger', 'quiet', 'off'].map((text): [string, string] => [
-    text,
-    'card',
-  ]),
-  ...['ok-soft', 'warn-soft', 'danger-soft', 'quiet-soft', 'off-soft', 'accent-soft'].flatMap(
+  ...['fg', 'muted', 'accent', 'ok', 'warn', 'danger', 'quiet', 'off', 'unknown'].map(
+    (text): [string, string] => [text, 'card'],
+  ),
+  ...['ok-soft', 'warn-soft', 'danger-soft', 'quiet-soft', 'off-soft', 'unknown-soft', 'accent-soft'].flatMap(
     (surface): [string, string][] => [
       ['fg', surface],
       ['muted', surface],
@@ -43,6 +42,7 @@ const pairs: [string, string][] = [
   ['danger', 'danger-soft'],
   ['quiet', 'quiet-soft'],
   ['off', 'off-soft'],
+  ['unknown', 'unknown-soft'],
   ['accent', 'accent-soft'],
 ]
 

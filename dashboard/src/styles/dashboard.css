@@ -22,6 +22,8 @@
   --_quiet-soft: var(--msd-quiet-soft, #f1f3f5);
   --_off: var(--msd-off, #6741d9);
   --_off-soft: var(--msd-off-soft, #f3f0ff);
+  --_unknown: var(--msd-unknown, #0b7285);
+  --_unknown-soft: var(--msd-unknown-soft, #e3fafc);
   --_accent-soft: var(--msd-accent-soft, #edf2ff);
   --_ok-tile: var(--msd-ok-tile, #b2e2bf);
   --_tile: var(--msd-tile, 14px);
@@ -287,10 +289,13 @@ button.msd-item:hover {
   --_tone: var(--_warn);
   --_tone-soft: var(--_warn-soft);
 }
-.msd [data-tone='silent'],
-.msd [data-tone='unknown'] {
+.msd [data-tone='silent'] {
   --_tone: var(--_quiet);
   --_tone-soft: var(--_quiet-soft);
+}
+.msd [data-tone='unknown'] {
+  --_tone: var(--_unknown);
+  --_tone-soft: var(--_unknown-soft);
 }
 .msd [data-tone='off'] {
   --_tone: var(--_off);
@@ -508,6 +513,11 @@ button.msd-item:hover {
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+.msd-group {
+  margin: 4px 0 0;
+  font-size: 0.9em;
+  font-weight: 600;
 }
 .msd-checks,
 .msd-tables {

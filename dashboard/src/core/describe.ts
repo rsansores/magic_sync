@@ -16,7 +16,7 @@ import {
   type TableRow,
   type TableShare,
 } from './derive.js'
-import type { Direction, DownTable, UpTable } from './flow.js'
+import type { Direction, DownFlow, UpFlow } from './flow.js'
 import { lasting, since, until } from './format.js'
 import type { Translate } from './i18n.js'
 
@@ -50,7 +50,7 @@ export function bannerOf(s: Summary, speech: Speech): Banner {
   if (s.counts.catching_up > 0)
     lines.push(t('mood.catching_up.detail', { n: s.counts.catching_up, total: s.total }))
   if (s.counts.unreachable > 0) lines.push(t('mood.unreachable', { n: s.counts.unreachable }))
-  if (s.counts.silent > 0) lines.push(t('mood.silent', { n: s.counts.silent }))
+  if (s.counts.silent > 0) lines.push(t('mood.unheard', { n: s.counts.silent }))
   if (s.fixes > 0) lines.push(t('mood.attention.detail', { n: s.fixes }))
   if (s.stuck && s.waitingSince != null) lines.push(t('mood.stuck', { since: ago(s.waitingSince, speech) }))
   if (s.unanswering > 0) lines.push(t('mood.unanswering', { n: s.unanswering }))
@@ -66,7 +66,7 @@ export function describeReplica(r: ReplicaRow, speech: Speech): string[] {
     if (r.retryAt != null) out.push(t('replica.retry', { until: ahead(r.retryAt, speech) }))
   }
   if (r.state === 'silent' && r.lastHeardAt != null)
-    out.push(t('replica.silent', { since: ago(r.lastHeardAt, speech) }))
+    out.push(t('replica.unheard', { since: ago(r.lastHeardAt, speech) }))
   if (r.quarantined > 0) out.push(t('replica.quarantined', { n: r.quarantined }))
   if (r.unfiled > 0) out.push(t('replica.unfiled', { n: r.unfiled }))
   if (r.parked > 0) out.push(t('replica.parked', { n: r.parked }))
@@ -177,7 +177,7 @@ export interface Chip {
 
 /** The counts beside a table the server sends: what is still to be sent,
  * what waits to be confirmed, what is set aside. */
-export function downChips(table: DownTable, speech: Speech): Chip[] {
+export function downChips(table: DownFlow, speech: Speech): Chip[] {
   const { t } = speech
   const chips: Chip[] = []
   if (table.toSend > 0) chips.push({ kind: 'to_send', text: t('chip.to_send', { n: table.toSend }) })
@@ -190,7 +190,7 @@ export function downChips(table: DownTable, speech: Speech): Chip[] {
 
 /** The counts beside a table a replica sends, and how long its oldest row
  * has waited. */
-export function upChips(table: UpTable, speech: Speech): Chip[] {
+export function upChips(table: UpFlow, speech: Speech): Chip[] {
   const { t } = speech
   const chips: Chip[] = []
   if (table.unsent > 0) chips.push({ kind: 'to_send', text: t('chip.to_send', { n: table.unsent }) })
@@ -206,7 +206,7 @@ export function upChips(table: UpTable, speech: Speech): Chip[] {
 
 /** Whether a table's rows reach the server as they are written, and when
  * the last one did: "Live · last 4 sec. ago". */
-export function describeFlow(table: UpTable, speech: Speech): string {
+export function describeFlow(table: UpFlow, speech: Speech): string {
   const { t } = speech
   if (table.lastFiledAt == null) return t('flow.never')
   const ago = since(table.lastFiledAt, speech.now, speech.locale)
@@ -221,7 +221,7 @@ export function describeSettled(n: number, speech: Speech, groups = false): stri
 
 /** When a replica was last heard, and whether what it writes reaches the
  * server as it writes it: "Last heard 9 sec. ago · uploading live". */
-export function describeHeard(r: ReplicaRow, up: Direction<UpTable>, speech: Speech): string[] {
+export function describeHeard(r: ReplicaRow, up: Direction<UpFlow>, speech: Speech): string[] {
   const { t } = speech
   const heard = r.lastHeardAt ?? r.heardAt
   const out = [heard == null ? t('detail.never_heard') : t('detail.heard', { since: ago(heard, speech) })]

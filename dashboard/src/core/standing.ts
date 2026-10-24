@@ -4,7 +4,7 @@
 // a host adds what only it knows (a link, a transport, anything) and may
 // combine them into states of its own.
 
-import type { ReplicaState } from './contract/types.js'
+import type { ReplicaCounts, ReplicaState } from './contract/types.js'
 import { knowsReplicaState, type ReplicaRow } from './derive.js'
 import { lasting, since, until } from './format.js'
 import type { Speech } from './describe.js'
@@ -147,12 +147,25 @@ export function tallyOf(standings: Iterable<Standing>): Tally[] {
   return [...by.values()].sort((a, b) => rankOf(a.tone) - rankOf(b.tone))
 }
 
-/** One replica that needs attention: where it stands, and one sentence. */
+/** The counters of a page: of where every replica stands, when the page has
+ * every replica (`Engine::states`) — the host's combined states included —
+ * else the engine's own counts. A page that knows only some replicas counts
+ * none of them by hand: the host's states need every replica. */
+export function countersOf(counts: ReplicaCounts, fleet: Standing[] | null, t: Translate): Tally[] {
+  if (fleet) return tallyOf(fleet)
+  return (Object.keys(counts) as ReplicaState[])
+    .filter((state) => counts[state] > 0)
+    .map((state) => ({ ...engineStanding(state, t), n: counts[state] }))
+    .sort((a, b) => rankOf(a.tone) - rankOf(b.tone))
+}
+
+/** One replica that needs attention: where it stands, and one sentence —
+ * `null` when the page holds no row of it to say it from. */
 export interface Attention {
   id: string
   name: string
   standing: Standing
-  line: string
+  line: string | null
 }
 
 /** What a replica waits on, in one short sentence. */
@@ -182,18 +195,34 @@ export interface AttentionOptions {
   line?: (r: ReplicaRow) => string | null | undefined
   /** Only those in this state — the engine's word, or the host's. */
   state?: string | null
+  /** Every replica, where each stands (the tiles of `Engine::states`): the
+   * list is of them, and `rows` only lends the sentences. Without it, the
+   * list is of `rows`. */
+  fleet?: { replica: string; name: string; standing: Standing }[] | null
 }
 
 /** The replicas that need attention, worst first, each with one sentence:
- * every one not settled, of the state asked for when one is. */
+ * every one not settled, of the state asked for when one is — of the whole
+ * fleet when it is given, else of the rows. */
 export function attentionOf(rows: ReplicaRow[], speech: Speech, options: AttentionOptions = {}): Attention[] {
-  return rows
-    .map((r) => ({
+  const said = (r: ReplicaRow) => options.line?.(r) ?? lineOf(r, speech)
+  const fleet = options.fleet
+  let listed: Attention[]
+  if (fleet) {
+    const byId = new Map(rows.map((r) => [r.id, r]))
+    listed = fleet.map((x) => {
+      const r = byId.get(x.replica)
+      return { id: x.replica, name: x.name, standing: x.standing, line: r ? said(r) : null }
+    })
+  } else {
+    listed = rows.map((r) => ({
       id: r.id,
       name: r.name,
       standing: options.standing?.(r) ?? engineStanding(r.state, speech.t),
-      line: options.line?.(r) ?? lineOf(r, speech),
+      line: said(r),
     }))
+  }
+  return listed
     .filter((a) => a.standing.tone !== 'ok' && (options.state == null || a.standing.state === options.state))
     .sort((a, b) => rankOf(a.standing.tone) - rankOf(b.standing.tone))
 }

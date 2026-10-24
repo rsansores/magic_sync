@@ -54,6 +54,7 @@ export {
   syncCheck,
   checksOf,
   tallyOf,
+  countersOf,
   lineOf,
   attentionOf,
 } from './standing.js'
@@ -69,15 +70,16 @@ export type {
 } from './standing.js'
 export { tilesOf, gridOf, into, levelUnder } from './grid.js'
 export type { Tile, TileOptions, Level, Place, Crumb, Cluster, Grid, GridOptions } from './grid.js'
-export { downOf, upOf, fleetOf, totalsOf } from './flow.js'
+export { downOf, upOf, fleetOf, totalsOf, drawnOf } from './flow.js'
 export type {
   TableGroupKey,
   GroupOf,
-  DownTable,
-  UpTable,
-  FleetTable,
+  DownFlow,
+  UpFlow,
+  FleetFlow,
   TableGroup,
   Direction,
+  Drawn,
   UpOptions,
   Totals,
 } from './flow.js'

@@ -3,14 +3,15 @@
 // everything is where it should be; counters that filter; every replica as
 // a tile, worst first; the replicas that need attention, a sentence each;
 // the tables and the problems. For the replica the host selects: where it
-// stands, its checks, and only the tables that wait, both ways.
+// stands, its checks, and only the tables that wait, both ways, every other
+// one folded into one line.
 //
 // It fetches nothing. The host passes the engine's answers in, and answers
 // `update:selected` (a replica picked: pass its progress and its own
-// listing back) and, when it
-// pages through the replicas, `update:filter` and `update:offset` (pass the
-// listing back). Where one row is belongs next to the row, in the host's own
-// listing: `RowPlaces`. Its look is in `magic_sync_dashboard/styles.css`.
+// listing back) and, when it pages through the replicas, `update:filter` and
+// `update:offset` (pass the listing back). Where one row is belongs next to
+// the row, in the host's own listing: `RowPlaces`. Its look is in
+// `magic_sync_dashboard/styles.css`.
 
 import { computed, nextTick, ref, useId, watch } from 'vue'
 import type { Listing, Overview, Progress, ReplicaState, States } from '../core/contract/types.js'
@@ -24,7 +25,7 @@ import {
   upChips,
 } from '../core/describe.js'
 import { knowsReplicaState, nameOf } from '../core/derive.js'
-import type { GroupOf } from '../core/flow.js'
+import { drawnOf, type GroupOf } from '../core/flow.js'
 import { count } from '../core/format.js'
 import { into, levelUnder, type Cluster, type Crumb, type Level, type Place } from '../core/grid.js'
 import type { Messages } from '../core/i18n.js'
@@ -58,7 +59,8 @@ const props = defineProps<{
   group?: GroupOf
   /** The checks the host knows of a replica, shown before the engine's own. */
   checks?: HostChecks
-  /** A state of the host's own from the engine's and the host's checks. */
+  /** A state of the host's own from the engine's and the host's checks:
+   * counted with `states`, which has every replica. */
   combine?: Combine
 }>()
 
@@ -73,14 +75,14 @@ const offset = defineModel<number>('offset', { default: 0 })
 /** The level the tiles are clustered by, and the places they are narrowed to. */
 const level = defineModel<string | null>('level', { default: null })
 const within = defineModel<Crumb[]>('within', { default: () => [] })
-/** A counter picked that is no state of the engine's — one of `combine`'s, or
- * a word this dashboard does not know: the tiles are narrowed to it, and the
- * listing is of every state. */
-const other = ref<string | null>(null)
-watch(filter, (state) => {
-  if (state != null) other.value = null
+/** The counter picked: the state the tiles and the replicas that need
+ * attention are narrowed to — the engine's word, which `filter` lists too,
+ * or one of `combine`'s, the listing then of every state. */
+const state = defineModel<string | null>('state', { default: null })
+watch(filter, (engine) => {
+  if (engine != null && state.value !== engine) state.value = null
 })
-const shown = computed(() => other.value ?? filter.value)
+const shown = computed(() => state.value ?? filter.value)
 
 const {
   summary,
@@ -95,6 +97,7 @@ const {
   attention,
   tables,
   detail,
+  fleet,
   progress: shares,
 } = useSyncDashboard({
   overview: () => props.overview,
@@ -146,10 +149,9 @@ const tabCount = computed(() => {
   }
 })
 
-function show(state: string | null) {
-  const engine = state != null && knowsReplicaState(state)
-  filter.value = engine ? state : null
-  other.value = engine ? null : state
+function show(picked: string | null) {
+  filter.value = picked != null && knowsReplicaState(picked) ? picked : null
+  state.value = picked
   offset.value = 0
 }
 const pageEnd = computed(() => (page.value ? page.value.offset + page.value.rows.length : 0))
@@ -177,15 +179,10 @@ const current = computed(() => {
   if (id == null) return null
   return { id, name: detail.value?.row.name ?? nameOf({ name: (r) => lookup(props.names, r) }, id) }
 })
-const flat = <T,>(groups: { lagging: T[]; settled: T[] }[]) =>
-  groups.flatMap((g) => [...g.lagging, ...g.settled])
-/** The selected replica's tables going up, each with its chips. */
-const upRows = computed(() => {
-  const d = detail.value
-  const sp = speech.value
-  if (!d || !sp) return []
-  return [...flat(d.up.lagging), ...flat(d.up.settled)].map((tb) => ({ tb, chips: upChips(tb, sp) }))
-})
+/** What the selected replica's tables wait on, each way: only the tables
+ * that wait, under their group's label when the host groups them. */
+const down = computed(() => (detail.value?.down ? drawnOf(detail.value.down) : null))
+const up = computed(() => (detail.value ? drawnOf(detail.value.up) : null))
 const total = (value: number | null) => (value == null ? '–' : n(value))
 
 // Focus follows the view: into the replica opened, and back to what opened it.
@@ -270,73 +267,88 @@ watch(selected, async (now, before) => {
               </span>
             </li>
           </ul>
+          <slot name="replica-extra" :replica="current.id" />
 
           <template v-if="!shares">
             <h4 class="msd-section">{{ t('detail.down') }}</h4>
             <p class="msd-muted">{{ t('detail.loading') }}</p>
           </template>
-          <template v-else-if="detail.down">
+          <template v-else-if="down">
             <h4 class="msd-section">{{ t('detail.down') }}</h4>
-            <ul class="msd-tables">
-              <li v-for="tb in flat(detail.down.lagging)" :key="tb.table" class="msd-table">
-                <div class="msd-row-head msd-spread">
-                  <span :id="`${id}-down-${tb.table}`" class="msd-name">{{ tb.label }}</span>
-                  <span class="msd-muted" aria-hidden="true">
-                    {{ t('detail.rows', { done: tb.upToDate, of: tb.should }) }}
-                  </span>
-                </div>
-                <div
-                  class="msd-bar"
-                  role="progressbar"
-                  aria-valuemin="0"
-                  aria-valuemax="100"
-                  :aria-valuenow="percent(tb.share)"
-                  :aria-valuetext="t('detail.rows', { done: tb.upToDate, of: tb.should })"
-                  :aria-labelledby="`${id}-down-${tb.table}`"
-                >
-                  <div :style="{ width: `${percent(tb.share)}%` }" />
+            <template v-for="g in down.groups" :key="g.key">
+              <h5 v-if="group" class="msd-group">{{ g.label }}</h5>
+              <ul class="msd-tables">
+                <li v-for="tb in g.tables" :key="tb.table" class="msd-table">
+                  <div class="msd-row-head msd-spread">
+                    <span :id="`${id}-down-${tb.table}`" class="msd-name">{{ tb.label }}</span>
+                    <span class="msd-muted" aria-hidden="true">
+                      {{ t('detail.rows', { done: tb.upToDate, of: tb.should }) }}
+                    </span>
+                  </div>
                   <div
-                    class="msd-bar-moving"
-                    :style="{
-                      width: `${tb.should === 0 ? 0 : Math.min(100 - percent(tb.share), (tb.inFlight / tb.should) * 100)}%`,
-                    }"
-                  />
-                </div>
-                <span class="msd-chips">
-                  <span
-                    v-for="chip in downChips(tb, speech)"
-                    :key="chip.kind"
-                    class="msd-chip-count"
-                    :data-kind="chip.kind"
+                    class="msd-bar"
+                    role="progressbar"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    :aria-valuenow="percent(tb.share)"
+                    :aria-valuetext="t('detail.rows', { done: tb.upToDate, of: tb.should })"
+                    :aria-labelledby="`${id}-down-${tb.table}`"
                   >
-                    {{ chip.text }}
+                    <div :style="{ width: `${percent(tb.share)}%` }" />
+                    <div
+                      class="msd-bar-moving"
+                      :style="{
+                        width: `${tb.should === 0 ? 0 : Math.min(100 - percent(tb.share), (tb.inFlight / tb.should) * 100)}%`,
+                      }"
+                    />
+                  </div>
+                  <span class="msd-chips">
+                    <span
+                      v-for="chip in downChips(tb, speech)"
+                      :key="chip.kind"
+                      class="msd-chip-count"
+                      :data-kind="chip.kind"
+                    >
+                      {{ chip.text }}
+                    </span>
                   </span>
-                </span>
-              </li>
-            </ul>
-            <p v-if="detail.down.settledTables > 0" class="msd-settled">
-              {{ describeSettled(detail.down.settledTables, speech) }}
+                </li>
+              </ul>
+            </template>
+            <p v-if="down.folded > 0" class="msd-settled">
+              {{ describeSettled(down.folded, speech) }}
             </p>
           </template>
 
-          <template v-if="upRows.length > 0">
+          <template v-if="up && (up.groups.length > 0 || up.folded > 0)">
             <h4 class="msd-section">{{ t('detail.up') }}</h4>
-            <ul class="msd-tables">
-              <li v-for="{ tb, chips } in upRows" :key="tb.table" class="msd-table">
-                <div class="msd-row-head msd-spread">
-                  <span class="msd-row-head">
-                    <span class="msd-dot msd-dot-small" :data-tone="tb.tone" aria-hidden="true" />
-                    <span class="msd-name">{{ tb.label }}</span>
+            <template v-for="g in up.groups" :key="g.key">
+              <h5 v-if="group" class="msd-group">{{ g.label }}</h5>
+              <ul class="msd-tables">
+                <li v-for="tb in g.tables" :key="tb.table" class="msd-table">
+                  <div class="msd-row-head msd-spread">
+                    <span class="msd-row-head">
+                      <span class="msd-dot msd-dot-small" :data-tone="tb.tone" aria-hidden="true" />
+                      <span class="msd-name">{{ tb.label }}</span>
+                    </span>
+                    <span class="msd-muted">{{ describeFlow(tb, speech) }}</span>
+                  </div>
+                  <span v-if="upChips(tb, speech).length" class="msd-chips">
+                    <span
+                      v-for="chip in upChips(tb, speech)"
+                      :key="chip.kind"
+                      class="msd-chip-count"
+                      :data-kind="chip.kind"
+                    >
+                      {{ chip.text }}
+                    </span>
                   </span>
-                  <span class="msd-muted">{{ describeFlow(tb, speech) }}</span>
-                </div>
-                <span v-if="chips.length" class="msd-chips">
-                  <span v-for="chip in chips" :key="chip.kind" class="msd-chip-count" :data-kind="chip.kind">
-                    {{ chip.text }}
-                  </span>
-                </span>
-              </li>
-            </ul>
+                </li>
+              </ul>
+            </template>
+            <p v-if="up.folded > 0" class="msd-settled">
+              {{ describeSettled(up.folded, speech) }}
+            </p>
           </template>
 
           <template v-if="detail.problems.length">
@@ -361,7 +373,7 @@ watch(selected, async (now, before) => {
           </template>
           <code v-else-if="detail.row.lastError">{{ detail.row.lastError }}</code>
         </template>
-        <slot name="replica-extra" :replica="current.id" />
+        <slot v-else name="replica-extra" :replica="current.id" />
       </section>
 
       <template v-else>
@@ -485,7 +497,13 @@ watch(selected, async (now, before) => {
               <span class="msd-muted">{{ t('grid.order') }}</span>
             </div>
             <p v-if="attention.length === 0" class="msd-muted">
-              {{ shown == null ? t('attention.none') : t('replica.none') }}
+              {{
+                !fleet && page.offset > 0
+                  ? t('attention.none_here')
+                  : shown == null
+                    ? t('attention.none')
+                    : t('replica.none')
+              }}
             </p>
             <ul class="msd-attention">
               <li v-for="a in attention" :key="a.id">
@@ -497,14 +515,14 @@ watch(selected, async (now, before) => {
                 >
                   <span class="msd-state" :data-tone="a.standing.tone">{{ a.standing.label }}</span>
                   <span class="msd-name">{{ a.name }}</span>
-                  <span class="msd-muted">{{ a.line }}</span>
+                  <span v-if="a.line" class="msd-muted">{{ a.line }}</span>
                 </button>
               </li>
             </ul>
-            <p v-if="page.worst && page.total > page.rows.length" class="msd-muted">
+            <p v-if="!fleet && page.worst && page.total > page.rows.length" class="msd-muted">
               {{ t('replicas.worst', { n: page.rows.length, total: page.total }) }}
             </p>
-            <nav v-else-if="!page.worst && page.total > page.rows.length" class="msd-pager">
+            <nav v-else-if="!fleet && !page.worst && page.total > page.rows.length" class="msd-pager">
               <button type="button" class="msd-chip" :aria-disabled="!hasPrevious" @click="turn(false)">
                 {{ t('replicas.previous') }}
               </button>

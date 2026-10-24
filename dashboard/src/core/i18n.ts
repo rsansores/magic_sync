@@ -30,7 +30,7 @@ const en: MessageTable = {
     one: '{n} replica cannot be reached; it gets what it is owed once it can.',
     other: '{n} replicas cannot be reached; each gets what it is owed once it can.',
   },
-  'mood.silent': {
+  'mood.unheard': {
     one: '{n} replica has said nothing for longer than it said it would.',
     other: '{n} replicas have said nothing for longer than they said they would.',
   },
@@ -86,7 +86,7 @@ const en: MessageTable = {
   'replica.heard': 'Last confirmed {since}.',
   'replica.never': 'Nothing confirmed yet.',
   'replica.unreachable': 'Cannot be reached.',
-  'replica.silent': 'Last heard {since}.',
+  'replica.unheard': 'Last heard {since}.',
   'replica.retry': 'Tried again {until}.',
   'replica.quarantined': {
     one: '{n} row set aside.',
@@ -286,6 +286,7 @@ const en: MessageTable = {
   'grid.legend': 'What each colour means',
   'attention.title': 'Need attention',
   'attention.none': 'Nothing needs attention.',
+  'attention.none_here': 'Nothing on this page needs attention.',
 }
 
 const es: MessageTable = {
@@ -303,7 +304,7 @@ const es: MessageTable = {
     one: '{n} réplica no se puede alcanzar; recibe lo que se le debe en cuanto se pueda.',
     other: '{n} réplicas no se pueden alcanzar; cada una recibe lo que se le debe en cuanto se pueda.',
   },
-  'mood.silent': {
+  'mood.unheard': {
     one: '{n} réplica lleva más tiempo sin señales del que dijo.',
     other: '{n} réplicas llevan más tiempo sin señales del que dijeron.',
   },
@@ -359,7 +360,7 @@ const es: MessageTable = {
   'replica.heard': 'Última confirmación {since}.',
   'replica.never': 'Aún no confirma nada.',
   'replica.unreachable': 'No se puede alcanzar.',
-  'replica.silent': 'Última señal {since}.',
+  'replica.unheard': 'Última señal {since}.',
   'replica.retry': 'Se reintenta {until}.',
   'replica.quarantined': {
     one: '{n} registro apartado.',
@@ -559,6 +560,7 @@ const es: MessageTable = {
   'grid.legend': 'Qué significa cada color',
   'attention.title': 'Piden atención',
   'attention.none': 'Nada pide atención.',
+  'attention.none_here': 'Nada en esta página pide atención.',
 }
 
 export const builtinMessages: Messages = { en, es }

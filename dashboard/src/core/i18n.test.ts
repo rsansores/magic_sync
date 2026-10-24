@@ -30,6 +30,15 @@ describe('translator', () => {
     expect(translator('en')('replica.retry')).toBe('Tried again {until}.')
   })
 
+  it('has no key that meant something else in an earlier release', () => {
+    // 0.3.0's `mood.silent` and `replica.silent` said a replica was not
+    // answering; that is `mood.unanswering` and `replica.unanswering` now, and
+    // an override a host wrote for the old meaning must not land on the
+    // silent state.
+    for (const key of ['mood.silent', 'replica.silent']) expect(builtinMessages.en![key], key).toBeUndefined()
+    expect(translator('en')('mood.unheard', { n: 2 })).toContain('said nothing')
+  })
+
   it('has every English message in Spanish, with the same placeholders and plural forms', () => {
     const { en, es } = builtinMessages
     const shape = (m: unknown) =>

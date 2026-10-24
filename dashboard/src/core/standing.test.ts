@@ -7,6 +7,7 @@ import { translator } from './i18n.js'
 import {
   attentionOf,
   checksOf,
+  countersOf,
   engineStanding,
   lineOf,
   standingOf,
@@ -166,6 +167,27 @@ describe('tallyOf', () => {
   })
 })
 
+describe('countersOf', () => {
+  const counts = { awaiting_fix: 3, unreachable: 0, silent: 40, catching_up: 7, synced: 950 }
+
+  it('are the engine’s counts when the page does not hold every replica', () => {
+    expect(countersOf(counts, null, t).map((x) => [x.state, x.n])).toEqual([
+      ['awaiting_fix', 3],
+      ['silent', 40],
+      ['catching_up', 7],
+      ['synced', 950],
+    ])
+  })
+
+  it('count where every replica stands when it does, the host’s states included', () => {
+    const fleet = [engineStanding('synced', t), { state: 'offline', tone: 'off' as const, label: 'Offline' }]
+    expect(countersOf(counts, fleet, t).map((x) => [x.state, x.n])).toEqual([
+      ['offline', 1],
+      ['synced', 1],
+    ])
+  })
+})
+
 describe('lineOf', () => {
   it('says the one thing a replica waits on most, in a short sentence', () => {
     expect(lineOf(rowOf({ state: 'awaiting_fix', unfiled: 1, quarantined: 2 }), speech())).toBe(
@@ -210,7 +232,7 @@ describe('attentionOf', () => {
       'silent',
       'catching_up',
     ])
-    expect(listed.every((a) => a.line.length > 0)).toBe(true)
+    expect(listed.every((a) => (a.line ?? '').length > 0)).toBe(true)
   })
 
   it('takes the host’s standing and sentence for a replica when it gives them', () => {
@@ -224,6 +246,21 @@ describe('attentionOf', () => {
     expect(listed.map((a) => [a.standing.state, a.name])).toContainEqual(['offline', '6'])
     expect(listed.find((a) => a.standing.state === 'offline')!.line).toBe('Offline for 3 hr.')
     expect(listed.map((a) => a.standing.tone)).toEqual(['attention', 'off', 'off', 'silent', 'moving'])
+  })
+
+  it('lists the whole fleet when it is given, each with the sentence of its row when the page has one', () => {
+    const tile = (replica: string, state: string) => ({
+      replica,
+      name: replica,
+      standing: engineStanding(state, t),
+    })
+    const listed = attentionOf(rows.slice(0, 1), speech(), {
+      fleet: [tile('off-page', 'silent'), tile(rows[0]!.id, rows[0]!.state), tile('fine', 'synced')],
+    })
+    expect(listed.map((a) => [a.id, a.line == null])).toEqual([
+      [rows[0]!.id, false],
+      ['off-page', true],
+    ])
   })
 
   it('narrows to one state, the host’s as well as the engine’s', () => {

@@ -16,10 +16,8 @@ import type { Messages } from '../core/i18n.js'
 import {
   attentionOf,
   checksOf,
-  engineStanding,
-  rankOf,
+  countersOf,
   standingOf,
-  tallyOf,
   type Combine,
   type HostChecks,
   type Tally,
@@ -76,7 +74,9 @@ export interface SyncDashboardOptions {
   group?: MaybeRefOrGetter<GroupOf | undefined>
   /** The checks the host knows of a replica, read before the engine's own. */
   checks?: MaybeRefOrGetter<HostChecks | undefined>
-  /** A state of the host's own from the engine's and the host's checks. */
+  /** A state of the host's own from the engine's and the host's checks.
+   * The counters count the host's states only with `states`, which has every
+   * replica; without it, they are the engine's counts. */
   combine?: MaybeRefOrGetter<Combine | undefined>
 }
 
@@ -136,11 +136,16 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
   const standing = (replica: string, state: string) =>
     standingOf(state, hostChecks(replica), t, toValue(options.combine))
 
-  /** Every replica as a tile: of `Engine::states`, else of the overview's worst. */
-  const tiles = computed((): Tile[] => {
+  /** Every replica as a tile, of `Engine::states`; `null` without it. */
+  const fleet = computed((): Tile[] | null => {
     const states = toValue(options.states)
-    if (!summary.value || !derive.value) return []
-    if (states && readsContract(states)) return tilesOf(states, t, { name: derive.value.name, standing })
+    if (!summary.value || !derive.value || !states || !readsContract(states)) return null
+    return tilesOf(states, t, { name: derive.value.name, standing })
+  })
+  /** The tiles: every replica, else the overview's worst. */
+  const tiles = computed((): Tile[] => {
+    if (fleet.value) return fleet.value
+    if (!summary.value) return []
     return summary.value.worst.map((r) => ({
       replica: r.id,
       name: r.name,
@@ -162,25 +167,22 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
       locale: locale.value,
     }),
   )
-  /** How many stand in each state, worst first: of every tile when the host
-   * passed `states`, else the engine's counts. */
+  /** How many stand in each state, worst first: of every replica when the
+   * host passed `states`, else the engine's counts. */
   const tally = computed((): Tally[] => {
     const s = summary.value
     if (!s) return []
-    const states = toValue(options.states)
-    if ((states && readsContract(states)) || toValue(options.combine))
-      return tallyOf(tiles.value.map((x) => x.standing))
-    return (Object.keys(s.counts) as ReplicaState[])
-      .filter((state) => s.counts[state] > 0)
-      .map((state) => ({ ...engineStanding(state, t), n: s.counts[state] }))
-      .sort((a, b) => rankOf(a.tone) - rankOf(b.tone))
+    return countersOf(s.counts, fleet.value?.map((x) => x.standing) ?? null, t)
   })
   const rowStanding = (r: ReplicaRow) => standing(r.id, r.state)
-  /** The replicas listed that are not settled, worst first, a sentence each:
-   * of the state shown, when one is. */
+  /** The replicas not settled, worst first, a sentence each, of the state
+   * shown when one is: every one of `states` when the host passed it (the
+   * sentence of each the page and the overview hold a row of), else the
+   * page's. */
   const attention = computed(() => {
-    if (!page.value || !speech.value) return []
-    return attentionOf(page.value.rows, speech.value, { standing: rowStanding, state: shown() })
+    if (!page.value || !speech.value || !summary.value) return []
+    const rows = fleet.value ? [...summary.value.worst, ...page.value.rows] : page.value.rows
+    return attentionOf(rows, speech.value, { standing: rowStanding, state: shown(), fleet: fleet.value })
   })
   /** The tables over the fleet, the settled folded. */
   const tables = computed(() =>
@@ -224,6 +226,7 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
     t,
     locale,
     now,
+    fleet,
     tiles,
     grid,
     tally,
