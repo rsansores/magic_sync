@@ -7,10 +7,21 @@
 // own handlers, behind its own auth) and passes them in.
 
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
-import type { Listing, Overview, Progress, ReplicaState } from '../core/contract/types.js'
-import { bannerOf, engineTableLabel, mismatchOf, type Speech } from '../core/describe.js'
-import { pageOf, progressOf, readsContract, summarize } from '../core/derive.js'
+import type { Listing, Overview, Progress, ReplicaState, States } from '../core/contract/types.js'
+import { bannerOf, describeHeard, engineTableLabel, mismatchOf, type Speech } from '../core/describe.js'
+import { pageOf, progressOf, readsContract, selectedRow, summarize, type ReplicaRow } from '../core/derive.js'
+import { downOf, fleetOf, totalsOf, upOf, type GroupOf } from '../core/flow.js'
+import { gridOf, tilesOf, type Crumb, type GridOptions, type Level, type Tile } from '../core/grid.js'
 import type { Messages } from '../core/i18n.js'
+import {
+  attentionOf,
+  checksOf,
+  countersOf,
+  standingOf,
+  type Combine,
+  type HostChecks,
+  type Tally,
+} from '../core/standing.js'
 import { useServerClock } from './clock.js'
 import { useDashboardI18n } from './i18n.js'
 
@@ -22,11 +33,18 @@ export interface SyncDashboardOptions {
   overview: MaybeRefOrGetter<Overview | null | undefined>
   /** `Engine::listing` for `filter`, when the host pages through the replicas. */
   listing?: MaybeRefOrGetter<Listing | null | undefined>
-  /** The state the replicas are listed in; every state when `null`. */
+  /** The engine's state the replicas are listed in; every state when `null`. */
   filter?: MaybeRefOrGetter<ReplicaState | null | undefined>
+  /** The state the tiles and the replicas that need attention are narrowed
+   * to, the engine's word or one of `combine`'s; `filter` when not given. */
+  state?: MaybeRefOrGetter<string | null | undefined>
   /** The replica being looked at, and `Engine::progress` for it. */
   selected?: MaybeRefOrGetter<string | null | undefined>
   progress?: MaybeRefOrGetter<Progress | null | undefined>
+  /** `Engine::listing` over the selected replica alone
+   * (`Scope::Replicas(&[selected])`): its row, wherever it is in the fleet.
+   * Without it, the row is looked for in the page and the overview's worst. */
+  replica?: MaybeRefOrGetter<Listing | null | undefined>
   /** The host's names for its replicas. */
   names?: MaybeRefOrGetter<Names | undefined>
   /** The host's names for the tables. */
@@ -37,10 +55,29 @@ export interface SyncDashboardOptions {
   messages?: MaybeRefOrGetter<Messages | undefined>
   /** How long a replica may leave what it was sent unconfirmed before it is
    * "not answering", in ms. Default 15 minutes. */
-  silentAfter?: MaybeRefOrGetter<number | undefined>
+  unansweringAfter?: MaybeRefOrGetter<number | undefined>
   /** How long a change may wait to be sent before the page asks for
    * attention, in ms. Default 15 minutes, the server's own alarm. */
   stuckAfter?: MaybeRefOrGetter<number | undefined>
+  /** `Engine::states`: every replica's state, for the tiles. Without it the
+   * tiles are the overview's worst. */
+  states?: MaybeRefOrGetter<States | null | undefined>
+  /** The levels the host places its replicas at, the widest first, and
+   * where each replica is at one: the tiles gather in a cluster per place.
+   * Without them, one cluster of every tile. */
+  levels?: MaybeRefOrGetter<Level[] | undefined>
+  placeOf?: MaybeRefOrGetter<GridOptions['placeOf']>
+  /** The level the tiles are clustered by, and the places they are narrowed to. */
+  level?: MaybeRefOrGetter<string | null | undefined>
+  within?: MaybeRefOrGetter<Crumb[] | undefined>
+  /** The group the host gathers each table in; a group per table otherwise. */
+  group?: MaybeRefOrGetter<GroupOf | undefined>
+  /** The checks the host knows of a replica, read before the engine's own. */
+  checks?: MaybeRefOrGetter<HostChecks | undefined>
+  /** A state of the host's own from the engine's and the host's checks.
+   * The counters count the host's states only with `states`, which has every
+   * replica; without it, they are the engine's counts. */
+  combine?: MaybeRefOrGetter<Combine | undefined>
 }
 
 export const lookup = (names: Names | undefined, key: string) =>
@@ -67,7 +104,7 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
           name: (replica: string) => lookup(toValue(options.names), replica),
           label: (table: string) => lookup(toValue(options.labels), table) ?? engineTableLabel(table, t),
           now: now.value,
-          silentAfter: toValue(options.silentAfter),
+          unansweringAfter: toValue(options.unansweringAfter),
           stuckAfter: toValue(options.stuckAfter),
         },
   )
@@ -95,7 +132,108 @@ export function useSyncDashboard(options: SyncDashboardOptions) {
     summary.value && speech.value ? bannerOf(summary.value, speech.value) : null,
   )
 
-  return { summary, page, progress, banner, error, speech, t, locale, now }
+  const hostChecks = (replica: string) => toValue(options.checks)?.(replica) ?? []
+  const standing = (replica: string, state: string) =>
+    standingOf(state, hostChecks(replica), t, toValue(options.combine))
+
+  /** Every replica as a tile, of `Engine::states`; `null` without it. */
+  const fleet = computed((): Tile[] | null => {
+    const states = toValue(options.states)
+    if (!summary.value || !derive.value || !states || !readsContract(states)) return null
+    return tilesOf(states, t, { name: derive.value.name, standing })
+  })
+  /** The tiles: every replica, else the overview's worst. */
+  const tiles = computed((): Tile[] => {
+    if (fleet.value) return fleet.value
+    if (!summary.value) return []
+    return summary.value.worst.map((r) => ({
+      replica: r.id,
+      name: r.name,
+      audience: r.audience,
+      standing: standing(r.id, r.state),
+    }))
+  })
+  /** The state the tiles and the replicas that need attention are narrowed to. */
+  const shown = () => toValue(options.state) ?? toValue(options.filter) ?? null
+  /** The tiles in clusters, narrowed to the state shown. */
+  const grid = computed(() =>
+    gridOf(tiles.value, {
+      levels: toValue(options.levels),
+      placeOf: toValue(options.placeOf),
+      level: toValue(options.level),
+      within: toValue(options.within),
+      state: shown(),
+      nowhere: t('grid.nowhere'),
+      locale: locale.value,
+    }),
+  )
+  /** How many stand in each state, worst first: of every replica when the
+   * host passed `states`, else the engine's counts. */
+  const tally = computed((): Tally[] => {
+    const s = summary.value
+    if (!s) return []
+    return countersOf(s.counts, fleet.value?.map((x) => x.standing) ?? null, t)
+  })
+  const rowStanding = (r: ReplicaRow) => standing(r.id, r.state)
+  /** The replicas not settled, worst first, a sentence each, of the state
+   * shown when one is: every one of `states` when the host passed it (the
+   * sentence of each the page and the overview hold a row of), else the
+   * page's. */
+  const attention = computed(() => {
+    if (!page.value || !speech.value || !summary.value) return []
+    const rows = fleet.value ? [...summary.value.worst, ...page.value.rows] : page.value.rows
+    return attentionOf(rows, speech.value, { standing: rowStanding, state: shown(), fleet: fleet.value })
+  })
+  /** The tables over the fleet, the settled folded. */
+  const tables = computed(() =>
+    summary.value ? fleetOf(summary.value.tables, toValue(options.group)) : null,
+  )
+
+  /** The replica looked at: where it stands, its checks, its tables both ways. */
+  const detail = computed(() => {
+    const id = toValue(options.selected)
+    const sp = speech.value
+    if (id == null || !sp || !derive.value) return null
+    const row = selectedRow(
+      id,
+      toValue(options.replica),
+      [...(page.value?.rows ?? []), ...(summary.value?.worst ?? [])],
+      derive.value,
+    )
+    if (!row) return null
+    const group = toValue(options.group)
+    const down = progress.value ? downOf(progress.value.tables, group) : null
+    const up = upOf(row, { label: derive.value.label }, group)
+    return {
+      row,
+      standing: rowStanding(row),
+      checks: checksOf(row, sp, toValue(options.checks)),
+      heard: describeHeard(row, up, sp),
+      totals: totalsOf(row, down),
+      down,
+      up,
+      problems: summary.value?.problems.filter((p) => p.replica === id) ?? [],
+    }
+  })
+
+  return {
+    summary,
+    page,
+    progress,
+    banner,
+    error,
+    speech,
+    t,
+    locale,
+    now,
+    fleet,
+    tiles,
+    grid,
+    tally,
+    attention,
+    tables,
+    detail,
+  }
 }
 
 export type SyncDashboard = ReturnType<typeof useSyncDashboard>

@@ -2,7 +2,7 @@
 import type { Listing } from '../types.js'
 
 export default {
-  "contract": 1,
+  "contract": 2,
   "now": "2026-01-01T00:00:00.123456Z",
   "offset": 0,
   "replicas": {
@@ -10,24 +10,29 @@ export default {
       {
         "applied_at": null,
         "audience": "test",
+        "awaiting_fix": 0,
         "backlog": {
           "at": "2026-01-01T00:00:00.123456Z",
           "tables": [
             {
+              "oldest_at": "2026-01-01T00:00:00.123456Z",
               "set_aside": 0,
               "table": "receipts",
               "unfiled": 1,
-              "unsent": 2
+              "unsent": 2,
+              "waits": true
             }
           ]
         },
         "failures": 0,
+        "filed": [],
         "last_error": null,
+        "last_heard_at": "2026-01-01T00:00:00.123456Z",
         "owed": 0,
         "parked": 0,
         "pending": 0,
         "quarantined": 0,
-        "replica": "00000000-0000-7000-8000-000000000004",
+        "replica": "00000000-0000-7000-8000-000000000005",
         "retry_at": null,
         "sent_at": "2026-01-01T00:00:00.123456Z",
         "state": "catching_up",

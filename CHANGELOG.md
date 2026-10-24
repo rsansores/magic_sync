@@ -1,5 +1,159 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
+(unchanged: fields added). Dashboard contract 2.
+
+- **A backlog is what is owed once its upload is filed.** An upload counted
+  the rows it carried as unsent, and the server stored, once it had filed
+  them, a backlog that still held them. A backlog now leaves them out, and
+  rows only on their way start nothing: the upload that carries them said
+  what was owed besides.
+- **How long a row has waited.** A replica stamps each note as it is made
+  (`sync_notes.noted_at`, by an engine trigger: the host's triggers do not
+  change), and its backlog says how long ago each table's oldest row was
+  written, as an age (`TableBacklog.oldest_ms`), so the two clocks need not
+  agree. A status reads it as `UpProgress::oldest_at`. A row written again
+  once its upload was made goes up again when that upload is filed, and has
+  waited since that upload, not since its first write: a row written over
+  and over is not taken for one that waits.
+- **Behind is what waits.** A replica is catching up from its side while a
+  row it wrote has waited longer than `Settings::behind_after` (two
+  minutes; not zero), or cannot go as it is: rows that flow are younger. A replica of
+  an earlier build, which says no age, is judged as before: catching up
+  while it says any row has not gone. The answer says which tables wait
+  (`UpTable::waits`, each table of `Backlog::tables`), so a dashboard keeps
+  no copy of the rule.
+- **Keepalive.** `Outbox::keepalive_every` (a minute) takes the place of
+  `Outbox::backlog_every`: once nothing has gone up on any lane for so long,
+  the replica sends a message on its first lane, its backlog in it, with
+  nothing else to say if need be, and every message says the cadence
+  (`Up.keepalive_ms`). The server keeps when it last heard from each
+  replica, on any lane (`ReplicaOverview::last_heard_at`), and when it last
+  filed a row of each table from it (`ReplicaOverview::filed`) — rows filed
+  again out of the inbox too, which are not hearing from it. A replica
+  refuses a keepalive over a day, which the server takes for none, and an
+  `idle` it would sleep past its keepalive by; keep the keepalive well
+  under `behind_after`.
+- **Silent.** `ReplicaState::Silent`: a replica that said its keepalive and
+  has said nothing for `Settings::silent_after_keepalives` (three) times
+  that — off, or cut off. After a fix and an unreachable one, before
+  catching up; counted (`ReplicaCounts::silent`), listed, and named in
+  `Health::silent` — the replicas in that state, as the counts count them
+  — which leaves the health healthy, and which the health reads without
+  settling every replica's state. A replica that says no
+  keepalive, as one of an earlier build, never is: a fleet upgrades over
+  days. The relay keeps `behind_after` and `silent_after_keepalives` in
+  the database when it takes its lock (`sync.settings`), with when it did,
+  and every status judges by them there: a process that only reads a
+  status judges as the relay does, and `Server::new` writes nothing. A
+  replica heard before the relay took its lock is silent only once it has
+  said nothing for its keepalives counted from then: after an outage of
+  the server, the fleet is not taken for silent. One state settles every
+  replica's, for every read. Its watch warns of a replica as it falls
+  silent, not on every pass, and of how many more than it names.
+- **What waits for a fix, per replica.** `ReplicaOverview::awaiting_fix`:
+  the rows set aside for it until a fix, not those held back behind them,
+  the rows it sent that wait in the inbox, and the changes of it alone set
+  aside — what makes it `awaiting_fix`, which a dashboard says without
+  adding up counts that hold more.
+- **Every replica's state at once.** `Engine::states(scope)`: each replica
+  of a scope with its audience and its state, worst first, for a map of the
+  fleet — some 15 ms over 4000 replicas.
+- **The dashboard shows only what waits.** The ready-made `SyncDashboard`
+  has counters that filter, a tile per replica worst first (from
+  `Engine::states`, passed as `states`), and the replicas that need
+  attention, a sentence each; a replica's page says when it was last heard
+  and whether what it writes goes up live, its three numbers (to send, to
+  confirm, set aside), its checks, and only the tables that wait, both ways
+  — under their group's name when the host groups them — every other one,
+  up a table whose rows go up live, folded into one line ("2 more tables up
+  to date"). With `states`, the replicas that need attention are of every
+  replica, not of one page. Its row
+  comes from a listing over it alone (`replica`), so a tile of a replica
+  on no page at hand opens it all the same. A host places its replicas (`levels`, `placeOf`: the tiles gather in a cluster
+  per place, a cluster's header leads a level down, `v-model:level` and
+  `v-model:within`), groups its tables (`group`), adds checks of its own
+  (`checks`) and more under them (the slot `replica-extra`), and states of
+  its own (`combine`), which filter the tiles and, given `states`, which
+  holds every replica, the counters count; the counter picked is
+  `v-model:state`. With `states`, the replicas that need attention are
+  shown a page (`pageSize`) at a time, and the listing only lends them
+  their sentences. A replica's sentence follows its state, in the engine's
+  order, and says a cause only within the state it explains; "N changes
+  wait for a fix" is the engine's figure (`ReplicaRow::awaitingFix`). A
+  table up with nothing on its way says *Nothing waiting · last …*, not
+  *Live*. Every tile reaches 3:1 against the card, so the default
+  `--msd-ok-tile` is a darker green. The Tables tab is called Data.
+- **The dashboard's core, for a host's own design system.** Pure functions
+  of the answers: a `Tone` per state; `syncCheck` and `checksOf`, the
+  engine's check after the host's; `standingOf` with a host's `Combine`,
+  for states of its own made from the engine's and its checks; `tallyOf`
+  and `countersOf`; `attentionOf` and `lineOf`; `selectedRow`; `tilesOf`,
+  `gridOf`, `into` and `levelUnder` for the tiles in clusters; `downOf`,
+  `upOf`, `fleetOf`, `drawnOf` and `totalsOf` for the tables both ways
+  (`DownFlow`, `UpFlow`, `FleetFlow`), live or stalled, in the host's
+  groups; `downChips`,
+  `upChips`, `describeFlow`, `describeSettled`, `describeHeard` and
+  `lasting` to say them. `useSyncDashboard` takes `states`, `replica`,
+  `levels`, `placeOf`, `level`, `within`, `group`, `checks`, `combine` and
+  `state` (the state the tiles and the replicas that need attention are
+  narrowed to, the host's or the engine's), and answers `tiles`, `grid`,
+  `tally`, `attention`, `tables` and `detail`. Every new sentence is in English and Spanish, and
+  every new look a variable (`--msd-quiet`, `--msd-off`, `--msd-unknown`,
+  their `-soft` tints, `--msd-accent-soft`, `--msd-ok-tile`, `--msd-tile`).
+
+Upgrading: the replica first or the server first, either way. An earlier
+replica says no age and no keepalive, and is judged as before but for
+silence; an earlier server ignores both.
+
+A status reads `sync.settings` now. Where the roles that read a status are
+granted `SELECT` table by table, rather than on the schema, grant it on
+`sync.settings` too: a status read without it fails, it does not judge by
+defaults. The relay's role writes it (`UPDATE`) when it takes its lock.
+
+### Breaking
+
+- **Server schema 5.** `Server::install` takes the database there; with
+  migrations of your own, run `plan::migration(5)`, which adds
+  `sync.replicas.last_heard_at`, `keepalive` and `filed`, and
+  `sync.settings`. Stop the server's
+  processes of the earlier build before the upgrade (*Upgrading*, in the
+  book).
+- **Replica schema 3.** `replica::install` takes the database there; with
+  migrations of your own, run `replica::migration(3)`, which adds
+  `sync_notes.noted_at`, the trigger `sync_notes_noted` that stamps it, and
+  `sync_spoken`. The triggers `replica::triggers` prints are printed alike.
+- **`Outbox::backlog_every` is `Outbox::keepalive_every`,** and
+  `Replica::new` refuses one over a day, or not over `idle`.
+- **`Settings::behind_after` may not be zero,** which `Server::new` refuses.
+- **Dashboard contract 2.** `catching_up` means what waits, not what is on
+  its way; `silent` is a state; `ReplicaOverview` says `last_heard_at` and
+  `filed` and `awaiting_fix`, `UpProgress` `oldest_at`, each table of a `Backlog` is an
+  `UpTable` (the said `UpProgress` and `waits`), `Health` says `silent`, and
+  `States` is the answer of `Engine::states`. The dashboard reads contract
+  2, and refuses 1.
+- **The ready-made dashboard's filters are counters,** drawn by
+  `.msd-counter` where they were `.msd-chip`, and a state's colour is its
+  tone (`data-tone`) where it was its state (`data-state`): a stylesheet of
+  a host's that styled those is restyled.
+- **"Silent" is the state alone, in the dashboard.** What it called a
+  replica not answering what it was sent is *unanswering*: `silentAfter` is
+  `unansweringAfter`, `ReplicaRow::silentFor` is `unansweringFor`,
+  `Summary::silent` is `unanswering`, and the messages `mood.silent` and
+  `replica.silent` are `mood.unanswering` and `replica.unanswering`; the
+  silent state's are new keys, `mood.unheard` and `replica.unheard`, so an
+  override written for the old meaning lands on neither. A silent replica
+  is said to be silent, not unanswering too.
+- The public API adds `Engine::states`, `States`, `StateEntry`, `Silent`,
+  `TableFiled`, `UpTable`, `ReplicaState::Silent`, `ReplicaCounts::silent`,
+  `Health::silent`, `ReplicaOverview::{last_heard_at, filed, awaiting_fix}`,
+  `UpProgress::oldest_at` and server `Settings::{behind_after,
+  silent_after_keepalives}`; it renames `Outbox::backlog_every` to
+  `Outbox::keepalive_every`, and `Backlog::tables` holds `UpTable`s where it
+  held `UpProgress`es.
+
 ## 0.3.0 — 2026-10-23
 
 Rows a view places. Schemas: server 4, replica 2 (unchanged). Protocol 1

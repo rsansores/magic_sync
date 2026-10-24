@@ -8,8 +8,10 @@ import {
   type Overview,
   type Progress,
   type ReplicaOverview,
+  type Level,
   type ReplicaState,
   type RowProgress,
+  type States,
   type TableOverview,
 } from '../src/index.js'
 
@@ -20,6 +22,8 @@ const scenario = ref<Scenario>((query.get('scenario') as Scenario | null) ?? 'ca
 const locale = ref(query.get('locale') ?? 'en')
 const selected = ref<string | null>(query.get('selected'))
 const theme = query.get('theme') ?? 'light'
+// ?places=1 gathers the tiles by where the registers are.
+const placed = ref(query.get('places') === '1')
 
 const now = Date.now()
 const ago = (minutes: number) => new Date(now - minutes * 60_000).toISOString()
@@ -49,13 +53,16 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     unconfirmed: false,
     quarantined: 0,
     unfiled: 0,
+    awaiting_fix: 0,
     failures: 0,
     last_error: null,
     retry_at: null,
     sent_at: ago(3 + i),
     applied_at: ago(3 + i),
     waiting_since: null,
+    last_heard_at: ago(i % 4),
     backlog: null,
+    filed: [{ table: 'receipts', last_filed_at: ago(2 + i) }],
     wishes: { pending: 0, waiting: 0, refused: 0, superseded: 0 },
   }
   if (scenario === 'healthy') return base
@@ -65,11 +72,24 @@ function replica(i: number, scenario: Scenario): ReplicaOverview {
     return {
       ...base,
       state: 'catching_up',
-      backlog: { at: ago(1), tables: [{ table: 'receipts', unsent: 3, unfiled: 1, set_aside: 0 }] },
+      backlog: {
+        at: ago(1),
+        tables: [
+          { table: 'receipts', unsent: 3, unfiled: 1, set_aside: 0, oldest_at: ago(200), waits: true },
+        ],
+      },
+    }
+  if (i === 13)
+    return {
+      ...base,
+      state: 'silent',
+      last_heard_at: ago(6),
+      filed: [{ table: 'receipts', last_filed_at: ago(6) }],
     }
   if (i === 11)
     return { ...base, state: 'catching_up', wishes: { pending: 1, waiting: 1, refused: 1, superseded: 0 } }
-  if (scenario === 'attention' && i === 2) return { ...base, state: 'awaiting_fix', quarantined: 2 }
+  if (scenario === 'attention' && i === 2)
+    return { ...base, state: 'awaiting_fix', quarantined: 2, awaiting_fix: 2 }
   if (scenario === 'attention' && i === 9)
     return {
       ...base,
@@ -102,11 +122,11 @@ function table(name: string, scenario: Scenario): TableOverview {
 const overview = computed<Overview>(() => {
   const s = scenario.value
   const attention = s === 'attention'
-  const severity: ReplicaState[] = ['awaiting_fix', 'unreachable', 'catching_up', 'synced']
+  const severity: ReplicaState[] = ['awaiting_fix', 'unreachable', 'silent', 'catching_up', 'synced']
   const replicas = Array.from({ length: FLEET }, (_, i) => replica(i, s)).sort(
     (a, b) => severity.indexOf(a.state) - severity.indexOf(b.state),
   )
-  const states = { awaiting_fix: 0, unreachable: 0, catching_up: 0, synced: 0 }
+  const states = { awaiting_fix: 0, unreachable: 0, silent: 0, catching_up: 0, synced: 0 }
   for (const r of replicas) states[r.state] += 1
   return {
     contract: CONTRACT,
@@ -146,10 +166,40 @@ const overview = computed<Overview>(() => {
             ]
           : [],
       },
+      silent: {
+        total: states.silent,
+        first: replicas
+          .filter((r) => r.state === 'silent')
+          .map((r) => ({ replica: r.replica, last_heard_at: r.last_heard_at! })),
+      },
     },
     tables: Object.keys(labels).map((name) => table(name, s)),
   }
 })
+
+// Every register's state, for a tile of each.
+const states = computed<States>(() => ({
+  contract: CONTRACT,
+  now: overview.value.now,
+  replicas: Array.from({ length: FLEET }, (_, i) => replica(i, scenario.value)).map((r) => ({
+    replica: r.replica,
+    audience: r.audience,
+    state: r.state,
+  })),
+}))
+
+// Where the registers are: a region, then a store.
+const levels: Level[] = [
+  { key: 'region', label: 'Region' },
+  { key: 'store', label: 'Store' },
+]
+const stores = ['Harbour', 'Airport', 'Market', 'Station']
+function placeOf(replica: string, level: string) {
+  const store = Number(replica.slice(-2)) % stores.length
+  return level === 'region'
+    ? { key: store < 2 ? 'north' : 'south', label: store < 2 ? 'North' : 'South' }
+    : { key: String(store), label: stores[store]! }
+}
 
 const progress = computed<Progress | null>(() => {
   if (!selected.value) return null
@@ -202,6 +252,7 @@ const progress = computed<Progress | null>(() => {
       <label v-for="s in ['healthy', 'catching_up', 'attention'] as const" :key="s">
         <input v-model="scenario" type="radio" :value="s" /> {{ s }}
       </label>
+      <label><input v-model="placed" type="checkbox" /> places</label>
       <select v-model="locale">
         <option value="en">English</option>
         <option value="es">Español</option>
@@ -210,6 +261,9 @@ const progress = computed<Progress | null>(() => {
     <SyncDashboard
       v-model:selected="selected"
       :overview="overview"
+      :states="states"
+      :levels="placed ? levels : undefined"
+      :place-of="placeOf"
       :progress="progress"
       :names="names"
       :labels="labels"
@@ -238,6 +292,14 @@ body {
   --msd-ok-soft: #16261c;
   --msd-warn-soft: #2b2112;
   --msd-danger-soft: #2d1719;
+  --msd-quiet: #aab2c2;
+  --msd-quiet-soft: #262b36;
+  --msd-off: #b197fc;
+  --msd-off-soft: #251f3a;
+  --msd-unknown: #66d9e8;
+  --msd-unknown-soft: #142a2e;
+  --msd-accent-soft: #1c2440;
+  --msd-ok-tile: #2f6b3d;
   background: #151821;
   color: #e6e9f0;
 }

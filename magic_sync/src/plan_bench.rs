@@ -378,7 +378,8 @@ async fn bench_1k_products_imported_for_4000_units(pool: crate::DbPool) {
 }
 
 /// What a dashboard costs over a partition of 200 replicas holding 3M rows
-/// between them: the overview, against counting what each should hold.
+/// between them: the overview and every replica's state, against counting
+/// what each should hold.
 #[sqlx::test(migrations = false)]
 #[ignore = "a benchmark: see CONTRIBUTING.md"]
 async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool) {
@@ -447,6 +448,12 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
         time(&format!("{round}: health"), started);
         let started = Instant::now();
         engine
+            .states(&mut conn, Scope::Partition(partition))
+            .await
+            .expect("states");
+        time(&format!("{round}: states of 200"), started);
+        let started = Instant::now();
+        engine
             .progress(&mut conn, Scope::Replicas(&replicas[..1]))
             .await
             .expect("progress");
@@ -465,5 +472,79 @@ async fn bench_the_dashboard_over_200_units_holding_3m_rows(pool: crate::DbPool)
         .execute(&mut *conn)
         .await
         .expect("renames");
+    }
+}
+
+/// What a map of the fleet costs at the size the crate is built for: every
+/// state of 4000 replicas, each heard with a backlog and the tables it filed,
+/// some silent and some waiting for a fix, while 2k changes wait to be
+/// planned — and the health beside it.
+#[sqlx::test(migrations = false)]
+#[ignore = "a benchmark: see CONTRIBUTING.md"]
+async fn bench_every_state_of_4000_units(pool: crate::DbPool) {
+    use crate::status::Scope;
+    let (mut conn, engine, partition, replicas) = fleet(&pool, 4000).await;
+    drain(&pool, &engine).await;
+    sqlx::query(
+        "UPDATE sync.replicas x SET last_sent_at = now(), applied_epoch = (SELECT epoch FROM sync.epoch),
+                applied_sequence = 1, applied_at = now(),
+                last_heard_at = now() - CASE WHEN n % 50 = 0 THEN interval '1 hour' ELSE interval '10 seconds' END,
+                keepalive = interval '1 minute',
+                backlog = '[{\"table\": \"sales\", \"unsent\": 3, \"unfiled\": 0, \"set_aside\": 0, \"oldest_ms\": 1000},
+                            {\"table\": \"cuts\", \"unsent\": 0, \"unfiled\": 1, \"set_aside\": 0, \"oldest_ms\": 2000}]',
+                backlog_at = now(),
+                filed = '{\"sales\": \"2026-10-24T00:00:00Z\", \"cuts\": \"2026-10-24T00:00:00Z\", \"events\": \"2026-10-24T00:00:00Z\"}'
+           FROM unnest($1::uuid[]) WITH ORDINALITY AS u(r, n) WHERE x.replica_id = u.r",
+    )
+    .bind(&replicas)
+    .execute(&mut *conn)
+    .await
+    .expect("heard");
+    sqlx::query(
+        "INSERT INTO sync.quarantine (replica_id, relation, row_key, reason, cause)
+         SELECT r, 'items', 'k', 'a bug', 'replica' FROM unnest($1::uuid[]) WITH ORDINALITY AS u(r, n)
+          WHERE n % 100 = 0",
+    )
+    .bind(&replicas)
+    .execute(&mut *conn)
+    .await
+    .expect("quarantined");
+    sqlx::query(
+        "INSERT INTO fixture.t_products (id, partition_id, name)
+         SELECT uuidv7(), $1, 'p' || n FROM generate_series(1, 2000) n",
+    )
+    .bind(partition)
+    .execute(&mut *conn)
+    .await
+    .expect("an import, noted and not planned");
+    sqlx::query("ANALYZE")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    for round in ["cold", "warm", "warm"] {
+        let started = Instant::now();
+        let states = engine
+            .states(&mut conn, Scope::Partition(partition))
+            .await
+            .expect("states");
+        println!("{round}: states of 4000: {:?}", started.elapsed());
+        assert_eq!(states.replicas.len(), 4000);
+        let started = Instant::now();
+        let health = engine
+            .health(&mut conn, Scope::Partition(partition), 20)
+            .await
+            .expect("health");
+        println!("{round}: health of 4000: {:?}", started.elapsed());
+        assert_eq!(
+            health.silent.total,
+            80 - 40,
+            "a 50th silent, but those awaiting a fix"
+        );
+        let started = Instant::now();
+        engine
+            .overview(&mut conn, Scope::Partition(partition), 20)
+            .await
+            .expect("overview");
+        println!("{round}: overview of 4000: {:?}", started.elapsed());
     }
 }

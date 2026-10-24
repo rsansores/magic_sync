@@ -26,14 +26,36 @@ describe('bannerOf', () => {
     const banner = bannerOf(summary(), speech())
     expect(banner.title).toBe('Needs attention')
     expect(banner.lines).toEqual([
-      '1 of 4 replicas has changes on their way.',
+      '1 of 5 replicas has changes on their way.',
       '1 replica cannot be reached; it gets what it is owed once it can.',
+      '1 replica has said nothing for longer than it said it would.',
       '7 problems wait for a fix.',
     ])
   })
 
   it('says so in the locale asked for', () => {
-    expect(bannerOf(summary(), speech(AT, 'es')).lines[2]).toBe('7 problemas esperan una corrección.')
+    expect(bannerOf(summary(), speech(AT, 'es')).lines[3]).toBe('7 problemas esperan una corrección.')
+  })
+
+  it('names a silent replica once, as silent, even when it has not answered either', () => {
+    const quiet = {
+      ...overview,
+      states: { awaiting_fix: 0, unreachable: 0, silent: 1, catching_up: 0, synced: 0 },
+      replicas: {
+        total: 1,
+        first: [
+          {
+            ...overview.replicas.first.find((r) => r.state === 'silent')!,
+            unconfirmed: true,
+            waiting_since: new Date(AT - 30 * MINUTE).toISOString(),
+          },
+        ],
+      },
+    }
+    const lines = bannerOf(summarize(quiet, { now: AT }), speech()).lines
+    expect(lines.filter((l) => l.includes('said nothing') || l.includes('not answering'))).toEqual([
+      '1 replica has said nothing for longer than it said it would.',
+    ])
   })
 })
 
@@ -54,16 +76,21 @@ describe('describeReplica', () => {
     ])
   })
 
+  it('says when a silent replica was last heard from', () => {
+    const later = AT + 10 * MINUTE
+    expect(describeReplica(row('4', later), speech(later))[0]).toBe('Last heard 10 min. ago.')
+  })
+
   it('says how long a replica has not answered, by the server’s clock', () => {
     const later = AT + 20 * MINUTE
-    expect(describeReplica(row('4', later), speech(later))).toEqual([
+    expect(describeReplica(row('5', later), speech(later))).toEqual([
       'Last answered 20 min. ago.',
       '3 rows of its own are not at the server yet.',
     ])
   })
 
   it('says when a replica with nothing to do last confirmed, or that it never has', () => {
-    const synced = row('5')
+    const synced = row('6')
     expect(describeReplica(synced, speech(AT + 3 * 60 * MINUTE))).toEqual(['Last confirmed 3 hr. ago.'])
     expect(describeReplica({ ...synced, heardAt: null }, speech())).toEqual(['Nothing confirmed yet.'])
   })
@@ -97,7 +124,7 @@ describe('describeProblem', () => {
 describe('mismatchOf', () => {
   it('refuses an answer of another contract, naming both', () => {
     expect(mismatchOf(overview, translator('en'))).toBeNull()
-    expect(mismatchOf({ contract: 2 }, translator('en'))).toMatch(/version 1.*version 2/)
+    expect(mismatchOf({ contract: 3 }, translator('en'))).toMatch(/version 2.*version 3/)
   })
 })
 

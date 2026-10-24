@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 // Every text the default look draws, against the surface it is drawn on,
-// must reach WCAG's 4.5:1.
+// must reach WCAG's 4.5:1; every tile, which says a state by its colour
+// alone, 3:1 against the card it sits on (WCAG 1.4.11).
 
 const css = readFileSync(new URL('./dashboard.css', import.meta.url), 'utf8')
 
@@ -24,23 +25,44 @@ function contrast(a: string, b: string): number {
   return (hi! + 0.05) / (lo! + 0.05)
 }
 
-// [text, surface]: the card under every list and chip, and each banner's
-// tint under the title and the lines.
+// [text, surface]: the card under every list and chip, each tint under the
+// title and the lines drawn on it, and each tone on its own tint.
 const pairs: [string, string][] = [
-  ...['fg', 'muted', 'accent', 'ok', 'warn', 'danger'].map((text): [string, string] => [text, 'card']),
-  ...['ok-soft', 'warn-soft', 'danger-soft'].flatMap((surface): [string, string][] => [
-    ['fg', surface],
-    ['muted', surface],
-  ]),
+  ...['fg', 'muted', 'accent', 'ok', 'warn', 'danger', 'quiet', 'off', 'unknown'].map(
+    (text): [string, string] => [text, 'card'],
+  ),
+  ...['ok-soft', 'warn-soft', 'danger-soft', 'quiet-soft', 'off-soft', 'unknown-soft', 'accent-soft'].flatMap(
+    (surface): [string, string][] => [
+      ['fg', surface],
+      ['muted', surface],
+    ],
+  ),
+  // Each tone's badge, chip and counter: its colour on its own tint.
+  ['ok', 'ok-soft'],
+  ['warn', 'warn-soft'],
+  ['danger', 'danger-soft'],
+  ['quiet', 'quiet-soft'],
+  ['off', 'off-soft'],
+  ['unknown', 'unknown-soft'],
+  ['accent', 'accent-soft'],
 ]
+
+// [tile, card]: the colour of each tone's tile.
+const tiles: [string, string][] = ['ok-tile', 'warn', 'quiet', 'unknown', 'off', 'danger'].map(
+  (tile): [string, string] => [tile, 'card'],
+)
 
 describe('the default colours', () => {
   it('are all read from the stylesheet', () => {
-    for (const [text, surface] of pairs)
+    for (const [text, surface] of [...pairs, ...tiles])
       expect([text, surface].map((k) => defaults[k])).not.toContain(undefined)
   })
 
   it.each(pairs)('draw %s on %s at 4.5:1 or more', (text, surface) => {
     expect(contrast(defaults[text]!, defaults[surface]!)).toBeGreaterThanOrEqual(4.5)
+  })
+
+  it.each(tiles)('draw the %s tile on %s at 3:1 or more', (tile, card) => {
+    expect(contrast(defaults[tile]!, defaults[card]!)).toBeGreaterThanOrEqual(3)
   })
 })

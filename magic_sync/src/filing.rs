@@ -217,7 +217,17 @@ pub(crate) async fn file<P: Sync + 'static>(
         }
     };
     said_apart(conn, codecs, sender, &standing, confirmed, upload).await?;
+    heard(conn, sender, upload, &tables_of(&filed)).await?;
     Ok(filed)
+}
+
+/// The tables `filed` wrote or removed rows of.
+fn tables_of(filed: &[Filed]) -> Vec<&str> {
+    filed
+        .iter()
+        .filter(|f| !f.written.is_empty() || !f.gone.is_empty())
+        .map(|f| f.table.as_str())
+        .collect()
 }
 
 /// What [`file`] does with an upload from `sender` whose filing failed as a
@@ -234,7 +244,61 @@ pub(crate) async fn file_failed<P: Sync + 'static>(
     let standing = standing(conn, sender).await?;
     keep_whole(conn, codecs, sender, upload, reason, inbox).await?;
     let confirmed = confirmation(sender, &standing, upload);
-    said_apart(conn, codecs, sender, &standing, confirmed, upload).await
+    said_apart(conn, codecs, sender, &standing, confirmed, upload).await?;
+    heard(conn, sender, upload, &[]).await
+}
+
+/// The longest a replica may say it stays quiet: past a day, it says
+/// nothing a dashboard waits on, and is taken as saying nothing.
+const KEEPALIVE: u64 = 24 * 60 * 60 * 1000;
+
+/// The server heard from `sender`: `upload` came, on whatever lane, saying
+/// how long it stays quiet at most, and rows of `tables` were filed from it.
+async fn heard(conn: &mut Conn, sender: Uuid, upload: &Up, tables: &[&str]) -> Result<(), Error> {
+    let keepalive = Some(upload.keepalive_ms)
+        .filter(|ms| (1..=KEEPALIVE).contains(ms))
+        .and_then(|ms| i64::try_from(ms).ok());
+    sqlx::query(&format!(
+        "UPDATE sync.replicas SET last_heard_at = now(), \
+                keepalive = $2::int8 * interval '1 millisecond', {} \
+          WHERE replica_id = $1",
+        filed_now("$3")
+    ))
+    .bind(sender)
+    .bind(keepalive)
+    .bind(tables)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The assignment that says a row of each table of the `tables` parameter
+/// was last filed from the replica now.
+fn filed_now(tables: &str) -> String {
+    format!(
+        "filed = CASE WHEN cardinality({tables}::text[]) = 0 THEN filed \
+                      ELSE coalesce(filed, '{{}}') \
+                           || (SELECT jsonb_object_agg(t, now()) FROM unnest({tables}::text[]) AS t) \
+                 END"
+    )
+}
+
+/// Rows of `tables` were filed from `sender` again, out of the inbox: when
+/// each was last filed moves, and when the replica was last heard does not —
+/// filing what it sent long ago is not hearing from it.
+async fn refiled(conn: &mut Conn, sender: Uuid, tables: &[&str]) -> Result<(), Error> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(&format!(
+        "UPDATE sync.replicas SET {} WHERE replica_id = $1",
+        filed_now("$2")
+    ))
+    .bind(sender)
+    .bind(tables)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// What `upload` says of `sender`, filed apart from its rows: a failure of
@@ -1156,17 +1220,50 @@ const COMPARED: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// Tables a backlog may name: more than any server mirrors.
 const BACKLOG_TABLES: usize = 1024;
 
+/// A table of a replica's backlog as the server stores it: what it said,
+/// its oldest row as the age it said — read against when it said it, by the
+/// server's clock alone.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Said {
+    table: String,
+    unsent: i64,
+    unfiled: i64,
+    #[serde(default)]
+    set_aside: i64,
+    #[serde(default)]
+    oldest_ms: Option<i64>,
+}
+
+impl Said {
+    /// The table as a status reads it, said at `at`.
+    pub(crate) fn progress(self, at: DateTime<Utc>) -> UpProgress {
+        UpProgress {
+            table: self.table,
+            unsent: self.unsent,
+            unfiled: self.unfiled,
+            set_aside: self.set_aside,
+            oldest_at: self
+                .oldest_ms
+                .and_then(|ms| at.checked_sub_signed(chrono::TimeDelta::try_milliseconds(ms)?)),
+        }
+    }
+}
+
 /// What `replica` says it wrote and the server has not filed.
 async fn backlog(conn: &mut Conn, replica: Uuid, told: &envelope::Backlog) -> Result<(), Error> {
-    let tables: Option<Vec<UpProgress>> = told
+    let tables: Option<Vec<Said>> = told
         .tables
         .iter()
         .map(|t| {
-            Some(UpProgress {
+            Some(Said {
                 table: stored(&t.table),
                 unsent: i64::try_from(t.unsent).ok()?,
                 unfiled: i64::try_from(t.unfiled).ok()?,
                 set_aside: i64::try_from(t.set_aside).ok()?,
+                oldest_ms: match t.oldest_ms {
+                    0 => None,
+                    ms => Some(i64::try_from(ms).ok()?),
+                },
             })
         })
         .collect();
@@ -1375,7 +1472,8 @@ pub(crate) async fn refile<P: Sync + 'static>(
             ours: envelope::PROTOCOL,
         });
     }
-    let (_, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known, None).await?;
+    let (filed, unfiled) = file_tables(conn, codecs, &up, kept.replica_id, known, None).await?;
+    refiled(conn, kept.replica_id, &tables_of(&filed)).await?;
     keep(conn, kept.replica_id, &unfiled, &mut Keeping::Again(&kept)).await?;
     Ok(unfiled.is_empty())
 }

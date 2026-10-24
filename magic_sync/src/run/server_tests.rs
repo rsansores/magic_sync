@@ -9,8 +9,9 @@ use crate::row::Table;
 use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
 use crate::testkit::{from_wire, to_wire, Item, ItemRow, BUGGY};
 use crate::wire::MapError;
+use chrono::{DateTime, Utc};
 use prost::Message as _;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 const SCHEMA: &str = "
@@ -434,6 +435,62 @@ async fn what_is_written_reaches_the_replicas_and_what_comes_up_is_filed_and_ans
     );
 }
 
+/// Every upload filed from a replica is when it was last heard, whatever it
+/// carries, with how long it says it stays quiet — none when it says none,
+/// or more than a day; and each table it uploaded rows of was filed then.
+#[sqlx::test(migrations = false)]
+async fn every_upload_is_when_its_replica_was_last_heard(pool: PgPool) {
+    let (_, [a, _]) = world(&pool).await;
+    let server = Server::new(
+        pool.clone(),
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the server");
+    type Heard = (
+        Option<DateTime<Utc>>,
+        Option<i64>,
+        Option<sqlx::types::Json<BTreeMap<String, DateTime<Utc>>>>,
+    );
+    let heard = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, Heard>(
+                "SELECT last_heard_at, (extract(epoch FROM keepalive) * 1000)::int8, filed \
+                   FROM sync.replicas WHERE replica_id = $1",
+            )
+            .bind(a)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let mut up = Up::decode(upload(3, "readings", vec![reading(a, "one")]).as_slice()).unwrap();
+    up.keepalive_ms = 60_000;
+    server.receive(a, &up.encode_to_vec()).await.unwrap();
+    let (first, keepalive, filed) = heard().await;
+    let filed = filed.expect("a table filed").0;
+    assert_eq!(keepalive, Some(60_000));
+    assert_eq!(filed.keys().collect::<Vec<_>>(), ["readings"]);
+    assert_eq!(Some(filed["readings"]), first);
+
+    for (keepalive_ms, kept) in [(0, None), (u64::MAX, None), (90_000, Some(90_000))] {
+        let quiet = Up {
+            protocol: envelope::PROTOCOL,
+            keepalive_ms,
+            ..Up::default()
+        };
+        server.receive(a, &quiet.encode_to_vec()).await.unwrap();
+        let (last, keepalive, again) = heard().await;
+        assert!(last > first, "heard again");
+        assert_eq!(keepalive, kept, "{keepalive_ms}");
+        assert_eq!(again.expect("still").0, filed, "nothing filed");
+    }
+}
+
 /// Two processes run the server; one of them runs the relay, so nothing is
 /// planned or sent twice.
 #[sqlx::test(migrations = false)]
@@ -778,7 +835,8 @@ async fn count(pool: &PgPool, sql: &str) -> i64 {
 /// An upload whose filing fails for a reason no resend cures is kept whole,
 /// answered so the replica stops sending it, and filed after a fix; an
 /// upload that fails again holds back no other. What it says of its sender
-/// is filed all the same: what it applied is recorded.
+/// is filed all the same: what it applied is recorded. Filed after the fix,
+/// its tables say they were filed then, and the replica is not heard again.
 #[sqlx::test(migrations = false)]
 async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool: PgPool) {
     let (partition, [a, b]) = world(&pool).await;
@@ -846,17 +904,46 @@ async fn an_upload_the_server_cannot_file_at_all_is_kept_whole_and_answered(pool
         2
     );
     assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM sync.replicas WHERE last_heard_at IS NOT NULL AND filed IS NULL"
+        )
+        .await,
+        2,
+        "heard, and nothing of theirs filed"
+    );
+    assert_eq!(
         count(&pool, "SELECT count(*) FROM fixture.readings").await,
         0
     );
 
     // b's sender is fixed, a's is not: a fails again, and b is filed.
+    sqlx::query("UPDATE sync.replicas SET last_heard_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
     senders.failing.lock().unwrap().remove(&b);
     let mut lock = Lock::take(&pool, LOCK_KEY).await.unwrap().unwrap();
     refile(&server, &mut lock).await;
     assert_eq!(
         count(&pool, "SELECT count(*) FROM fixture.readings").await,
         1
+    );
+    let heard: Vec<(Uuid, bool, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT replica_id, last_heard_at < now() - interval '59 minutes', filed -> 'readings' \
+           FROM sync.replicas ORDER BY replica_id = $1 DESC",
+    )
+    .bind(b)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        heard
+            .iter()
+            .map(|(r, old, f)| (*r, *old, f.is_some()))
+            .collect::<Vec<_>>(),
+        [(b, true, true), (a, true, false)],
+        "b's readings filed now, and neither heard again"
     );
     let left: (Uuid, i32) = sqlx::query_as("SELECT replica_id, attempts FROM sync.inbox")
         .fetch_one(&pool)
@@ -1143,11 +1230,13 @@ async fn whatever_a_replica_sends_up_the_server_never_stops_on_it(pool: PgPool) 
                         unsent: [0, 5, u64::MAX][walk.below(3)],
                         unfiled: 1,
                         set_aside: 0,
+                        oldest_ms: [0, 1, u64::MAX][walk.below(3)],
                     }],
                 }),
                 nonce: [0, 1, walk.next(), u64::MAX][walk.below(4)],
                 mac: (0..walk.below(20)).map(|_| walk.below(256) as u8).collect(),
                 gap: [0, 0, 1, walk.next(), u64::MAX][walk.below(5)],
+                keepalive_ms: [0, 60_000, u64::MAX][walk.below(3)],
             };
             came += up
                 .tables
@@ -1305,7 +1394,7 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
     world(&pool).await;
     /// A setting made zero.
     type Zeroed = (&'static str, fn(&mut Settings));
-    let cases: [Zeroed; 8] = [
+    let cases: [Zeroed; 9] = [
         ("idle", |s| s.idle = Duration::ZERO),
         ("send_timeout", |s| s.send_timeout = Duration::ZERO),
         ("unconfirmed_after", |s| {
@@ -1316,6 +1405,7 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
         ("prune_after", |s| s.prune_after = Duration::ZERO),
         ("watch_every", |s| s.watch_every = Duration::ZERO),
         ("stuck_after", |s| s.stuck_after = Duration::ZERO),
+        ("behind_after", |s| s.behind_after = Duration::ZERO),
     ];
     for (what, set) in cases {
         let mut wrong = settings();
@@ -1334,6 +1424,55 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
             Ok(_) => panic!("{what}: not refused"),
         }
     }
+}
+
+/// The relay keeps what a status judges by where every process reads it,
+/// with when it started listening, once it takes its lock; a server only
+/// built — a process that reads a status, or files what replicas send —
+/// writes none of it, whatever it was built with.
+#[sqlx::test(migrations = false)]
+async fn the_relay_keeps_what_a_status_judges_by(pool: PgPool) {
+    world(&pool).await;
+    let mut set = settings();
+    set.behind_after = Duration::from_secs(7 * 60);
+    set.silent_after_keepalives = std::num::NonZeroU32::new(5).unwrap();
+    let server = Server::new(
+        pool.clone(),
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        set,
+    )
+    .await
+    .unwrap();
+    let kept = || async {
+        sqlx::query_as::<_, (String, i32, bool)>(
+            "SELECT behind_after::text, silent_after_keepalives, \
+                    started_at > now() - interval '1 minute' FROM sync.settings",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let unset: (String, i32, Option<bool>) = sqlx::query_as(
+        "SELECT behind_after::text, silent_after_keepalives, started_at IS NOT NULL FROM sync.settings",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unset,
+        ("00:02:00".to_owned(), 3, Some(false)),
+        "a server only built writes nothing"
+    );
+    until(&[&server], || async {
+        sqlx::query_scalar::<_, bool>("SELECT started_at IS NOT NULL FROM sync.settings")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(kept().await, ("00:07:00".to_owned(), 5, true));
 }
 
 /// An upload beyond the server's limits — more bytes, or more rows and
@@ -1624,4 +1763,53 @@ async fn a_transaction_on_a_connection_without_the_lock_is_refused(pool: PgPool)
     );
     assert!(!elsewhere.still_held().await, "nor counts as held");
     held.release(LOCK_KEY).await;
+}
+
+/// The watch warns of a replica as it falls silent, not on every pass for as
+/// long as it stays so — whichever replicas it named, and however many fell
+/// silent at once: it names some, and says how many more.
+#[test]
+fn the_watch_warns_of_a_replica_as_it_falls_silent() {
+    use crate::status::Silent;
+    let ids: Vec<Uuid> = (0..9).map(|_| Uuid::now_v7()).collect();
+    let [a, b, c] = [ids[0], ids[1], ids[2]];
+    let at = Utc::now();
+    let silent = |named: &[Uuid]| -> Vec<Silent> {
+        named
+            .iter()
+            .map(|&replica| Silent {
+                replica,
+                last_heard_at: at,
+            })
+            .collect()
+    };
+    let fell = |silenced: &mut Silenced, silent: &[Silent]| {
+        let (fell, more) = silenced.since(silent);
+        (fell.iter().map(|s| s.replica).collect::<Vec<_>>(), more)
+    };
+    let mut silenced = Silenced::default();
+    assert_eq!(fell(&mut silenced, &silent(&[a])), (vec![a], 0));
+    assert_eq!(
+        fell(&mut silenced, &silent(&[a])),
+        (vec![], 0),
+        "still silent"
+    );
+    assert_eq!(fell(&mut silenced, &silent(&[a, b])), (vec![b], 0));
+    let (named, more) = fell(&mut silenced, &silent(&ids));
+    assert_eq!(
+        (named, more),
+        (ids[2..7].to_vec(), 2),
+        "seven fell silent at once: five named, two more"
+    );
+    assert_eq!(
+        fell(&mut silenced, &silent(&ids)),
+        (vec![], 0),
+        "the two not named are not taken for newly silent the next time"
+    );
+    assert_eq!(fell(&mut silenced, &silent(&[])), (vec![], 0));
+    assert_eq!(
+        fell(&mut silenced, &silent(&[a, c])),
+        (vec![a, c], 0),
+        "silent again"
+    );
 }

@@ -922,7 +922,10 @@ async fn a_schema_from_before_routed_tables_is_upgraded_keeping_its_notes(pool: 
     let mut tx = conn.begin().await.expect("a transaction");
     migrate(&mut tx).await.expect("upgraded");
     tx.commit().await.expect("upgraded");
-    assert_eq!(version(&mut conn).await.unwrap(), Some(4));
+    assert_eq!(
+        version(&mut conn).await.unwrap(),
+        Some(crate::SERVER_SCHEMA_VERSION)
+    );
     sqlx::raw_sql(&format!(
         r#"INSERT INTO sync.notes (kind, relation, partition_id) VALUES ('rerouted', '"fixture"."rules"', '{A}')"#
     ))

@@ -11,13 +11,18 @@ import {
   type Progress,
   type ReplicaState,
   type RowProgress,
+  type States,
 } from 'magic_sync_dashboard'
 import { api, type FooterTwin, type Product, type ShopState } from './api'
 
 const state = ref<ShopState | null>(null)
 const overview = ref<Overview | null>(null)
+// Every register's state, for a tile of each.
+const states = ref<States | null>(null)
 const selected = ref<string | null>(null)
+// The register looked at: where it is on each table, and its own row.
 const progress = ref<Progress | null>(null)
+const replica = ref<Listing | null>(null)
 // The replicas listed, a page at a time, in the state picked.
 const filter = ref<ReplicaState | null>(null)
 const offset = ref(0)
@@ -33,12 +38,15 @@ const labels = { products: 'Products', receipts: 'Receipts' }
 
 async function refresh() {
   try {
-    ;[state.value, overview.value, listing.value] = await Promise.all([
+    ;[state.value, overview.value, states.value, listing.value] = await Promise.all([
       api.state(),
       api.overview(),
+      api.states(),
       api.listing(filter.value, offset.value),
     ])
-    progress.value = selected.value ? await api.progress(selected.value) : null
+    ;[progress.value, replica.value] = selected.value
+      ? await Promise.all([api.progress(selected.value), api.replica(selected.value)])
+      : [null, null]
     places.value = holding.value ? await api.row('products', holding.value) : null
     error.value = ''
   } catch (e) {
@@ -203,18 +211,20 @@ function pageOf(url: string) {
       <section>
         <h2>Sync</h2>
         <!-- ANCHOR: dashboard -->
-        <!-- A register unplugged is "not answering" after 30 s, not 15 min: it is a demo. -->
+        <!-- It is a demo: a register is "not answering" after 30 s, not 15 min. -->
         <SyncDashboard
           v-model:selected="selected"
           v-model:filter="filter"
           v-model:offset="offset"
           :overview="overview"
+          :states="states"
           :listing="listing"
           :progress="progress"
+          :replica="replica"
           :page-size="20"
           :names="names"
           :labels="labels"
-          :silent-after="30_000"
+          :unanswering-after="30_000"
         />
         <!-- ANCHOR_END: dashboard -->
       </section>
@@ -282,11 +292,13 @@ function pageOf(url: string) {
         <p class="legend">
           Each register's own page, as its cashier sees it. To see the engine at work, break things:
           <b>Go offline</b> (on a register) — it stops talking to the head office, keeps selling, and its
-          receipts wait in its outbox until it is back online, then go up in order;
-          <b>break the network</b> (here) — every send from the head office to it fails, the dashboard shows
-          it unreachable, and the head office retries, waiting longer each time; nothing it sends is lost,
-          because it is recorded before it is sent; <b>printer off</b> (on a register) — not sync at all: the
-          hardware a footer wish is carried out on, so a wish waits, and applies once the printer is back on.
+          receipts wait in its outbox until it is back online, then go up in order; the head office stops
+          hearing from it, and after three of its 5 s keepalives the dashboard shows it <b>silent</b> — as it
+          does a register you stop; <b>break the network</b> (here) — every send from the head office to it
+          fails, the dashboard shows it unreachable, and the head office retries, waiting longer each time;
+          nothing it sends is lost, because it is recorded before it is sent; <b>printer off</b> (on a
+          register) — not sync at all: the hardware a footer wish is carried out on, so a wish waits, and
+          applies once the printer is back on.
         </p>
         <p v-if="state && state.registers.length === 0" class="note">
           No register yet. Start one: <code>cargo run -- --name "Register 1" --port 8081</code> in

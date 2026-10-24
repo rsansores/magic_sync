@@ -100,5 +100,38 @@ On a replica:
 That is the shop register's "2 receipts not at the head office yet". The
 replica tells the server the same, on its main lane, whenever it changes —
 with the rows it sends, at once when it starts or empties, and at most every
-`Outbox::backlog_every` while it grows. The server shows it as the replica's
-`backlog`, as of when it was said; a replica with one is still catching up.
+`Outbox::keepalive_every` while it grows — and how long ago each table's
+oldest row was written. The server shows it as the replica's `backlog`, as
+of when it was said, each table's `oldest_at` reckoned from that age; a
+replica is catching up while a row of it has waited longer than the
+server's `Settings::behind_after` (two minutes), or cannot go as it is:
+rows that flow are not waiting. Each table says whether its rows wait
+(`waits`); of a replica of an earlier build, which says no age, they wait
+while any has not gone. Keep `keepalive_every` well under `behind_after`:
+a replica that writes nothing else says what waits only that often.
+
+## A replica that says nothing
+
+A replica that has sent nothing on any lane for `Outbox::keepalive_every`
+(a minute) says it is there, on its main lane, and every message it sends
+says how long that is. The server keeps when it last heard from each
+replica (`last_heard_at`) and when it last filed a row of each table from
+it (`filed`); one that has said nothing for
+`Settings::silent_after_keepalives` (three) of its keepalives is `silent` —
+off, or cut off, which nothing on the server's side tells apart — and is
+listed in the health's `silent`, which leaves it healthy. A replica of an
+earlier build says no keepalive, and is never silent. A replica refuses a
+keepalive over a day, which the server would take for none, and one its
+`idle` would sleep past.
+
+The relay keeps `behind_after` and `silent_after_keepalives` in the
+database (`sync.settings`) when it takes its lock, and every status reads
+them there: a process that only reads a status judges as the relay does,
+whatever settings it was built with. It keeps when it took the lock too,
+and a replica heard before then is silent only once it has said nothing
+for its keepalives counted from then: after the server was down, the fleet
+is not taken for silent. A role that reads a status reads `sync.settings`.
+
+`engine().states(&mut conn, scope)` answers every replica's state at once,
+and nothing else of them: what a map of the fleet colours its tiles by —
+some 15 ms over 4000 replicas.

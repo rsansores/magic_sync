@@ -168,6 +168,13 @@ pub struct Up {
     /// snapshot, unless one that began after this sequence is on its way.
     #[prost(uint64, tag = "10")]
     pub gap: u64,
+    /// How long, in milliseconds, the replica stays quiet at most: once it has
+    /// sent nothing on any lane for so long, it sends an Up on its first lane,
+    /// with nothing else to say if it has nothing. The server takes one that
+    /// says nothing for several of these for one that stopped. 0: it does not
+    /// say, and is never taken for one that stopped.
+    #[prost(uint64, tag = "13")]
+    pub keepalive_ms: u64,
 }
 /// What a replica wrote that the server has not filed yet.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -191,6 +198,12 @@ pub struct TableBacklog {
     /// the replica runs again.
     #[prost(uint64, tag = "4")]
     pub set_aside: u64,
+    /// How long ago the oldest of these rows was written, in milliseconds, as
+    /// the replica measured it when it made the message: an age, not a time, so
+    /// the two clocks need not agree. At least 1 from a replica that says it; 0
+    /// from one that does not.
+    #[prost(uint64, tag = "5")]
+    pub oldest_ms: u64,
 }
 /// A row a replica could not take, or could not let go of, and why. The key
 /// is required.

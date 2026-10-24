@@ -479,7 +479,8 @@ should be. Per replica, one state:
 | State | Means |
 |---|---|
 | `synced` | it holds what it should, and the server filed everything it last said it wrote |
-| `catching_up` | changes are on their way to it (noted and not yet planned, held back by a parked note that may concern it, or in a message it has not confirmed) or from it (its backlog) |
+| `catching_up` | changes are on their way to it (noted and not yet planned, held back by a parked note that may concern it, or in a message it has not confirmed) or from it (its backlog: a row that has waited longer than the server lets it, or cannot go as it is) |
+| `silent` | it said how long it stays quiet at most, and has said nothing for several times that: off, or cut off |
 | `unreachable` | sends to it fail; it is tried again after a backoff |
 | `awaiting_fix` | something of its own is set aside until a fix: a row in quarantine, a parked note owed to it alone, an upload of its in the inbox |
 

@@ -28,7 +28,7 @@ export interface SummaryOptions {
   now: number
   /** A replica that has not moved on what it was sent for this long is not
    * answering (it is off, or out of reach). Default 15 minutes. */
-  silentAfter?: number
+  unansweringAfter?: number
   /** A change waiting this long to be sent means the engine is stuck.
    * Default 15 minutes: the server's own alarm (`Settings::stuck_after`). */
   stuckAfter?: number
@@ -40,10 +40,13 @@ export interface ReplicaRow {
   /** The audience it is of: the kind of replica, as the server names it. */
   audience: string
   state: ReplicaState
-  /** How long it has not answered, when that is longer than `silentAfter`. */
-  silentFor: number | null
+  /** How long it has not answered what it was sent, when that is longer
+   * than `unansweringAfter` — and it is not silent, which says more. */
+  unansweringFor: number | null
   /** When it last said it applied a message. */
   heardAt: number | null
+  /** When the server last heard from it at all: an upload of any kind. */
+  lastHeardAt: number | null
   pending: number
   /** Messages written for it that the transport has not taken yet. */
   owed: number
@@ -51,11 +54,15 @@ export interface ReplicaRow {
   quarantined: number
   parked: number
   unfiled: number
+  /** What of its own waits for a fix, as the engine counts it: what makes
+   * it `awaiting_fix`. */
+  awaitingFix: number
   failures: number
   lastError: string | null
   retryAt: number | null
-  /** What it last said it wrote and the server has not filed, summed. */
-  backlog: { unsent: number; unfiled: number; at: number | null } | null
+  /** What it last said it wrote and the server has not filed, summed,
+   * and whether any of it waits (the server's judgement, table by table). */
+  backlog: { unsent: number; unfiled: number; setAside: number; waits: boolean; at: number | null } | null
   /** Its settings' wishes, by where they stand. */
   wishes: WishCounts
   source: ReplicaOverview
@@ -111,8 +118,9 @@ export interface Summary {
   counts: ReplicaCounts
   /** Things set aside until a fix is deployed. */
   fixes: number
-  /** Replicas not answering, among the overview's worst. */
-  silent: number
+  /** Replicas not answering what they were sent, among the overview's
+   * worst: the silent are counted as silent. */
+  unanswering: number
   /** Changes noted and not yet sent, and since when the oldest waits. */
   pending: number
   waitingSince: number | null
@@ -169,6 +177,7 @@ export function placeMoodOf(state: string): PlaceMood {
 const replicaStates: Record<ReplicaState, true> = {
   awaiting_fix: true,
   unreachable: true,
+  silent: true,
   catching_up: true,
   synced: true,
 }
@@ -196,27 +205,41 @@ function labelOf(options: Pick<SummaryOptions, 'label'>, table: string): string 
 function replicaRow(r: ReplicaOverview, options: SummaryOptions): ReplicaRow {
   const waiting = timeOf(r.waiting_since)
   const quiet = waiting == null ? null : options.now - waiting
-  const silentFor = quiet != null && quiet > (options.silentAfter ?? 15 * MINUTE) ? quiet : null
-  const unsent = r.backlog?.tables.reduce((n, t) => n + t.unsent, 0) ?? 0
-  const unfiled = r.backlog?.tables.reduce((n, t) => n + t.unfiled, 0) ?? 0
+  const unansweringFor =
+    r.state !== 'silent' && quiet != null && quiet > (options.unansweringAfter ?? 15 * MINUTE) ? quiet : null
+  const tables = r.backlog?.tables ?? []
+  const unsent = tables.reduce((n, t) => n + t.unsent, 0)
+  const unfiled = tables.reduce((n, t) => n + t.unfiled, 0)
+  const setAside = tables.reduce((n, t) => n + t.set_aside, 0)
   return {
     id: r.replica,
     name: nameOf(options, r.replica),
     // An engine that predates audiences serves one, and names none.
     audience: r.audience ?? '',
     state: r.state,
-    silentFor,
+    unansweringFor,
     heardAt: timeOf(r.applied_at),
+    lastHeardAt: timeOf(r.last_heard_at),
     pending: r.pending,
     owed: r.owed,
     unconfirmed: r.unconfirmed,
     quarantined: r.quarantined,
     parked: r.parked,
     unfiled: r.unfiled,
+    awaitingFix: r.awaiting_fix,
     failures: r.failures,
     lastError: r.last_error,
     retryAt: timeOf(r.retry_at),
-    backlog: unsent + unfiled > 0 ? { unsent, unfiled, at: timeOf(r.backlog?.at ?? null) } : null,
+    backlog:
+      unsent + unfiled + setAside > 0
+        ? {
+            unsent,
+            unfiled,
+            setAside,
+            waits: tables.some((t) => t.waits),
+            at: timeOf(r.backlog?.at ?? null),
+          }
+        : null,
     // An engine that predates wishes says nothing of them.
     wishes: r.wishes ?? { pending: 0, waiting: 0, refused: 0, superseded: 0 },
     source: r,
@@ -316,7 +339,7 @@ export function summarize(overview: Overview, options: SummaryOptions): Summary 
     total,
     counts: states,
     fixes,
-    silent: worst.filter((r) => r.silentFor != null).length,
+    unanswering: worst.filter((r) => r.unansweringFor != null).length,
     pending: health.pending,
     waitingSince,
     stuck,
@@ -352,6 +375,20 @@ export function pageOf(
     total: filter == null ? everyone(states) : states[filter],
     worst: true,
   }
+}
+
+/** The row of the replica `id`: from `Engine::listing` over it alone when
+ * the host fetched one — it is wherever it is in the fleet — else from the
+ * rows already at hand (a page, the overview's worst); `null` when none
+ * holds it. */
+export function selectedRow(
+  id: string,
+  own: Listing | null | undefined,
+  rows: ReplicaRow[],
+  options: SummaryOptions,
+): ReplicaRow | null {
+  const listed = own && readsContract(own) ? own.replicas.first.find((r) => r.replica === id) : undefined
+  return listed ? replicaRow(listed, options) : (rows.find((r) => r.id === id) ?? null)
 }
 
 export interface TableShare {

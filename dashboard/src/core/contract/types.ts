@@ -1,13 +1,13 @@
 // Generated from magic_sync::status by its test `the_dashboards_types_are_generated_from_these`: UPDATE_CONTRACT=1 rewrites it.
 
 /** The contract these types describe: an answer of another is refused. */
-export const CONTRACT = 1
+export const CONTRACT = 2
 
 /**
  * Where a replica stands, in one word: the first of these that applies.
  * Ordered worst first.
  */
-export type ReplicaState = "awaiting_fix" | "unreachable" | "catching_up" | "synced";
+export type ReplicaState = "awaiting_fix" | "unreachable" | "silent" | "catching_up" | "synced";
 
 /**
  * What one row is to one replica.
@@ -40,7 +40,47 @@ unfiled: number,
 /**
  * Rows that cannot go up as they are, until a build that can send them.
  */
-set_aside: number, };
+set_aside: number, 
+/**
+ * When the oldest of these rows was written: by the replica's clock on
+ * the replica, and on the server as it reckons it from the age the
+ * replica said. `None` from a replica that does not say.
+ */
+oldest_at: string | null, };
+
+/**
+ * One table of a replica's backlog, and whether its rows wait.
+ */
+export type UpTable = { 
+/**
+ * Its rows wait, and hold the replica back: some cannot go as they
+ * are, or the oldest was written longer than the server's
+ * `Settings::behind_after` ago — or, of a replica that says no age,
+ * some have not gone. Rows written a moment ago flow.
+ */
+waits: boolean, 
+/**
+ * The table.
+ */
+table: string, 
+/**
+ * Rows written and not sent yet.
+ */
+unsent: number, 
+/**
+ * Rows sent that the server has not said it filed.
+ */
+unfiled: number, 
+/**
+ * Rows that cannot go up as they are, until a build that can send them.
+ */
+set_aside: number, 
+/**
+ * When the oldest of these rows was written: by the replica's clock on
+ * the replica, and on the server as it reckons it from the age the
+ * replica said. `None` from a replica that does not say.
+ */
+oldest_at: string | null, };
 
 /**
  * What a replica wrote and the server has not filed, as of when it said so.
@@ -49,7 +89,7 @@ export type Backlog = {
 /**
  * Each table with something on its way.
  */
-tables: Array<UpProgress>, 
+tables: Array<UpTable>, 
 /**
  * When the replica said so.
  */
@@ -100,6 +140,13 @@ quarantined: number,
  */
 unfiled: number, 
 /**
+ * What of its own waits for a fix: its rows set aside until one (not
+ * those held back behind them), the rows it sent that wait in the
+ * inbox, and the changes of it alone the planner set aside. More than
+ * none is what makes it `awaiting_fix`.
+ */
+awaiting_fix: number, 
+/**
  * Sends to it that failed in a row.
  */
 failures: number, 
@@ -127,10 +174,18 @@ applied_at: string | null,
  */
 waiting_since: string | null, 
 /**
+ * When the server last heard from it: an upload of any kind.
+ */
+last_heard_at: string | null, 
+/**
  * What it last said it wrote and the server has not filed, per table:
  * `None` until it says.
  */
 backlog: Backlog | null, 
+/**
+ * When the server last filed a row of each table from it, by table.
+ */
+filed: Array<TableFiled>, 
 /**
  * Its settings' wishes, by where they stand.
  */
@@ -148,6 +203,10 @@ awaiting_fix: number,
  * Replicas whose state is `unreachable`.
  */
 unreachable: number, 
+/**
+ * Replicas whose state is `silent`.
+ */
+silent: number, 
 /**
  * Replicas whose state is `catching_up`.
  */
@@ -342,6 +401,33 @@ last_error: string | null,
 retry_at: string | null, };
 
 /**
+ * A replica that has said nothing for longer than it said it would.
+ */
+export type Silent = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * When the server last heard from it.
+ */
+last_heard_at: string, };
+
+/**
+ * When the server last filed a row of one table from a replica: a table
+ * whose rows flow was filed a moment ago.
+ */
+export type TableFiled = { 
+/**
+ * The table.
+ */
+table: string, 
+/**
+ * When a row of it was last filed.
+ */
+last_filed_at: string, };
+
+/**
  * What the engine is waiting on, over a scope: each entry is either the
  * infrastructure (wait) or a bug (deploy a fix) — never data to repair by
  * hand. Lists are cut at the limit the read was given; `total` is uncut.
@@ -376,7 +462,13 @@ inbox: Listed<Unfiled>,
 /**
  * Replicas that sends keep failing to.
  */
-failing: Listed<Failing>, };
+failing: Listed<Failing>, 
+/**
+ * Replicas whose state is `silent` — they have said nothing for longer
+ * than they said they would: off, or cut off — the longest quiet first.
+ * Not unhealthy, as one out of reach is not.
+ */
+silent: Listed<Silent>, };
 
 /**
  * `Engine::overview`: everything a dashboard shows first, in one read.
@@ -435,6 +527,42 @@ offset: number,
  * The page.
  */
 replicas: Listed<ReplicaOverview>, };
+
+/**
+ * Where one replica stands, in one word.
+ */
+export type StateEntry = { 
+/**
+ * The replica.
+ */
+replica: string, 
+/**
+ * The audience it is of.
+ */
+audience: string, 
+/**
+ * Where it stands.
+ */
+state: ReplicaState, };
+
+/**
+ * `Engine::states`: where every replica of a scope stands, in one word
+ * each, worst first — what a map of the fleet colours it by, with no
+ * figure beside.
+ */
+export type States = { 
+/**
+ * The contract this answer serializes as: `CONTRACT`.
+ */
+contract: number, 
+/**
+ * The server's time when the answer was read.
+ */
+now: string, 
+/**
+ * Every replica of the scope.
+ */
+replicas: Array<StateEntry>, };
 
 /**
  * One table on one replica, counted from what the replica acknowledged

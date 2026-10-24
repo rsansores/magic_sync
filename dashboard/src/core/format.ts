@@ -37,12 +37,16 @@ const units: [Intl.RelativeTimeFormatUnit, number][] = [
   ['second', 1_000],
 ]
 
-/** The largest unit the span reaches once rounded in the unit below it:
+/** The largest unit a span reaches once rounded in the unit below it:
  * 59.6 minutes is an hour, not "60 minutes". */
-function relative(ms: number, locale: string): string {
+function unitOf(ms: number): [Intl.RelativeTimeFormatUnit, number] {
   const size = Math.abs(ms)
   const at = units.findIndex(([, length], i) => size >= length - (units[i + 1]?.[1] ?? 0) / 2)
-  const [unit, length] = units[at === -1 ? units.length - 1 : at]!
+  return units[at === -1 ? units.length - 1 : at]!
+}
+
+function relative(ms: number, locale: string): string {
+  const [unit, length] = unitOf(ms)
   return relativeFormat(locale).format(Math.round(ms / length), unit)
 }
 
@@ -54,6 +58,26 @@ export function since(at: number, now: number, locale: string): string {
 /** "in 2 min.", for a moment to come. */
 export function until(at: number, now: number, locale: string): string {
   return relative(Math.max(0, at - now), locale)
+}
+
+const spanFormat = cached(
+  (locale) =>
+    new Map(
+      units.map(([unit]) => [
+        unit,
+        new Intl.NumberFormat(locale, { style: 'unit', unit, unitDisplay: 'short' }),
+      ]),
+    ),
+)
+
+/** "6 min", for how long something has lasted: in the largest unit it
+ * reaches, as `since` picks it. */
+export function lasting(ms: number, locale: string): string {
+  const size = Math.max(0, ms)
+  const [unit, length] = unitOf(size)
+  return spanFormat(locale)
+    .get(unit)!
+    .format(Math.round(size / length))
 }
 
 /** 12,345 */

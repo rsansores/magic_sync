@@ -3,11 +3,11 @@ import type { RowProgress } from '../types.js'
 
 export default [
   {
-    "contract": 1,
+    "contract": 2,
     "places": [
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000005",
+        "replica": "00000000-0000-7000-8000-000000000006",
         "state": "outdated"
       },
       {
@@ -17,22 +17,27 @@ export default [
       },
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000004",
+        "replica": "00000000-0000-7000-8000-000000000005",
         "state": "on_its_way"
       },
       {
         "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "on_its_way"
+      },
+      {
+        "audience": "test",
+        "replica": "00000000-0000-7000-8000-000000000004",
+        "state": "outdated"
       }
     ]
   },
   {
-    "contract": 1,
+    "contract": 2,
     "places": [
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000005",
+        "replica": "00000000-0000-7000-8000-000000000006",
         "state": "leaving"
       },
       {
@@ -42,22 +47,27 @@ export default [
       },
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000004",
+        "replica": "00000000-0000-7000-8000-000000000005",
         "state": "leaving"
       },
       {
         "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "leaving"
+      },
+      {
+        "audience": "test",
+        "replica": "00000000-0000-7000-8000-000000000004",
+        "state": "leaving"
       }
     ]
   },
   {
-    "contract": 1,
+    "contract": 2,
     "places": [
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000005",
+        "replica": "00000000-0000-7000-8000-000000000006",
         "state": "holds"
       },
       {
@@ -67,22 +77,27 @@ export default [
       },
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000004",
+        "replica": "00000000-0000-7000-8000-000000000005",
         "state": "on_its_way"
       },
       {
         "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
         "state": "on_its_way"
+      },
+      {
+        "audience": "test",
+        "replica": "00000000-0000-7000-8000-000000000004",
+        "state": "holds"
       }
     ]
   },
   {
-    "contract": 1,
+    "contract": 2,
     "places": [
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000005",
+        "replica": "00000000-0000-7000-8000-000000000006",
         "state": "missing"
       },
       {
@@ -92,12 +107,17 @@ export default [
       },
       {
         "audience": "test",
-        "replica": "00000000-0000-7000-8000-000000000004",
+        "replica": "00000000-0000-7000-8000-000000000005",
         "state": "missing"
       },
       {
         "audience": "test",
         "replica": "00000000-0000-7000-8000-000000000001",
+        "state": "missing"
+      },
+      {
+        "audience": "test",
+        "replica": "00000000-0000-7000-8000-000000000004",
         "state": "missing"
       }
     ]

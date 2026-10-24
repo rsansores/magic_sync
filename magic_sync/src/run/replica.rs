@@ -235,12 +235,26 @@ impl<P: Sync + 'static, I: Identity, U: Uplink> Replica<P, I, U> {
             ("wishes_every", settings.wishes_every),
             ("wishes_timeout", settings.wishes_timeout),
             ("outbox.resend_after", settings.outbox.resend_after),
-            ("outbox.backlog_every", settings.outbox.backlog_every),
+            ("outbox.keepalive_every", settings.outbox.keepalive_every),
         ];
         if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
             return Err(Error::Misuse(format!(
                 "`{what}` is zero: the replica would spin, or say the same thing without end"
             )));
+        }
+        if settings.outbox.keepalive_every > std::time::Duration::from_secs(24 * 60 * 60) {
+            return Err(Error::Misuse(
+                "`outbox.keepalive_every` is over a day: the server would take it for none, \
+                 and never know the replica stopped"
+                    .into(),
+            ));
+        }
+        if settings.idle >= settings.outbox.keepalive_every {
+            return Err(Error::Misuse(
+                "`idle` is not under `outbox.keepalive_every`: the replica would sleep past \
+                 its keepalive, and be taken for one that stopped"
+                    .into(),
+            ));
         }
         let mut conn = pool.acquire().await?;
         replica::checked(&mut conn, &codecs.iter().collect::<Vec<_>>()).await?;

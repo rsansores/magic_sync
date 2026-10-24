@@ -108,6 +108,7 @@ pub async fn overview(engine: &Engine, pool: &PgPool, customer: Uuid) -> Result<
             ReplicaState::Synced => "holds what it should; all it wrote is filed".to_owned(),
             ReplicaState::CatchingUp => format!("{} changes on their way", r.pending),
             ReplicaState::Unreachable => format!("{} sends failed: {:?}", r.failures, r.last_error),
+            ReplicaState::Silent => format!("said nothing since {:?}", r.last_heard_at),
             ReplicaState::AwaitingFix => format!("{} rows set aside", r.quarantined),
             _ => "a state of a later version".to_owned(),
         };

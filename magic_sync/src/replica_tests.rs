@@ -3518,19 +3518,31 @@ async fn what_the_replica_wrote_is_pending_until_the_server_filed_it(pool: Sqlit
             .await
             .unwrap();
     }
-    let pending = |unsent, unfiled| {
-        vec![UpProgress {
-            table: "events".to_owned(),
-            unsent,
-            unfiled,
-            set_aside: 0,
-        }]
+    let pending = |progress: Vec<UpProgress>| {
+        progress
+            .into_iter()
+            .map(|t| {
+                (
+                    t.table,
+                    t.unsent,
+                    t.unfiled,
+                    t.set_aside,
+                    t.oldest_at.is_some(),
+                )
+            })
+            .collect::<Vec<_>>()
     };
     let mut conn = w.pool.acquire().await.unwrap();
-    assert_eq!(progress(&mut conn).await.unwrap(), pending(2, 0));
+    assert_eq!(
+        pending(progress(&mut conn).await.unwrap()),
+        [("events".to_owned(), 2, 0, 0, true)]
+    );
     let up = w.up(0, false).await.expect("the rows");
     assert_eq!(up.tables[0].upserts.len(), 2);
-    assert_eq!(progress(&mut conn).await.unwrap(), pending(0, 2));
+    assert_eq!(
+        pending(progress(&mut conn).await.unwrap()),
+        [("events".to_owned(), 0, 2, 0, true)]
+    );
     assert!(
         w.up(0, false)
             .await
@@ -4035,6 +4047,7 @@ async fn a_message_up_is_full_to_the_byte(pool: SqlitePool) {
     let part = |rows: &[usize]| framed(6) + rows.iter().map(|r| framed(*r) + key).sum::<usize>();
     let bare = Up {
         protocol: envelope::PROTOCOL,
+        keepalive_ms: 60_000,
         ..Up::default()
     }
     .encoded_len();
@@ -4814,7 +4827,7 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         turn(0, settings.clone()).await.is_none(),
         "it grows, said a moment ago"
     );
-    settings.backlog_every = std::time::Duration::ZERO;
+    settings.keepalive_every = std::time::Duration::ZERO;
     let main = turn(0, settings.clone()).await;
     assert_eq!(said(&main), Some(vec![("events".into(), 2, 0)]), "when due");
     let again = turn(0, settings.clone()).await;
@@ -4829,17 +4842,19 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
         .encoded(),
     )
     .await;
-    settings.backlog_every = std::time::Duration::from_secs(3600);
+    settings.keepalive_every = std::time::Duration::from_secs(3600);
     let main = turn(0, settings.clone()).await;
     assert_eq!(said(&main), Some(vec![]), "it empties, said at once");
     assert!(turn(0, settings.clone()).await.is_none());
     let zero = Outbox {
-        backlog_every: std::time::Duration::ZERO,
+        keepalive_every: std::time::Duration::ZERO,
         ..settings.clone()
     };
-    assert!(
-        turn(0, zero).await.is_none(),
-        "empty, said: not said again however due"
+    let keepalive = turn(0, zero).await;
+    assert_eq!(
+        said(&keepalive),
+        Some(vec![]),
+        "empty, said: said again only as it says it is there"
     );
 
     write().execute(&w.pool).await.unwrap();
@@ -4859,6 +4874,72 @@ async fn the_backlog_is_said_when_it_changes(pool: SqlitePool) {
     assert!(told.up.backlog.is_some());
 }
 
+/// The backlog an upload says is what is owed once it is filed: the rows it
+/// carries are not, and an upload of everything says nothing is owed.
+#[sqlx::test(migrations = false)]
+async fn an_upload_of_everything_says_nothing_is_owed(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["one", "two", "three"]).await;
+    let up = w.up(0, false).await.expect("the rows");
+    assert_eq!(up.tables[0].upserts.len(), 3);
+    assert_eq!(up.backlog.expect("said").tables, vec![]);
+    let mut conn = w.pool.acquire().await.unwrap();
+    let unfiled: Vec<i64> = progress(&mut conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.unfiled)
+        .collect();
+    assert_eq!(unfiled, [3], "on their way until the server files them");
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
+    assert!(w.up(0, false).await.is_none(), "nothing changed to say");
+}
+
+/// A replica that has said everything stays quiet for its keepalive, then
+/// says it is there on its first lane — its backlog in it, nothing else to
+/// say — and every message it sends says how long it stays quiet. What goes
+/// on another lane is heard as well, and puts the keepalive off.
+#[sqlx::test(migrations = false)]
+async fn a_quiet_replica_says_it_is_there_every_keepalive(pool: SqlitePool) {
+    let settings = Settings {
+        lanes: vec![Lane::new("main", &[]), Lane::new("fast", &["events"])],
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    for _ in 0..3 {
+        w.up(0, false).await;
+    }
+    assert!(w.up(0, false).await.is_none(), "it spoke a moment ago");
+    events(&w, &["x"]).await;
+    let fast = w.up(1, false).await.expect("the row");
+    assert_eq!(fast.keepalive_ms, 60_000);
+
+    w.exec("UPDATE sync_spoken SET at = at - 60000")
+        .await
+        .unwrap();
+    let main = w.up(0, false).await.expect("it says it is there");
+    assert!(main.tables.is_empty() && main.rejected.is_empty() && main.sequence == 0);
+    assert_eq!(main.keepalive_ms, 60_000);
+    let backlog = main.backlog.expect("its backlog");
+    assert_eq!(backlog.tables[0].unfiled, 1);
+    assert!(w.up(0, false).await.is_none(), "and is quiet again");
+
+    w.exec("UPDATE sync_spoken SET at = at - 60000")
+        .await
+        .unwrap();
+    events(&w, &["y"]).await;
+    w.up(1, false).await.expect("the row");
+    assert!(w.up(0, false).await.is_none(), "heard on the other lane");
+}
+
 /// What the replica stored of the backlog it last told, it reads in a shape
 /// of its own: one it cannot read — another build's — it never told, and
 /// tells now, rather than fail every message up.
@@ -4872,7 +4953,8 @@ async fn a_backlog_told_in_a_shape_it_cannot_read_is_told_again(pool: SqlitePool
         .unwrap();
     events(&w, &["y"]).await;
     let up = w.up(0, false).await.expect("sent");
-    assert_eq!(up.backlog.expect("told").tables[0].unsent, 1);
+    let told = up.backlog.expect("told");
+    assert_eq!((told.tables[0].unsent, told.tables[0].unfiled), (0, 1));
 }
 
 /// A clock set back makes nothing wait for it to come round again: an upload
@@ -5254,8 +5336,11 @@ async fn a_connection_the_engine_cannot_keep_its_word_on_is_refused(pool: Sqlite
 #[sqlx::test(migrations = false)]
 async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     let pool = settled(pool).await;
-    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] =
-        [0xe5dd_b8ea_c465_953a, 0x3663_5d6b_eb53_4f77];
+    let released: [u64; crate::REPLICA_SCHEMA_VERSION as usize] = [
+        0xe5dd_b8ea_c465_953a,
+        0x3663_5d6b_eb53_4f77,
+        0x67ab_c07e_2400_1fc0,
+    ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -5279,6 +5364,128 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
     install(&mut conn, &codecs())
         .await
         .expect("nothing left to migrate");
+}
+
+/// A database of version 2 is brought to 3 keeping its notes, each stamped
+/// as the step runs; a note made after is stamped as it is made, and a note
+/// written again keeps the time it was first made.
+#[sqlx::test(migrations = false)]
+async fn a_replica_of_version_2_stamps_the_notes_it_has(pool: SqlitePool) {
+    let pool = settled(pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    for step in 1..=2 {
+        let step = migration(step).expect("a released step");
+        sqlx::raw_sql(&step).execute(&mut *conn).await.unwrap();
+    }
+    sqlx::raw_sql(TABLES).execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql("INSERT INTO sync_notes (relation, row_key) VALUES ('events', 'before')")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    install(&mut conn, &codecs()).await.expect("upgraded");
+    assert_eq!(schema_version(&mut conn).await.unwrap(), 3);
+    let noted = |key: &'static str| {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT noted_at FROM sync_notes WHERE row_key = $1")
+            .bind(key)
+    };
+    let clock = chrono::Utc::now().timestamp_millis();
+    let before = noted("before").fetch_one(&mut *conn).await.unwrap();
+    assert!(
+        before.is_some_and(|at| (clock - at).abs() < 60_000),
+        "{before:?}"
+    );
+    sqlx::raw_sql(
+        "INSERT INTO sync_notes (relation, row_key) VALUES ('events', 'after'); \
+         UPDATE sync_notes SET noted_at = 1 WHERE row_key = 'before'; \
+         INSERT INTO sync_notes (relation, row_key) VALUES ('events', 'before') \
+             ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let after = noted("after").fetch_one(&mut *conn).await.unwrap();
+    assert!(
+        after.is_some_and(|at| (clock - at).abs() < 60_000),
+        "{after:?}"
+    );
+    assert_eq!(
+        noted("before").fetch_one(&mut *conn).await.unwrap(),
+        Some(1)
+    );
+}
+
+/// The backlog says how long ago each table's oldest row was written, as an
+/// age: of a row noted five minutes ago, five minutes; of one noted "in the
+/// future", by a clock set back since, the least age there is.
+#[sqlx::test(migrations = false)]
+async fn the_backlog_says_how_long_its_oldest_row_has_waited(pool: SqlitePool) {
+    let settings = Settings {
+        lanes: vec![Lane::new("main", &[]), Lane::new("fast", &["events"])],
+        ..Settings::default()
+    };
+    let w = world_with(pool, settings).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["waited"]).await;
+    w.exec(
+        "UPDATE sync_notes SET noted_at = \
+             CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 300000",
+    )
+    .await
+    .unwrap();
+    let up = w.up(0, false).await.expect("the backlog");
+    let age = up.backlog.expect("said").tables[0].oldest_ms;
+    assert!((300_000..360_000).contains(&age), "{age}");
+
+    w.exec("DELETE FROM sync_backlog; UPDATE sync_notes SET noted_at = 32503680000000")
+        .await
+        .unwrap();
+    let up = w.up(0, false).await.expect("the backlog");
+    assert_eq!(up.backlog.expect("said").tables[0].oldest_ms, 1);
+}
+
+/// A row written again after its upload was made goes up again, and has
+/// waited since that upload, not since it was first written: a row written
+/// over and over, upload after upload, is never taken for one that waits.
+#[sqlx::test(migrations = false)]
+async fn a_row_written_again_after_its_upload_waits_since_that_upload(pool: SqlitePool) {
+    let w = world(pool).await;
+    w.exec("DELETE FROM sync_notes").await.unwrap();
+    events(&w, &["first"]).await;
+    let oldest = |w: &World| {
+        let pool = w.pool.clone();
+        async move {
+            let mut conn = pool.acquire().await.unwrap();
+            let progress = progress(&mut conn).await.unwrap();
+            progress[0].oldest_at.expect("stamped")
+        }
+    };
+    for round in 0..3 {
+        // Noted ten minutes ago, as far as the note can tell.
+        w.exec(
+            "UPDATE sync_notes SET noted_at = \
+                 CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 600000",
+        )
+        .await
+        .unwrap();
+        let up = w.up(0, false).await.expect("the row");
+        assert_eq!(up.tables[0].upserts.len(), 1, "round {round}");
+        // Written again, as a host's trigger notes it.
+        w.exec("UPDATE sync_notes SET writes = writes + 1")
+            .await
+            .unwrap();
+        w.receive(
+            &Body::Filed(Filed {
+                uploads: up.uploads.clone(),
+            })
+            .encoded(),
+        )
+        .await;
+        let waited = chrono::Utc::now() - oldest(&w).await;
+        assert!(
+            waited < chrono::TimeDelta::seconds(60),
+            "round {round}: waited {waited}"
+        );
+    }
 }
 
 /// A database whose engine tables are of another version is refused, with

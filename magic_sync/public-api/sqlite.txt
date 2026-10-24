@@ -79,7 +79,7 @@ impl core::marker::UnsafeUnpin for magic_sync::replica::Lane
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Lane
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Lane
 #[non_exhaustive] pub struct magic_sync::replica::Outbox
-pub magic_sync::replica::Outbox::backlog_every: core::time::Duration
+pub magic_sync::replica::Outbox::keepalive_every: core::time::Duration
 pub magic_sync::replica::Outbox::limits: magic_sync::envelope::Limits
 pub magic_sync::replica::Outbox::resend_after: core::time::Duration
 impl core::clone::Clone for magic_sync::replica::Outbox
@@ -96,6 +96,7 @@ impl core::marker::UnsafeUnpin for magic_sync::replica::Outbox
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Outbox
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Outbox
 #[non_exhaustive] pub struct magic_sync::replica::UpProgress
+pub magic_sync::replica::UpProgress::oldest_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::replica::UpProgress::set_aside: i64
 pub magic_sync::replica::UpProgress::table: alloc::string::String
 pub magic_sync::replica::UpProgress::unfiled: i64

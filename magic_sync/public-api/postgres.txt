@@ -48,6 +48,7 @@ pub async fn magic_sync::plan::Engine::listing(&self, &mut magic_sync::Conn, mag
 pub async fn magic_sync::plan::Engine::overview(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, u32) -> core::result::Result<magic_sync::status::Overview, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>) -> core::result::Result<magic_sync::status::Progress, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::row_progress(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, &str, &str) -> core::result::Result<magic_sync::status::RowProgress, magic_sync::Error>
+pub async fn magic_sync::plan::Engine::states(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>) -> core::result::Result<magic_sync::status::States, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::wishes(&self, &mut magic_sync::Conn, magic_sync::status::Scope<'_>, core::option::Option<magic_sync::status::WishState>, magic_sync::status::Page) -> core::result::Result<magic_sync::status::WishListing, magic_sync::Error>
 impl magic_sync::plan::Engine
 pub async fn magic_sync::plan::Engine::indexes<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::plan::Audience<P>]) -> core::result::Result<alloc::string::String, magic_sync::Error>
@@ -290,6 +291,7 @@ impl<S, T> !core::panic::unwind_safe::UnwindSafe for magic_sync::run::server::Se
 #[non_exhaustive] pub struct magic_sync::run::server::Settings
 pub magic_sync::run::server::Settings::backoff: magic_sync::run::Backoff
 pub magic_sync::run::server::Settings::batch: core::num::nonzero::NonZeroU32
+pub magic_sync::run::server::Settings::behind_after: core::time::Duration
 pub magic_sync::run::server::Settings::concurrency: core::num::nonzero::NonZeroU32
 pub magic_sync::run::server::Settings::idle: core::time::Duration
 pub magic_sync::run::server::Settings::inbox: core::num::nonzero::NonZeroU32
@@ -301,6 +303,7 @@ pub magic_sync::run::server::Settings::replica_backoff: magic_sync::run::Backoff
 pub magic_sync::run::server::Settings::retry_every: core::time::Duration
 pub magic_sync::run::server::Settings::role: core::option::Option<alloc::string::String>
 pub magic_sync::run::server::Settings::send_timeout: core::time::Duration
+pub magic_sync::run::server::Settings::silent_after_keepalives: core::num::nonzero::NonZeroU32
 pub magic_sync::run::server::Settings::standby: core::time::Duration
 pub magic_sync::run::server::Settings::stuck_after: core::time::Duration
 pub magic_sync::run::server::Settings::unconfirmed_after: core::time::Duration
@@ -417,6 +420,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::NoteKind
 #[non_exhaustive] pub enum magic_sync::status::ReplicaState
 pub magic_sync::status::ReplicaState::AwaitingFix
 pub magic_sync::status::ReplicaState::CatchingUp
+pub magic_sync::status::ReplicaState::Silent
 pub magic_sync::status::ReplicaState::Synced
 pub magic_sync::status::ReplicaState::Unreachable
 impl core::clone::Clone for magic_sync::status::ReplicaState
@@ -524,7 +528,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::WishState
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::WishState
 #[non_exhaustive] pub struct magic_sync::status::Backlog
 pub magic_sync::status::Backlog::at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
-pub magic_sync::status::Backlog::tables: alloc::vec::Vec<magic_sync::status::UpProgress>
+pub magic_sync::status::Backlog::tables: alloc::vec::Vec<magic_sync::status::UpTable>
 impl core::clone::Clone for magic_sync::status::Backlog
 pub fn magic_sync::status::Backlog::clone(&self) -> Self
 impl core::fmt::Debug for magic_sync::status::Backlog
@@ -564,6 +568,7 @@ pub magic_sync::status::Health::oldest: core::option::Option<chrono::datetime::D
 pub magic_sync::status::Health::parked: magic_sync::status::Listed<magic_sync::status::Parked>
 pub magic_sync::status::Health::pending: i64
 pub magic_sync::status::Health::quarantine: magic_sync::status::Listed<magic_sync::status::Quarantined>
+pub magic_sync::status::Health::silent: magic_sync::status::Listed<magic_sync::status::Silent>
 impl core::clone::Clone for magic_sync::status::Health
 pub fn magic_sync::status::Health::clone(&self) -> Self
 impl core::default::Default for magic_sync::status::Health
@@ -719,6 +724,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::Quarantined
 #[non_exhaustive] pub struct magic_sync::status::ReplicaCounts
 pub magic_sync::status::ReplicaCounts::awaiting_fix: i64
 pub magic_sync::status::ReplicaCounts::catching_up: i64
+pub magic_sync::status::ReplicaCounts::silent: i64
 pub magic_sync::status::ReplicaCounts::synced: i64
 pub magic_sync::status::ReplicaCounts::unreachable: i64
 impl core::clone::Clone for magic_sync::status::ReplicaCounts
@@ -744,9 +750,12 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::ReplicaCounts
 #[non_exhaustive] pub struct magic_sync::status::ReplicaOverview
 pub magic_sync::status::ReplicaOverview::applied_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::status::ReplicaOverview::audience: alloc::string::String
+pub magic_sync::status::ReplicaOverview::awaiting_fix: i64
 pub magic_sync::status::ReplicaOverview::backlog: core::option::Option<magic_sync::status::Backlog>
 pub magic_sync::status::ReplicaOverview::failures: i32
+pub magic_sync::status::ReplicaOverview::filed: alloc::vec::Vec<magic_sync::status::TableFiled>
 pub magic_sync::status::ReplicaOverview::last_error: core::option::Option<alloc::string::String>
+pub magic_sync::status::ReplicaOverview::last_heard_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::status::ReplicaOverview::owed: i64
 pub magic_sync::status::ReplicaOverview::parked: i64
 pub magic_sync::status::ReplicaOverview::pending: i64
@@ -826,6 +835,80 @@ impl core::marker::Unpin for magic_sync::status::RowProgress
 impl core::marker::UnsafeUnpin for magic_sync::status::RowProgress
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::RowProgress
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::RowProgress
+#[non_exhaustive] pub struct magic_sync::status::Silent
+pub magic_sync::status::Silent::last_heard_at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+pub magic_sync::status::Silent::replica: uuid::Uuid
+impl core::clone::Clone for magic_sync::status::Silent
+pub fn magic_sync::status::Silent::clone(&self) -> Self
+impl core::fmt::Debug for magic_sync::status::Silent
+pub fn magic_sync::status::Silent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for magic_sync::status::Silent
+pub fn magic_sync::status::Silent::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::Silent
+impl core::marker::Send for magic_sync::status::Silent
+impl core::marker::Sync for magic_sync::status::Silent
+impl core::marker::Unpin for magic_sync::status::Silent
+impl core::marker::UnsafeUnpin for magic_sync::status::Silent
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::Silent
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::Silent
+#[non_exhaustive] pub struct magic_sync::status::StateEntry
+pub magic_sync::status::StateEntry::audience: alloc::string::String
+pub magic_sync::status::StateEntry::replica: uuid::Uuid
+pub magic_sync::status::StateEntry::state: magic_sync::status::ReplicaState
+impl core::clone::Clone for magic_sync::status::StateEntry
+pub fn magic_sync::status::StateEntry::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::status::StateEntry
+impl core::cmp::PartialEq for magic_sync::status::StateEntry
+pub fn magic_sync::status::StateEntry::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::status::StateEntry
+pub fn magic_sync::status::StateEntry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::status::StateEntry
+impl serde_core::ser::Serialize for magic_sync::status::StateEntry
+pub fn magic_sync::status::StateEntry::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::StateEntry
+impl core::marker::Send for magic_sync::status::StateEntry
+impl core::marker::Sync for magic_sync::status::StateEntry
+impl core::marker::Unpin for magic_sync::status::StateEntry
+impl core::marker::UnsafeUnpin for magic_sync::status::StateEntry
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::StateEntry
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::StateEntry
+#[non_exhaustive] pub struct magic_sync::status::States
+pub magic_sync::status::States::contract: u32
+pub magic_sync::status::States::now: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+pub magic_sync::status::States::replicas: alloc::vec::Vec<magic_sync::status::StateEntry>
+impl core::clone::Clone for magic_sync::status::States
+pub fn magic_sync::status::States::clone(&self) -> Self
+impl core::fmt::Debug for magic_sync::status::States
+pub fn magic_sync::status::States::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for magic_sync::status::States
+pub fn magic_sync::status::States::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::States
+impl core::marker::Send for magic_sync::status::States
+impl core::marker::Sync for magic_sync::status::States
+impl core::marker::Unpin for magic_sync::status::States
+impl core::marker::UnsafeUnpin for magic_sync::status::States
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::States
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::States
+#[non_exhaustive] pub struct magic_sync::status::TableFiled
+pub magic_sync::status::TableFiled::last_filed_at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+pub magic_sync::status::TableFiled::table: alloc::string::String
+impl core::clone::Clone for magic_sync::status::TableFiled
+pub fn magic_sync::status::TableFiled::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::status::TableFiled
+impl core::cmp::PartialEq for magic_sync::status::TableFiled
+pub fn magic_sync::status::TableFiled::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::status::TableFiled
+pub fn magic_sync::status::TableFiled::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::status::TableFiled
+impl serde_core::ser::Serialize for magic_sync::status::TableFiled
+pub fn magic_sync::status::TableFiled::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::TableFiled
+impl core::marker::Send for magic_sync::status::TableFiled
+impl core::marker::Sync for magic_sync::status::TableFiled
+impl core::marker::Unpin for magic_sync::status::TableFiled
+impl core::marker::UnsafeUnpin for magic_sync::status::TableFiled
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::TableFiled
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::TableFiled
 #[non_exhaustive] pub struct magic_sync::status::TableOverview
 pub magic_sync::status::TableOverview::audience: alloc::string::String
 pub magic_sync::status::TableOverview::in_flight: i64
@@ -906,6 +989,7 @@ impl core::marker::UnsafeUnpin for magic_sync::status::Unfiled
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::Unfiled
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::Unfiled
 #[non_exhaustive] pub struct magic_sync::status::UpProgress
+pub magic_sync::status::UpProgress::oldest_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::status::UpProgress::set_aside: i64
 pub magic_sync::status::UpProgress::table: alloc::string::String
 pub magic_sync::status::UpProgress::unfiled: i64
@@ -929,6 +1013,22 @@ impl core::marker::Unpin for magic_sync::status::UpProgress
 impl core::marker::UnsafeUnpin for magic_sync::status::UpProgress
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::UpProgress
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::UpProgress
+#[non_exhaustive] pub struct magic_sync::status::UpTable
+pub magic_sync::status::UpTable::progress: magic_sync::status::UpProgress
+pub magic_sync::status::UpTable::waits: bool
+impl core::clone::Clone for magic_sync::status::UpTable
+pub fn magic_sync::status::UpTable::clone(&self) -> Self
+impl core::fmt::Debug for magic_sync::status::UpTable
+pub fn magic_sync::status::UpTable::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for magic_sync::status::UpTable
+pub fn magic_sync::status::UpTable::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::status::UpTable
+impl core::marker::Send for magic_sync::status::UpTable
+impl core::marker::Sync for magic_sync::status::UpTable
+impl core::marker::Unpin for magic_sync::status::UpTable
+impl core::marker::UnsafeUnpin for magic_sync::status::UpTable
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::status::UpTable
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::UpTable
 #[non_exhaustive] pub struct magic_sync::status::WishCounts
 pub magic_sync::status::WishCounts::pending: i64
 pub magic_sync::status::WishCounts::refused: i64

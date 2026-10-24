@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { knowsReplicaState, pageOf, placeMoodOf, progressOf, summarize } from './derive.js'
+import { knowsReplicaState, pageOf, placeMoodOf, progressOf, selectedRow, summarize } from './derive.js'
 import type { Overview } from './contract/types.js'
 import overview from './contract/fixtures/overview.js'
 import listing from './contract/fixtures/listing.js'
@@ -15,8 +15,9 @@ const id = (n: number) => `00000000-0000-7000-8000-${String(n).padStart(12, '0')
 const names: Record<string, string> = {
   [id(1)]: 'Away',
   [id(2)]: 'Refusing',
-  [id(4)]: 'Silent',
-  [id(5)]: 'Synced',
+  [id(4)]: 'Quiet',
+  [id(5)]: 'Writing',
+  [id(6)]: 'Synced',
 }
 const options = { name: (r: string) => names[r], now: AT }
 
@@ -32,7 +33,7 @@ const settled: Overview = {
     inbox: { total: 0, first: [] },
     failing: { total: 0, first: [] },
   },
-  states: { awaiting_fix: 0, unreachable: 0, catching_up: 0, synced: 4 },
+  states: { awaiting_fix: 0, unreachable: 0, silent: 0, catching_up: 0, synced: 4 },
   replicas: {
     total: 4,
     first: overview.replicas.first.map((r) => ({ ...r, state: 'synced' as const })),
@@ -46,11 +47,12 @@ describe('summarize', () => {
     expect(summary.worst.map((r) => [r.name, r.state])).toEqual([
       ['Refusing', 'awaiting_fix'],
       ['Away', 'unreachable'],
-      ['Silent', 'catching_up'],
+      ['Quiet', 'silent'],
+      ['Writing', 'catching_up'],
       ['Synced', 'synced'],
     ])
-    expect(summary.counts).toEqual({ awaiting_fix: 1, unreachable: 1, catching_up: 1, synced: 1 })
-    expect(summary.total).toBe(4)
+    expect(summary.counts).toEqual({ awaiting_fix: 1, unreachable: 1, silent: 1, catching_up: 1, synced: 1 })
+    expect(summary.total).toBe(5)
   })
 
   it('calls the page for attention while anything waits for a fix', () => {
@@ -86,25 +88,38 @@ describe('summarize', () => {
   it('says there is no replica rather than that every one is in sync', () => {
     const empty: Overview = {
       ...settled,
-      states: { awaiting_fix: 0, unreachable: 0, catching_up: 0, synced: 0 },
+      states: { awaiting_fix: 0, unreachable: 0, silent: 0, catching_up: 0, synced: 0 },
       replicas: { total: 0, first: [] },
     }
     expect(summarize(empty, options).mood).toBe('empty')
   })
 
   it('says a replica is not answering once it has not moved for long, by the server’s clock', () => {
-    const silent = (now: number) =>
-      summarize(overview, { ...options, now }).worst.find((r) => r.name === 'Silent')!
-    expect(silent(AT + 5 * MINUTE).silentFor).toBeNull()
-    expect(silent(AT + 20 * MINUTE).silentFor).toBe(20 * MINUTE)
-    expect(summarize(overview, { ...options, now: AT + 20 * MINUTE, silentAfter: 30 * MINUTE }).silent).toBe(
-      0,
-    )
+    const writing = (now: number) =>
+      summarize(overview, { ...options, now }).worst.find((r) => r.name === 'Writing')!
+    expect(writing(AT + 5 * MINUTE).unansweringFor).toBeNull()
+    expect(writing(AT + 20 * MINUTE).unansweringFor).toBe(20 * MINUTE)
+    expect(
+      summarize(overview, { ...options, now: AT + 20 * MINUTE, unansweringAfter: 30 * MINUTE }).unanswering,
+    ).toBe(0)
+  })
+
+  it('leaves a silent replica to its state, rather than saying it is not answering too', () => {
+    const quiet: Overview = {
+      ...overview,
+      replicas: {
+        total: 1,
+        first: overview.replicas.first.filter((r) => r.unconfirmed).map((r) => ({ ...r, state: 'silent' })),
+      },
+    }
+    const s = summarize(quiet, { ...options, now: AT + 20 * MINUTE })
+    expect(s.worst.length).toBeGreaterThan(0)
+    expect([s.worst[0]!.unansweringFor, s.unanswering]).toEqual([null, 0])
   })
 
   it('sums what a replica said it wrote and the server has not filed', () => {
-    const silent = summarize(overview, options).worst.find((r) => r.name === 'Silent')!
-    expect(silent.backlog).toEqual({ unsent: 2, unfiled: 1, at: AT })
+    const silent = summarize(overview, options).worst.find((r) => r.name === 'Writing')!
+    expect(silent.backlog).toEqual({ unsent: 2, unfiled: 1, setAside: 0, waits: true, at: AT })
   })
 
   it('lists every problem with the names of what it is about, and counts the rest', () => {
@@ -157,7 +172,7 @@ describe('pageOf', () => {
   it('lists the host’s page when it is for the filter shown', () => {
     const page = pageOf(overview, listing, 'catching_up', options)
     expect([page.rows.map((r) => r.name), page.offset, page.total, page.worst]).toEqual([
-      ['Silent'],
+      ['Writing'],
       0,
       1,
       false,
@@ -168,15 +183,31 @@ describe('pageOf', () => {
     const page = pageOf(overview, listing, 'synced', options)
     expect([page.rows.map((r) => r.name), page.total, page.worst]).toEqual([['Synced'], 1, true])
     const all = pageOf(overview, null, null, options)
-    expect([all.rows.length, all.total]).toEqual([4, 4])
+    expect([all.rows.length, all.total]).toEqual([5, 5])
+  })
+})
+
+describe('selectedRow', () => {
+  const own = listing.replicas.first[0]!
+
+  it('takes the replica’s own listing, so a replica on no page at hand still has its row', () => {
+    const row = selectedRow(own.replica, listing, [], options)
+    expect([row?.id, row?.state]).toEqual([own.replica, own.state])
+  })
+
+  it('falls back to the rows at hand, and has none for a replica nowhere', () => {
+    const rows = summarize(overview, options).worst
+    expect(selectedRow(id(6), null, rows, options)?.name).toBe('Synced')
+    expect(selectedRow(id(6), { ...listing, contract: 1 }, rows, options)?.name).toBe('Synced')
+    expect(selectedRow(id(99), listing, rows, options)).toBeNull()
   })
 })
 
 describe('progressOf', () => {
   it('counts a replica as far along as it confirmed, never further', () => {
-    const synced = progressOf(progress.replicas.find((p) => p.replica === id(5))!)
+    const synced = progressOf(progress.replicas.find((p) => p.replica === id(6))!)
     expect([synced.upToDate, synced.should, synced.share]).toEqual([3, 3, 1])
-    const silent = progressOf(progress.replicas.find((p) => p.replica === id(4))!)
+    const silent = progressOf(progress.replicas.find((p) => p.replica === id(5))!)
     expect([silent.upToDate, silent.should, silent.share]).toEqual([0, 3, 0])
     expect(silent.tables[0]!.inFlight).toBe(3)
   })

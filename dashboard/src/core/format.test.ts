@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { count, normalizeLocale, since, until } from './format.js'
+import { count, lasting, normalizeLocale, since, until } from './format.js'
 
 const MINUTE = 60_000
 
@@ -35,5 +35,14 @@ describe('since and until', () => {
     expect(since(0, 3 * 60 * MINUTE, 'es')).not.toBe(since(0, 3 * 60 * MINUTE, 'en'))
     expect(count(12345, 'en')).toBe('12,345')
     expect(count(12345, 'de')).toBe('12.345')
+  })
+})
+
+describe('lasting', () => {
+  it('says how long in the largest unit the span reaches, never less than nothing', () => {
+    expect(lasting(6 * MINUTE, 'en')).toBe('6 min')
+    expect(lasting(59.6 * MINUTE, 'en')).toBe('1 hr')
+    expect(lasting(3 * 1_000, 'es')).toBe('3 s')
+    expect(lasting(-5 * MINUTE, 'en')).toBe('0 sec')
   })
 })

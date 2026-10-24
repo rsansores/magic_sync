@@ -7,7 +7,7 @@ serves no HTTP. That is on purpose — *who may see which replicas* is your
 system's question, asked behind your login, and the engine only takes the
 answer as a scope.
 
-![The shop's head office: one register refusing a product, another out of reach](../images/dashboard.png)
+![The shop's head office: one register refusing a product, another silent](../images/dashboard.png)
 
 ## The handlers
 
@@ -31,8 +31,9 @@ version it refuses, saying so, rather than draw it wrong.
 > fifth of a second at worst, while a whole fleet has rows on their way — and
 > the page can ask every few seconds. It counts every replica but lists only
 > the worst twenty; the listing pages through the rest, in one state or all.
-> Progress counts what one replica should hold: ask it for the one being
-> looked at, not for the fleet.
+> The states are every replica's state in a word, and nothing else — some
+> 15 ms over 4000 — for a tile of each. Progress counts what one
+> replica should hold: ask it for the one being looked at, not for the fleet.
 
 ## The page
 
@@ -60,15 +61,66 @@ import 'magic_sync_dashboard/styles.css'
 
 > **What happens:** a banner says in one line where things stand — green,
 > *everything is in sync*, most of the time; amber while changes are on their
-> way or a replica is out of reach; red when something waits for a fix — then
-> the replicas, worst first, the tables, and the problems, each with its
-> reason. Picking a state, or turning a page, sets `filter` or `offset`; you
-> fetch that page of the listing. Without a listing, the dashboard shows the
-> overview's worst and says how many there are in all. Clicking a replica
-> sets `selected`; you fetch its progress, and it shows table by table. How
-> long ago something happened is measured from the server's `now` in the
-> answer, moved on by the time passed in the page — the browser's clock is
-> never compared with the server's.
+> way or a replica is out of reach; red when something waits for a fix. Under
+> it, a counter per state, each a filter; a tile per replica, coloured by its
+> state, worst first; and the replicas that need attention, each in one
+> sentence — *1 row set aside*, *last heard 6 min. ago*, *14 changes on their
+> way* — every one of them, from the states, a page at a time, the sentence
+> of each whose row is at hand. The tables and the problems, each with its reason, are a tab away.
+> Picking a state, or turning a page, sets `filter` or `offset`; you fetch
+> that page of the listing. Without a listing, the dashboard shows the
+> overview's worst and says how many there are in all. Clicking a tile or a
+> replica sets `selected`; you fetch its progress and the listing over it
+> alone (`Scope::Replicas(&[id])`: its row, whatever page it is on), and
+> its page shows when it was last heard and whether what it writes goes up
+> live, what it has to send, to confirm and set aside, and only the tables
+> that wait — to it, with how far along each is and what is on its way; from
+> it, with how long its oldest row has waited, and whether the server judges
+> that its rows wait — every other table, up one whose rows go up live,
+> folded into one line. How long ago
+> something happened is measured from the server's `now` in the answer,
+> moved on by the time passed in the page — the browser's clock is never
+> compared with the server's.
+
+## Silent
+
+A replica says it is there: when nothing else has gone up for
+`Outbox::keepalive_every` (a minute), it sends a message with nothing in it
+but its backlog, and says the cadence. The server keeps when it last heard
+from it, and a replica that has said nothing for three of its keepalives
+(`Settings::silent_after_keepalives`) is *silent* — off, or cut off. The
+shop's registers say it every 5 s, so one you stop, or take offline, is
+silent within 15 s. A silent replica is not unhealthy, as one out of reach
+is not: nothing waits for a fix, and it catches up once it is back.
+
+## What only your system knows
+
+The engine knows what it records: whether each replica holds what it should,
+and when it last heard from it. Your system knows more — where each replica
+is, whether its link is up, how you group your tables — and gives it to the
+dashboard as functions:
+
+- **Places.** `levels` (`[{ key: 'region', label: 'Region' }, …]`, the
+  widest first) and `placeOf(replica, level)`: the tiles gather in a cluster
+  per place, the worst first, and a cluster's header leads a level down;
+  `v-model:level` and `v-model:within` are the level and the trail, for your
+  URL.
+- **Groups.** `group(table)` → `{ key, label, order }`: a replica's tables
+  roll up in your groups; a group that waits shows its tables that wait
+  under its name, and every settled table is folded into one line.
+- **Checks.** `checks(replica)` → `[{ key, label, status, line }]`, read
+  before the engine's own: a passing check stays quiet, one that fails says
+  why in its colour. The slot `replica-extra` takes whatever else you show
+  of a replica.
+
+A system with a design system of its own draws the same with its own parts,
+through `useSyncDashboard` and the functions of `magic_sync_dashboard/core`
+— and may combine its checks and the engine's state into states of its own
+(`combine`, which the ready-made dashboard takes too): *offline* when its
+link is down, before anything the engine says. Those states filter the
+tiles and the replicas that need attention (`v-model:state`), and the
+counters count them once you pass the states, which hold every replica:
+without them, the counters are the engine's counts.
 
 ## Where one row is
 

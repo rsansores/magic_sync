@@ -358,6 +358,7 @@ const MIGRATIONS: [&str; crate::SERVER_SCHEMA_VERSION as usize] = [
     include_str!("../sql/postgres/2.sql"),
     include_str!("../sql/postgres/3.sql"),
     include_str!("../sql/postgres/4.sql"),
+    include_str!("../sql/postgres/5.sql"),
 ];
 
 /// The engine's step to `version` of its schema on the server, as one SQL

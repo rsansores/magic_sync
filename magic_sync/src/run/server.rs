@@ -159,6 +159,22 @@ pub struct Settings {
     pub watch_every: Duration,
     /// How long the oldest pending note may wait before that is an alarm.
     pub stuck_after: Duration,
+    /// How long a row a replica wrote may wait to be filed before a status
+    /// calls the replica behind (catching up): rows that flow are younger.
+    /// Not zero. A replica's `Outbox::keepalive_every` stays well under it:
+    /// a replica that writes nothing else says what waits only that often,
+    /// so a row of it may be judged by a backlog that old.
+    ///
+    /// The relay keeps this and `silent_after_keepalives` in the database
+    /// when it takes its lock (`sync.settings`), and every status reads them
+    /// there: every process judges alike, as the relay last started says.
+    pub behind_after: Duration,
+    /// How many times the cadence a replica says it keeps
+    /// (`Outbox::keepalive_every`) it may say nothing for before a status
+    /// calls it silent — counted from when the relay took its lock, if it
+    /// was heard before: no replica is silent for a time no server
+    /// listened. A replica that says none never is.
+    pub silent_after_keepalives: NonZeroU32,
 }
 
 impl Default for Settings {
@@ -181,6 +197,8 @@ impl Default for Settings {
             prune_after: Duration::from_secs(30 * 24 * 60 * 60),
             watch_every: Duration::from_secs(5 * 60),
             stuck_after: Duration::from_secs(15 * 60),
+            behind_after: Duration::from_secs(2 * 60),
+            silent_after_keepalives: NonZeroU32::new(3).expect("not zero"),
         }
     }
 }
@@ -199,6 +217,7 @@ impl Settings {
             ("prune_after", self.prune_after),
             ("watch_every", self.watch_every),
             ("stuck_after", self.stuck_after),
+            ("behind_after", self.behind_after),
         ];
         if let Some((what, _)) = zero.iter().find(|(_, d)| d.is_zero()) {
             return Err(Error::Misuse(format!(
@@ -206,6 +225,18 @@ impl Settings {
             )));
         }
         Ok(())
+    }
+
+    /// What a status judges a replica by: past a century, `behind_after`
+    /// is a century, which no row waits for.
+    fn judging(&self) -> crate::status::Judging {
+        let century = chrono::TimeDelta::days(36_525);
+        crate::status::Judging {
+            behind_after: chrono::TimeDelta::from_std(self.behind_after)
+                .map_or(century, |d| d.min(century)),
+            silent_after: i32::try_from(self.silent_after_keepalives.get()).unwrap_or(i32::MAX),
+            started_at: None,
+        }
     }
 }
 
@@ -272,7 +303,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// the kinds of replica it serves — where it finds each kind, and the
     /// tables they hold, parents first; `transport` how a message reaches a
     /// replica; `senders` what the host knows of a replica that sends
-    /// something up.
+    /// something up. It writes nothing: a process that only reads a status,
+    /// or files what replicas send, builds one too, and what a status
+    /// judges by is written by the relay, when [`Server::run`] takes its
+    /// lock.
     ///
     /// # Errors
     ///
@@ -293,7 +327,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
         let audiences = with_wishes(audiences)?;
         let mut tx = begin(&pool, "BEGIN", settings.role.as_deref()).await?;
         let engine = Engine::new(&mut tx, &Declared::of(&audiences)).await?;
-        tx.rollback().await?;
+        tx.commit().await?;
         Ok(Self::with(
             pool, engine, audiences, transport, senders, settings,
         ))
@@ -423,7 +457,10 @@ impl<S: Senders, T: Transport> Server<S, T> {
 
     /// Runs the relay until `shutdown` resolves: stands by while another
     /// process holds the lock, and runs passes while this one does. A pass
-    /// `shutdown` cuts short runs again, as after a crash.
+    /// `shutdown` cuts short runs again, as after a crash. Once it holds the
+    /// lock it keeps what a status judges by — `Settings::behind_after`,
+    /// `Settings::silent_after_keepalives`, and now as when a server started
+    /// listening — for every process to read.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
         loop {
@@ -673,10 +710,17 @@ impl<S: Senders, T: Transport> Server<S, T> {
         let now = Instant::now();
         let (mut retry_at, mut prune_at, mut watch_at) = (now, now, now);
         let mut refiling = None;
+        let mut silenced = Silenced::default();
+        let mut judging_kept = false;
         loop {
             if !lock.still_held().await {
                 tracing::error!("sync: the relay's lock is gone — standing by");
                 return;
+            }
+            // Before the first watch: until it is kept, a replica would be
+            // judged silent for the time no server listened to it.
+            if !judging_kept {
+                judging_kept = self.keep_judging(&mut lock).await;
             }
             if Instant::now() >= retry_at {
                 retry_at = Instant::now()
@@ -696,8 +740,8 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 prune_at =
                     Instant::now() + self.settings.prune_after.min(Duration::from_secs(60 * 60));
             }
-            if Instant::now() >= watch_at {
-                self.watch(&mut lock).await;
+            if judging_kept && Instant::now() >= watch_at {
+                self.watch(&mut lock, &mut silenced).await;
                 watch_at = Instant::now() + self.settings.watch_every;
             }
             if let Some(walk) = refiling {
@@ -723,6 +767,22 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 }
             }
         }
+    }
+
+    /// Keeps what a status judges by, as the relay holding `lock`; answers
+    /// whether it did.
+    async fn keep_judging(&self, lock: &mut Lock) -> bool {
+        let kept = async {
+            let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
+            self.settings.judging().keep(&mut tx).await?;
+            tx.commit().await?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(e) = &kept {
+            tracing::warn!("sync: keeping what a status judges by failed, and is tried again: {e}");
+        }
+        kept.is_ok()
     }
 
     /// The lock, once this process gets it.
@@ -865,7 +925,7 @@ impl<S: Senders, T: Transport> Server<S, T> {
     /// too long ([`relay::heal`]), and logs whatever in the engine's health
     /// needs someone: each one means wait (the network) or deploy a fix (a
     /// bug), never repair data.
-    async fn watch(&self, lock: &mut Lock) {
+    async fn watch(&self, lock: &mut Lock, silenced: &mut Silenced) {
         let healed = async {
             let mut tx = lock.fenced("BEGIN", self.settings.role.as_deref()).await?;
             let healed =
@@ -887,13 +947,19 @@ impl<S: Senders, T: Transport> Server<S, T> {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *tx)
                 .await?;
-            self.engine
+            let health = self
+                .engine
                 .health(&mut tx, crate::status::Scope::All, 5)
-                .await
+                .await?;
+            let silent = self
+                .engine
+                .silent(&mut tx, crate::status::Scope::All)
+                .await?;
+            Ok::<_, Error>((health, silent))
         }
         .await;
-        let health = match health {
-            Ok(health) => health,
+        let (health, silent) = match health {
+            Ok(read) => read,
             Err(e) => {
                 tracing::warn!("sync: the engine's health could not be read: {e}");
                 return;
@@ -940,6 +1006,48 @@ impl<S: Senders, T: Transport> Server<S, T> {
                 "sync: a replica keeps failing to be reached — it waits, the others carry on"
             );
         }
+        let (fell, more) = silenced.since(&silent);
+        for replica in fell {
+            tracing::warn!(
+                replica = %replica.replica,
+                last_heard_at = %replica.last_heard_at,
+                "sync: a replica has said nothing for longer than it said it would — off, or cut off"
+            );
+        }
+        if more > 0 {
+            tracing::warn!(
+                more,
+                silent = silent.len(),
+                "sync: more replicas fell silent than are named"
+            );
+        }
+    }
+}
+
+/// The silent replicas the watch has seen, so that it warns of each as it
+/// falls silent, not on every pass for as long as it stays so.
+#[derive(Debug, Default)]
+struct Silenced {
+    seen: std::collections::HashSet<Uuid>,
+}
+
+impl Silenced {
+    /// How many newly silent replicas the watch names on one pass.
+    const NAMED: usize = 5;
+
+    /// Of every silent replica, the ones that were not the last time, up to
+    /// [`Silenced::NAMED`] of them; and how many more there are.
+    fn since<'a>(
+        &mut self,
+        silent: &'a [crate::status::Silent],
+    ) -> (Vec<&'a crate::status::Silent>, usize) {
+        let fell: Vec<&crate::status::Silent> = silent
+            .iter()
+            .filter(|s| !self.seen.contains(&s.replica))
+            .collect();
+        self.seen = silent.iter().map(|s| s.replica).collect();
+        let more = fell.len().saturating_sub(Self::NAMED);
+        (fell.into_iter().take(Self::NAMED).collect(), more)
     }
 }
 

@@ -2,7 +2,7 @@
 import type { WishListing } from '../types.js'
 
 export default {
-  "contract": 1,
+  "contract": 2,
   "now": "2026-01-01T00:00:00.123456Z",
   "offset": 0,
   "state": null,
