@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-10-24
 
 Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
 (unchanged: fields added). Dashboard contract 2.
