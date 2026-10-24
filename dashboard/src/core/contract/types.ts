@@ -140,6 +140,13 @@ quarantined: number,
  */
 unfiled: number, 
 /**
+ * What of its own waits for a fix: its rows set aside until one (not
+ * those held back behind them), the rows it sent that wait in the
+ * inbox, and the changes of it alone the planner set aside. More than
+ * none is what makes it `awaiting_fix`.
+ */
+awaiting_fix: number, 
+/**
  * Sends to it that failed in a row.
  */
 failures: number, 

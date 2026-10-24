@@ -117,6 +117,7 @@ export default {
       {
         "applied_at": "2026-01-01T00:00:00.123456Z",
         "audience": "test",
+        "awaiting_fix": 4,
         "backlog": null,
         "failures": 0,
         "filed": [],
@@ -143,6 +144,7 @@ export default {
       {
         "applied_at": null,
         "audience": "test",
+        "awaiting_fix": 0,
         "backlog": null,
         "failures": 1,
         "filed": [],
@@ -169,6 +171,7 @@ export default {
       {
         "applied_at": "2026-01-01T00:00:00.123456Z",
         "audience": "test",
+        "awaiting_fix": 0,
         "backlog": null,
         "failures": 0,
         "filed": [
@@ -200,6 +203,7 @@ export default {
       {
         "applied_at": null,
         "audience": "test",
+        "awaiting_fix": 0,
         "backlog": {
           "at": "2026-01-01T00:00:00.123456Z",
           "tables": [
@@ -238,6 +242,7 @@ export default {
       {
         "applied_at": "2026-01-01T00:00:00.123456Z",
         "audience": "test",
+        "awaiting_fix": 0,
         "backlog": null,
         "failures": 0,
         "filed": [],

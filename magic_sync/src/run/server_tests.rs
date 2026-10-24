@@ -1426,14 +1426,17 @@ async fn a_server_refuses_settings_it_cannot_run_with(pool: PgPool) {
     }
 }
 
-/// A server keeps what a status judges by where every process reads it.
+/// The relay keeps what a status judges by where every process reads it,
+/// with when it started listening, once it takes its lock; a server only
+/// built — a process that reads a status, or files what replicas send —
+/// writes none of it, whatever it was built with.
 #[sqlx::test(migrations = false)]
-async fn a_server_keeps_what_a_status_judges_by(pool: PgPool) {
+async fn the_relay_keeps_what_a_status_judges_by(pool: PgPool) {
     world(&pool).await;
     let mut set = settings();
     set.behind_after = Duration::from_secs(7 * 60);
     set.silent_after_keepalives = std::num::NonZeroU32::new(5).unwrap();
-    Server::new(
+    let server = Server::new(
         pool.clone(),
         vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
         Wire::default(),
@@ -1442,12 +1445,34 @@ async fn a_server_keeps_what_a_status_judges_by(pool: PgPool) {
     )
     .await
     .unwrap();
-    let kept: (String, i32) =
-        sqlx::query_as("SELECT behind_after::text, silent_after_keepalives FROM sync.settings")
+    let kept = || async {
+        sqlx::query_as::<_, (String, i32, bool)>(
+            "SELECT behind_after::text, silent_after_keepalives, \
+                    started_at > now() - interval '1 minute' FROM sync.settings",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let unset: (String, i32, Option<bool>) = sqlx::query_as(
+        "SELECT behind_after::text, silent_after_keepalives, started_at IS NOT NULL FROM sync.settings",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unset,
+        ("00:02:00".to_owned(), 3, Some(false)),
+        "a server only built writes nothing"
+    );
+    until(&[&server], || async {
+        sqlx::query_scalar::<_, bool>("SELECT started_at IS NOT NULL FROM sync.settings")
             .fetch_one(&pool)
             .await
-            .unwrap();
-    assert_eq!(kept, ("00:07:00".to_owned(), 5));
+            .unwrap()
+    })
+    .await;
+    assert_eq!(kept().await, ("00:07:00".to_owned(), 5, true));
 }
 
 /// An upload beyond the server's limits — more bytes, or more rows and
@@ -1741,41 +1766,50 @@ async fn a_transaction_on_a_connection_without_the_lock_is_refused(pool: PgPool)
 }
 
 /// The watch warns of a replica as it falls silent, not on every pass for as
-/// long as it stays so; and of how many are, when more are than it names and
-/// that changes.
+/// long as it stays so — whichever replicas it named, and however many fell
+/// silent at once: it names some, and says how many more.
 #[test]
 fn the_watch_warns_of_a_replica_as_it_falls_silent() {
-    use crate::status::{Listed, Silent};
-    let [a, b, c] = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+    use crate::status::Silent;
+    let ids: Vec<Uuid> = (0..9).map(|_| Uuid::now_v7()).collect();
+    let [a, b, c] = [ids[0], ids[1], ids[2]];
     let at = Utc::now();
-    let listed = |total: i64, named: &[Uuid]| Listed {
-        total,
-        first: named
+    let silent = |named: &[Uuid]| -> Vec<Silent> {
+        named
             .iter()
             .map(|&replica| Silent {
                 replica,
                 last_heard_at: at,
             })
-            .collect(),
+            .collect()
     };
-    let fell = |silenced: &mut Silenced, listed: &Listed<Silent>| {
-        let (fell, total) = silenced.since(listed);
-        (fell.iter().map(|s| s.replica).collect::<Vec<_>>(), total)
+    let fell = |silenced: &mut Silenced, silent: &[Silent]| {
+        let (fell, more) = silenced.since(silent);
+        (fell.iter().map(|s| s.replica).collect::<Vec<_>>(), more)
     };
     let mut silenced = Silenced::default();
-    assert_eq!(fell(&mut silenced, &listed(1, &[a])), (vec![a], None));
+    assert_eq!(fell(&mut silenced, &silent(&[a])), (vec![a], 0));
     assert_eq!(
-        fell(&mut silenced, &listed(1, &[a])),
-        (vec![], None),
+        fell(&mut silenced, &silent(&[a])),
+        (vec![], 0),
         "still silent"
     );
-    assert_eq!(fell(&mut silenced, &listed(2, &[a, b])), (vec![b], None));
-    assert_eq!(fell(&mut silenced, &listed(9, &[a, b])), (vec![], Some(9)));
-    assert_eq!(fell(&mut silenced, &listed(9, &[a, b])), (vec![], None));
-    assert_eq!(fell(&mut silenced, &listed(0, &[])), (vec![], None));
+    assert_eq!(fell(&mut silenced, &silent(&[a, b])), (vec![b], 0));
+    let (named, more) = fell(&mut silenced, &silent(&ids));
     assert_eq!(
-        fell(&mut silenced, &listed(2, &[a, c])),
-        (vec![a, c], None),
+        (named, more),
+        (ids[2..7].to_vec(), 2),
+        "seven fell silent at once: five named, two more"
+    );
+    assert_eq!(
+        fell(&mut silenced, &silent(&ids)),
+        (vec![], 0),
+        "the two not named are not taken for newly silent the next time"
+    );
+    assert_eq!(fell(&mut silenced, &silent(&[])), (vec![], 0));
+    assert_eq!(
+        fell(&mut silenced, &silent(&[a, c])),
+        (vec![a, c], 0),
         "silent again"
     );
 }

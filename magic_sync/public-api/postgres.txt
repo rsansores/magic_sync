@@ -750,6 +750,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::status::ReplicaCounts
 #[non_exhaustive] pub struct magic_sync::status::ReplicaOverview
 pub magic_sync::status::ReplicaOverview::applied_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::status::ReplicaOverview::audience: alloc::string::String
+pub magic_sync::status::ReplicaOverview::awaiting_fix: i64
 pub magic_sync::status::ReplicaOverview::backlog: core::option::Option<magic_sync::status::Backlog>
 pub magic_sync::status::ReplicaOverview::failures: i32
 pub magic_sync::status::ReplicaOverview::filed: alloc::vec::Vec<magic_sync::status::TableFiled>

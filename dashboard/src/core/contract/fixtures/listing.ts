@@ -10,6 +10,7 @@ export default {
       {
         "applied_at": null,
         "audience": "test",
+        "awaiting_fix": 0,
         "backlog": {
           "at": "2026-01-01T00:00:00.123456Z",
           "tables": [

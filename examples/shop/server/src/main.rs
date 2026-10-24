@@ -120,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A fix deployed (a register restarted without its bug) gets through
     // within seconds, not the hour a real server waits.
     settings.retry_every = Duration::from_secs(10);
-    // A register's oldest receipt is late after 30 s, not 2 min; and one
-    // that says nothing for three of its keepalives is silent.
+    // A register's oldest receipt is late after 30 s, not 2 min. Silence
+    // keeps the default, three keepalives: 15 s of a register's 5 s.
     settings.behind_after = Duration::from_secs(30);
     // No migrations of its own: the engine sets up what the database lacks.
     let server = Arc::new(

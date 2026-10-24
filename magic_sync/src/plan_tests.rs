@@ -2534,7 +2534,7 @@ async fn every_step_of_the_engines_schema_is_as_released(pool: crate::DbPool) {
         0xa4c8_9065_538b_9cb5,
         0x64b0_376e_5c2a_ed54,
         0x8a3d_90b7_c465_07f0,
-        0x7c26_08ec_c3b3_691d,
+        0x58d1_a267_ae4a_3c3c,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {

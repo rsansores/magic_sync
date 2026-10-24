@@ -124,10 +124,13 @@ earlier build says no keepalive, and is never silent. A replica refuses a
 keepalive over a day, which the server would take for none, and one its
 `idle` would sleep past.
 
-The server keeps `behind_after` and `silent_after_keepalives` in its
-database (`sync.settings`) when it starts, and every status reads them
-there: a process that only reads a status judges as the server does,
-whatever settings it was built with.
+The relay keeps `behind_after` and `silent_after_keepalives` in the
+database (`sync.settings`) when it takes its lock, and every status reads
+them there: a process that only reads a status judges as the relay does,
+whatever settings it was built with. It keeps when it took the lock too,
+and a replica heard before then is silent only once it has said nothing
+for its keepalives counted from then: after the server was down, the fleet
+is not taken for silent. A role that reads a status reads `sync.settings`.
 
 `engine().states(&mut conn, scope)` answers every replica's state at once,
 and nothing else of them: what a map of the fleet colours its tiles by —

@@ -541,7 +541,13 @@ async fn a_replica_quiet_for_longer_than_it_said_is_silent(pool: crate::DbPool) 
     .await
     .unwrap();
     let fix = world.overview(Scope::Replicas(&[a])).await;
-    assert_eq!(fix.replicas.first[0].state, ReplicaState::AwaitingFix);
+    assert_eq!(
+        (
+            fix.replicas.first[0].state,
+            fix.replicas.first[0].awaiting_fix
+        ),
+        (ReplicaState::AwaitingFix, 1)
+    );
     assert_eq!(
         (fix.states.silent, fix.health.silent.total),
         (0, 0),
@@ -635,11 +641,77 @@ async fn a_status_judges_by_what_the_server_kept(pool: crate::DbPool) {
     crate::status::Judging {
         behind_after: chrono::TimeDelta::hours(1),
         silent_after: 10,
+        started_at: None,
     }
     .keep(&mut conn)
     .await
     .unwrap();
     assert_eq!(state().await, ReplicaState::Synced, "as a server kept it");
+}
+
+/// No replica is silent for a time no server listened to it: after an
+/// outage, each heard before the relay took its lock again first has its
+/// keepalives to speak, counted from then.
+#[sqlx::test(migrations = false)]
+async fn no_replica_is_silent_for_a_time_no_server_listened(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let wire = Fake::default();
+    world.pass(&wire).await;
+    world.acknowledge(a, world.last_sent(a).await).await;
+    let up = envelope::Up {
+        keepalive_ms: 60_000,
+        ..envelope::Up::default()
+    };
+    crate::testkit::file(&world.pool, &world.codecs, &up, a, &()).await;
+    sqlx::query(
+        "UPDATE sync.replicas SET last_heard_at = now() - interval '1 hour' WHERE replica_id = $1",
+    )
+    .bind(a)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let started = |ago: &'static str| {
+        let pool = world.pool.clone();
+        async move {
+            sqlx::query("UPDATE sync.settings SET started_at = now() - $1::interval")
+                .bind(ago)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    let read = || async {
+        let overview = world.overview(Scope::Replicas(&[a])).await;
+        let mut conn = world.pool.acquire().await.unwrap();
+        let health = world
+            .engine
+            .health(&mut conn, Scope::Replicas(&[a]), 10)
+            .await
+            .unwrap();
+        (
+            overview.replicas.first[0].state,
+            overview.health.silent.total,
+            health.silent.total,
+        )
+    };
+    assert_eq!(
+        read().await,
+        (ReplicaState::Silent, 1, 1),
+        "no relay has run: by when it was heard"
+    );
+    started("10 seconds").await;
+    assert_eq!(
+        read().await,
+        (ReplicaState::Synced, 0, 0),
+        "a server listening for less than three keepalives"
+    );
+    started("181 seconds").await;
+    assert_eq!(
+        read().await,
+        (ReplicaState::Silent, 1, 1),
+        "three keepalives since the server started listening"
+    );
 }
 
 /// Every replica's state at once is the one the overview gives it, in the

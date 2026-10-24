@@ -44,10 +44,20 @@ Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
   — which leaves the health healthy, and which the health reads without
   settling every replica's state. A replica that says no
   keepalive, as one of an earlier build, never is: a fleet upgrades over
-  days. The server keeps `behind_after` and `silent_after_keepalives` in
-  its database when it starts (`sync.settings`), and every status judges
-  by them there: a process that only reads a status judges as the server
-  does. Its watch warns of a replica as it falls silent, not on every pass.
+  days. The relay keeps `behind_after` and `silent_after_keepalives` in
+  the database when it takes its lock (`sync.settings`), with when it did,
+  and every status judges by them there: a process that only reads a
+  status judges as the relay does, and `Server::new` writes nothing. A
+  replica heard before the relay took its lock is silent only once it has
+  said nothing for its keepalives counted from then: after an outage of
+  the server, the fleet is not taken for silent. One state settles every
+  replica's, for every read. Its watch warns of a replica as it falls
+  silent, not on every pass, and of how many more than it names.
+- **What waits for a fix, per replica.** `ReplicaOverview::awaiting_fix`:
+  the rows set aside for it until a fix, not those held back behind them,
+  the rows it sent that wait in the inbox, and the changes of it alone set
+  aside — what makes it `awaiting_fix`, which a dashboard says without
+  adding up counts that hold more.
 - **Every replica's state at once.** `Engine::states(scope)`: each replica
   of a scope with its audience and its state, worst first, for a map of the
   fleet — some 15 ms over 4000 replicas.
@@ -91,6 +101,11 @@ Upgrading: the replica first or the server first, either way. An earlier
 replica says no age and no keepalive, and is judged as before but for
 silence; an earlier server ignores both.
 
+A status reads `sync.settings` now. Where the roles that read a status are
+granted `SELECT` table by table, rather than on the schema, grant it on
+`sync.settings` too: a status read without it fails, it does not judge by
+defaults. The relay's role writes it (`UPDATE`) when it takes its lock.
+
 ### Breaking
 
 - **Server schema 5.** `Server::install` takes the database there; with
@@ -108,7 +123,7 @@ silence; an earlier server ignores both.
 - **`Settings::behind_after` may not be zero,** which `Server::new` refuses.
 - **Dashboard contract 2.** `catching_up` means what waits, not what is on
   its way; `silent` is a state; `ReplicaOverview` says `last_heard_at` and
-  `filed`, `UpProgress` `oldest_at`, each table of a `Backlog` is an
+  `filed` and `awaiting_fix`, `UpProgress` `oldest_at`, each table of a `Backlog` is an
   `UpTable` (the said `UpProgress` and `waits`), `Health` says `silent`, and
   `States` is the answer of `Engine::states`. The dashboard reads contract
   2, and refuses 1.
@@ -126,7 +141,7 @@ silence; an earlier server ignores both.
   is said to be silent, not unanswering too.
 - The public API adds `Engine::states`, `States`, `StateEntry`, `Silent`,
   `TableFiled`, `UpTable`, `ReplicaState::Silent`, `ReplicaCounts::silent`,
-  `Health::silent`, `ReplicaOverview::{last_heard_at, filed}`,
+  `Health::silent`, `ReplicaOverview::{last_heard_at, filed, awaiting_fix}`,
   `UpProgress::oldest_at` and server `Settings::{behind_after,
   silent_after_keepalives}`; it renames `Outbox::backlog_every` to
   `Outbox::keepalive_every`, and `Backlog::tables` holds `UpTable`s where it
