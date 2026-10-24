@@ -20,7 +20,9 @@ const overview = ref<Overview | null>(null)
 // Every register's state, for a tile of each.
 const states = ref<States | null>(null)
 const selected = ref<string | null>(null)
+// The register looked at: where it is on each table, and its own row.
 const progress = ref<Progress | null>(null)
+const replica = ref<Listing | null>(null)
 // The replicas listed, a page at a time, in the state picked.
 const filter = ref<ReplicaState | null>(null)
 const offset = ref(0)
@@ -42,7 +44,9 @@ async function refresh() {
       api.states(),
       api.listing(filter.value, offset.value),
     ])
-    progress.value = selected.value ? await api.progress(selected.value) : null
+    ;[progress.value, replica.value] = selected.value
+      ? await Promise.all([api.progress(selected.value), api.replica(selected.value)])
+      : [null, null]
     places.value = holding.value ? await api.row('products', holding.value) : null
     error.value = ''
   } catch (e) {
@@ -207,8 +211,7 @@ function pageOf(url: string) {
       <section>
         <h2>Sync</h2>
         <!-- ANCHOR: dashboard -->
-        <!-- It is a demo: a register is "not answering" after 30 s, not 15 min, and a
-             receipt is late after 30 s, as the server's `behind_after` says. -->
+        <!-- It is a demo: a register is "not answering" after 30 s, not 15 min. -->
         <SyncDashboard
           v-model:selected="selected"
           v-model:filter="filter"
@@ -217,11 +220,11 @@ function pageOf(url: string) {
           :states="states"
           :listing="listing"
           :progress="progress"
+          :replica="replica"
           :page-size="20"
           :names="names"
           :labels="labels"
-          :silent-after="30_000"
-          :behind-after="30_000"
+          :unanswering-after="30_000"
         />
         <!-- ANCHOR_END: dashboard -->
       </section>

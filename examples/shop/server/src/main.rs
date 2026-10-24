@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sync/replicas", get(listing))
         .route("/api/sync/states", get(states))
         .route("/api/sync/progress/{register}", get(progress))
+        .route("/api/sync/replicas/{register}", get(replica))
         .route("/api/sync/rows/{table}/{key}", get(row))
         .route("/api/sync/wishes", get(wishes))
         .route("/api/products", post(add_product))
@@ -397,6 +398,26 @@ async fn progress(
         .progress(&mut conn, Scope::Replicas(&[register]))
         .await?;
     Ok(Json(progress))
+}
+
+// The register looked at, as the listing says it, wherever it is in the
+// fleet: a listing over it alone.
+async fn replica(
+    State(app): State<App>,
+    Path(register): Path<Uuid>,
+) -> Result<Json<Listing>, Failure> {
+    let mut conn = app.pool.acquire().await?;
+    let listing = app
+        .server
+        .engine()
+        .listing(
+            &mut conn,
+            Scope::Replicas(&[register]),
+            None,
+            magic_sync::status::Page::new(0, 1),
+        )
+        .await?;
+    Ok(Json(listing))
 }
 
 async fn row(

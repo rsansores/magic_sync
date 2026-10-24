@@ -75,6 +75,7 @@ export const api = {
     ask<Listing>('GET', `/api/sync/replicas?offset=${offset}${state ? `&state=${state}` : ''}`),
   states: () => ask<States>('GET', '/api/sync/states'),
   progress: (register: string) => ask<Progress>('GET', `/api/sync/progress/${register}`),
+  replica: (register: string) => ask<Listing>('GET', `/api/sync/replicas/${register}`),
   wishFooter: (seen: Footer, text: string) =>
     ask<void>('POST', `/api/registers/${seen.register_id}/footer`, { seen, text }),
   withdrawFooter: (register: string) => ask<void>('DELETE', `/api/registers/${register}/footer/wish`),

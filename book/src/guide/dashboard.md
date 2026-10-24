@@ -69,11 +69,13 @@ import 'magic_sync_dashboard/styles.css'
 > Picking a state, or turning a page, sets `filter` or `offset`; you fetch
 > that page of the listing. Without a listing, the dashboard shows the
 > overview's worst and says how many there are in all. Clicking a tile or a
-> replica sets `selected`; you fetch its progress, and its page shows when
-> it was last heard and whether what it writes goes up live, what it has to
-> send, to confirm and set aside, and only the tables that wait — to it,
-> with how far along each is and what is on its way; from it, with how long
-> its oldest row has waited — the settled folded into one line. How long ago
+> replica sets `selected`; you fetch its progress and the listing over it
+> alone (`Scope::Replicas(&[id])`: its row, whatever page it is on), and
+> its page shows when it was last heard and whether what it writes goes up
+> live, what it has to send, to confirm and set aside, and only the tables
+> that wait — to it, with how far along each is and what is on its way; from
+> it, with how long its oldest row has waited, and whether the server judges
+> that its rows wait — the settled folded into one line. How long ago
 > something happened is measured from the server's `now` in the answer,
 > moved on by the time passed in the page — the browser's clock is never
 > compared with the server's.
@@ -112,8 +114,9 @@ dashboard as functions:
 A system with a design system of its own draws the same with its own parts,
 through `useSyncDashboard` and the functions of `magic_sync_dashboard/core`
 — and may combine its checks and the engine's state into states of its own
-(`combine`): *offline* when its link is down, before anything the engine
-says.
+(`combine`, which the ready-made dashboard takes too): *offline* when its
+link is down, before anything the engine says. Its counters count those
+states, and filter the tiles and the replicas that need attention by them.
 
 ## Where one row is
 
