@@ -21,8 +21,8 @@ describe('translator', () => {
   })
 
   it('takes a regional locale’s language, and English for what it lacks', () => {
-    expect(translator('es_MX')('tab.tables')).toBe('Tablas')
-    expect(translator('de')('tab.tables')).toBe('Tables')
+    expect(translator('es_MX')('tab.tables')).toBe('Datos')
+    expect(translator('de')('tab.tables')).toBe('Data')
     expect(translator('es', { es: {}, en: { only: 'English' } })('only')).toBe('English')
   })
 

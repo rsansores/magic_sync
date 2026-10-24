@@ -37,10 +37,51 @@ export {
   engineTableLabel,
   tableMood,
   percent,
+  downChips,
+  upChips,
+  describeFlow,
+  describeSettled,
+  describeHeard,
 } from './describe.js'
-export type { Speech, Banner, ProblemText } from './describe.js'
+export type { Speech, Banner, ProblemText, Chip } from './describe.js'
+export {
+  tones,
+  rankOf,
+  toneOf,
+  engineStanding,
+  standingOf,
+  syncCheck,
+  checksOf,
+  tallyOf,
+  lineOf,
+  attentionOf,
+} from './standing.js'
+export type {
+  Tone,
+  Standing,
+  Check,
+  HostChecks,
+  Combine,
+  Tally,
+  Attention,
+  AttentionOptions,
+} from './standing.js'
+export { tilesOf, gridOf, into, levelUnder } from './grid.js'
+export type { Tile, TileOptions, Level, Place, Crumb, Cluster, Grid, GridOptions } from './grid.js'
+export { downOf, upOf, fleetOf, totalsOf } from './flow.js'
+export type {
+  TableGroupKey,
+  GroupOf,
+  DownTable,
+  UpTable,
+  FleetTable,
+  TableGroup,
+  Direction,
+  UpOptions,
+  Totals,
+} from './flow.js'
 export { parseTimestamp, serverNow } from './time.js'
-export { since, until, count, normalizeLocale } from './format.js'
+export { since, until, lasting, count, normalizeLocale } from './format.js'
 export { builtinMessages, translator } from './i18n.js'
 export type { Messages, MessageTable, Message, Plural, Locale, Translate } from './i18n.js'
 export { tabAfter } from './tabs.js'

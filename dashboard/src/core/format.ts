@@ -56,6 +56,27 @@ export function until(at: number, now: number, locale: string): string {
   return relative(Math.max(0, at - now), locale)
 }
 
+const spanFormat = cached(
+  (locale) =>
+    new Map(
+      units.map(([unit]) => [
+        unit,
+        new Intl.NumberFormat(locale, { style: 'unit', unit, unitDisplay: 'short' }),
+      ]),
+    ),
+)
+
+/** "6 min", for how long something has lasted: in the largest unit it
+ * reaches, as `since` picks it. */
+export function lasting(ms: number, locale: string): string {
+  const size = Math.max(0, ms)
+  const at = units.findIndex(([, length], i) => size >= length - (units[i + 1]?.[1] ?? 0) / 2)
+  const [unit, length] = units[at === -1 ? units.length - 1 : at]!
+  return spanFormat(locale)
+    .get(unit)!
+    .format(Math.round(size / length))
+}
+
 /** 12,345 */
 export function count(n: number, locale: string): string {
   return numberFormat(locale).format(n)
