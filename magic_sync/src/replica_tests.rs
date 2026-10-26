@@ -5340,6 +5340,7 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
         0xe5dd_b8ea_c465_953a,
         0x3663_5d6b_eb53_4f77,
         0x67ab_c07e_2400_1fc0,
+        0x7d32_fe37_f7b3_87aa,
     ];
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -5366,7 +5367,7 @@ async fn every_step_of_the_engines_tables_is_as_released(pool: SqlitePool) {
         .expect("nothing left to migrate");
 }
 
-/// A database of version 2 is brought to 3 keeping its notes, each stamped
+/// A database of version 2 is brought up keeping its notes, each stamped
 /// as the step runs; a note made after is stamped as it is made, and a note
 /// written again keeps the time it was first made.
 #[sqlx::test(migrations = false)]
@@ -5383,7 +5384,10 @@ async fn a_replica_of_version_2_stamps_the_notes_it_has(pool: SqlitePool) {
         .await
         .unwrap();
     install(&mut conn, &codecs()).await.expect("upgraded");
-    assert_eq!(schema_version(&mut conn).await.unwrap(), 3);
+    assert_eq!(
+        schema_version(&mut conn).await.unwrap(),
+        crate::REPLICA_SCHEMA_VERSION
+    );
     let noted = |key: &'static str| {
         sqlx::query_scalar::<_, Option<i64>>("SELECT noted_at FROM sync_notes WHERE row_key = $1")
             .bind(key)
@@ -5918,3 +5922,6 @@ fn a_replicas_default_limits_are_the_servers() {
 
 #[path = "replica_wish_tests.rs"]
 mod wishes;
+
+#[path = "replica_status_tests.rs"]
+mod status_of;

@@ -520,6 +520,25 @@ table, rows it wrote that are not sent yet, and rows sent the server has not
 filed yet. It tells the server the same whenever it changes, and the server
 shows it as the replica's backlog.
 
+[`replica::status`] is the rest of what a replica knows of itself, for a
+screen on the replica — read from its own database, so it answers when the
+server cannot be reached: that backlog, since when the server has kept an
+upload unfiled (a resend does not move it), when the server was last heard
+from (any message), last sent rows that were applied, and last filed an
+upload, whether a snapshot is in progress or a message was missed, the rows
+it refused and those it cannot send, and the wished settings not carried
+out. `ReplicaStatus::standing` judges it in one word, worst first:
+`not_linked`, `awaiting_fix`, `offline`, `not_provisioned`, `not_answered`,
+`resyncing`, `catching_up`, `synced` — `awaiting_fix`, `catching_up` and
+`synced` by the server's own rule, over the half of the facts the replica
+holds: it cannot see what the server has yet to send it, so it may call
+itself synced while the dashboard has it catching up, never the other way
+about. Whether the transport is connected is the host's to say (`Link`), and
+so is how long things may wait (`Waits`); the words on the screen are the
+host's too. A server with nothing to send sends nothing, so a
+replica that has not heard from it for a while is not, by that alone,
+behind.
+
 ### What an operator sees
 
 [`plan::Engine::health`] answers what the engine waits on over a scope: how
@@ -653,6 +672,7 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`plan::Engine::row_progress`]: api/server/magic_sync/plan/struct.Engine.html#method.row_progress
 [`plan::Replicas`]: api/server/magic_sync/plan/struct.Replicas.html
 [`replica::progress`]: api/replica/magic_sync/replica/fn.progress.html
+[`replica::status`]: api/replica/magic_sync/replica/fn.status.html
 [`run::server::Transport`]: api/server/magic_sync/run/server/trait.Transport.html
 [`run::replica::Uplink`]: api/replica/magic_sync/run/replica/trait.Uplink.html
 [`run::server::Senders`]: api/server/magic_sync/run/server/trait.Senders.html

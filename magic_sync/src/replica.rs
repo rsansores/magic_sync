@@ -3,10 +3,19 @@
 //! [`Replica`](crate::run::replica::Replica). What a host does here itself is set up the
 //! database ([`install`], or [`triggers`] and [`check`] for one with
 //! migrations), say how its writes go up ([`Lane`], [`Outbox`]), and ask how
-//! far along they are ([`progress`]).
+//! far along they are ([`progress`]) and where its sync stands ([`status`]).
 
 use crate::envelope;
 use crate::wire::Codec;
+
+#[cfg(feature = "sqlite")]
+mod status;
+#[cfg(feature = "sqlite")]
+pub use crate::wish::WishState;
+#[cfg(feature = "sqlite")]
+pub use status::{
+    status, HeldWishes, Link, Receiving, Refused, ReplicaStatus, SetAside, Standing, Waits,
+};
 #[cfg(feature = "sqlite")]
 use {
     crate::dialect::{ident, literal},
@@ -65,6 +74,7 @@ const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [
     include_str!("../sql/sqlite/1.sql"),
     include_str!("../sql/sqlite/2.sql"),
     include_str!("../sql/sqlite/3.sql"),
+    include_str!("../sql/sqlite/4.sql"),
 ];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
@@ -318,7 +328,7 @@ async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Res
         sqlx::query(&format!(
             "INSERT INTO sync_notes (relation, row_key, restated) SELECT {}, {}, 1 FROM {} t{only} \
              ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, restated = 1, \
-                    upload = NULL, sent = NULL, sent_at = NULL",
+                    upload = NULL, sent = NULL, sent_at = NULL, first_sent_at = NULL",
             literal(table.name),
             key_sql(table, "t"),
             ident(table.name)
@@ -791,6 +801,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
         .await;
     let received = received?;
     quiet?;
+    heard(conn, &received).await?;
     Ok(received)
 }
 
@@ -1124,6 +1135,38 @@ async fn act<P: Sync + 'static>(
         }
     }
 }
+
+/// What `received` tells of the server, stamped now by the database's
+/// clock in the transaction the message was acted on in — one rolled back
+/// to come again was not heard: any message read, and whether it applied
+/// rows or filed uploads. A message dropped as malformed says nothing.
+#[cfg(feature = "sqlite")]
+async fn heard(conn: &mut Conn, received: &Received) -> Result<(), Error> {
+    let (applied, filed) = match received {
+        Received::Malformed(_) => return Ok(()),
+        Received::Applied(_) | Received::SnapshotEnded => (true, false),
+        Received::Filed => (false, true),
+        Received::AlreadyApplied | Received::Gap => (false, false),
+    };
+    sqlx::query(&format!(
+        "INSERT INTO sync_heard (id, heard_at, applied_at, filed_at) \
+         SELECT 1, now, CASE WHEN $1 THEN now END, CASE WHEN $2 THEN now END \
+           FROM (SELECT {MILLIS_NOW} AS now) WHERE true \
+         ON CONFLICT (id) DO UPDATE SET heard_at = EXCLUDED.heard_at, \
+             applied_at = coalesce(EXCLUDED.applied_at, applied_at), \
+             filed_at = coalesce(EXCLUDED.filed_at, filed_at)"
+    ))
+    .bind(applied)
+    .bind(filed)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Now, by the database's clock, in unix milliseconds: as the engine stamps
+/// `sync_notes.noted_at`.
+#[cfg(feature = "sqlite")]
+const MILLIS_NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
 
 /// Where a message stands in what the server sends this replica.
 #[cfg(feature = "sqlite")]
@@ -2113,7 +2156,7 @@ async fn filed<P: Sync + 'static>(
     for sql in [
         "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) \
             AND writes = sent",
-        "UPDATE sync_notes SET restated = 0, \
+        "UPDATE sync_notes SET restated = 0, first_sent_at = NULL, \
                 noted_at = CAST((coalesce(julianday(sent_at), julianday('now')) - 2440587.5) \
                                 * 86400000 AS INTEGER) \
           WHERE upload IN (SELECT value FROM json_each($1))",
@@ -2182,6 +2225,22 @@ pub struct UpProgress {
     /// replica said. `None` from a replica that does not say.
     #[serde(default)]
     pub oldest_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl UpProgress {
+    /// Whether its rows wait, and hold the replica back: some cannot go as
+    /// they are, or the oldest was written before `since` — or, said by a
+    /// replica that gives no age, some have not gone. Rows written since
+    /// flow. `since` is `None` when no row is old enough to wait. The one
+    /// rule the server's dashboard and the replica's own status both judge
+    /// by.
+    pub(crate) fn waits(&self, since: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+        self.set_aside > 0
+            || (self.unsent + self.unfiled > 0
+                && self
+                    .oldest_at
+                    .is_none_or(|oldest| since.is_some_and(|since| oldest < since)))
+    }
 }
 
 /// A table's backlog as the replica stores what it last told the server
@@ -2992,16 +3051,15 @@ async fn unreported(
 /// what was applied, and the replica has spoken. Run it in one transaction.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
-    sqlx::query(
-        "INSERT INTO sync_spoken (id, at) VALUES (1, $1) \
-         ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at",
-    )
-    .bind(chrono::Utc::now().timestamp_millis())
+    sqlx::query(&format!(
+        "INSERT INTO sync_spoken (id, at) VALUES (1, {MILLIS_NOW}) \
+             ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at"
+    ))
     .execute(&mut *conn)
     .await?;
     if let Some(number) = outgoing.up.uploads.first() {
         sqlx::query(&format!(
-            "UPDATE sync_notes SET sent_at = {} \
+            "UPDATE sync_notes SET sent_at = {}, first_sent_at = coalesce(first_sent_at, {MILLIS_NOW}) \
               WHERE upload = $1 AND id IN (SELECT value FROM json_each($2))",
             crate::dialect::NOW
         ))

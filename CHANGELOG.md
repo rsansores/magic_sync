@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+What a replica can tell about itself. Schemas: server 5, replica **4**.
+Protocol 1 (unchanged). Dashboard contract 2 (unchanged).
+
+- **`replica::status`.** Everything a replica records about how its sync
+  stands, read from its own database for a screen on the replica: the
+  backlog per table (`UpProgress`), since when the server has kept an upload
+  unfiled (`unfiled_since`, which a resend does not move), when the
+  transport last took a message (`spoken_at`), when the server was last
+  heard from, last sent rows that were applied, and last filed an upload
+  (`heard_at`, `applied_at`, `filed_at`), where it stands in what the server
+  sends (`Receiving`: unprovisioned, following, a snapshot in progress, a
+  message missed), whether it applied a message the server has not been
+  told of (`unconfirmed`), the rows it refused (`Refused`) and those it
+  cannot send (`SetAside`), per table with why, and the wished settings not
+  carried out, per table and answer (`HeldWishes`).
+- **`ReplicaStatus::standing`.** The status judged in one word, worst first
+  (`Standing`): `not_linked`, `awaiting_fix`, `offline`, `not_provisioned`,
+  `not_answered`, `resyncing`, `catching_up`, `synced`. `awaiting_fix`,
+  `catching_up` and `synced` are judged by the rule the server's dashboard
+  judges by — one function, `UpProgress`'s, decides whether a table's rows
+  wait — over the half of the facts a replica holds: it cannot see what the
+  server has yet to send it. The host says whether its transport is
+  connected (`Link`) and how long things may wait (`Waits`, built from the
+  replica's `Outbox`: patience never under its `resend_after`).
+  `not_answered` needs both an upload unfiled for longer than the patience
+  and nothing filed in that time, so a row written faster than the server
+  answers is not taken for a server gone quiet.
+- **`WishState`** is one type on both sides: `status::WishState` and
+  `replica::WishState` are the same, and it orders as declared.
+- **Replica schema 4.** `sync_heard` keeps the three times, stamped by the
+  database's clock in the transaction a message is acted on in, and
+  `sync_notes.first_sent_at` when a note's upload first went. A host with
+  migrations of its own runs `replica::migration(4)`; `install` runs it by
+  itself. Until a message arrives after the upgrade the times are `None`; a
+  note already sent waits since its last send.
+
 ## 0.4.0 — 2026-10-24
 
 Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1
