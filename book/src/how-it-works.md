@@ -523,15 +523,19 @@ shows it as the replica's backlog.
 [`replica::status`] is the rest of what a replica knows of itself, for a
 screen on the replica — read from its own database, so it answers when the
 server cannot be reached: that backlog, since when the server has kept an
-upload unfiled, when the server was last heard from (any message), last sent
-rows that were applied, and last filed an upload, whether a snapshot is in
-progress or a message was missed, the rows it refused and those it cannot
-send, and the wished settings not carried out. `ReplicaStatus::standing`
-judges it in one word, worst first: `not_linked`, `awaiting_fix`, `offline`,
-`not_answered`, `resyncing`, `catching_up`, `synced` — the server's words
-where they mean the same. Whether the transport is connected is the host's to
-say (`Link`), and so is how long an upload may go unfiled (`patience`); the
-words on the screen are the host's too.
+upload unfiled (a resend does not move it), when the server was last heard
+from (any message), last sent rows that were applied, and last filed an
+upload, whether a snapshot is in progress or a message was missed, the rows
+it refused and those it cannot send, and the wished settings not carried
+out. `ReplicaStatus::standing` judges it in one word, worst first:
+`not_linked`, `not_provisioned`, `awaiting_fix`, `offline`, `not_answered`,
+`resyncing`, `catching_up`, `synced` — `awaiting_fix`, `catching_up` and
+`synced` by the server's own rules, so the replica's screen and the
+dashboard agree. Whether the transport is connected is the host's to say
+(`Link`), and so is how long things may wait (`Judging`); the words on the
+screen are the host's too. A server with nothing to send sends nothing, so a
+replica that has not heard from it for a while is not, by that alone,
+behind.
 
 ### What an operator sees
 

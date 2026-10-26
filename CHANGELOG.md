@@ -7,23 +7,29 @@ Protocol 1 (unchanged). Dashboard contract 2 (unchanged).
 
 - **`replica::status`.** Everything a replica records about how its sync
   stands, read from its own database for a screen on the replica: the
-  backlog per table (`UpProgress`), since when an upload has gone unfiled
-  (`unfiled_since`), when the transport last took a message (`spoken_at`),
-  when the server was last heard from, last sent rows that were applied, and
-  last filed an upload (`heard_at`, `applied_at`, `filed_at`), where it
-  stands in what the server sends (`Receiving`: unprovisioned, following, a
-  snapshot in progress, a message missed), the rows it refused (`Refused`)
-  and those it cannot send (`SetAside`), per table with why, and the wished
-  settings not carried out (`HeldWish`).
+  backlog per table (`UpProgress`), since when the server has kept an upload
+  unfiled (`unfiled_since`, which a resend does not move), when the
+  transport last took a message (`spoken_at`), when the server was last
+  heard from, last sent rows that were applied, and last filed an upload
+  (`heard_at`, `applied_at`, `filed_at`), where it stands in what the server
+  sends (`Receiving`: unprovisioned, following, a snapshot in progress, a
+  message missed), the rows it refused (`Refused`) and those it cannot send
+  (`SetAside`), per table with why, and the wished settings not carried out,
+  per table and answer (`HeldWishes`).
 - **`ReplicaStatus::standing`.** The status judged in one word, worst first
-  (`Standing`): `not_linked`, `awaiting_fix`, `offline`, `not_answered`,
-  `resyncing`, `catching_up`, `synced`. The host says whether its transport is
-  connected (`Link`) and how long an upload may go unfiled before the server
-  is not answering (`patience`).
+  (`Standing`): `not_linked`, `not_provisioned`, `awaiting_fix`, `offline`,
+  `not_answered`, `resyncing`, `catching_up`, `synced`. `awaiting_fix`,
+  `catching_up` and `synced` are judged as the server judges them — a row
+  is behind once it has waited `behind_after`, and one that cannot go as it
+  is waits — so the replica's screen and the server's dashboard agree. The
+  host says whether its transport is connected (`Link`) and how long things
+  may wait (`Judging`: `patience` for an unfiled upload, `behind_after`).
 - **Replica schema 4.** `sync_heard` keeps the three times, stamped in the
-  transaction a message is acted on in. A host with migrations of its own
-  runs `replica::migration(4)`; `install` runs it by itself. Until a message
-  arrives after the upgrade, the times are `None`.
+  transaction a message is acted on in, and `sync_notes.first_sent_at` when
+  a note's upload first went. A host with migrations of its own runs
+  `replica::migration(4)`; `install` runs it by itself. Until a message
+  arrives after the upgrade the times are `None`, and a note sent before it
+  waits since nothing.
 
 ## 0.4.0 — 2026-10-24
 

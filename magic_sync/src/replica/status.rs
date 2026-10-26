@@ -23,14 +23,16 @@ pub struct ReplicaStatus {
     /// What it wrote that has not reached the server, per table with
     /// something on its way.
     pub up: Vec<UpProgress>,
-    /// When the oldest upload the server has not said it filed was taken by
-    /// the transport: how long the server has kept the replica waiting.
+    /// When the transport first took the oldest upload the server has not
+    /// filed: a resend does not move it, so it is how long the server has
+    /// kept the replica waiting.
     pub unfiled_since: Option<DateTime<Utc>>,
     /// When the transport last took a message of the replica's, on any
     /// lane.
     pub spoken_at: Option<DateTime<Utc>>,
     /// When the replica last received a message from the server it could
-    /// read, whatever it said.
+    /// read, whatever it said. A server with nothing to send sends nothing,
+    /// so a time long past is no fault by itself.
     pub heard_at: Option<DateTime<Utc>>,
     /// When it last applied rows the server sent, or the end of a snapshot.
     pub applied_at: Option<DateTime<Utc>>,
@@ -41,12 +43,13 @@ pub struct ReplicaStatus {
     /// Rows the server sent that the replica could not take, per table: the
     /// server quarantines them and sends them again once a fix is deployed.
     pub refused: Vec<Refused>,
-    /// Rows the replica wrote that cannot go up as they are, per table: they
-    /// go once a build that can send them runs.
+    /// Rows the replica wrote that cannot go up as they are, per table, with
+    /// why: they go once a build that can send them runs. The same rows
+    /// `up` counts as `set_aside`.
     pub set_aside: Vec<SetAside>,
-    /// The settings the server wished, not carried out yet or not carried out
-    /// at all; those carried out are not listed.
-    pub wishes: Vec<HeldWish>,
+    /// The settings the server wished that the replica has not carried out,
+    /// per table and answer; those carried out are not counted.
+    pub wishes: Vec<HeldWishes>,
 }
 
 /// Where a replica stands in what the server sends it.
@@ -76,7 +79,7 @@ pub struct Refused {
     /// Why the latest of them was refused.
     pub reason: String,
     /// When the oldest was refused.
-    pub since: Option<DateTime<Utc>>,
+    pub since: DateTime<Utc>,
     /// Whether the server has been told of every one of them.
     pub reported: bool,
 }
@@ -94,24 +97,22 @@ pub struct SetAside {
     pub reason: String,
 }
 
-/// A setting the server wished, as the replica holds the wish.
+/// The wishes of one table's settings that stand at one answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
-pub struct HeldWish {
-    /// The setting's table.
+pub struct HeldWishes {
+    /// The settings' table.
     pub table: String,
-    /// The setting row's key, its parts joined by `|`.
-    pub key: String,
-    /// Where it stands.
+    /// Where they stand.
     pub state: WishAnswer,
-    /// Why, for an answer that says.
+    /// How many.
+    pub rows: i64,
+    /// Why, as the latest answer of them says; `None` when none says.
     pub reason: Option<String>,
-    /// What the server's host said of it when it wished it.
-    pub note: Option<String>,
 }
 
 /// Where a wish the replica has not carried out stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum WishAnswer {
@@ -124,6 +125,24 @@ pub enum WishAnswer {
     Refused,
     /// Based on a version of the setting the replica no longer held.
     Superseded,
+}
+
+impl WishAnswer {
+    /// The answer `outcome` writes, as the replica's wish table holds it: no
+    /// answer to the wish's version is pending, and so is a word this build
+    /// does not know — a later build's — which is logged.
+    fn of(outcome: Option<&str>) -> Self {
+        match outcome {
+            None => WishAnswer::Pending,
+            Some("waiting") => WishAnswer::Waiting,
+            Some("refused") => WishAnswer::Refused,
+            Some("superseded") => WishAnswer::Superseded,
+            Some(word) => {
+                tracing::warn!("sync: a wish answered `{word}`, which this build does not know");
+                WishAnswer::Pending
+            }
+        }
+    }
 }
 
 /// The state of the replica's link to the server, which only the host knows:
@@ -140,10 +159,44 @@ pub enum Link {
     Unknown,
 }
 
+/// How long [`ReplicaStatus::standing`] lets things wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Judging {
+    /// How long the server may keep an upload unfiled before it is not
+    /// answering. Over the replica's `Outbox::resend_after`, which a
+    /// healthy upload that was lost waits out.
+    pub patience: Duration,
+    /// How long a row the replica wrote may wait before it is behind: rows
+    /// younger flow, and are no change waiting. The server's
+    /// `Settings::behind_after`, so both say the same of one replica.
+    pub behind_after: Duration,
+}
+
+impl Judging {
+    /// Waits of `patience` and `behind_after`.
+    #[must_use]
+    pub const fn new(patience: Duration, behind_after: Duration) -> Self {
+        Judging {
+            patience,
+            behind_after,
+        }
+    }
+}
+
+impl Default for Judging {
+    /// Fifteen minutes of patience, and the server's default `behind_after`,
+    /// two minutes.
+    fn default() -> Self {
+        Judging::new(Duration::from_secs(15 * 60), Duration::from_secs(120))
+    }
+}
+
 /// Where a replica stands, in one word: the first of these that applies,
-/// ordered worst first. It shares the server's words where they mean the
-/// same (`awaiting_fix`, `catching_up`, `synced`), so whoever stands at the
-/// replica and whoever reads the server's dashboard say the same thing.
+/// ordered worst first. `awaiting_fix`, `catching_up` and `synced` are the
+/// server's words (`status::ReplicaState`) and judged by the same rules, so
+/// whoever stands at the replica and whoever reads the server's dashboard
+/// say the same thing; the rest only the replica can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -151,30 +204,47 @@ pub enum Standing {
     /// It does not know which replica it is yet: nothing syncs until it is
     /// set up.
     NotLinked,
-    /// Rows wait for a fix to be deployed: ones the server sent that it could
-    /// not take, or ones it wrote that this build cannot send.
+    /// It knows which it is, and the server has sent it nothing yet: the
+    /// server has not provisioned it.
+    NotProvisioned,
+    /// Rows the server sent wait for a fix to be deployed: ones the replica
+    /// could not take.
     AwaitingFix,
     /// The host says its link to the server is down.
     Offline,
-    /// The link is up, or cannot be told, and the server has not said it
-    /// filed what the replica sent it for longer than the host's patience.
+    /// The link is up, or cannot be told, and the server has not filed what
+    /// the replica sent it for longer than [`Judging::patience`].
     NotAnswered,
     /// The server is sending it everything again: a snapshot is in progress,
     /// or it missed a message and waits for one.
     Resyncing,
-    /// Changes are on their way: rows it wrote not yet filed, or a wished
+    /// Changes wait: rows it wrote that have waited longer than
+    /// [`Judging::behind_after`], or that cannot go as they are, or a wished
     /// setting not carried out yet.
     CatchingUp,
-    /// The server has filed everything it wrote, and nothing waits.
+    /// Nothing waits: what it wrote is filed, or flows.
     Synced,
 }
 
 impl Standing {
+    /// Every standing, worst first.
+    pub const ALL: [Standing; 8] = [
+        Standing::NotLinked,
+        Standing::NotProvisioned,
+        Standing::AwaitingFix,
+        Standing::Offline,
+        Standing::NotAnswered,
+        Standing::Resyncing,
+        Standing::CatchingUp,
+        Standing::Synced,
+    ];
+
     /// The word it is written as in JSON.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Standing::NotLinked => "not_linked",
+            Standing::NotProvisioned => "not_provisioned",
             Standing::AwaitingFix => "awaiting_fix",
             Standing::Offline => "offline",
             Standing::NotAnswered => "not_answered",
@@ -186,31 +256,38 @@ impl Standing {
 }
 
 impl ReplicaStatus {
-    /// Where the replica stands, by `link` — the host's word on its
-    /// transport — at `now`. `patience` is how long an upload may go unfiled
-    /// before the server is not answering: a few times the replica's
-    /// keepalive (`Outbox::keepalive_every`) is a fair measure.
+    /// Where the replica stands at `now`, by `link` — the host's word on its
+    /// transport — and the waits `judging` allows.
     #[must_use]
-    pub fn standing(&self, link: Link, now: DateTime<Utc>, patience: Duration) -> Standing {
-        let patience = chrono::Duration::from_std(patience).unwrap_or(chrono::Duration::MAX);
+    pub fn standing(&self, link: Link, now: DateTime<Utc>, judging: &Judging) -> Standing {
+        let longer = |wait: Duration, since: DateTime<Utc>| {
+            chrono::Duration::from_std(wait)
+                .is_ok_and(|wait| now.signed_duration_since(since) > wait)
+        };
         if self.replica.is_none() {
             Standing::NotLinked
-        } else if !self.refused.is_empty() || !self.set_aside.is_empty() {
+        } else if self.receiving == Receiving::Unprovisioned {
+            Standing::NotProvisioned
+        } else if !self.refused.is_empty() {
             Standing::AwaitingFix
         } else if link == Link::Down {
             Standing::Offline
         } else if self
             .unfiled_since
-            .is_some_and(|since| now.signed_duration_since(since) > patience)
+            .is_some_and(|since| longer(judging.patience, since))
         {
             Standing::NotAnswered
         } else if matches!(self.receiving, Receiving::Snapshot | Receiving::Missed) {
             Standing::Resyncing
-        } else if self.up.iter().any(|t| t.unsent + t.unfiled > 0)
-            || self
-                .wishes
-                .iter()
-                .any(|w| matches!(w.state, WishAnswer::Pending | WishAnswer::Waiting))
+        } else if self.up.iter().any(|t| {
+            t.set_aside > 0
+                || (t.unsent + t.unfiled > 0
+                    && t.oldest_at
+                        .is_some_and(|oldest| longer(judging.behind_after, oldest)))
+        }) || self
+            .wishes
+            .iter()
+            .any(|w| matches!(w.state, WishAnswer::Pending | WishAnswer::Waiting))
         {
             Standing::CatchingUp
         } else {
@@ -231,12 +308,10 @@ pub async fn status(conn: &mut Conn) -> Result<ReplicaStatus, Error> {
         .fetch_optional(&mut *conn)
         .await?;
     let up = owed(conn, 0).await?;
-    let unfiled_since: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT min(sent_at) FROM sync_notes \
-          WHERE set_aside IS NULL AND sent_at IS NOT NULL AND writes = sent",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
+    let unfiled_since: Option<i64> =
+        sqlx::query_scalar("SELECT min(first_sent_at) FROM sync_notes WHERE set_aside IS NULL")
+            .fetch_one(&mut *conn)
+            .await?;
     let spoken_at: Option<i64> = sqlx::query_scalar("SELECT at FROM sync_spoken WHERE id = 1")
         .fetch_optional(&mut *conn)
         .await?;
@@ -255,11 +330,11 @@ pub async fn status(conn: &mut Conn) -> Result<ReplicaStatus, Error> {
         Some((Some(_), _)) => Receiving::Snapshot,
         Some((None, _)) => Receiving::Following,
     };
-    let refused = sqlx::query_as::<_, (String, i64, String, Option<DateTime<Utc>>, bool)>(
+    let refused = sqlx::query_as::<_, (String, i64, String, DateTime<Utc>, bool)>(
         "SELECT table_name, count(*), \
                 (SELECT reason FROM sync_rejections l \
                   WHERE l.table_name = r.table_name AND l.held_back = 0 \
-                  ORDER BY rejected_at DESC LIMIT 1), \
+                  ORDER BY rejected_at DESC, rowid DESC LIMIT 1), \
                 min(rejected_at), \
                 min(reported_at IS NOT NULL) \
            FROM sync_rejections r WHERE held_back = 0 \
@@ -293,44 +368,43 @@ pub async fn status(conn: &mut Conn) -> Result<ReplicaStatus, Error> {
         reason,
     })
     .collect();
-    let wishes = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT relation, row_key, \
-                CASE WHEN answered IS version THEN outcome END, reason, note \
+    // Each wish not carried out, as its answer stands: none to its version
+    // is pending, whatever an earlier version's answer said.
+    let answers = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        "SELECT relation, CASE WHEN answered IS version THEN outcome END, \
+                CASE WHEN answered IS version THEN reason END \
            FROM sync_wishes \
           WHERE retired_at IS NULL \
             AND (answered IS NOT version OR outcome IS NOT 'applied') \
-          ORDER BY relation, row_key",
+          ORDER BY relation, answered_at",
     )
     .fetch_all(&mut *conn)
-    .await?
-    .into_iter()
-    .map(|(table, key, outcome, reason, note)| HeldWish {
-        table,
-        key,
-        state: match outcome.as_deref() {
-            Some("waiting") => WishAnswer::Waiting,
-            Some("refused") => WishAnswer::Refused,
-            Some("superseded") => WishAnswer::Superseded,
-            _ => WishAnswer::Pending,
-        },
-        reason,
-        note,
-    })
-    .collect();
+    .await?;
+    let mut wishes: Vec<HeldWishes> = Vec::new();
+    for (table, outcome, reason) in answers {
+        let state = WishAnswer::of(outcome.as_deref());
+        match wishes
+            .iter_mut()
+            .find(|w| w.table == table && w.state == state)
+        {
+            Some(held) => {
+                held.rows += 1;
+                held.reason = reason.or(held.reason.take());
+            }
+            None => wishes.push(HeldWishes {
+                table,
+                state,
+                rows: 1,
+                reason,
+            }),
+        }
+    }
+    wishes.sort_by(|a, b| (&a.table, a.state).cmp(&(&b.table, b.state)));
     let at = |ms: Option<i64>| ms.and_then(DateTime::from_timestamp_millis);
     Ok(ReplicaStatus {
         replica,
         up,
-        unfiled_since,
+        unfiled_since: at(unfiled_since),
         spoken_at: at(spoken_at),
         heard_at: at(heard_at),
         applied_at: at(applied_at),

@@ -12,7 +12,8 @@ use crate::wire::Codec;
 mod status;
 #[cfg(feature = "sqlite")]
 pub use status::{
-    status, HeldWish, Link, Receiving, Refused, ReplicaStatus, SetAside, Standing, WishAnswer,
+    status, HeldWishes, Judging, Link, Receiving, Refused, ReplicaStatus, SetAside, Standing,
+    WishAnswer,
 };
 #[cfg(feature = "sqlite")]
 use {
@@ -786,7 +787,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
     if let Some(why) = envelope::oversized(&body, limits) {
         return Ok(malformed(why));
     }
-    heard(conn, "heard_at").await?;
+    heard(conn, Heard::Any).await?;
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
@@ -1078,7 +1079,7 @@ async fn act<P: Sync + 'static>(
     match body {
         Body::Filed(message) => {
             filed(conn, codecs, &message, care).await?;
-            heard(conn, "filed_at").await?;
+            heard(conn, Heard::Filed).await?;
             Ok(Received::Filed)
         }
         Body::Down(down) => {
@@ -1105,7 +1106,7 @@ async fn act<P: Sync + 'static>(
                         restate(conn, codecs).await?;
                     }
                     let applied = apply(conn, codecs, &down, &by, care).await?;
-                    heard(conn, "applied_at").await?;
+                    heard(conn, Heard::Applied).await?;
                     Ok(Received::Applied(applied))
                 }
                 Err(skipped) => Ok(skipped),
@@ -1127,7 +1128,7 @@ async fn act<P: Sync + 'static>(
                         restate(conn, codecs).await?;
                     }
                     end_snapshot(conn, codecs, &end, &by, care).await?;
-                    heard(conn, "applied_at").await?;
+                    heard(conn, Heard::Applied).await?;
                     Ok(Received::SnapshotEnded)
                 }
                 Err(skipped) => Ok(skipped),
@@ -1136,18 +1137,41 @@ async fn act<P: Sync + 'static>(
     }
 }
 
-/// Stamps `column` of `sync_heard` now, by the replica's clock: in the
-/// transaction the message is acted on in, so a message rolled back to come
-/// again was not heard.
+/// Which time of `sync_heard` a message stamps.
 #[cfg(feature = "sqlite")]
-async fn heard(conn: &mut Conn, column: &'static str) -> Result<(), Error> {
-    sqlx::query(&format!(
-        "INSERT INTO sync_heard (id, {column}) VALUES (1, $1) \
-         ON CONFLICT (id) DO UPDATE SET {column} = EXCLUDED.{column}"
-    ))
-    .bind(chrono::Utc::now().timestamp_millis())
-    .execute(&mut *conn)
-    .await?;
+#[derive(Clone, Copy)]
+enum Heard {
+    /// Any message this build could read.
+    Any,
+    /// Rows applied, or the end of a snapshot.
+    Applied,
+    /// Uploads filed.
+    Filed,
+}
+
+/// Stamps `what` now, by the replica's clock: in the transaction the
+/// message is acted on in, so a message rolled back to come again was not
+/// heard.
+#[cfg(feature = "sqlite")]
+async fn heard(conn: &mut Conn, what: Heard) -> Result<(), Error> {
+    let sql = match what {
+        Heard::Any => {
+            "INSERT INTO sync_heard (id, heard_at) VALUES (1, $1) \
+             ON CONFLICT (id) DO UPDATE SET heard_at = EXCLUDED.heard_at"
+        }
+        Heard::Applied => {
+            "INSERT INTO sync_heard (id, applied_at) VALUES (1, $1) \
+             ON CONFLICT (id) DO UPDATE SET applied_at = EXCLUDED.applied_at"
+        }
+        Heard::Filed => {
+            "INSERT INTO sync_heard (id, filed_at) VALUES (1, $1) \
+             ON CONFLICT (id) DO UPDATE SET filed_at = EXCLUDED.filed_at"
+        }
+    };
+    sqlx::query(sql)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -2139,7 +2163,7 @@ async fn filed<P: Sync + 'static>(
     for sql in [
         "DELETE FROM sync_notes WHERE upload IN (SELECT value FROM json_each($1)) \
             AND writes = sent",
-        "UPDATE sync_notes SET restated = 0, \
+        "UPDATE sync_notes SET restated = 0, first_sent_at = NULL, \
                 noted_at = CAST((coalesce(julianday(sent_at), julianday('now')) - 2440587.5) \
                                 * 86400000 AS INTEGER) \
           WHERE upload IN (SELECT value FROM json_each($1))",
@@ -3027,12 +3051,13 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
     .await?;
     if let Some(number) = outgoing.up.uploads.first() {
         sqlx::query(&format!(
-            "UPDATE sync_notes SET sent_at = {} \
+            "UPDATE sync_notes SET sent_at = {}, first_sent_at = coalesce(first_sent_at, $3) \
               WHERE upload = $1 AND id IN (SELECT value FROM json_each($2))",
             crate::dialect::NOW
         ))
         .bind(i64::try_from(*number).unwrap_or(i64::MAX))
         .bind(json(&outgoing.notes))
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&mut *conn)
         .await?;
     }
