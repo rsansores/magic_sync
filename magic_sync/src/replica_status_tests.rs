@@ -645,7 +645,9 @@ async fn a_row_written_again_waits_from_its_next_send(pool: SqlitePool) {
     w.write_event().await;
     let up = w.up(0, false).await.expect("the write");
     // Written again, as a note's trigger counts it.
-    w.exec("UPDATE sync_notes SET writes = writes + 1").await.unwrap();
+    w.exec("UPDATE sync_notes SET writes = writes + 1")
+        .await
+        .unwrap();
     w.receive(
         &Body::Filed(Filed {
             uploads: up.uploads.clone(),
