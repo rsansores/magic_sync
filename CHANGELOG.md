@@ -26,6 +26,9 @@ Protocol 1 (unchanged). Dashboard contract 2 (unchanged).
   server has yet to send it. The host says whether its transport is
   connected (`Link`) and how long things may wait (`Waits`, built from the
   replica's `Outbox`: patience never under its `resend_after`).
+  `not_answered` needs both an upload unfiled for longer than the patience
+  and nothing filed in that time, so a row written faster than the server
+  answers is not taken for a server gone quiet.
 - **`WishState`** is one type on both sides: `status::WishState` and
   `replica::WishState` are the same, and it orders as declared.
 - **Replica schema 4.** `sync_heard` keeps the three times, stamped by the

@@ -270,7 +270,7 @@ pub magic_sync::replica::ReplicaStatus::unfiled_since: core::option::Option<chro
 pub magic_sync::replica::ReplicaStatus::up: alloc::vec::Vec<magic_sync::replica::UpProgress>
 pub magic_sync::replica::ReplicaStatus::wishes: alloc::vec::Vec<magic_sync::replica::HeldWishes>
 impl magic_sync::replica::ReplicaStatus
-pub fn magic_sync::replica::ReplicaStatus::standing(&self, magic_sync::replica::Link, chrono::datetime::DateTime<chrono::offset::utc::Utc>, &magic_sync::replica::Waits) -> magic_sync::replica::Standing
+pub fn magic_sync::replica::ReplicaStatus::standing(&self, magic_sync::replica::Link, chrono::datetime::DateTime<chrono::offset::utc::Utc>, magic_sync::replica::Waits) -> magic_sync::replica::Standing
 impl core::clone::Clone for magic_sync::replica::ReplicaStatus
 pub fn magic_sync::replica::ReplicaStatus::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::replica::ReplicaStatus

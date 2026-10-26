@@ -23,7 +23,7 @@ impl World {
     }
 
     async fn standing_at(&self, now: chrono::DateTime<Utc>) -> Standing {
-        self.status().await.standing(Link::Up, now, &waits())
+        self.status().await.standing(Link::Up, now, waits())
     }
 
     async fn write_event(&self) {
@@ -86,7 +86,7 @@ async fn a_replica_is_linked_then_provisioned(pool: SqlitePool) {
     assert_eq!(unlinked.receiving, Receiving::Unprovisioned);
     assert_eq!(unlinked.heard_at, None);
     assert_eq!(
-        unlinked.standing(Link::Up, Utc::now(), &waits()),
+        unlinked.standing(Link::Up, Utc::now(), waits()),
         Standing::NotLinked
     );
     let me = Uuid::now_v7();
@@ -102,7 +102,7 @@ async fn a_replica_is_linked_then_provisioned(pool: SqlitePool) {
     let linked = read().await;
     assert_eq!(linked.replica, Some(me));
     assert_eq!(
-        linked.standing(Link::Up, Utc::now(), &waits()),
+        linked.standing(Link::Up, Utc::now(), waits()),
         Standing::NotProvisioned,
         "a device the server has not set up holds nothing: not synced"
     );
@@ -132,16 +132,16 @@ async fn a_write_catches_up_until_the_server_files_it(pool: SqlitePool) {
     assert!(sent.spoken_at.is_some());
     let an_hour_on = since + chrono::Duration::hours(1);
     assert_eq!(
-        sent.standing(Link::Up, an_hour_on, &waits()),
+        sent.standing(Link::Up, an_hour_on, waits()),
         Standing::NotAnswered
     );
     assert_eq!(
-        sent.standing(Link::Unknown, an_hour_on, &waits()),
+        sent.standing(Link::Unknown, an_hour_on, waits()),
         Standing::NotAnswered,
         "a link the host cannot tell is not taken for down"
     );
     assert_eq!(
-        sent.standing(Link::Down, an_hour_on, &waits()),
+        sent.standing(Link::Down, an_hour_on, waits()),
         Standing::Offline,
         "the host's link down says why"
     );
@@ -212,7 +212,7 @@ async fn a_row_the_replica_could_not_take_awaits_a_fix(pool: SqlitePool) {
     assert!(!refused.reported);
     for link in [Link::Up, Link::Down, Link::Unknown] {
         assert_eq!(
-            status.standing(link, Utc::now(), &waits()),
+            status.standing(link, Utc::now(), waits()),
             Standing::AwaitingFix
         );
     }
@@ -453,7 +453,7 @@ fn the_worst_that_applies_is_the_standing() {
         rows: 1,
         reason: None,
     };
-    let judged = |status: &ReplicaStatus, link| status.standing(link, now, &waits());
+    let judged = |status: &ReplicaStatus, link| status.standing(link, now, waits());
     assert_eq!(judged(&synced, Link::Up), Standing::Synced);
     assert_eq!(judged(&synced, Link::Down), Standing::Offline);
 
@@ -555,9 +555,9 @@ fn patience_waits_out_a_resend() {
         set_aside: Vec::new(),
         wishes: Vec::new(),
     };
-    assert_eq!(status.standing(Link::Up, now, &hasty), Standing::Synced);
+    assert_eq!(status.standing(Link::Up, now, hasty), Standing::Synced);
     assert_eq!(
-        status.standing(Link::Up, now + chrono::Duration::minutes(6), &hasty),
+        status.standing(Link::Up, now + chrono::Duration::minutes(6), hasty),
         Standing::NotAnswered
     );
 }
@@ -603,4 +603,62 @@ async fn an_applied_message_is_unconfirmed_until_told(pool: SqlitePool) {
     w.up(0, false).await.expect("the confirmation");
     assert!(!w.status().await.unconfirmed);
     assert_eq!(w.standing().await, Standing::Synced);
+}
+
+/// A row written faster than the server answers leaves each filing naming an
+/// upload the note has already left: it waits on and on, and the server is
+/// answering all the same. It is not answered only once the server has filed
+/// nothing for as long.
+#[test]
+fn a_server_that_files_is_answering() {
+    let now = Utc::now();
+    let hot = ReplicaStatus {
+        replica: Some(Uuid::now_v7()),
+        up: Vec::new(),
+        unfiled_since: Some(now - chrono::Duration::hours(1)),
+        spoken_at: None,
+        heard_at: None,
+        applied_at: None,
+        filed_at: Some(now - chrono::Duration::seconds(5)),
+        receiving: Receiving::Following,
+        unconfirmed: false,
+        refused: Vec::new(),
+        set_aside: Vec::new(),
+        wishes: Vec::new(),
+    };
+    assert_eq!(hot.standing(Link::Up, now, waits()), Standing::Synced);
+    let quiet = ReplicaStatus {
+        filed_at: Some(now - chrono::Duration::hours(1)),
+        ..hot
+    };
+    assert_eq!(
+        quiet.standing(Link::Up, now, waits()),
+        Standing::NotAnswered
+    );
+}
+
+/// A row written again while its upload was on its way stays once that
+/// upload is filed, to go again, and waits from that next send.
+#[sqlx::test(migrations = false)]
+async fn a_row_written_again_waits_from_its_next_send(pool: SqlitePool) {
+    let w = told(pool).await;
+    w.write_event().await;
+    let up = w.up(0, false).await.expect("the write");
+    // Written again, as a note's trigger counts it.
+    w.exec("UPDATE sync_notes SET writes = writes + 1").await.unwrap();
+    w.receive(
+        &Body::Filed(Filed {
+            uploads: up.uploads.clone(),
+        })
+        .encoded(),
+    )
+    .await;
+    let filed = w.status().await;
+    assert_eq!((filed.up[0].unsent, filed.up[0].unfiled), (1, 0));
+    assert_eq!(filed.unfiled_since, None, "not sent again yet");
+    w.up(0, false).await.expect("again");
+    assert!(
+        w.status().await.unfiled_since
+            > Some(filed.filed_at.unwrap() - chrono::Duration::seconds(1))
+    );
 }

@@ -298,21 +298,6 @@ pub struct WishListing {
     pub wishes: Listed<WishEntry>,
 }
 
-impl WishState {
-    /// The state `word` writes, as a listing shows it: a word of no state
-    /// this build knows — an answer of a later replica's — shows as
-    /// pending, and is logged.
-    pub(crate) fn shown(word: &str) -> Self {
-        Self::of(word).unwrap_or_else(|| {
-            tracing::warn!(
-                state = word,
-                "sync: a wish in a state this build does not know — shown as pending"
-            );
-            WishState::Pending
-        })
-    }
-}
-
 /// Where a replica stands, in one word: the first of these that applies.
 /// Ordered worst first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

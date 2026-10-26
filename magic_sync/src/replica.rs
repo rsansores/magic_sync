@@ -3051,11 +3051,10 @@ async fn unreported(
 /// what was applied, and the replica has spoken. Run it in one transaction.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<(), Error> {
-    sqlx::query(
-        "INSERT INTO sync_spoken (id, at) VALUES (1, $1) \
-         ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at",
-    )
-    .bind(chrono::Utc::now().timestamp_millis())
+    sqlx::query(&format!(
+        "INSERT INTO sync_spoken (id, at) VALUES (1, {MILLIS_NOW}) \
+             ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at"
+    ))
     .execute(&mut *conn)
     .await?;
     if let Some(number) = outgoing.up.uploads.first() {

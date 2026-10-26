@@ -1321,4 +1321,17 @@ impl WishState {
         .into_iter()
         .find(|state| state.as_str() == word)
     }
+
+    /// The state `word` writes, as a listing shows it: a word of no state
+    /// this build knows — an answer of a later replica's — shows as
+    /// pending, and is logged.
+    pub(crate) fn shown(word: &str) -> Self {
+        Self::of(word).unwrap_or_else(|| {
+            tracing::warn!(
+                state = word,
+                "sync: a wish in a state this build does not know — shown as pending"
+            );
+            WishState::Pending
+        })
+    }
 }

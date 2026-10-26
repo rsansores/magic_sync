@@ -97,7 +97,7 @@ pub struct SetAside {
     pub table: String,
     /// How many rows.
     pub rows: i64,
-    /// Why, as the newest of them says.
+    /// Why, as the most recently noted of them says.
     pub reason: String,
 }
 
@@ -113,17 +113,6 @@ pub struct HeldWishes {
     pub rows: i64,
     /// Why, as the latest of their answers that gives a reason says.
     pub reason: Option<String>,
-}
-
-/// The state an answer the replica holds writes: none to the wish's version
-/// is pending, and so is a word this build does not know — a later
-/// build's.
-fn answer(outcome: Option<&str>) -> WishState {
-    let word = outcome.unwrap_or("pending");
-    WishState::of(word).unwrap_or_else(|| {
-        tracing::debug!("sync: a wish answered `{word}`, which this build does not know");
-        WishState::Pending
-    })
 }
 
 /// The state of the replica's link to the server, which only the host knows:
@@ -190,8 +179,9 @@ impl Waits {
 /// half of the facts a replica holds: what it wrote and what it applied. The
 /// server also counts what it has yet to send, which the replica cannot see,
 /// so a replica can be synced by its own account while the dashboard has it
-/// catching up — never the other way about. The rest only the replica can
-/// tell.
+/// catching up. With the server's `behind_after` ([`Waits::behind_after`])
+/// and clocks that agree, never the other way about. The rest only the
+/// replica can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -207,8 +197,10 @@ pub enum Standing {
     /// It knows which it is, and the server has sent it nothing yet: the
     /// server has not provisioned it.
     NotProvisioned,
-    /// The link is up, or cannot be told, and the server has not filed what
-    /// the replica sent it for longer than the patience of its [`Waits`].
+    /// The link is up, or cannot be told, an upload has gone unfiled for
+    /// longer than the patience of its [`Waits`], and the server has filed
+    /// nothing in that time: a row written faster than the server answers
+    /// waits for ever on one upload after another, and is not this.
     NotAnswered,
     /// The server is sending it everything again: a snapshot is in progress,
     /// or it missed a message and waits for one.
@@ -255,7 +247,7 @@ impl ReplicaStatus {
     /// Where the replica stands at `now`, by `link` — the host's word on its
     /// transport — and the waits `waits` allows.
     #[must_use]
-    pub fn standing(&self, link: Link, now: DateTime<Utc>, waits: &Waits) -> Standing {
+    pub fn standing(&self, link: Link, now: DateTime<Utc>, waits: Waits) -> Standing {
         let ago = |wait: Duration| {
             chrono::Duration::from_std(wait)
                 .ok()
@@ -270,11 +262,10 @@ impl ReplicaStatus {
             Standing::Offline
         } else if self.receiving == Receiving::Unprovisioned {
             Standing::NotProvisioned
-        } else if self
-            .unfiled_since
-            .zip(patience)
-            .is_some_and(|(since, limit)| since < limit)
-        {
+        } else if patience.is_some_and(|limit| {
+            self.unfiled_since.is_some_and(|since| since < limit)
+                && self.filed_at.is_none_or(|filed| filed < limit)
+        }) {
             Standing::NotAnswered
         } else if matches!(self.receiving, Receiving::Snapshot | Receiving::Missed) {
             Standing::Resyncing
@@ -377,7 +368,8 @@ pub async fn status(conn: &mut Conn) -> Result<ReplicaStatus, Error> {
     .await?;
     let mut wishes: Vec<HeldWishes> = Vec::new();
     for (table, outcome, reason) in answers {
-        let state = answer(outcome.as_deref());
+        // No answer to the wish's version is pending.
+        let state = WishState::shown(outcome.as_deref().unwrap_or("pending"));
         match wishes
             .iter_mut()
             .find(|w| w.table == table && w.state == state)
