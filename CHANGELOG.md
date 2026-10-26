@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## 0.5.0 — 2026-10-26
 
 What a replica can tell about itself. Schemas: server 5, replica **4**.
 Protocol 1 (unchanged). Dashboard contract 2 (unchanged).

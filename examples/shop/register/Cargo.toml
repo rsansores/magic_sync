@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 # A replica's side. Outside this repository, leave `path` out.
-magic_sync = { version = "0.4.0", path = "../../../magic_sync", features = ["sqlite"] }
+magic_sync = { version = "0.5.0", path = "../../../magic_sync", features = ["sqlite"] }
 # The rows both sides share, built for a replica.
 shop_rows = { path = "../rows", features = ["register"] }
 axum = "0.8"

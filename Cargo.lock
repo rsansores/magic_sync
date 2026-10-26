@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "magic_sync"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "hmac",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "magic_sync_derive"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proc-macro2",
  "quote",
