@@ -1552,6 +1552,8 @@ pub(crate) struct Table {
     /// The table as SQL names it on this backend, quoted.
     pub(crate) qualified: &'static str,
     pub(crate) key: &'static [&'static str],
+    /// [`Row::CONFLICT`]: the primary key's columns.
+    pub(crate) conflict: &'static [&'static str],
     pub(crate) mirror: Mirror,
     #[cfg(feature = "postgres")]
     pub(crate) route: Route,
@@ -1584,6 +1586,7 @@ impl Table {
             schema: R::SCHEMA,
             qualified: R::QUALIFIED,
             key: R::KEY,
+            conflict: R::CONFLICT,
             mirror: R::MIRROR,
             #[cfg(feature = "postgres")]
             route: R::ROUTE,
@@ -1646,7 +1649,8 @@ impl Table {
     /// How the table differs from its row on this database: each column the
     /// table has and the row does not, or the other way round, one nullable
     /// on one side only, generated on one side only, or of a type its field
-    /// does not decode, and a primary key of other columns than the row's. The columns
+    /// does not decode, and a primary key of other columns than the row's
+    /// conflict columns (its key, unless it says otherwise). The columns
     /// the row leaves out — its retired column, its unmirrored ones — are
     /// not compared. Empty when they agree.
     pub(crate) async fn differences(&self, conn: &mut Conn) -> Result<Vec<String>, Error> {
@@ -1712,7 +1716,7 @@ impl Table {
             }
         }
         let mut primary_key = crate::dialect::primary_key(conn, self.schema, self.name).await?;
-        let mut key: Vec<&str> = self.key.to_vec();
+        let mut key: Vec<&str> = self.conflict.to_vec();
         // In any order: a key is compared, written and bound column by
         // column, by name.
         primary_key.sort_unstable();
@@ -1892,6 +1896,9 @@ mod tests {
         .await
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
+        parity(&mut conn, &[&Table::of::<Reading>()])
+            .await
+            .expect("its primary key is its conflict columns");
         let first = Reading {
             id: Uuid::now_v7(),
             at: chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap(),
