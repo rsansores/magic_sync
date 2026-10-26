@@ -204,6 +204,11 @@ pub const SERVER_SCHEMA_VERSION: i32 = 5;
 #[cfg(feature = "sqlite")]
 pub const REPLICA_SCHEMA_VERSION: i32 = 4;
 
+/// How long a row a replica wrote may wait before it is behind, unless a
+/// host says otherwise: the server's `Settings::behind_after`, and the
+/// replica's own status judges by the same.
+pub(crate) const BEHIND_AFTER: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+
 use __private::Db;
 
 #[cfg(all(test, feature = "postgres"))]

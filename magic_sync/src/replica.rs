@@ -11,9 +11,10 @@ use crate::wire::Codec;
 #[cfg(feature = "sqlite")]
 mod status;
 #[cfg(feature = "sqlite")]
+pub use crate::wish::WishState;
+#[cfg(feature = "sqlite")]
 pub use status::{
-    status, HeldWishes, Judging, Link, Receiving, Refused, ReplicaStatus, SetAside, Standing,
-    WishAnswer,
+    status, HeldWishes, Link, Receiving, Refused, ReplicaStatus, SetAside, Standing, Waits,
 };
 #[cfg(feature = "sqlite")]
 use {
@@ -327,7 +328,7 @@ async fn restate<P: Sync + 'static>(conn: &mut Conn, codecs: &[Codec<P>]) -> Res
         sqlx::query(&format!(
             "INSERT INTO sync_notes (relation, row_key, restated) SELECT {}, {}, 1 FROM {} t{only} \
              ON CONFLICT (relation, row_key) DO UPDATE SET writes = writes + 1, restated = 1, \
-                    upload = NULL, sent = NULL, sent_at = NULL",
+                    upload = NULL, sent = NULL, sent_at = NULL, first_sent_at = NULL",
             literal(table.name),
             key_sql(table, "t"),
             ident(table.name)
@@ -787,7 +788,6 @@ pub(crate) async fn receive<P: Sync + 'static>(
     if let Some(why) = envelope::oversized(&body, limits) {
         return Ok(malformed(why));
     }
-    heard(conn, Heard::Any).await?;
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
@@ -801,6 +801,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
         .await;
     let received = received?;
     quiet?;
+    heard(conn, &received).await?;
     Ok(received)
 }
 
@@ -1079,7 +1080,6 @@ async fn act<P: Sync + 'static>(
     match body {
         Body::Filed(message) => {
             filed(conn, codecs, &message, care).await?;
-            heard(conn, Heard::Filed).await?;
             Ok(Received::Filed)
         }
         Body::Down(down) => {
@@ -1105,9 +1105,9 @@ async fn act<P: Sync + 'static>(
                     if down.previous == 0 {
                         restate(conn, codecs).await?;
                     }
-                    let applied = apply(conn, codecs, &down, &by, care).await?;
-                    heard(conn, Heard::Applied).await?;
-                    Ok(Received::Applied(applied))
+                    Ok(Received::Applied(
+                        apply(conn, codecs, &down, &by, care).await?,
+                    ))
                 }
                 Err(skipped) => Ok(skipped),
             }
@@ -1128,7 +1128,6 @@ async fn act<P: Sync + 'static>(
                         restate(conn, codecs).await?;
                     }
                     end_snapshot(conn, codecs, &end, &by, care).await?;
-                    heard(conn, Heard::Applied).await?;
                     Ok(Received::SnapshotEnded)
                 }
                 Err(skipped) => Ok(skipped),
@@ -1137,43 +1136,37 @@ async fn act<P: Sync + 'static>(
     }
 }
 
-/// Which time of `sync_heard` a message stamps.
+/// What `received` tells of the server, stamped now by the database's
+/// clock in the transaction the message was acted on in — one rolled back
+/// to come again was not heard: any message read, and whether it applied
+/// rows or filed uploads. A message dropped as malformed says nothing.
 #[cfg(feature = "sqlite")]
-#[derive(Clone, Copy)]
-enum Heard {
-    /// Any message this build could read.
-    Any,
-    /// Rows applied, or the end of a snapshot.
-    Applied,
-    /// Uploads filed.
-    Filed,
-}
-
-/// Stamps `what` now, by the replica's clock: in the transaction the
-/// message is acted on in, so a message rolled back to come again was not
-/// heard.
-#[cfg(feature = "sqlite")]
-async fn heard(conn: &mut Conn, what: Heard) -> Result<(), Error> {
-    let sql = match what {
-        Heard::Any => {
-            "INSERT INTO sync_heard (id, heard_at) VALUES (1, $1) \
-             ON CONFLICT (id) DO UPDATE SET heard_at = EXCLUDED.heard_at"
-        }
-        Heard::Applied => {
-            "INSERT INTO sync_heard (id, applied_at) VALUES (1, $1) \
-             ON CONFLICT (id) DO UPDATE SET applied_at = EXCLUDED.applied_at"
-        }
-        Heard::Filed => {
-            "INSERT INTO sync_heard (id, filed_at) VALUES (1, $1) \
-             ON CONFLICT (id) DO UPDATE SET filed_at = EXCLUDED.filed_at"
-        }
+async fn heard(conn: &mut Conn, received: &Received) -> Result<(), Error> {
+    let (applied, filed) = match received {
+        Received::Malformed(_) => return Ok(()),
+        Received::Applied(_) | Received::SnapshotEnded => (true, false),
+        Received::Filed => (false, true),
+        Received::AlreadyApplied | Received::Gap => (false, false),
     };
-    sqlx::query(sql)
-        .bind(chrono::Utc::now().timestamp_millis())
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO sync_heard (id, heard_at, applied_at, filed_at) \
+         SELECT 1, now, CASE WHEN $1 THEN now END, CASE WHEN $2 THEN now END \
+           FROM (SELECT {MILLIS_NOW} AS now) WHERE true \
+         ON CONFLICT (id) DO UPDATE SET heard_at = EXCLUDED.heard_at, \
+             applied_at = coalesce(EXCLUDED.applied_at, applied_at), \
+             filed_at = coalesce(EXCLUDED.filed_at, filed_at)"
+    ))
+    .bind(applied)
+    .bind(filed)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
+
+/// Now, by the database's clock, in unix milliseconds: as the engine stamps
+/// `sync_notes.noted_at`.
+#[cfg(feature = "sqlite")]
+const MILLIS_NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
 
 /// Where a message stands in what the server sends this replica.
 #[cfg(feature = "sqlite")]
@@ -2234,6 +2227,22 @@ pub struct UpProgress {
     pub oldest_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl UpProgress {
+    /// Whether its rows wait, and hold the replica back: some cannot go as
+    /// they are, or the oldest was written before `since` — or, said by a
+    /// replica that gives no age, some have not gone. Rows written since
+    /// flow. `since` is `None` when no row is old enough to wait. The one
+    /// rule the server's dashboard and the replica's own status both judge
+    /// by.
+    pub(crate) fn waits(&self, since: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+        self.set_aside > 0
+            || (self.unsent + self.unfiled > 0
+                && self
+                    .oldest_at
+                    .is_none_or(|oldest| since.is_some_and(|since| oldest < since)))
+    }
+}
+
 /// A table's backlog as the replica stores what it last told the server
 /// — its own shape, apart from [`UpProgress`]'s, which a host reads and a
 /// later release may change. `oldest`: when its oldest row was written
@@ -3051,13 +3060,12 @@ pub(crate) async fn delivered(conn: &mut Conn, outgoing: &Outgoing) -> Result<()
     .await?;
     if let Some(number) = outgoing.up.uploads.first() {
         sqlx::query(&format!(
-            "UPDATE sync_notes SET sent_at = {}, first_sent_at = coalesce(first_sent_at, $3) \
+            "UPDATE sync_notes SET sent_at = {}, first_sent_at = coalesce(first_sent_at, {MILLIS_NOW}) \
               WHERE upload = $1 AND id IN (SELECT value FROM json_each($2))",
             crate::dialect::NOW
         ))
         .bind(i64::try_from(*number).unwrap_or(i64::MAX))
         .bind(json(&outgoing.notes))
-        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&mut *conn)
         .await?;
     }

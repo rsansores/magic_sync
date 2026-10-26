@@ -2,11 +2,14 @@
 //! come and uploads go, and judged in one word.
 
 use super::*;
-use crate::replica::{HeldWishes, Judging, Link, Receiving, Standing, WishAnswer};
+use crate::replica::{HeldWishes, Link, Receiving, Standing, Waits, WishState};
 use std::time::Duration;
 
-/// Ten minutes of patience; rows behind once they waited a minute.
-const JUDGING: Judging = Judging::new(Duration::from_secs(600), Duration::from_secs(60));
+/// The default outbox's waits — ten minutes' resend, twenty of patience —
+/// with rows behind once they waited a minute.
+fn waits() -> Waits {
+    Waits::new(&Outbox::default()).behind_after(Duration::from_secs(60))
+}
 
 impl World {
     async fn status(&self) -> ReplicaStatus {
@@ -20,7 +23,7 @@ impl World {
     }
 
     async fn standing_at(&self, now: chrono::DateTime<Utc>) -> Standing {
-        self.status().await.standing(Link::Up, now, &JUDGING)
+        self.status().await.standing(Link::Up, now, &waits())
     }
 
     async fn write_event(&self) {
@@ -42,6 +45,13 @@ impl World {
     }
 }
 
+/// A provisioned replica that has told the server what it applied.
+async fn told(pool: SqlitePool) -> World {
+    let w = world(pool).await;
+    w.up(0, false).await.expect("the provisioning confirmed");
+    w
+}
+
 fn later(minutes: i64) -> chrono::DateTime<Utc> {
     Utc::now() + chrono::Duration::minutes(minutes)
 }
@@ -50,7 +60,7 @@ fn later(minutes: i64) -> chrono::DateTime<Utc> {
 /// which it is, and when it heard the server.
 #[sqlx::test(migrations = false)]
 async fn a_provisioned_replica_is_synced(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     let status = w.status().await;
     assert_eq!(status.replica, Some(w.me));
     assert_eq!(status.receiving, Receiving::Following);
@@ -76,7 +86,7 @@ async fn a_replica_is_linked_then_provisioned(pool: SqlitePool) {
     assert_eq!(unlinked.receiving, Receiving::Unprovisioned);
     assert_eq!(unlinked.heard_at, None);
     assert_eq!(
-        unlinked.standing(Link::Up, Utc::now(), &JUDGING),
+        unlinked.standing(Link::Up, Utc::now(), &waits()),
         Standing::NotLinked
     );
     let me = Uuid::now_v7();
@@ -92,7 +102,7 @@ async fn a_replica_is_linked_then_provisioned(pool: SqlitePool) {
     let linked = read().await;
     assert_eq!(linked.replica, Some(me));
     assert_eq!(
-        linked.standing(Link::Up, Utc::now(), &JUDGING),
+        linked.standing(Link::Up, Utc::now(), &waits()),
         Standing::NotProvisioned,
         "a device the server has not set up holds nothing: not synced"
     );
@@ -104,7 +114,7 @@ async fn a_replica_is_linked_then_provisioned(pool: SqlitePool) {
 /// and once filed, synced, with when it was.
 #[sqlx::test(migrations = false)]
 async fn a_write_catches_up_until_the_server_files_it(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     w.write_event().await;
     let written = w.status().await;
     assert_eq!(
@@ -122,16 +132,16 @@ async fn a_write_catches_up_until_the_server_files_it(pool: SqlitePool) {
     assert!(sent.spoken_at.is_some());
     let an_hour_on = since + chrono::Duration::hours(1);
     assert_eq!(
-        sent.standing(Link::Up, an_hour_on, &JUDGING),
+        sent.standing(Link::Up, an_hour_on, &waits()),
         Standing::NotAnswered
     );
     assert_eq!(
-        sent.standing(Link::Unknown, an_hour_on, &JUDGING),
+        sent.standing(Link::Unknown, an_hour_on, &waits()),
         Standing::NotAnswered,
         "a link the host cannot tell is not taken for down"
     );
     assert_eq!(
-        sent.standing(Link::Down, an_hour_on, &JUDGING),
+        sent.standing(Link::Down, an_hour_on, &waits()),
         Standing::Offline,
         "the host's link down says why"
     );
@@ -176,7 +186,7 @@ async fn a_resend_keeps_how_long_the_server_kept_it_waiting(pool: SqlitePool) {
 /// counted per table with why — reported once the server is told.
 #[sqlx::test(migrations = false)]
 async fn a_row_the_replica_could_not_take_awaits_a_fix(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     let [good] = ids();
     w.receive(&down(
         1,
@@ -202,7 +212,7 @@ async fn a_row_the_replica_could_not_take_awaits_a_fix(pool: SqlitePool) {
     assert!(!refused.reported);
     for link in [Link::Up, Link::Down, Link::Unknown] {
         assert_eq!(
-            status.standing(link, Utc::now(), &JUDGING),
+            status.standing(link, Utc::now(), &waits()),
             Standing::AwaitingFix
         );
     }
@@ -220,7 +230,7 @@ async fn a_row_the_replica_could_not_take_awaits_a_fix(pool: SqlitePool) {
 /// the count all of them.
 #[sqlx::test(migrations = false)]
 async fn the_reason_is_the_latest(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     w.exec(&format!(
         "INSERT INTO sync_rejections (table_name, row_key, reason, epoch, sequence, rejected_at) VALUES \
            ('items', 'a', 'older', '{EPOCH}', 1, '2026-01-01T00:00:00.000Z'), \
@@ -262,7 +272,7 @@ async fn the_reason_is_the_latest(pool: SqlitePool) {
 /// the server says of it.
 #[sqlx::test(migrations = false)]
 async fn a_write_this_build_cannot_send_is_catching_up(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     w.write_event().await;
     w.exec("UPDATE sync_notes SET set_aside = 'a later build sends it'")
         .await
@@ -289,7 +299,7 @@ async fn a_write_this_build_cannot_send_is_catching_up(pool: SqlitePool) {
 /// is retired, is not counted.
 #[sqlx::test(migrations = false)]
 async fn the_wishes_not_carried_out_are_counted(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     let wish = |n: u8, version: i64, answered: &str, outcome: &str, reason: &str, retired: &str| {
         format!(
             "(x'{n:032x}', 'screens', '{n}', x'', {version}, 0, NULL, {answered}, {outcome}, {reason}, \
@@ -322,14 +332,24 @@ async fn the_wishes_not_carried_out_are_counted(pool: SqlitePool) {
     assert_eq!(
         status.wishes,
         [
-            held(WishAnswer::Pending, 3, None),
-            held(WishAnswer::Waiting, 1, Some("away")),
-            held(WishAnswer::Refused, 1, Some("no screen")),
-            held(WishAnswer::Superseded, 1, None),
+            held(WishState::Pending, 3, None),
+            held(WishState::Waiting, 1, Some("away")),
+            held(WishState::Refused, 1, Some("no screen")),
+            held(WishState::Superseded, 1, None),
         ],
         "1 unanswered, 2 answered an earlier version, 8 a word this build does not know"
     );
-    assert_eq!(w.standing().await, Standing::CatchingUp);
+    assert_eq!(w.standing().await, Standing::CatchingUp, "the pending ones");
+    w.as_engine(
+        "UPDATE sync_wishes SET answered = version, outcome = 'refused' \
+          WHERE answered IS NOT version OR outcome = 'later build'",
+    )
+    .await;
+    assert_eq!(
+        w.standing().await,
+        Standing::Synced,
+        "a wish waiting for the replica is no change on its way, as the server says"
+    );
 }
 
 /// A replica that missed a message waits for the server to send everything
@@ -337,7 +357,7 @@ async fn the_wishes_not_carried_out_are_counted(pool: SqlitePool) {
 /// the snapshot ends.
 #[sqlx::test(migrations = false)]
 async fn a_missed_message_or_a_snapshot_is_resyncing(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     let [a, b] = ids();
     w.receive(&down(2, "", vec![upserts("items", vec![item(a, "a")])]))
         .await;
@@ -352,6 +372,7 @@ async fn a_missed_message_or_a_snapshot_is_resyncing(pool: SqlitePool) {
     assert_eq!(w.standing().await, Standing::Resyncing);
     w.receive(&end(4, &s, &["items"])).await;
     assert_eq!(w.status().await.receiving, Receiving::Following);
+    w.up(0, false).await.expect("the snapshot confirmed");
     assert_eq!(w.standing().await, Standing::Synced);
 }
 
@@ -359,7 +380,7 @@ async fn a_missed_message_or_a_snapshot_is_resyncing(pool: SqlitePool) {
 /// delivered again is, and applies nothing.
 #[sqlx::test(migrations = false)]
 async fn heard_is_when_a_message_was_read(pool: SqlitePool) {
-    let w = world(pool).await;
+    let w = told(pool).await;
     w.exec("DELETE FROM sync_heard").await.unwrap();
     assert!(matches!(
         w.receive(b"not a message").await,
@@ -378,8 +399,7 @@ async fn heard_is_when_a_message_was_read(pool: SqlitePool) {
 }
 
 /// A replica of version 3 is brought to 4 having heard nothing it
-/// recorded, and its notes waiting since nothing: what it hears and sends
-/// from then on is recorded.
+/// recorded, and a note it had sent waiting since that send.
 #[sqlx::test(migrations = false)]
 async fn a_replica_of_version_3_has_heard_nothing_yet(pool: SqlitePool) {
     let pool = settled(pool).await;
@@ -399,13 +419,13 @@ async fn a_replica_of_version_3_has_heard_nothing_yet(pool: SqlitePool) {
     install(&mut conn, &codecs()).await.expect("upgraded");
     let status = status(&mut conn).await.unwrap();
     assert_eq!(
-        (
-            status.heard_at,
-            status.applied_at,
-            status.filed_at,
-            status.unfiled_since
-        ),
-        (None, None, None, None)
+        (status.heard_at, status.applied_at, status.filed_at),
+        (None, None, None)
+    );
+    assert_eq!(
+        status.unfiled_since.map(|at| at.to_rfc3339()),
+        Some("2026-01-01T00:00:00+00:00".to_owned()),
+        "a note sent before waits since its last send"
     );
 }
 
@@ -422,6 +442,7 @@ fn the_worst_that_applies_is_the_standing() {
         applied_at: None,
         filed_at: None,
         receiving: Receiving::Following,
+        unconfirmed: false,
         refused: Vec::new(),
         set_aside: Vec::new(),
         wishes: Vec::new(),
@@ -432,16 +453,25 @@ fn the_worst_that_applies_is_the_standing() {
         rows: 1,
         reason: None,
     };
-    let judged = |status: &ReplicaStatus, link| status.standing(link, now, &JUDGING);
+    let judged = |status: &ReplicaStatus, link| status.standing(link, now, &waits());
     assert_eq!(judged(&synced, Link::Up), Standing::Synced);
     assert_eq!(judged(&synced, Link::Down), Standing::Offline);
 
     let wished = ReplicaStatus {
-        wishes: vec![wish(WishAnswer::Pending)],
+        wishes: vec![wish(WishState::Pending)],
         ..synced.clone()
     };
     assert_eq!(judged(&wished, Link::Up), Standing::CatchingUp);
-    for settled in [WishAnswer::Refused, WishAnswer::Superseded] {
+    let unconfirmed = ReplicaStatus {
+        unconfirmed: true,
+        ..synced.clone()
+    };
+    assert_eq!(judged(&unconfirmed, Link::Up), Standing::CatchingUp);
+    for settled in [
+        WishState::Waiting,
+        WishState::Refused,
+        WishState::Superseded,
+    ] {
         let answered = ReplicaStatus {
             wishes: vec![wish(settled)],
             ..synced.clone()
@@ -463,6 +493,16 @@ fn the_worst_that_applies_is_the_standing() {
     };
     assert_eq!(judged(&unanswered, Link::Up), Standing::NotAnswered);
     assert_eq!(judged(&unanswered, Link::Down), Standing::Offline);
+    let unprovisioned = ReplicaStatus {
+        receiving: Receiving::Unprovisioned,
+        ..unanswered.clone()
+    };
+    assert_eq!(judged(&unprovisioned, Link::Up), Standing::NotProvisioned);
+    assert_eq!(
+        judged(&unprovisioned, Link::Down),
+        Standing::Offline,
+        "a new device without its cable is told of the cable"
+    );
     let broken = ReplicaStatus {
         refused: vec![Refused {
             table: "items".into(),
@@ -471,17 +511,12 @@ fn the_worst_that_applies_is_the_standing() {
             since: now,
             reported: true,
         }],
-        ..unanswered.clone()
+        ..unprovisioned.clone()
     };
     assert_eq!(judged(&broken, Link::Down), Standing::AwaitingFix);
-    let unprovisioned = ReplicaStatus {
-        receiving: Receiving::Unprovisioned,
-        ..broken.clone()
-    };
-    assert_eq!(judged(&unprovisioned, Link::Down), Standing::NotProvisioned);
     let unlinked = ReplicaStatus {
         replica: None,
-        ..unprovisioned
+        ..broken
     };
     assert_eq!(judged(&unlinked, Link::Down), Standing::NotLinked);
     let mut sorted = Standing::ALL;
@@ -494,4 +529,78 @@ fn the_worst_that_applies_is_the_standing() {
             "the word is the JSON's"
         );
     }
+}
+
+/// Patience never drops under the outbox's resend: a healthy upload that
+/// was lost, and waits to go again, is not taken for a server gone quiet.
+#[test]
+fn patience_waits_out_a_resend() {
+    let outbox = Outbox {
+        resend_after: Duration::from_secs(600),
+        ..Outbox::default()
+    };
+    let hasty = Waits::new(&outbox).patience(Duration::from_secs(1));
+    let now = Utc::now();
+    let status = ReplicaStatus {
+        replica: Some(Uuid::now_v7()),
+        up: Vec::new(),
+        unfiled_since: Some(now - chrono::Duration::minutes(5)),
+        spoken_at: None,
+        heard_at: None,
+        applied_at: None,
+        filed_at: None,
+        receiving: Receiving::Following,
+        unconfirmed: false,
+        refused: Vec::new(),
+        set_aside: Vec::new(),
+        wishes: Vec::new(),
+    };
+    assert_eq!(status.standing(Link::Up, now, &hasty), Standing::Synced);
+    assert_eq!(
+        status.standing(Link::Up, now + chrono::Duration::minutes(6), &hasty),
+        Standing::NotAnswered
+    );
+}
+
+/// A snapshot begun re-states the replica's settings, to go again to a
+/// server that may be another: what one waited for before is not what it
+/// waits for now.
+#[sqlx::test(migrations = false)]
+async fn a_snapshot_begun_waits_for_no_setting_sent_before(pool: SqlitePool) {
+    let w = world_of(
+        pool,
+        &format!("{TABLES}{SCREENS}"),
+        Settings {
+            wishes: crate::wish::Wishes::new().on::<Screen>(crate::wish::Direct),
+            ..Settings::default()
+        },
+        golden_codecs(),
+    )
+    .await;
+    sqlx::query("INSERT INTO screens (replica_id, id, level, revision) VALUES ($1, $2, 1, 1)")
+        .bind(w.me)
+        .bind(Uuid::now_v7())
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.up(0, false).await.expect("the setting");
+    assert!(w.status().await.unfiled_since.is_some());
+    let s = Uuid::now_v7().to_string();
+    w.receive(&begin(1, &s, vec![])).await;
+    assert_eq!(w.status().await.unfiled_since, None);
+}
+
+/// A message applied is unconfirmed until the replica tells the server.
+#[sqlx::test(migrations = false)]
+async fn an_applied_message_is_unconfirmed_until_told(pool: SqlitePool) {
+    let w = told(pool).await;
+    w.up(0, false).await;
+    let a = Uuid::now_v7();
+    w.receive(&down(1, "", vec![upserts("items", vec![item(a, "a")])]))
+        .await;
+    assert!(w.status().await.unconfirmed);
+    assert_eq!(w.standing().await, Standing::CatchingUp);
+    w.up(0, false).await.expect("the confirmation");
+    assert!(!w.status().await.unconfirmed);
+    assert_eq!(w.standing().await, Standing::Synced);
 }

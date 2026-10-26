@@ -197,7 +197,7 @@ impl Default for Settings {
             prune_after: Duration::from_secs(30 * 24 * 60 * 60),
             watch_every: Duration::from_secs(5 * 60),
             stuck_after: Duration::from_secs(15 * 60),
-            behind_after: Duration::from_secs(2 * 60),
+            behind_after: crate::BEHIND_AFTER,
             silent_after_keepalives: NonZeroU32::new(3).expect("not zero"),
         }
     }

@@ -125,33 +125,41 @@ impl core::marker::Unpin for magic_sync::replica::Standing
 impl core::marker::UnsafeUnpin for magic_sync::replica::Standing
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Standing
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Standing
-#[non_exhaustive] pub enum magic_sync::replica::WishAnswer
-pub magic_sync::replica::WishAnswer::Pending
-pub magic_sync::replica::WishAnswer::Refused
-pub magic_sync::replica::WishAnswer::Superseded
-pub magic_sync::replica::WishAnswer::Waiting
-impl core::clone::Clone for magic_sync::replica::WishAnswer
-pub fn magic_sync::replica::WishAnswer::clone(&self) -> Self
-impl core::cmp::Eq for magic_sync::replica::WishAnswer
-impl core::cmp::Ord for magic_sync::replica::WishAnswer
-pub fn magic_sync::replica::WishAnswer::cmp(&self, &Self) -> core::cmp::Ordering
-impl core::cmp::PartialEq for magic_sync::replica::WishAnswer
-pub fn magic_sync::replica::WishAnswer::eq(&self, &Self) -> bool
-impl core::cmp::PartialOrd for magic_sync::replica::WishAnswer
-pub fn magic_sync::replica::WishAnswer::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
-impl core::fmt::Debug for magic_sync::replica::WishAnswer
-pub fn magic_sync::replica::WishAnswer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for magic_sync::replica::WishAnswer
-impl core::marker::StructuralPartialEq for magic_sync::replica::WishAnswer
-impl serde_core::ser::Serialize for magic_sync::replica::WishAnswer
-pub fn magic_sync::replica::WishAnswer::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl core::marker::Freeze for magic_sync::replica::WishAnswer
-impl core::marker::Send for magic_sync::replica::WishAnswer
-impl core::marker::Sync for magic_sync::replica::WishAnswer
-impl core::marker::Unpin for magic_sync::replica::WishAnswer
-impl core::marker::UnsafeUnpin for magic_sync::replica::WishAnswer
-impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::WishAnswer
-impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::WishAnswer
+#[non_exhaustive] pub enum magic_sync::replica::WishState
+pub magic_sync::replica::WishState::Applied
+pub magic_sync::replica::WishState::Pending
+pub magic_sync::replica::WishState::Refused
+pub magic_sync::replica::WishState::Superseded
+pub magic_sync::replica::WishState::Waiting
+impl magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::as_str(self) -> &'static str
+pub fn magic_sync::replica::WishState::of(&str) -> core::option::Option<Self>
+impl core::clone::Clone for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::WishState
+impl core::cmp::Ord for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::eq(&self, &Self) -> bool
+impl core::cmp::PartialOrd for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for magic_sync::replica::WishState
+impl core::marker::StructuralPartialEq for magic_sync::replica::WishState
+impl serde_core::ser::Serialize for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for magic_sync::replica::WishState
+pub fn magic_sync::replica::WishState::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for magic_sync::replica::WishState
+impl core::marker::Send for magic_sync::replica::WishState
+impl core::marker::Sync for magic_sync::replica::WishState
+impl core::marker::Unpin for magic_sync::replica::WishState
+impl core::marker::UnsafeUnpin for magic_sync::replica::WishState
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::WishState
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::WishState
 #[non_exhaustive] pub struct magic_sync::replica::Applied
 pub magic_sync::replica::Applied::keys: alloc::vec::Vec<magic_sync::row::Key>
 pub magic_sync::replica::Applied::table: alloc::string::String
@@ -173,7 +181,7 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Applied
 #[non_exhaustive] pub struct magic_sync::replica::HeldWishes
 pub magic_sync::replica::HeldWishes::reason: core::option::Option<alloc::string::String>
 pub magic_sync::replica::HeldWishes::rows: i64
-pub magic_sync::replica::HeldWishes::state: magic_sync::replica::WishAnswer
+pub magic_sync::replica::HeldWishes::state: magic_sync::replica::WishState
 pub magic_sync::replica::HeldWishes::table: alloc::string::String
 impl core::clone::Clone for magic_sync::replica::HeldWishes
 pub fn magic_sync::replica::HeldWishes::clone(&self) -> Self
@@ -192,29 +200,6 @@ impl core::marker::Unpin for magic_sync::replica::HeldWishes
 impl core::marker::UnsafeUnpin for magic_sync::replica::HeldWishes
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::HeldWishes
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::HeldWishes
-#[non_exhaustive] pub struct magic_sync::replica::Judging
-pub magic_sync::replica::Judging::behind_after: core::time::Duration
-pub magic_sync::replica::Judging::patience: core::time::Duration
-impl magic_sync::replica::Judging
-pub const fn magic_sync::replica::Judging::new(core::time::Duration, core::time::Duration) -> Self
-impl core::clone::Clone for magic_sync::replica::Judging
-pub fn magic_sync::replica::Judging::clone(&self) -> Self
-impl core::cmp::Eq for magic_sync::replica::Judging
-impl core::cmp::PartialEq for magic_sync::replica::Judging
-pub fn magic_sync::replica::Judging::eq(&self, &Self) -> bool
-impl core::default::Default for magic_sync::replica::Judging
-pub fn magic_sync::replica::Judging::default() -> Self
-impl core::fmt::Debug for magic_sync::replica::Judging
-pub fn magic_sync::replica::Judging::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for magic_sync::replica::Judging
-impl core::marker::StructuralPartialEq for magic_sync::replica::Judging
-impl core::marker::Freeze for magic_sync::replica::Judging
-impl core::marker::Send for magic_sync::replica::Judging
-impl core::marker::Sync for magic_sync::replica::Judging
-impl core::marker::Unpin for magic_sync::replica::Judging
-impl core::marker::UnsafeUnpin for magic_sync::replica::Judging
-impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Judging
-impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Judging
 #[non_exhaustive] pub struct magic_sync::replica::Lane
 pub magic_sync::replica::Lane::name: &'static str
 pub magic_sync::replica::Lane::tables: &'static [&'static str]
@@ -280,11 +265,12 @@ pub magic_sync::replica::ReplicaStatus::refused: alloc::vec::Vec<magic_sync::rep
 pub magic_sync::replica::ReplicaStatus::replica: core::option::Option<uuid::Uuid>
 pub magic_sync::replica::ReplicaStatus::set_aside: alloc::vec::Vec<magic_sync::replica::SetAside>
 pub magic_sync::replica::ReplicaStatus::spoken_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::ReplicaStatus::unconfirmed: bool
 pub magic_sync::replica::ReplicaStatus::unfiled_since: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::replica::ReplicaStatus::up: alloc::vec::Vec<magic_sync::replica::UpProgress>
 pub magic_sync::replica::ReplicaStatus::wishes: alloc::vec::Vec<magic_sync::replica::HeldWishes>
 impl magic_sync::replica::ReplicaStatus
-pub fn magic_sync::replica::ReplicaStatus::standing(&self, magic_sync::replica::Link, chrono::datetime::DateTime<chrono::offset::utc::Utc>, &magic_sync::replica::Judging) -> magic_sync::replica::Standing
+pub fn magic_sync::replica::ReplicaStatus::standing(&self, magic_sync::replica::Link, chrono::datetime::DateTime<chrono::offset::utc::Utc>, &magic_sync::replica::Waits) -> magic_sync::replica::Standing
 impl core::clone::Clone for magic_sync::replica::ReplicaStatus
 pub fn magic_sync::replica::ReplicaStatus::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::replica::ReplicaStatus
@@ -348,6 +334,27 @@ impl core::marker::Unpin for magic_sync::replica::UpProgress
 impl core::marker::UnsafeUnpin for magic_sync::replica::UpProgress
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::UpProgress
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::UpProgress
+pub struct magic_sync::replica::Waits
+impl magic_sync::replica::Waits
+pub fn magic_sync::replica::Waits::behind_after(self, core::time::Duration) -> Self
+pub fn magic_sync::replica::Waits::new(&magic_sync::replica::Outbox) -> Self
+pub fn magic_sync::replica::Waits::patience(self, core::time::Duration) -> Self
+impl core::clone::Clone for magic_sync::replica::Waits
+pub fn magic_sync::replica::Waits::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::Waits
+impl core::cmp::PartialEq for magic_sync::replica::Waits
+pub fn magic_sync::replica::Waits::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::Waits
+pub fn magic_sync::replica::Waits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::replica::Waits
+impl core::marker::StructuralPartialEq for magic_sync::replica::Waits
+impl core::marker::Freeze for magic_sync::replica::Waits
+impl core::marker::Send for magic_sync::replica::Waits
+impl core::marker::Sync for magic_sync::replica::Waits
+impl core::marker::Unpin for magic_sync::replica::Waits
+impl core::marker::UnsafeUnpin for magic_sync::replica::Waits
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Waits
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Waits
 pub async fn magic_sync::replica::check<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>]) -> core::result::Result<(), magic_sync::Error>
 pub async fn magic_sync::replica::install<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>]) -> core::result::Result<(), magic_sync::Error>
 pub fn magic_sync::replica::migration(i32) -> core::option::Option<alloc::string::String>

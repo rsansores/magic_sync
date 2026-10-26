@@ -17,5 +17,9 @@ CREATE TABLE sync_heard (
 -- When the transport first took a note's upload (unix milliseconds): a
 -- resend, which stamps `sent_at` again, keeps it, so it says how long the
 -- server has kept the note waiting. A note written again once its upload was
--- filed goes again, and waits from its next send.
+-- filed goes again, and waits from its next send. A note this step finds
+-- sent waits since its last send, the earliest this step can know.
 ALTER TABLE sync_notes ADD COLUMN first_sent_at INTEGER;
+
+UPDATE sync_notes SET first_sent_at = CAST((julianday(sent_at) - 2440587.5) * 86400000 AS INTEGER)
+ WHERE sent_at IS NOT NULL;

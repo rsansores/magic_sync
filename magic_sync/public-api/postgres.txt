@@ -507,8 +507,12 @@ pub fn magic_sync::status::WishState::of(&str) -> core::option::Option<Self>
 impl core::clone::Clone for magic_sync::status::WishState
 pub fn magic_sync::status::WishState::clone(&self) -> Self
 impl core::cmp::Eq for magic_sync::status::WishState
+impl core::cmp::Ord for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::cmp(&self, &Self) -> core::cmp::Ordering
 impl core::cmp::PartialEq for magic_sync::status::WishState
 pub fn magic_sync::status::WishState::eq(&self, &Self) -> bool
+impl core::cmp::PartialOrd for magic_sync::status::WishState
+pub fn magic_sync::status::WishState::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
 impl core::fmt::Debug for magic_sync::status::WishState
 pub fn magic_sync::status::WishState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::hash::Hash for magic_sync::status::WishState

@@ -239,28 +239,7 @@ pub enum RowState {
     Quarantined,
 }
 
-/// Where a wish stands: what its replica answered to it, or that it has
-/// not yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum WishState {
-    /// No answer to it yet: on its way, or carried out and the answer on its
-    /// way back.
-    Pending,
-    /// The replica cannot carry it out yet — the hardware away, a build that
-    /// cannot read it — and tries again; the reason says why.
-    Waiting,
-    /// Carried out: the setting holds what was wished.
-    Applied,
-    /// The replica will not carry it out; the reason says why. Wish again to
-    /// try again.
-    Refused,
-    /// Based on a version of the setting the replica no longer held: not
-    /// carried out, and the replica's value stands.
-    Superseded,
-}
+pub use crate::wish::WishState;
 
 /// How many of a replica's wishes stand where: those it carried out are
 /// the rest.
@@ -320,33 +299,6 @@ pub struct WishListing {
 }
 
 impl WishState {
-    /// The word it is written as, in the engine's tables and in JSON.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WishState::Pending => "pending",
-            WishState::Waiting => "waiting",
-            WishState::Applied => "applied",
-            WishState::Refused => "refused",
-            WishState::Superseded => "superseded",
-        }
-    }
-
-    /// The state `word` writes; `None` for a word of no state this build
-    /// knows.
-    #[must_use]
-    pub fn of(word: &str) -> Option<Self> {
-        [
-            WishState::Pending,
-            WishState::Waiting,
-            WishState::Applied,
-            WishState::Refused,
-            WishState::Superseded,
-        ]
-        .into_iter()
-        .find(|state| state.as_str() == word)
-    }
-
     /// The state `word` writes, as a listing shows it: a word of no state
     /// this build knows — an answer of a later replica's — shows as
     /// pending, and is logged.
@@ -527,11 +479,7 @@ impl UpTable {
     /// The table as said, judged against `since`: rows written before it
     /// wait.
     fn judged(progress: UpProgress, since: Option<DateTime<Utc>>) -> Self {
-        let waits = progress.set_aside > 0
-            || (progress.unsent + progress.unfiled > 0
-                && progress
-                    .oldest_at
-                    .is_none_or(|oldest| since.is_some_and(|since| oldest < since)));
+        let waits = progress.waits(since);
         UpTable { progress, waits }
     }
 }
