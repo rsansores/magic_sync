@@ -1,0 +1,5 @@
+error: conflict: a unique index the key's column `id` is not in does not identify the row
+ --> tests/derive/fail/conflict_without_the_key.rs:2:55
+  |
+2 | #[row(table = "things", mirror = "record", conflict = "at")]
+  |                                                       ^^^^

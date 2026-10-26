@@ -202,6 +202,11 @@ pub trait Row:
     /// The primary key's columns, in key order: `id`, unless the row says
     /// otherwise.
     const KEY: &'static [&'static str];
+    /// The columns of the unique index the server's write of a filed row is
+    /// checked against: the key, unless the table's unique indexes must hold
+    /// more — a partitioned table's (or a TimescaleDB hypertable's) hold the
+    /// partition column.
+    const CONFLICT: &'static [&'static str] = Self::KEY;
     /// Where the table lives.
     const MIRROR: Mirror;
 
@@ -584,20 +589,20 @@ fn key_of_row(
         .collect()
 }
 
-/// `ON CONFLICT (key) DO UPDATE SET` every written column `take` keeps but
-/// the key and the row's `created` column; nothing to set is `DO NOTHING`.
+/// `ON CONFLICT (conflict) DO UPDATE SET` every written column `take` keeps but
+/// the conflict columns and the row's `created` column; nothing to set is `DO NOTHING`.
 fn update_clause_where<R: Row>(take: impl Fn(&str) -> bool) -> String {
     let set: Vec<String> = written_names::<R>()
         .into_iter()
-        .filter(|c| !R::KEY.contains(c) && Some(*c) != R::CREATED && take(c))
+        .filter(|c| !R::CONFLICT.contains(c) && Some(*c) != R::CREATED && take(c))
         .map(|c| format!("{0} = EXCLUDED.{0}", ident(c)))
         .collect();
     if set.is_empty() {
-        return format!(" ON CONFLICT ({}) DO NOTHING", listed(R::KEY));
+        return format!(" ON CONFLICT ({}) DO NOTHING", listed(R::CONFLICT));
     }
     format!(
         " ON CONFLICT ({}) DO UPDATE SET {}",
-        listed(R::KEY),
+        listed(R::CONFLICT),
         set.join(", ")
     )
 }
@@ -1520,7 +1525,7 @@ pub(crate) async fn insert_ignore<R: Row>(
     exec: &mut Conn,
     rows: Vec<R>,
 ) -> Result<Vec<Key>, Error> {
-    let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(R::KEY));
+    let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(R::CONFLICT));
     write_keys(exec, rows, &conflict).await
 }
 
@@ -1861,6 +1866,64 @@ mod tests {
             .unwrap();
         assert_eq!(inserted, [other.key()], "the one it held left as it was");
         assert_eq!(by_key(&mut conn, &first).await, [newer]);
+    }
+
+    /// A record filed into a table partitioned by when it was taken, whose
+    /// unique index holds that column beside the key.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(table = "readings", mirror = "record", conflict = "id, at")]
+    struct Reading {
+        id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+        value: i64,
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = false)]
+    async fn a_record_is_filed_into_a_partitioned_table_by_its_conflict_columns(
+        pool: sqlx::PgPool,
+    ) {
+        sqlx::raw_sql(
+            "CREATE TABLE readings (id uuid NOT NULL, at timestamptz NOT NULL, value bigint NOT NULL, \
+                                    PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+             CREATE TABLE readings_all PARTITION OF readings DEFAULT",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let first = Reading {
+            id: Uuid::now_v7(),
+            at: chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap(),
+            value: 1,
+        };
+        let again = Reading {
+            value: 2,
+            ..first.clone()
+        };
+        let other = Reading {
+            id: Uuid::now_v7(),
+            ..first.clone()
+        };
+        let inserted = insert_ignore(&mut conn, vec![first.clone(), other.clone()])
+            .await
+            .unwrap();
+        assert_eq!(inserted, [first.key(), other.key()]);
+        let inserted = insert_ignore(&mut conn, vec![again.clone()]).await.unwrap();
+        assert!(inserted.is_empty(), "the one it held left as it was");
+        assert_eq!(
+            get_by_keys::<Reading>(&mut conn, &[first.key()])
+                .await
+                .unwrap(),
+            [first]
+        );
+        overwrite(&mut conn, vec![again.clone()]).await.unwrap();
+        assert_eq!(
+            get_by_keys::<Reading>(&mut conn, &[again.key()])
+                .await
+                .unwrap(),
+            [again]
+        );
     }
 
     /// A setting: the replica's, whose level the server may wish.

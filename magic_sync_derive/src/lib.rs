@@ -44,8 +44,8 @@ pub fn derive_columns(input: Tokens) -> Tokens {
 }
 
 /// The keys `#[row(…)]` takes on a struct that derives `Row`.
-const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `from`, \
-                        `depends`, `retired`, `origin`, `unmirrored`, `apply` or `crate`";
+const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `conflict`, `active`, \
+                        `from`, `depends`, `retired`, `origin`, `unmirrored`, `apply` or `crate`";
 
 /// PostgreSQL keeps the first 63 bytes of a longer name, and would answer
 /// for a table or column the row does not name.
@@ -55,6 +55,7 @@ const LONGEST_NAME: usize = 63;
 struct Args {
     table: Option<LitStr>,
     key: Option<LitStr>,
+    conflict: Option<LitStr>,
     schema: Option<LitStr>,
     mirror: Option<LitStr>,
     sync: Option<LitStr>,
@@ -81,6 +82,7 @@ fn parse_args(input: &DeriveInput, only_crate: bool) -> syn::Result<Args> {
                 )),
                 Some("table") => &mut args.table,
                 Some("key") => &mut args.key,
+                Some("conflict") => &mut args.conflict,
                 Some("schema") => &mut args.schema,
                 Some("mirror") => &mut args.mirror,
                 Some("sync") => &mut args.sync,
@@ -771,6 +773,32 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         key_columns.push(column);
     }
 
+    let conflict = match &args.conflict {
+        Some(lit) => {
+            if !matches!(mirror, Mirror::Record | Mirror::Setting) {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    "only a table the server files (`record` or `setting`) has a `conflict`",
+                ));
+            }
+            let names = names(lit)?;
+            if let Some(name) = names.iter().find(|n| column(n).is_none()) {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("conflict: `{name}` is not a field of the row"),
+                ));
+            }
+            if let Some(name) = key.iter().find(|k| !names.contains(k)) {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("conflict: a unique index the key's column `{name}` is not in does not identify the row"),
+                ));
+            }
+            names
+        }
+        None => key.clone(),
+    };
+
     if let Some(lit) = &args.origin {
         let origin = identifier(&lit.value(), lit.span())?;
         if matches!(mirror, Mirror::Catalog) {
@@ -877,6 +905,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             const TABLE: &'static ::core::primitive::str = #table;
             const SCHEMA: &'static ::core::primitive::str = #schema;
             const KEY: &'static [&'static ::core::primitive::str] = &[#(#key),*];
+            const CONFLICT: &'static [&'static ::core::primitive::str] = &[#(#conflict),*];
             const MIRROR: #krate::row::Mirror = #krate::row::Mirror::#variant;
             const QUALIFIED: &'static ::core::primitive::str = #krate::__qualified!(#quoted_schema, #quoted_table);
             const ROUTE: #private::Route = #route;
