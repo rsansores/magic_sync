@@ -28,6 +28,28 @@ impl core::panic::unwind_safe::UnwindSafe for magic_sync::envelope::Limits
 pub const magic_sync::envelope::ENVELOPE_ROOM: usize
 pub const magic_sync::envelope::PROTOCOL: u32
 pub mod magic_sync::replica
+#[non_exhaustive] pub enum magic_sync::replica::Link
+pub magic_sync::replica::Link::Down
+pub magic_sync::replica::Link::Unknown
+pub magic_sync::replica::Link::Up
+impl core::clone::Clone for magic_sync::replica::Link
+pub fn magic_sync::replica::Link::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::Link
+impl core::cmp::PartialEq for magic_sync::replica::Link
+pub fn magic_sync::replica::Link::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::Link
+pub fn magic_sync::replica::Link::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::replica::Link
+impl core::marker::StructuralPartialEq for magic_sync::replica::Link
+impl serde_core::ser::Serialize for magic_sync::replica::Link
+pub fn magic_sync::replica::Link::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::Link
+impl core::marker::Send for magic_sync::replica::Link
+impl core::marker::Sync for magic_sync::replica::Link
+impl core::marker::Unpin for magic_sync::replica::Link
+impl core::marker::UnsafeUnpin for magic_sync::replica::Link
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Link
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Link
 #[non_exhaustive] pub enum magic_sync::replica::Received
 pub magic_sync::replica::Received::AlreadyApplied
 pub magic_sync::replica::Received::Applied(alloc::vec::Vec<magic_sync::replica::Applied>)
@@ -44,6 +66,86 @@ impl core::marker::Unpin for magic_sync::replica::Received
 impl core::marker::UnsafeUnpin for magic_sync::replica::Received
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Received
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Received
+#[non_exhaustive] pub enum magic_sync::replica::Receiving
+pub magic_sync::replica::Receiving::Following
+pub magic_sync::replica::Receiving::Missed
+pub magic_sync::replica::Receiving::Snapshot
+pub magic_sync::replica::Receiving::Unprovisioned
+impl core::clone::Clone for magic_sync::replica::Receiving
+pub fn magic_sync::replica::Receiving::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::Receiving
+impl core::cmp::PartialEq for magic_sync::replica::Receiving
+pub fn magic_sync::replica::Receiving::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::Receiving
+pub fn magic_sync::replica::Receiving::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::replica::Receiving
+impl core::marker::StructuralPartialEq for magic_sync::replica::Receiving
+impl serde_core::ser::Serialize for magic_sync::replica::Receiving
+pub fn magic_sync::replica::Receiving::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::Receiving
+impl core::marker::Send for magic_sync::replica::Receiving
+impl core::marker::Sync for magic_sync::replica::Receiving
+impl core::marker::Unpin for magic_sync::replica::Receiving
+impl core::marker::UnsafeUnpin for magic_sync::replica::Receiving
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Receiving
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Receiving
+#[non_exhaustive] pub enum magic_sync::replica::Standing
+pub magic_sync::replica::Standing::AwaitingFix
+pub magic_sync::replica::Standing::CatchingUp
+pub magic_sync::replica::Standing::NotAnswered
+pub magic_sync::replica::Standing::NotLinked
+pub magic_sync::replica::Standing::Offline
+pub magic_sync::replica::Standing::Resyncing
+pub magic_sync::replica::Standing::Synced
+impl magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::as_str(self) -> &'static str
+impl core::clone::Clone for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::Standing
+impl core::cmp::Ord for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::cmp(&self, &Self) -> core::cmp::Ordering
+impl core::cmp::PartialEq for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::eq(&self, &Self) -> bool
+impl core::cmp::PartialOrd for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for magic_sync::replica::Standing
+impl core::marker::StructuralPartialEq for magic_sync::replica::Standing
+impl serde_core::ser::Serialize for magic_sync::replica::Standing
+pub fn magic_sync::replica::Standing::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::Standing
+impl core::marker::Send for magic_sync::replica::Standing
+impl core::marker::Sync for magic_sync::replica::Standing
+impl core::marker::Unpin for magic_sync::replica::Standing
+impl core::marker::UnsafeUnpin for magic_sync::replica::Standing
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Standing
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Standing
+#[non_exhaustive] pub enum magic_sync::replica::WishAnswer
+pub magic_sync::replica::WishAnswer::Pending
+pub magic_sync::replica::WishAnswer::Refused
+pub magic_sync::replica::WishAnswer::Superseded
+pub magic_sync::replica::WishAnswer::Waiting
+impl core::clone::Clone for magic_sync::replica::WishAnswer
+pub fn magic_sync::replica::WishAnswer::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::WishAnswer
+impl core::cmp::PartialEq for magic_sync::replica::WishAnswer
+pub fn magic_sync::replica::WishAnswer::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::WishAnswer
+pub fn magic_sync::replica::WishAnswer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for magic_sync::replica::WishAnswer
+impl core::marker::StructuralPartialEq for magic_sync::replica::WishAnswer
+impl serde_core::ser::Serialize for magic_sync::replica::WishAnswer
+pub fn magic_sync::replica::WishAnswer::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::WishAnswer
+impl core::marker::Send for magic_sync::replica::WishAnswer
+impl core::marker::Sync for magic_sync::replica::WishAnswer
+impl core::marker::Unpin for magic_sync::replica::WishAnswer
+impl core::marker::UnsafeUnpin for magic_sync::replica::WishAnswer
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::WishAnswer
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::WishAnswer
 #[non_exhaustive] pub struct magic_sync::replica::Applied
 pub magic_sync::replica::Applied::keys: alloc::vec::Vec<magic_sync::row::Key>
 pub magic_sync::replica::Applied::table: alloc::string::String
@@ -62,6 +164,29 @@ impl core::marker::Unpin for magic_sync::replica::Applied
 impl core::marker::UnsafeUnpin for magic_sync::replica::Applied
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Applied
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Applied
+#[non_exhaustive] pub struct magic_sync::replica::HeldWish
+pub magic_sync::replica::HeldWish::key: alloc::string::String
+pub magic_sync::replica::HeldWish::note: core::option::Option<alloc::string::String>
+pub magic_sync::replica::HeldWish::reason: core::option::Option<alloc::string::String>
+pub magic_sync::replica::HeldWish::state: magic_sync::replica::WishAnswer
+pub magic_sync::replica::HeldWish::table: alloc::string::String
+impl core::clone::Clone for magic_sync::replica::HeldWish
+pub fn magic_sync::replica::HeldWish::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::HeldWish
+impl core::cmp::PartialEq for magic_sync::replica::HeldWish
+pub fn magic_sync::replica::HeldWish::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::HeldWish
+pub fn magic_sync::replica::HeldWish::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::replica::HeldWish
+impl serde_core::ser::Serialize for magic_sync::replica::HeldWish
+pub fn magic_sync::replica::HeldWish::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::HeldWish
+impl core::marker::Send for magic_sync::replica::HeldWish
+impl core::marker::Sync for magic_sync::replica::HeldWish
+impl core::marker::Unpin for magic_sync::replica::HeldWish
+impl core::marker::UnsafeUnpin for magic_sync::replica::HeldWish
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::HeldWish
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::HeldWish
 #[non_exhaustive] pub struct magic_sync::replica::Lane
 pub magic_sync::replica::Lane::name: &'static str
 pub magic_sync::replica::Lane::tables: &'static [&'static str]
@@ -95,6 +220,81 @@ impl core::marker::Unpin for magic_sync::replica::Outbox
 impl core::marker::UnsafeUnpin for magic_sync::replica::Outbox
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Outbox
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Outbox
+#[non_exhaustive] pub struct magic_sync::replica::Refused
+pub magic_sync::replica::Refused::reason: alloc::string::String
+pub magic_sync::replica::Refused::reported: bool
+pub magic_sync::replica::Refused::rows: i64
+pub magic_sync::replica::Refused::since: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::Refused::table: alloc::string::String
+impl core::clone::Clone for magic_sync::replica::Refused
+pub fn magic_sync::replica::Refused::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::Refused
+impl core::cmp::PartialEq for magic_sync::replica::Refused
+pub fn magic_sync::replica::Refused::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::Refused
+pub fn magic_sync::replica::Refused::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::replica::Refused
+impl serde_core::ser::Serialize for magic_sync::replica::Refused
+pub fn magic_sync::replica::Refused::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::Refused
+impl core::marker::Send for magic_sync::replica::Refused
+impl core::marker::Sync for magic_sync::replica::Refused
+impl core::marker::Unpin for magic_sync::replica::Refused
+impl core::marker::UnsafeUnpin for magic_sync::replica::Refused
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::Refused
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::Refused
+#[non_exhaustive] pub struct magic_sync::replica::ReplicaStatus
+pub magic_sync::replica::ReplicaStatus::applied_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::ReplicaStatus::filed_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::ReplicaStatus::heard_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::ReplicaStatus::receiving: magic_sync::replica::Receiving
+pub magic_sync::replica::ReplicaStatus::refused: alloc::vec::Vec<magic_sync::replica::Refused>
+pub magic_sync::replica::ReplicaStatus::replica: core::option::Option<uuid::Uuid>
+pub magic_sync::replica::ReplicaStatus::set_aside: alloc::vec::Vec<magic_sync::replica::SetAside>
+pub magic_sync::replica::ReplicaStatus::spoken_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::ReplicaStatus::unfiled_since: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
+pub magic_sync::replica::ReplicaStatus::up: alloc::vec::Vec<magic_sync::replica::UpProgress>
+pub magic_sync::replica::ReplicaStatus::wishes: alloc::vec::Vec<magic_sync::replica::HeldWish>
+impl magic_sync::replica::ReplicaStatus
+pub fn magic_sync::replica::ReplicaStatus::standing(&self, magic_sync::replica::Link, chrono::datetime::DateTime<chrono::offset::utc::Utc>, core::time::Duration) -> magic_sync::replica::Standing
+impl core::clone::Clone for magic_sync::replica::ReplicaStatus
+pub fn magic_sync::replica::ReplicaStatus::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::ReplicaStatus
+impl core::cmp::PartialEq for magic_sync::replica::ReplicaStatus
+pub fn magic_sync::replica::ReplicaStatus::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::ReplicaStatus
+pub fn magic_sync::replica::ReplicaStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::replica::ReplicaStatus
+impl serde_core::ser::Serialize for magic_sync::replica::ReplicaStatus
+pub fn magic_sync::replica::ReplicaStatus::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::ReplicaStatus
+impl core::marker::Send for magic_sync::replica::ReplicaStatus
+impl core::marker::Sync for magic_sync::replica::ReplicaStatus
+impl core::marker::Unpin for magic_sync::replica::ReplicaStatus
+impl core::marker::UnsafeUnpin for magic_sync::replica::ReplicaStatus
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::ReplicaStatus
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::ReplicaStatus
+#[non_exhaustive] pub struct magic_sync::replica::SetAside
+pub magic_sync::replica::SetAside::reason: alloc::string::String
+pub magic_sync::replica::SetAside::rows: i64
+pub magic_sync::replica::SetAside::table: alloc::string::String
+impl core::clone::Clone for magic_sync::replica::SetAside
+pub fn magic_sync::replica::SetAside::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::replica::SetAside
+impl core::cmp::PartialEq for magic_sync::replica::SetAside
+pub fn magic_sync::replica::SetAside::eq(&self, &Self) -> bool
+impl core::fmt::Debug for magic_sync::replica::SetAside
+pub fn magic_sync::replica::SetAside::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for magic_sync::replica::SetAside
+impl serde_core::ser::Serialize for magic_sync::replica::SetAside
+pub fn magic_sync::replica::SetAside::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for magic_sync::replica::SetAside
+impl core::marker::Send for magic_sync::replica::SetAside
+impl core::marker::Sync for magic_sync::replica::SetAside
+impl core::marker::Unpin for magic_sync::replica::SetAside
+impl core::marker::UnsafeUnpin for magic_sync::replica::SetAside
+impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::replica::SetAside
+impl core::panic::unwind_safe::UnwindSafe for magic_sync::replica::SetAside
 #[non_exhaustive] pub struct magic_sync::replica::UpProgress
 pub magic_sync::replica::UpProgress::oldest_at: core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>
 pub magic_sync::replica::UpProgress::set_aside: i64
@@ -124,6 +324,7 @@ pub async fn magic_sync::replica::check<P: core::marker::Sync + 'static>(&mut ma
 pub async fn magic_sync::replica::install<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::wire::Codec<P>]) -> core::result::Result<(), magic_sync::Error>
 pub fn magic_sync::replica::migration(i32) -> core::option::Option<alloc::string::String>
 pub async fn magic_sync::replica::progress(&mut magic_sync::Conn) -> core::result::Result<alloc::vec::Vec<magic_sync::replica::UpProgress>, magic_sync::Error>
+pub async fn magic_sync::replica::status(&mut magic_sync::Conn) -> core::result::Result<magic_sync::replica::ReplicaStatus, magic_sync::Error>
 pub fn magic_sync::replica::triggers<P: core::marker::Sync + 'static>(&[magic_sync::wire::Codec<P>]) -> core::result::Result<alloc::string::String, magic_sync::Error>
 pub mod magic_sync::row
 #[non_exhaustive] pub enum magic_sync::row::Apply

@@ -3,10 +3,17 @@
 //! [`Replica`](crate::run::replica::Replica). What a host does here itself is set up the
 //! database ([`install`], or [`triggers`] and [`check`] for one with
 //! migrations), say how its writes go up ([`Lane`], [`Outbox`]), and ask how
-//! far along they are ([`progress`]).
+//! far along they are ([`progress`]) and where its sync stands ([`status`]).
 
 use crate::envelope;
 use crate::wire::Codec;
+
+#[cfg(feature = "sqlite")]
+mod status;
+#[cfg(feature = "sqlite")]
+pub use status::{
+    status, HeldWish, Link, Receiving, Refused, ReplicaStatus, SetAside, Standing, WishAnswer,
+};
 #[cfg(feature = "sqlite")]
 use {
     crate::dialect::{ident, literal},
@@ -65,6 +72,7 @@ const MIGRATIONS: [&str; crate::REPLICA_SCHEMA_VERSION as usize] = [
     include_str!("../sql/sqlite/1.sql"),
     include_str!("../sql/sqlite/2.sql"),
     include_str!("../sql/sqlite/3.sql"),
+    include_str!("../sql/sqlite/4.sql"),
 ];
 
 /// The engine's step to `version` of its tables on a replica, as one SQL
@@ -778,6 +786,7 @@ pub(crate) async fn receive<P: Sync + 'static>(
     if let Some(why) = envelope::oversized(&body, limits) {
         return Ok(malformed(why));
     }
+    heard(conn, "heard_at").await?;
     sqlx::query("INSERT OR IGNORE INTO sync_applying (id) VALUES (1)")
         .execute(&mut *conn)
         .await?;
@@ -1069,6 +1078,7 @@ async fn act<P: Sync + 'static>(
     match body {
         Body::Filed(message) => {
             filed(conn, codecs, &message, care).await?;
+            heard(conn, "filed_at").await?;
             Ok(Received::Filed)
         }
         Body::Down(down) => {
@@ -1094,9 +1104,9 @@ async fn act<P: Sync + 'static>(
                     if down.previous == 0 {
                         restate(conn, codecs).await?;
                     }
-                    Ok(Received::Applied(
-                        apply(conn, codecs, &down, &by, care).await?,
-                    ))
+                    let applied = apply(conn, codecs, &down, &by, care).await?;
+                    heard(conn, "applied_at").await?;
+                    Ok(Received::Applied(applied))
                 }
                 Err(skipped) => Ok(skipped),
             }
@@ -1117,12 +1127,28 @@ async fn act<P: Sync + 'static>(
                         restate(conn, codecs).await?;
                     }
                     end_snapshot(conn, codecs, &end, &by, care).await?;
+                    heard(conn, "applied_at").await?;
                     Ok(Received::SnapshotEnded)
                 }
                 Err(skipped) => Ok(skipped),
             }
         }
     }
+}
+
+/// Stamps `column` of `sync_heard` now, by the replica's clock: in the
+/// transaction the message is acted on in, so a message rolled back to come
+/// again was not heard.
+#[cfg(feature = "sqlite")]
+async fn heard(conn: &mut Conn, column: &'static str) -> Result<(), Error> {
+    sqlx::query(&format!(
+        "INSERT INTO sync_heard (id, {column}) VALUES (1, $1) \
+         ON CONFLICT (id) DO UPDATE SET {column} = EXCLUDED.{column}"
+    ))
+    .bind(chrono::Utc::now().timestamp_millis())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Where a message stands in what the server sends this replica.

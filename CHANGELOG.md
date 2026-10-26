@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+What a replica can tell about itself. Schemas: server 5, replica **4**.
+Protocol 1 (unchanged). Dashboard contract 2 (unchanged).
+
+- **`replica::status`.** Everything a replica records about how its sync
+  stands, read from its own database for a screen on the replica: the
+  backlog per table (`UpProgress`), since when an upload has gone unfiled
+  (`unfiled_since`), when the transport last took a message (`spoken_at`),
+  when the server was last heard from, last sent rows that were applied, and
+  last filed an upload (`heard_at`, `applied_at`, `filed_at`), where it
+  stands in what the server sends (`Receiving`: unprovisioned, following, a
+  snapshot in progress, a message missed), the rows it refused (`Refused`)
+  and those it cannot send (`SetAside`), per table with why, and the wished
+  settings not carried out (`HeldWish`).
+- **`ReplicaStatus::standing`.** The status judged in one word, worst first
+  (`Standing`): `not_linked`, `awaiting_fix`, `offline`, `not_answered`,
+  `resyncing`, `catching_up`, `synced`. The host says whether its transport is
+  connected (`Link`) and how long an upload may go unfiled before the server
+  is not answering (`patience`).
+- **Replica schema 4.** `sync_heard` keeps the three times, stamped in the
+  transaction a message is acted on in. A host with migrations of its own
+  runs `replica::migration(4)`; `install` runs it by itself. Until a message
+  arrives after the upgrade, the times are `None`.
+
 ## 0.4.0 — 2026-10-24
 
 Where a replica is stuck. Schemas: server 5, replica 3. Protocol 1

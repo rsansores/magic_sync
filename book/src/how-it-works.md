@@ -520,6 +520,19 @@ table, rows it wrote that are not sent yet, and rows sent the server has not
 filed yet. It tells the server the same whenever it changes, and the server
 shows it as the replica's backlog.
 
+[`replica::status`] is the rest of what a replica knows of itself, for a
+screen on the replica — read from its own database, so it answers when the
+server cannot be reached: that backlog, since when the server has kept an
+upload unfiled, when the server was last heard from (any message), last sent
+rows that were applied, and last filed an upload, whether a snapshot is in
+progress or a message was missed, the rows it refused and those it cannot
+send, and the wished settings not carried out. `ReplicaStatus::standing`
+judges it in one word, worst first: `not_linked`, `awaiting_fix`, `offline`,
+`not_answered`, `resyncing`, `catching_up`, `synced` — the server's words
+where they mean the same. Whether the transport is connected is the host's to
+say (`Link`), and so is how long an upload may go unfiled (`patience`); the
+words on the screen are the host's too.
+
 ### What an operator sees
 
 [`plan::Engine::health`] answers what the engine waits on over a scope: how
@@ -653,6 +666,7 @@ through `DATABASE_URL`; each test gets a database of its own) and
 [`plan::Engine::row_progress`]: api/server/magic_sync/plan/struct.Engine.html#method.row_progress
 [`plan::Replicas`]: api/server/magic_sync/plan/struct.Replicas.html
 [`replica::progress`]: api/replica/magic_sync/replica/fn.progress.html
+[`replica::status`]: api/replica/magic_sync/replica/fn.status.html
 [`run::server::Transport`]: api/server/magic_sync/run/server/trait.Transport.html
 [`run::replica::Uplink`]: api/replica/magic_sync/run/replica/trait.Uplink.html
 [`run::server::Senders`]: api/server/magic_sync/run/server/trait.Senders.html
