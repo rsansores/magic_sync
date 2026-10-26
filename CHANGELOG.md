@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **`#[row(conflict = "…")]`.** A `record` or a `setting` filed into a table
+  whose unique indexes must hold more than the key — a partitioned table, a
+  TimescaleDB hypertable, both of which require the partition column in
+  every one — names the index it is filed against: `conflict = "id, at"`.
+  The key's columns and more, each a field of the row; the key still names
+  the row everywhere else. `Row::CONFLICT`, defaulting to `Row::KEY`, so a
+  row that does not say is filed as before.
+
 ## 0.5.0 — 2026-10-26
 
 What a replica can tell about itself. Schemas: server 5, replica **4**.
