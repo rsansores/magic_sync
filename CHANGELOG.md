@@ -8,9 +8,11 @@ contract 2 (unchanged).
 - **`#[row(conflict = "…")]`.** A `record` filed into a table partitioned by
   time — natively or as a TimescaleDB hypertable — whose unique indexes must
   hold the partition column: `conflict = "id, taken_at"` is the server's
-  primary key, and what the record is filed against. The extra columns are
-  fields of the row, never NULL, written once and never changed. A replica's
-  table keeps the key alone, which still names the row everywhere else.
+  `PRIMARY KEY`, and what the record is filed against. The extra columns are
+  fields of the row, never NULL, and the host never changes them: the engine
+  does not check, and a report with another value is filed as another row. A
+  replica's table keeps the key alone, which still names the row everywhere
+  else.
   API: `Row::CONFLICT`, defaulting to `Row::KEY`; a row that does not say is
   filed as before. Recipe: *Records kept in a partitioned table*.
 

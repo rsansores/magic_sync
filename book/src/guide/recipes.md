@@ -124,7 +124,8 @@ CREATE TABLE shop.stores (
 A record that piles up for ever — readings, events, a GPS track — is often kept
 in a table partitioned by when it was taken, natively or as a TimescaleDB
 hypertable. PostgreSQL then requires every unique index to hold the partition
-column, so the server's primary key is not the key alone. Name it:
+column, so the server's primary key is not the key alone. Name it — it must
+be the table's `PRIMARY KEY`, not just a unique index:
 
 ```rust,ignore
 {{#include ../../snippets/src/rows.rs:conflict}}
@@ -137,7 +138,9 @@ CREATE TABLE shop.readings (
 ```
 
 The server files the record against `(id, taken_at)`; the replica's table keeps
-`PRIMARY KEY (id)`. The key still names the row everywhere else. The extra
-columns are written once and never change: a report of the row with another
-`taken_at` is another row, which no index refuses. Reading a row by its key
-alone visits every partition — bound such a read by the partition column.
+`PRIMARY KEY (id)`. The key still names the row everywhere else. Never change
+`taken_at` once the row is written: the engine does not check, and a report of
+the row with another `taken_at` is filed as another row while the first stays,
+which no index refuses. Whatever reads or deletes by the key alone — a read of
+yours, or the engine deleting a record its replica deleted — visits every
+partition: bound your own reads by the partition column.

@@ -1,4 +1,4 @@
-error: conflict: holds every key column, and `id` is missing
+error: `conflict` holds every key column: `id` is missing
  --> tests/derive/fail/conflict_without_the_key.rs:2:55
   |
 2 | #[row(table = "things", mirror = "record", conflict = "at")]

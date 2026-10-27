@@ -785,15 +785,23 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             if let Some(name) = key.iter().find(|k| !names.contains(k)) {
                 return Err(syn::Error::new_spanned(
                     lit,
-                    format!("conflict: holds every key column, and `{name}` is missing"),
+                    format!("`conflict` holds every key column: `{name}` is missing"),
+                ));
+            }
+            if names.len() == key.len() {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    "`conflict` names columns beyond the key: the key alone is the default",
                 ));
             }
             for name in names.iter().filter(|n| !key.contains(n)) {
                 let Some(column) = column(name) else {
-                    return Err(syn::Error::new_spanned(
-                        lit,
-                        format!("conflict: `{name}` is not a field of the row itself"),
-                    ));
+                    let why = if flattened.is_empty() {
+                        format!("the conflict column `{name}` is not a field of the row")
+                    } else {
+                        format!("the conflict column `{name}` is not a field of the row itself: a conflict column is not flattened in")
+                    };
+                    return Err(syn::Error::new_spanned(lit, why));
                 };
                 if column.nullable {
                     return Err(syn::Error::new(

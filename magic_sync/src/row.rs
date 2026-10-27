@@ -202,12 +202,13 @@ pub trait Row:
     /// The primary key's columns, in key order: `id`, unless the row says
     /// otherwise.
     const KEY: &'static [&'static str];
-    /// The server's primary key of a `record`, which its filing is checked
-    /// against: the key, unless the table's unique indexes must hold more — a
-    /// partitioned table's (or a TimescaleDB hypertable's) hold the partition
-    /// column. The columns beyond the key are written once with the row and
-    /// never change: a report of the row with another value of one is
-    /// another row. A replica's table is keyed by the key alone.
+    /// The columns the server's `ON CONFLICT` names when it files a `record`,
+    /// and its table's `PRIMARY KEY`: the key, unless the table's unique
+    /// indexes must hold more — a partitioned table's (or a TimescaleDB
+    /// hypertable's) hold the partition column. The host never changes the
+    /// columns beyond the key once the row is written: the engine does not
+    /// check, and a report with another value is filed as another row while
+    /// the first stays as it was. A replica's table is keyed by the key alone.
     const CONFLICT: &'static [&'static str] = Self::KEY;
     /// Where the table lives.
     const MIRROR: Mirror;
@@ -1729,7 +1730,8 @@ impl Table {
             }
         }
         let mut primary_key = crate::dialect::primary_key(conn, self.schema, self.name).await?;
-        let mut key: Vec<&str> = if cfg!(feature = "postgres") {
+        let by_conflict = cfg!(feature = "postgres") && self.conflict != self.key;
+        let mut key: Vec<&str> = if by_conflict {
             self.conflict.to_vec()
         } else {
             self.key.to_vec()
@@ -1739,8 +1741,13 @@ impl Table {
         primary_key.sort_unstable();
         key.sort_unstable();
         if primary_key != key {
+            let what = if by_conflict {
+                "conflict columns"
+            } else {
+                "key"
+            };
             out.push(format!(
-                "the primary key is {primary_key:?}, and the row's key {key:?}"
+                "the primary key is {primary_key:?}, and the row's {what} {key:?}"
             ));
         }
         let described = sqlx::Executor::describe(
@@ -1947,6 +1954,63 @@ mod tests {
                 .await
                 .unwrap(),
             [again]
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = false)]
+    async fn a_server_table_keyed_by_the_key_alone_is_refused(pool: sqlx::PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE readings (id uuid PRIMARY KEY, at timestamptz NOT NULL, value bigint NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let refused = parity(&mut conn, &[&Table::of::<Reading>()])
+            .await
+            .expect_err("its primary key is not its conflict columns");
+        assert!(
+            refused.to_string().contains(
+                r#"the primary key is ["id"], and the row's conflict columns ["at", "id"]"#
+            ),
+            "{refused}"
+        );
+    }
+
+    /// The engine trusts the host to never change a conflict column: a report
+    /// with another value is another row, and the first stays.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = false)]
+    async fn a_record_reported_with_another_conflict_value_is_another_row(pool: sqlx::PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE readings (id uuid NOT NULL, at timestamptz NOT NULL, value bigint NOT NULL, \
+                                    PRIMARY KEY (id, at))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let first = Reading {
+            id: Uuid::now_v7(),
+            at: chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap(),
+            value: 1,
+        };
+        let moved = Reading {
+            at: first.at + chrono::Duration::seconds(1),
+            ..first.clone()
+        };
+        insert_ignore(&mut conn, vec![first.clone()]).await.unwrap();
+        assert_eq!(
+            insert_ignore(&mut conn, vec![moved]).await.unwrap(),
+            [first.key()]
+        );
+        assert_eq!(
+            get_by_keys::<Reading>(&mut conn, &[first.key()])
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 
