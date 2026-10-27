@@ -1,0 +1,5 @@
+error: only a `record` has a `conflict`
+ --> tests/derive/fail/conflict_on_a_setting.rs:7:16
+  |
+7 |     conflict = "replica_id, id, at"
+  |                ^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: a conflict column cannot be NULL
+ --> tests/derive/fail/conflict_nullable.rs:5:9
+  |
+5 |     pub at: Option<chrono::DateTime<chrono::Utc>>,
+  |         ^^

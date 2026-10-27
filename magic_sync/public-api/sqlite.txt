@@ -484,6 +484,7 @@ impl magic_sync::row::KeyValue for uuid::Uuid
 pub const uuid::Uuid::KIND: magic_sync::row::KeyKind
 pub fn uuid::Uuid::key_part(&self) -> magic_sync::row::KeyPart
 pub trait magic_sync::row::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
+pub const magic_sync::row::Row::CONFLICT: &'static [&'static str]
 pub const magic_sync::row::Row::KEY: &'static [&'static str]
 pub const magic_sync::row::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::row::Row::SCHEMA: &'static str
@@ -730,6 +731,7 @@ impl !core::panic::unwind_safe::UnwindSafe for magic_sync::Error
 pub const magic_sync::REPLICA_SCHEMA_VERSION: i32
 pub trait magic_sync::Columns: crate::__private::Sealed
 pub trait magic_sync::Row: magic_sync::row::Columns + for<'r> sqlx_core::from_row::FromRow<'r, <__private::Db as sqlx_core::database::Database>::Row> + core::marker::Send + core::marker::Unpin + 'static
+pub const magic_sync::Row::CONFLICT: &'static [&'static str]
 pub const magic_sync::Row::KEY: &'static [&'static str]
 pub const magic_sync::Row::MIRROR: magic_sync::row::Mirror
 pub const magic_sync::Row::SCHEMA: &'static str

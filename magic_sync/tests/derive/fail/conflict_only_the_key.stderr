@@ -1,0 +1,5 @@
+error: `conflict` names columns beyond the key: the key alone is the default
+ --> tests/derive/fail/conflict_only_the_key.rs:2:55
+  |
+2 | #[row(table = "things", mirror = "record", conflict = "id")]
+  |                                                       ^^^^

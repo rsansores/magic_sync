@@ -44,8 +44,8 @@ pub fn derive_columns(input: Tokens) -> Tokens {
 }
 
 /// The keys `#[row(…)]` takes on a struct that derives `Row`.
-const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `active`, `from`, \
-                        `depends`, `retired`, `origin`, `unmirrored`, `apply` or `crate`";
+const ROW_KEYS: &str = "`table`, `schema`, `mirror`, `sync`, `key`, `conflict`, `active`, \
+                        `from`, `depends`, `retired`, `origin`, `unmirrored`, `apply` or `crate`";
 
 /// PostgreSQL keeps the first 63 bytes of a longer name, and would answer
 /// for a table or column the row does not name.
@@ -55,6 +55,7 @@ const LONGEST_NAME: usize = 63;
 struct Args {
     table: Option<LitStr>,
     key: Option<LitStr>,
+    conflict: Option<LitStr>,
     schema: Option<LitStr>,
     mirror: Option<LitStr>,
     sync: Option<LitStr>,
@@ -81,6 +82,7 @@ fn parse_args(input: &DeriveInput, only_crate: bool) -> syn::Result<Args> {
                 )),
                 Some("table") => &mut args.table,
                 Some("key") => &mut args.key,
+                Some("conflict") => &mut args.conflict,
                 Some("schema") => &mut args.schema,
                 Some("mirror") => &mut args.mirror,
                 Some("sync") => &mut args.sync,
@@ -771,6 +773,55 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
         key_columns.push(column);
     }
 
+    let conflict = match &args.conflict {
+        Some(lit) => {
+            if mirror != Mirror::Record {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    "only a `record` has a `conflict`",
+                ));
+            }
+            let names = names(lit)?;
+            if let Some(name) = key.iter().find(|k| !names.contains(k)) {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("`conflict` holds every key column: `{name}` is missing"),
+                ));
+            }
+            if names.len() == key.len() {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    "`conflict` names columns beyond the key: the key alone is the default",
+                ));
+            }
+            for name in names.iter().filter(|n| !key.contains(n)) {
+                let Some(column) = column(name) else {
+                    let why = if flattened.is_empty() {
+                        format!("the conflict column `{name}` is not a field of the row")
+                    } else {
+                        format!("the conflict column `{name}` is not a field of the row itself: a conflict column is not flattened in")
+                    };
+                    return Err(syn::Error::new_spanned(lit, why));
+                };
+                if column.nullable {
+                    return Err(syn::Error::new(
+                        column.at,
+                        "a conflict column cannot be NULL",
+                    ));
+                }
+                if let Some(at) = column.flags.any() {
+                    return Err(syn::Error::new(
+                        at,
+                        "a conflict column is written once with the row: it is not generated, \
+                         owned by a replica, a version, a creation time or desired",
+                    ));
+                }
+            }
+            names
+        }
+        None => key.clone(),
+    };
+
     if let Some(lit) = &args.origin {
         let origin = identifier(&lit.value(), lit.span())?;
         if matches!(mirror, Mirror::Catalog) {
@@ -877,6 +928,7 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
             const TABLE: &'static ::core::primitive::str = #table;
             const SCHEMA: &'static ::core::primitive::str = #schema;
             const KEY: &'static [&'static ::core::primitive::str] = &[#(#key),*];
+            const CONFLICT: &'static [&'static ::core::primitive::str] = &[#(#conflict),*];
             const MIRROR: #krate::row::Mirror = #krate::row::Mirror::#variant;
             const QUALIFIED: &'static ::core::primitive::str = #krate::__qualified!(#quoted_schema, #quoted_table);
             const ROUTE: #private::Route = #route;
