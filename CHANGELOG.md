@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 — 2026-10-27
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
 contract 2 (unchanged).

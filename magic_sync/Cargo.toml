@@ -22,7 +22,7 @@ sqlite = ["sqlx/sqlite"]
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 hmac = { version = "0.12", optional = true }
-magic_sync_derive = { version = "=0.5.0", path = "../magic_sync_derive" }
+magic_sync_derive = { version = "=0.5.1", path = "../magic_sync_derive" }
 prost = "0.14"
 rand = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"] }

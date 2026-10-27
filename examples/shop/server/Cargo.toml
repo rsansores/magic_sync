@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 # The server's side. Outside this repository, leave `path` out.
-magic_sync = { version = "0.5.0", path = "../../../magic_sync", features = ["postgres"] }
+magic_sync = { version = "0.5.1", path = "../../../magic_sync", features = ["postgres"] }
 # The rows both sides share, built for the server.
 shop_rows = { path = "../rows", features = ["server"] }
 axum = "0.8"
