@@ -126,3 +126,19 @@ pub struct RegisterSetting {
     pub changed_at: DateTime<Utc>,
 }
 // ANCHOR_END: setting
+
+// ANCHOR: conflict
+/// A reading: kept for ever, in a table partitioned by when it was taken.
+#[derive(sqlx::FromRow, Clone, magic_sync::Row)]
+#[row(
+    table = "readings",
+    schema = "shop",
+    mirror = "record",
+    conflict = "id, taken_at"
+)]
+pub struct Reading {
+    pub id: Uuid,
+    pub taken_at: DateTime<Utc>,
+    pub value: f64,
+}
+// ANCHOR_END: conflict

@@ -1,4 +1,4 @@
-error: conflict: `at` is not a field of the row
+error: conflict: `at` is not a field of the row itself
  --> tests/derive/fail/conflict_not_a_field.rs:2:55
   |
 2 | #[row(table = "things", mirror = "record", conflict = "id, at")]

@@ -45,7 +45,6 @@ pub struct Stamps {
     schema = "fleet",
     mirror = "record",
     key = "replica_id, sensor, seq",
-    conflict = "replica_id, sensor, seq, at",
     origin = "replica_id"
 )]
 pub struct Reading {

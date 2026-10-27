@@ -1,5 +1,0 @@
-error: only a table the server files (`record` or `setting`) has a `conflict`
- --> tests/derive/fail/conflict_on_a_catalog.rs:2:76
-  |
-2 | #[row(table = "things", mirror = "catalog", sync = "broadcast", conflict = "id, at")]
-  |                                                                            ^^^^^^^^

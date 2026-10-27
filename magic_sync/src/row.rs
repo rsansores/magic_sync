@@ -202,10 +202,12 @@ pub trait Row:
     /// The primary key's columns, in key order: `id`, unless the row says
     /// otherwise.
     const KEY: &'static [&'static str];
-    /// The columns of the unique index the server's write of a filed row is
-    /// checked against: the key, unless the table's unique indexes must hold
-    /// more — a partitioned table's (or a TimescaleDB hypertable's) hold the
-    /// partition column.
+    /// The server's primary key of a `record`, which its filing is checked
+    /// against: the key, unless the table's unique indexes must hold more — a
+    /// partitioned table's (or a TimescaleDB hypertable's) hold the partition
+    /// column. The columns beyond the key are written once with the row and
+    /// never change: a report of the row with another value of one is
+    /// another row. A replica's table is keyed by the key alone.
     const CONFLICT: &'static [&'static str] = Self::KEY;
     /// Where the table lives.
     const MIRROR: Mirror;
@@ -589,20 +591,31 @@ fn key_of_row(
         .collect()
 }
 
+/// The columns this side's primary key is: [`Row::CONFLICT`] on the server,
+/// the key on a replica.
+fn conflict<R: Row>() -> &'static [&'static str] {
+    if cfg!(feature = "postgres") {
+        R::CONFLICT
+    } else {
+        R::KEY
+    }
+}
+
 /// `ON CONFLICT (conflict) DO UPDATE SET` every written column `take` keeps but
 /// the conflict columns and the row's `created` column; nothing to set is `DO NOTHING`.
 fn update_clause_where<R: Row>(take: impl Fn(&str) -> bool) -> String {
+    let conflict = conflict::<R>();
     let set: Vec<String> = written_names::<R>()
         .into_iter()
-        .filter(|c| !R::CONFLICT.contains(c) && Some(*c) != R::CREATED && take(c))
+        .filter(|c| !conflict.contains(c) && Some(*c) != R::CREATED && take(c))
         .map(|c| format!("{0} = EXCLUDED.{0}", ident(c)))
         .collect();
     if set.is_empty() {
-        return format!(" ON CONFLICT ({}) DO NOTHING", listed(R::CONFLICT));
+        return format!(" ON CONFLICT ({}) DO NOTHING", listed(conflict));
     }
     format!(
         " ON CONFLICT ({}) DO UPDATE SET {}",
-        listed(R::CONFLICT),
+        listed(conflict),
         set.join(", ")
     )
 }
@@ -1525,7 +1538,7 @@ pub(crate) async fn insert_ignore<R: Row>(
     exec: &mut Conn,
     rows: Vec<R>,
 ) -> Result<Vec<Key>, Error> {
-    let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(R::CONFLICT));
+    let conflict = format!(" ON CONFLICT ({}) DO NOTHING", listed(conflict::<R>()));
     write_keys(exec, rows, &conflict).await
 }
 
@@ -1552,7 +1565,7 @@ pub(crate) struct Table {
     /// The table as SQL names it on this backend, quoted.
     pub(crate) qualified: &'static str,
     pub(crate) key: &'static [&'static str],
-    /// [`Row::CONFLICT`]: the primary key's columns.
+    /// [`Row::CONFLICT`]: what the server's table's primary key must be.
     pub(crate) conflict: &'static [&'static str],
     pub(crate) mirror: Mirror,
     #[cfg(feature = "postgres")]
@@ -1650,7 +1663,7 @@ impl Table {
     /// table has and the row does not, or the other way round, one nullable
     /// on one side only, generated on one side only, or of a type its field
     /// does not decode, and a primary key of other columns than the row's
-    /// conflict columns (its key, unless it says otherwise). The columns
+    /// — its conflict columns on the server, its key on a replica. The columns
     /// the row leaves out — its retired column, its unmirrored ones — are
     /// not compared. Empty when they agree.
     pub(crate) async fn differences(&self, conn: &mut Conn) -> Result<Vec<String>, Error> {
@@ -1716,7 +1729,11 @@ impl Table {
             }
         }
         let mut primary_key = crate::dialect::primary_key(conn, self.schema, self.name).await?;
-        let mut key: Vec<&str> = self.conflict.to_vec();
+        let mut key: Vec<&str> = if cfg!(feature = "postgres") {
+            self.conflict.to_vec()
+        } else {
+            self.key.to_vec()
+        };
         // In any order: a key is compared, written and bound column by
         // column, by name.
         primary_key.sort_unstable();
@@ -1931,6 +1948,80 @@ mod tests {
                 .unwrap(),
             [again]
         );
+    }
+
+    /// A record of the same table whose later reports win.
+    #[derive(sqlx::FromRow, Clone, Debug, PartialEq, crate::Row)]
+    #[row(table = "readings", mirror = "record", conflict = "id, at")]
+    struct Revised {
+        id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+        value: i64,
+        #[row(version)]
+        revision: i64,
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = false)]
+    async fn a_versioned_record_is_upserted_by_its_conflict_columns(pool: sqlx::PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE readings (id uuid NOT NULL, at timestamptz NOT NULL, value bigint NOT NULL, \
+                                    revision bigint NOT NULL, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+             CREATE TABLE readings_all PARTITION OF readings DEFAULT",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let first = Revised {
+            id: Uuid::now_v7(),
+            at: chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap(),
+            value: 1,
+            revision: 2,
+        };
+        let older = Revised {
+            value: 0,
+            revision: 1,
+            ..first.clone()
+        };
+        let newer = Revised {
+            value: 3,
+            revision: 3,
+            ..first.clone()
+        };
+        upsert(&mut conn, vec![first.clone()]).await.unwrap();
+        upsert(&mut conn, vec![older]).await.unwrap();
+        assert_eq!(
+            get_by_keys::<Revised>(&mut conn, &[first.key()])
+                .await
+                .unwrap(),
+            [first],
+            "a late report"
+        );
+        upsert(&mut conn, vec![newer.clone()]).await.unwrap();
+        assert_eq!(
+            get_by_keys::<Revised>(&mut conn, &[newer.key()])
+                .await
+                .unwrap(),
+            [newer]
+        );
+    }
+
+    /// A replica's table is keyed by the key alone, whatever the server's
+    /// primary key holds.
+    #[cfg(feature = "sqlite")]
+    #[sqlx::test(migrations = false)]
+    async fn a_replica_keys_a_record_with_conflict_columns_by_its_key(pool: sqlx::SqlitePool) {
+        sqlx::raw_sql(
+            "CREATE TABLE readings (id BLOB NOT NULL PRIMARY KEY, at TEXT NOT NULL, value INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        parity(&mut conn, &[&Table::of::<Reading>()])
+            .await
+            .expect("keyed by its key");
     }
 
     /// A setting: the replica's, whose level the server may wish.

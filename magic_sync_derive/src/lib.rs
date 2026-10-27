@@ -775,24 +775,39 @@ fn row(input: &DeriveInput) -> syn::Result<TokenStream> {
 
     let conflict = match &args.conflict {
         Some(lit) => {
-            if !matches!(mirror, Mirror::Record | Mirror::Setting) {
+            if mirror != Mirror::Record {
                 return Err(syn::Error::new_spanned(
                     lit,
-                    "only a table the server files (`record` or `setting`) has a `conflict`",
+                    "only a `record` has a `conflict`",
                 ));
             }
             let names = names(lit)?;
-            if let Some(name) = names.iter().find(|n| column(n).is_none()) {
-                return Err(syn::Error::new_spanned(
-                    lit,
-                    format!("conflict: `{name}` is not a field of the row"),
-                ));
-            }
             if let Some(name) = key.iter().find(|k| !names.contains(k)) {
                 return Err(syn::Error::new_spanned(
                     lit,
-                    format!("conflict: a unique index the key's column `{name}` is not in does not identify the row"),
+                    format!("conflict: holds every key column, and `{name}` is missing"),
                 ));
+            }
+            for name in names.iter().filter(|n| !key.contains(n)) {
+                let Some(column) = column(name) else {
+                    return Err(syn::Error::new_spanned(
+                        lit,
+                        format!("conflict: `{name}` is not a field of the row itself"),
+                    ));
+                };
+                if column.nullable {
+                    return Err(syn::Error::new(
+                        column.at,
+                        "a conflict column cannot be NULL",
+                    ));
+                }
+                if let Some(at) = column.flags.any() {
+                    return Err(syn::Error::new(
+                        at,
+                        "a conflict column is written once with the row: it is not generated, \
+                         owned by a replica, a version, a creation time or desired",
+                    ));
+                }
             }
             names
         }

@@ -2,14 +2,17 @@
 
 ## Unreleased
 
-- **`#[row(conflict = "…")]`.** A `record` or a `setting` filed into a table
-  whose unique indexes must hold more than the key — a partitioned table, a
-  TimescaleDB hypertable, both of which require the partition column in
-  every one — names the index it is filed against: `conflict = "id, at"`.
-  The key's columns and more, each a field of the row, and the table's
-  primary key; the key still names
-  the row everywhere else. `Row::CONFLICT`, defaulting to `Row::KEY`, so a
-  row that does not say is filed as before.
+Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
+contract 2 (unchanged).
+
+- **`#[row(conflict = "…")]`.** A `record` filed into a table partitioned by
+  time — natively or as a TimescaleDB hypertable — whose unique indexes must
+  hold the partition column: `conflict = "id, taken_at"` is the server's
+  primary key, and what the record is filed against. The extra columns are
+  fields of the row, never NULL, written once and never changed. A replica's
+  table keeps the key alone, which still names the row everywhere else.
+  API: `Row::CONFLICT`, defaulting to `Row::KEY`; a row that does not say is
+  filed as before. Recipe: *Records kept in a partitioned table*.
 
 ## 0.5.0 — 2026-10-26
 

@@ -118,3 +118,26 @@ CREATE TABLE shop.stores (
 > is pointed at by every column of the key, `company_id` too.
 
 [`Engine::triggers`]: ../api/server/magic_sync/plan/struct.Engine.html#method.triggers
+
+## Records kept in a partitioned table
+
+A record that piles up for ever — readings, events, a GPS track — is often kept
+in a table partitioned by when it was taken, natively or as a TimescaleDB
+hypertable. PostgreSQL then requires every unique index to hold the partition
+column, so the server's primary key is not the key alone. Name it:
+
+```rust,ignore
+{{#include ../../snippets/src/rows.rs:conflict}}
+```
+
+```sql
+CREATE TABLE shop.readings (
+    id UUID NOT NULL, taken_at TIMESTAMPTZ NOT NULL, value DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (id, taken_at)) PARTITION BY RANGE (taken_at);
+```
+
+The server files the record against `(id, taken_at)`; the replica's table keeps
+`PRIMARY KEY (id)`. The key still names the row everywhere else. The extra
+columns are written once and never change: a report of the row with another
+`taken_at` is another row, which no index refuses. Reading a row by its key
+alone visits every partition — bound such a read by the partition column.

@@ -1,0 +1,5 @@
+error: a conflict column is written once with the row: it is not generated, owned by a replica, a version, a creation time or desired
+ --> tests/derive/fail/conflict_version.rs:5:11
+  |
+5 |     #[row(version)]
+  |           ^^^^^^^
