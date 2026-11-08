@@ -1104,7 +1104,7 @@ pub const magic_sync::status::CONTRACT: u32
 pub mod magic_sync::wire
 pub struct magic_sync::wire::Codec<P>
 impl<P: core::marker::Sync + 'static> magic_sync::wire::Codec<P>
-pub fn magic_sync::wire::Codec<P>::filed<R: magic_sync::row::Row + 'static>(self, magic_sync::wire::Filed<R, P>) -> Self
+pub fn magic_sync::wire::Codec<P>::filed<R: magic_sync::row::Row + 'static>(self, magic_sync::wire::FiledWith<R, P>) -> Self
 pub fn magic_sync::wire::Codec<P>::json<R>(core::option::Option<magic_sync::wire::Place<R, P>>) -> Self where R: magic_sync::row::Row + core::clone::Clone + core::marker::Send + core::marker::Sync + serde_core::ser::Serialize + serde_core::de::DeserializeOwned
 pub fn magic_sync::wire::Codec<P>::new<R, M>(fn(R) -> core::result::Result<M, magic_sync::wire::MapError>, fn(M) -> core::result::Result<R, magic_sync::wire::MapError>, core::option::Option<magic_sync::wire::Place<R, P>>) -> Self where R: magic_sync::row::Row + core::clone::Clone + core::marker::Send + core::marker::Sync, M: prost::message::Message + core::default::Default + 'static
 impl<P> core::fmt::Debug for magic_sync::wire::Codec<P>
@@ -1132,7 +1132,7 @@ impl core::marker::Unpin for magic_sync::wire::MapError
 impl core::marker::UnsafeUnpin for magic_sync::wire::MapError
 impl core::panic::unwind_safe::RefUnwindSafe for magic_sync::wire::MapError
 impl core::panic::unwind_safe::UnwindSafe for magic_sync::wire::MapError
-pub type magic_sync::wire::Filed<R, P> = for<'c> fn(&'c mut magic_sync::Conn, &'c [R], &'c P) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), magic_sync::Error>> + core::marker::Send + 'c)>>
+pub type magic_sync::wire::FiledWith<R, P> = for<'c> fn(&'c mut magic_sync::Conn, &'c [R], &'c P) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), magic_sync::Error>> + core::marker::Send + 'c)>>
 pub type magic_sync::wire::Place<R, P> = fn(&mut R, uuid::Uuid, &P)
 #[non_exhaustive] pub enum magic_sync::Error
 pub magic_sync::Error::Database(sqlx_core::error::Error)

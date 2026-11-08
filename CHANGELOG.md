@@ -7,15 +7,21 @@ contract 2 (unchanged).
 
 - **`Codec::filed`.** What the host files with the rows a replica uploads,
   in the transaction that files them, once the engine wrote them: a running
-  total, a row in an index over several tables. It is handed only the rows
-  written — never a record already filed, a setting older than the server's,
-  or a row the database refused — each as `place` left it, and of a key an
-  upload carries twice the one written. When it fails, the rows are filed one
-  by one, and a row whose `filed` fails waits in the inbox with it; a
-  transient failure fails the upload, filed again whole. The server refuses
-  to start with a `filed` of another row type than its codec's, or a second
-  one. API: `wire::Filed`, `Codec::filed` (server). Recipe: *Something filed
+  total, a row in an index over several tables. It is handed the rows an
+  upload writes, as the table holds them: a record's once; a versioned
+  record's or a setting's whenever an upload writes them, an upload
+  delivered again and settings restated included; a two-way row's read back.
+  Never a row the database refused, nor a delete. When it fails, the rows
+  are filed one by one, and a row whose `filed` fails waits in the inbox
+  with it; a transient failure fails the upload, filed again whole. The
+  server refuses to start with a `filed` of another row type than its
+  codec's, of a table replicas never write, or a second one.
+  API: `wire::FiledWith`, `Codec::filed` (server). Recipe: *Something filed
   with every row a replica sends*.
+- **A key sent twice, beside a refused row.** Of a key one upload part
+  carries twice, the last row is filed, as before, now also when another row
+  of the part is refused and the rest are filed one by one, which filed the
+  first.
 
 ## 0.5.1 — 2026-10-27
 

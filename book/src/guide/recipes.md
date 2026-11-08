@@ -156,15 +156,28 @@ engine wrote:
 {{#include ../../snippets/src/server/filed.rs:filed}}
 ```
 
-`filed` is handed only the rows the upload wrote, each as `place` left it. A
-record delivered twice, a setting older than the server's, a row the database
-refused: none is handed to it, so what it writes follows what the table holds.
-A row written again later, the newer version of a setting, is handed to it
-again. What it writes commits with the rows or not at all. When it fails, the
+`filed` is handed the rows each upload writes, as the table now holds them:
+
+- of a record, the rows the upload added. An upload delivered again adds
+  nothing, and hands nothing: each row once, so a running sum, as above, is
+  right.
+- of a record with a version, or a setting, every row the upload wrote, newer
+  than the server's or as new. An upload delivered again hands its rows again,
+  and a replica that restates its settings hands every one it restates.
+- of a table both sides write, the rows the replica's columns were written to,
+  read back, so the server's columns are the server's.
+
+For all but a record without a version, write what a row implies by its
+key, an upsert, not a sum. A delete is not handed: `Server::receive` answers
+the keys a replica deleted, in `Filed::gone`.
+
+What `filed` writes commits with the rows or not at all. When it fails, the
 engine files the upload's rows one by one, each with its own `filed`, and a
-row whose `filed` fails waits in the inbox as a row the database refused does,
-until a build that files it. A failure [`Error::is_transient`] calls the
-machine's fails the whole upload, which is filed again. The server refuses to
-start with a `filed` of another row type than its codec's.
+row whose `filed` fails waits in the inbox as a row the database refused
+does, until a build that files it. A failure [`Error::is_transient`] calls
+the machine's, a lock or a statement timeout among them, fails the whole
+upload, which is filed again: keep `filed` quick. The server refuses to start
+with a `filed` of another row type than its codec's, or of a table replicas
+never write.
 
 [`Error::is_transient`]: ../api/server/magic_sync/enum.Error.html#method.is_transient

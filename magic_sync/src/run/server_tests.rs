@@ -1823,9 +1823,19 @@ fn nothing<'c>(
     Box::pin(async { Ok(()) })
 }
 
-/// A codec given what files rows of another table, or given two, is the
-/// host's mistake: the server refuses to be built with it, naming it, rather
-/// than filing a table without what the host files with it.
+/// What the host files with the readings filed: nothing, here.
+fn none_read<'c>(
+    _: &'c mut Conn,
+    _: &'c [Reading],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async { Ok(()) })
+}
+
+/// A codec given what files rows of another table, what files rows of a
+/// table replicas never write, or two, is the host's mistake: the server
+/// refuses to be built with it, naming it, rather than filing a table
+/// without what the host files with it.
 #[test]
 fn the_server_refuses_a_codec_given_a_filing_it_cannot_run() {
     let readings =
@@ -1833,7 +1843,11 @@ fn the_server_refuses_a_codec_given_a_filing_it_cannot_run() {
     let items = || Codec::<()>::new::<Item, ItemRow>(to_wire, from_wire, None);
     for (codec, what) in [
         (readings().filed(nothing), "takes rows of another type"),
-        (items().filed(nothing).filed(nothing), "the table's second"),
+        (items().filed(nothing), "replicas never write"),
+        (
+            readings().filed(none_read).filed(none_read),
+            "the table's second",
+        ),
     ] {
         let audience = Audience::new("registers", REPLICAS, vec![codec]);
         match with_wishes(vec![audience]) {
@@ -1847,7 +1861,7 @@ fn the_server_refuses_a_codec_given_a_filing_it_cannot_run() {
     assert!(with_wishes(vec![Audience::new(
         "registers",
         REPLICAS,
-        vec![items().filed(nothing)]
+        vec![readings().filed(none_read)]
     )])
     .is_ok());
 }

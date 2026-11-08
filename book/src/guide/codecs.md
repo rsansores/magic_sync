@@ -59,4 +59,7 @@ A multi-company shop would make `P` the register's company, read when the
 upload arrives ([`Senders`](server.md#what-you-know-about-a-sender-senders)),
 and stamp it on every receipt.
 
+What the server writes along with the rows an upload files, a running total
+or an index of its own, is the codec's `filed` ([Recipes](recipes.md#something-filed-with-every-row-a-replica-sends)).
+
 [`prost`]: https://crates.io/crates/prost

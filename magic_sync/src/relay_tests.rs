@@ -1292,7 +1292,7 @@ fn ledger<'c>(
                 "unledgered" if BUGGY.get() => {
                     return Err(Error::host(false, "a reading the ledger refuses"));
                 }
-                "busy" => return Err(Error::host(true, "the ledger is away")),
+                "busy" if BUGGY.get() => return Err(Error::host(true, "the ledger is away")),
                 _ => {}
             }
             sqlx::query("INSERT INTO fixture.ledger VALUES ($1, $2, $3)")
@@ -1453,6 +1453,95 @@ async fn a_row_the_host_cannot_file_with_waits_in_the_inbox_with_it(pool: crate:
         failed.as_ref().is_err_and(Error::is_transient),
         "the machine's failure is the upload's: {failed:?}"
     );
+    drop(tx);
+    assert_eq!(world.count(both).await, 2, "nothing of it is filed");
+    BUGGY.set(false);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &busy, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    BUGGY.set(true);
+    assert_eq!(
+        world.count(both).await,
+        4,
+        "filed again whole, once the machine is back"
+    );
+}
+
+/// Of a key an upload carries twice beside a row the host refuses, the row
+/// filed — one by one, as the batch would have — is the one handed, once.
+#[sqlx::test(migrations = false)]
+async fn a_key_sent_twice_beside_a_refused_row_is_filed_and_handed_once(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let codecs = ledgered(&world).await;
+    let (one, two) = (Uuid::now_v7(), Uuid::now_v7());
+    let upload = readings(&[(one, "first"), (two, "unledgered"), (one, "last")]);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &upload, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let filed: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT r.id, r.value FROM fixture.readings r JOIN fixture.ledger l USING (id, value)",
+    )
+    .fetch_all(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!(filed, vec![(one, "last".to_owned())]);
+    assert_eq!(world.count("SELECT count(*) FROM fixture.ledger").await, 1);
+}
+
+/// What the host files with a tally, from the row as the server holds it.
+fn tallied<'c>(
+    conn: &'c mut crate::Conn,
+    tallies: &'c [Tally],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async move {
+        for tally in tallies {
+            sqlx::query("INSERT INTO fixture.tallied VALUES ($1, $2, $3)")
+                .bind(tally.id)
+                .bind(&tally.title)
+                .bind(tally.seen)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+/// A replica's edit of a row both sides write hands the row as the server
+/// holds it: its count, and the server's title, not the replica's copy.
+#[sqlx::test(migrations = false)]
+async fn a_two_way_row_is_handed_as_the_server_holds_it(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    sqlx::raw_sql("CREATE TABLE fixture.tallied (id UUID, title TEXT, seen INTEGER)")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let id = world.tally("count").await;
+    world.pass(&Fake::default()).await;
+    let codecs = vec![Codec::<()>::json::<Tally>(None).filed(tallied)];
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(
+        &mut tx,
+        &codecs,
+        &edit(world.partition, id, "stale", 3),
+        a,
+        &(),
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let handed: (Uuid, String, i32) = sqlx::query_as("SELECT id, title, seen FROM fixture.tallied")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(handed, (id, "count".to_owned(), 3));
 }
 
 /// A transaction that began before a pass read and commits after it: what

@@ -20,17 +20,17 @@ type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 /// (`P`, the host's: the server's `Senders` says what it is).
 pub type Place<R, P> = fn(&mut R, Uuid, &P);
 
-/// What the host files with rows a replica uploaded, in the transaction that
-/// files them: it is handed the connection, the rows the engine just wrote —
-/// placed, and never one it skipped as a duplicate or refused — and what the
-/// server knows of their sender. A failure is the rows' (see
-/// [`Codec::filed`]).
+/// What the host files with the rows a replica uploaded, in the transaction
+/// that files them: it is handed the connection, the rows the engine just
+/// wrote, and what the server knows of their sender. Which rows, and what
+/// becomes of a failure: [`Codec::filed`].
 #[cfg(feature = "postgres")]
-pub type Filed<R, P> = for<'c> fn(
-    &'c mut Conn,
-    &'c [R],
-    &'c P,
-) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>>;
+pub type FiledWith<R, P> =
+    for<'c> fn(
+        &'c mut Conn,
+        &'c [R],
+        &'c P,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>>;
 
 /// One mirrored table: how its rows turn into bytes and back, and how each
 /// side writes the other's, without its row type. `P` is what the server
@@ -206,19 +206,38 @@ impl<P: Sync + 'static> Codec<P> {
         }
     }
 
-    /// The same table, and `filed` run with the rows of each upload the
-    /// engine writes, in the same transaction, after it wrote them: only the
-    /// rows written — a record already filed, a setting older than the
-    /// server's, a row refused are not handed to it — each as
-    /// [`Place`] left it. What it writes is filed with them or not at all:
-    /// when it fails, the engine files the rows one by one, each with its own
-    /// `filed`, and a row whose `filed` fails waits in the inbox as a row the
-    /// database refused does ([`Error::is_transient`] failures stop the
-    /// upload, which is filed again whole). A row written again later — the
-    /// newer version of a setting — is handed to it again.
+    /// The same table, and `filed` run with the rows each upload writes, in
+    /// the transaction that files them, once the engine wrote them, each as
+    /// the table now holds it:
+    ///
+    /// - a record: the rows the upload added. One already filed — the same
+    ///   upload delivered again — is not handed again: each row once.
+    /// - a record with a version, or a setting: every row the upload wrote,
+    ///   a version newer than the server's or equal to it — an upload
+    ///   delivered again hands its rows again — and, when the replica
+    ///   restates its settings, every row it restates, whatever its version.
+    /// - a table both sides write: the rows the replica's columns were
+    ///   written to, read back, the server's columns as the server holds them.
+    ///
+    /// Of a key an upload carries twice, the row written; a row the database
+    /// refused, never. Deletes are not handed: [`Filed::gone`] is the keys a
+    /// replica deleted. So `filed` writes what it derives from a row by the
+    /// row's key — an upsert, not a running sum — for every table but a
+    /// record without a version.
+    ///
+    /// What it writes is filed with the rows or not at all. When it fails,
+    /// the engine files the upload's rows one by one, each with its own
+    /// `filed`, and a row whose `filed` fails waits in the inbox, as a row the
+    /// database refused does, until a build that files it. A failure
+    /// [`Error::is_transient`] calls the machine's — a lock or a statement
+    /// timeout among them — fails the whole upload, which is filed again: a
+    /// `filed` that is slow holds up its replica's uploads.
     ///
     /// The server refuses to start ([`Error::Misuse`]) when `filed` is of
-    /// another row type than the codec's, or a codec is given two.
+    /// another row type than the codec's, of a table replicas never write, or
+    /// a codec is given two.
+    ///
+    /// [`Filed::gone`]: crate::run::server::Filed::gone
     ///
     /// ```
     /// use magic_sync::wire::Codec;
@@ -253,7 +272,7 @@ impl<P: Sync + 'static> Codec<P> {
     /// ```
     #[cfg(feature = "postgres")]
     #[must_use]
-    pub fn filed<R: Row + 'static>(mut self, filed: Filed<R, P>) -> Self {
+    pub fn filed<R: Row + 'static>(mut self, filed: FiledWith<R, P>) -> Self {
         if let Err(why) = self.ops.file_with(&filed) {
             self.misuse.get_or_insert_with(|| {
                 format!(
@@ -652,8 +671,9 @@ pub(crate) trait Ops<P>: Send + Sync {
     /// for a setting.
     #[cfg(feature = "postgres")]
     fn builder(&self) -> Option<std::sync::Arc<dyn Build>>;
-    /// Takes `filed`, a [`Filed`] of the table's row type: why not, when it
-    /// is not one or the table has one already.
+    /// Takes `filed`, a [`FiledWith`] of the table's row type: why not, when
+    /// it is not one, the table goes no further than its replicas, or has one
+    /// already.
     #[cfg(feature = "postgres")]
     fn file_with(&mut self, _filed: &dyn std::any::Any) -> Result<(), &'static str> {
         Err("is given to a table of the engine's")
@@ -734,7 +754,7 @@ struct Typed<R, P> {
     place: std::marker::PhantomData<fn(&P)>,
     /// What the host files with the rows written: the server's alone.
     #[cfg(feature = "postgres")]
-    filed: Option<Filed<R, P>>,
+    filed: Option<FiledWith<R, P>>,
 }
 
 fn malformed(table: &str, e: impl std::fmt::Display) -> Error {
@@ -864,6 +884,15 @@ where
         if rows.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        // Of a key the rows carry twice, the last is the one written, by one
+        // write and one by one alike.
+        let mut seen = std::collections::HashSet::new();
+        let mut rows: Placed<R> = rows
+            .into_iter()
+            .rev()
+            .filter(|(_, row)| seen.insert(row.key()))
+            .collect();
+        rows.reverse();
         let all: Vec<R> = rows.iter().map(|(_, row)| row.clone()).collect();
         let all = match self.attempt(conn, all, how, known).await? {
             Ok(written) => return Ok((written, Vec::new())),
@@ -902,9 +931,10 @@ where
         row::released(conn, result).await
     }
 
-    /// Writes `rows`, then hands the host's [`Filed`] the ones written — of a
-    /// key an upload carries twice, the last, which is the one written — when
-    /// there is one and the rows came from a replica (`known`).
+    /// Writes `rows`, then hands the host's [`FiledWith`] the ones written,
+    /// when there is one and the rows came from a replica (`known`): as
+    /// written, but read back for a table both sides write, whose server's
+    /// columns the replica's rows do not hold.
     async fn filing(
         &self,
         conn: &mut Conn,
@@ -915,13 +945,14 @@ where
         #[cfg(feature = "postgres")]
         if let (Some(filed), Some(known)) = (self.filed, known) {
             let keys = self.write(conn, rows.clone(), how).await?;
-            let mut unfiled: std::collections::HashSet<&Key> = keys.iter().collect();
-            let mut written: Vec<R> = rows
-                .into_iter()
-                .rev()
-                .filter(|row| unfiled.remove(&row.key()))
-                .collect();
-            written.reverse();
+            let written: Vec<R> = if let How::OnlyOwned(_) = how {
+                row::get_by_keys::<R>(conn, &keys).await?
+            } else {
+                let written: std::collections::HashSet<&Key> = keys.iter().collect();
+                rows.into_iter()
+                    .filter(|row| written.contains(&row.key()))
+                    .collect()
+            };
             if !written.is_empty() {
                 filed(conn, &written, known).await?;
             }
@@ -1000,9 +1031,12 @@ where
 {
     #[cfg(feature = "postgres")]
     fn file_with(&mut self, filed: &dyn std::any::Any) -> Result<(), &'static str> {
-        let Some(filed) = filed.downcast_ref::<Filed<R, P>>() else {
+        let Some(filed) = filed.downcast_ref::<FiledWith<R, P>>() else {
             return Err("takes rows of another type than the table's");
         };
+        if !R::MIRROR.goes_up() {
+            return Err("is of a table replicas never write: nothing of it is filed");
+        }
         if self.filed.replace(*filed).is_some() {
             return Err("is the table's second: a table files one");
         }
