@@ -160,7 +160,7 @@ engine wrote:
 
 - of a record, the rows the upload added. An upload delivered again adds
   nothing, and hands nothing, so a running sum, as above, is right for a
-  record no replica deletes.
+  record neither side deletes.
 - of a record with a version, or a setting, every row the upload wrote, newer
   than the server's or as new. An upload delivered again hands its rows again,
   and a replica that restates its settings hands every one it restates.
@@ -168,20 +168,21 @@ engine wrote:
   read back, so the server's columns are the server's.
 
 For all but such a record, write what a row implies by its key, an upsert,
-not a sum. But for a table both sides write, a row is handed as sent, not
+not a sum. Except for a table both sides write, a row is handed as sent, not
 read back: a column the table keeps or computes itself (a `created` one, a
 generated one, a trigger's) is the table's. A delete is not handed: `Server::receive` answers the keys a replica
 deleted, in `Filed::gone`.
 
 `filed` runs table by table, in the order the upload lists them, so it sees
-the tables filed before its own. It may run again on rows it was handed, one
+the tables filed before its own; a row filed again from the inbox comes
+after whatever was filed since. It may run again on rows it was handed, one
 by one after a refusal or on the next delivery after a transient failure:
 only what it writes through its connection is kept once, so it queues a
 message in a table of yours rather than sending it.
 
 What it writes commits with the rows or not at all. When it fails, or
-catches a statement's error and so leaves the transaction aborted, the
-engine files that table's rows of the upload one by one, each with its own
+catches a statement's error and so leaves the transaction aborted (a
+refusal, whatever the error was), the engine files that table's rows of the upload one by one, each with its own
 `filed`, and a row whose `filed` fails waits in the inbox as a row the
 database refused does, until a build that files it. A failure [`Error::is_transient`] calls
 the machine's, a lock or a statement timeout among them, fails the whole

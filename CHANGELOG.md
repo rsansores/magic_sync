@@ -13,8 +13,9 @@ contract 2 (unchanged).
   delivered again and settings restated included; a two-way row's read back.
   Never a row the database refused, nor a delete. It may run again on the
   same rows: only what it writes through its connection is kept once.
-  When it fails, that table's rows are filed one by one, and a row whose
-  `filed` fails waits in the inbox with it; a transient failure fails the
+  When it fails, or catches a statement's error and leaves the transaction
+  aborted, that table's rows are filed one by one, and a row whose `filed`
+  fails waits in the inbox with it; a transient failure fails the
   upload, filed again whole. The
   server refuses to start with a `filed` of another row type than its
   codec's, of a table replicas never write, or a second one.
@@ -24,12 +25,6 @@ contract 2 (unchanged).
   message carries twice, the last row is written, as before, now also when
   another row of the part is refused and the rest are written one by one,
   which wrote the first — on the server and on a replica alike.
-- **Work that leaves the transaction aborted is refused.** A savepoint's
-  work that answers as done after a statement failed in it (a host's
-  `filed` catching the error) is rolled back and refused, its rows written
-  one by one, instead of failing the upload with the earlier tables' rows
-  in it.
-
 ## 0.5.1 — 2026-10-27
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard

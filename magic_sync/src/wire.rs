@@ -218,27 +218,29 @@ impl<P: Sync + 'static> Codec<P> {
     /// - a table both sides write: the rows the replica's columns were
     ///   written to, read back, the server's columns as the server holds them.
     ///
-    /// But for a table both sides write, a row is handed as the replica sent
+    /// Except for a table both sides write, a row is handed as the replica sent
     /// it and `place` left it, not read back: what the table makes of it
     /// itself — a `created` column it keeps, a generated column, a trigger, a
-    /// value its type rounds — is the table's, not the row's. Of a key an
-    /// upload carries twice, the row written; a row the database refused,
+    /// value its type rounds — is the table's, not the row's. Of a key one
+    /// part of an upload carries twice, the row written; a row the database refused,
     /// never. Deletes are not handed: [`Filed::gone`] is the keys a replica
     /// deleted. So `filed` writes what it derives from a row by the row's key
     /// — an upsert, not a running sum — for every table but a record without
-    /// a version that no replica deletes.
+    /// a version that neither side deletes.
     ///
     /// `filed` runs inside the filing, table by table in the order the upload
     /// lists them, each table's rows before its deletes: it sees what the
-    /// upload filed before it, nothing after. It may run more than once on
+    /// upload filed before it, nothing after — but a row filed again from
+    /// the inbox is filed after whatever came since. It may run more than once on
     /// the same rows — again one by one after a refusal, again on the next
     /// delivery after a transient failure — and only what it writes through
     /// the connection it is handed is kept once: a message it sends, or a
     /// count it keeps in memory, is not.
     ///
     /// What it writes is filed with the rows or not at all. When it fails —
-    /// or leaves the transaction aborted, having caught a statement's error
-    /// — the engine files that table's rows of the upload one by one, each
+    /// or leaves the transaction aborted, having caught a statement's error,
+    /// which is a refusal whatever the error was — the engine files that
+    /// table's rows of the upload one by one, each
     /// with its own `filed`, and a row whose `filed` fails waits in the
     /// inbox, as a row the database refused does, until a build that files
     /// it. A constraint it defers to the commit is judged after every table:
@@ -268,23 +270,26 @@ impl<P: Sync + 'static> Codec<P> {
     ///     pub total_cents: i64,
     /// }
     ///
-    /// /// Each receipt filed is counted in the day's takings, in the same transaction.
-    /// fn takings<'c>(
+    /// /// Each receipt filed is entered in the ledger, in the same transaction.
+    /// fn ledger<'c>(
     ///     conn: &'c mut Conn,
     ///     receipts: &'c [Receipt],
     ///     _: &'c (),
     /// ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>> {
     ///     Box::pin(async move {
-    ///         let cents: i64 = receipts.iter().map(|r| r.total_cents).sum();
-    ///         sqlx::query("UPDATE shop.takings SET cents = cents + $1 WHERE day = current_date")
-    ///             .bind(cents)
-    ///             .execute(&mut *conn)
-    ///             .await?;
+    ///         for r in receipts {
+    ///             sqlx::query("INSERT INTO shop.ledger (receipt_id, cents) VALUES ($1, $2) \
+    ///                          ON CONFLICT (receipt_id) DO NOTHING")
+    ///                 .bind(r.id)
+    ///                 .bind(r.total_cents)
+    ///                 .execute(&mut *conn)
+    ///                 .await?;
+    ///         }
     ///         Ok(())
     ///     })
     /// }
     ///
-    /// let codec: Codec<()> = Codec::json::<Receipt>(None).filed(takings);
+    /// let codec: Codec<()> = Codec::json::<Receipt>(None).filed(ledger);
     /// ```
     #[cfg(feature = "postgres")]
     #[must_use]

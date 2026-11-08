@@ -1235,7 +1235,10 @@ pub(crate) async fn released<T>(
             .await
         {
             Ok(_) => return Ok(Ok(value)),
-            Err(e) => Error::from(e),
+            Err(e) => match Error::from(e) {
+                e if !e.is_refusal() => return Err(e),
+                e => e,
+            },
         },
         Err(e) if !e.is_refusal() => return Err(e),
         Err(e) => e,

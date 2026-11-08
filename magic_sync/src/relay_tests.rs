@@ -1298,6 +1298,7 @@ fn ledger<'c>(
                     let _ = sqlx::query("INSERT INTO fixture.nowhere VALUES (1)")
                         .execute(&mut *conn)
                         .await;
+                    return Ok(());
                 }
                 _ => {}
             }
