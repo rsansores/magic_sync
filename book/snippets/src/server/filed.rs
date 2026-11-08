@@ -16,6 +16,11 @@ pub struct Sale {
     pub total_cents: i64,
 }
 
+/// A sale is filed under the register that sent it, whatever it says.
+fn place(sale: &mut Sale, register: Uuid, _: &()) {
+    sale.register_id = register;
+}
+
 /// Each sale filed moves its register's takings, in the transaction that
 /// files it.
 pub fn takings<'c>(
@@ -25,17 +30,20 @@ pub fn takings<'c>(
 ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>> {
     Box::pin(async move {
         for sale in sales {
-            sqlx::query("UPDATE shop.takings SET cents = cents + $2 WHERE register_id = $1")
-                .bind(sale.register_id)
-                .bind(sale.total_cents)
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(
+                "INSERT INTO shop.takings (register_id, cents) VALUES ($1, $2) \
+                 ON CONFLICT (register_id) DO UPDATE SET cents = takings.cents + EXCLUDED.cents",
+            )
+            .bind(sale.register_id)
+            .bind(sale.total_cents)
+            .execute(&mut *conn)
+            .await?;
         }
         Ok(())
     })
 }
 
 pub fn sales() -> Codec<()> {
-    Codec::json::<Sale>(None).filed(takings)
+    Codec::json::<Sale>(Some(place)).filed(takings)
 }
 // ANCHOR_END: filed

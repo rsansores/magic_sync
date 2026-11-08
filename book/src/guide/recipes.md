@@ -156,7 +156,8 @@ engine wrote:
 {{#include ../../snippets/src/server/filed.rs:filed}}
 ```
 
-`filed` is handed the rows each upload writes, as the replica sent them:
+`filed` is handed the rows each upload writes, as the replica sent them and
+`place` left them:
 
 - of a record, the rows the upload added. An upload delivered again adds
   nothing, and hands nothing, so a running sum, as above, is right for a
@@ -171,7 +172,9 @@ For all but such a record, write what a row implies by its key, an upsert,
 not a sum. Except for a table both sides write, a row is handed as sent, not
 read back: a column the table keeps or computes itself (a `created` one, a
 generated one, a trigger's) is the table's. A delete is not handed: `Server::receive` answers the keys a replica
-deleted, in `Filed::gone`.
+deleted, in `Filed::gone`, after the commit — so what you do with them is
+not filed with them — and a delete filed again from the inbox is answered in
+no `Filed`.
 
 `filed` runs table by table, in the order the upload lists them, so it sees
 the tables filed before its own; a row filed again from the inbox comes

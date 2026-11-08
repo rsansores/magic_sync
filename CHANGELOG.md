@@ -8,7 +8,7 @@ contract 2 (unchanged).
 - **`Codec::filed`.** What the host files with the rows a replica uploads,
   in the transaction that files them, once the engine wrote them: a running
   total, a row in an index over several tables. It is handed the rows an
-  upload writes, as the replica sent them: a record's once; a versioned
+  upload writes, as the replica sent them and `place` left them: a record's once; a versioned
   record's or a setting's whenever an upload writes them, an upload
   delivered again and settings restated included; a two-way row's read back.
   Never a row the database refused, nor a delete. It may run again on the
@@ -22,7 +22,7 @@ contract 2 (unchanged).
   API: `wire::FiledWith`, `Codec::filed` (server). Recipe: *Something filed
   with every row a replica sends*.
 - **A key sent twice, beside a refused row.** Of a key one part of an
-  upload carries twice, the server writes the last row, as one statement
+  upload carries twice, the server writes the last row that decodes, as one statement
   writes it, now also when another row of the part is refused and the rest
   are written one by one, which wrote the first.
 
