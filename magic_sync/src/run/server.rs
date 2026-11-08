@@ -79,11 +79,13 @@ impl Anyone {
     }
 }
 
-/// `audiences`, each with the engine's own tables after its codecs.
+/// `audiences`, each with the engine's own tables after its codecs: refused
+/// when a codec was built as it cannot be honoured ([`Codec::filed`]).
 fn with_wishes<P: Sync + 'static>(audiences: Vec<Audience<P>>) -> Result<Vec<Audience<P>>, Error> {
     audiences
         .into_iter()
         .map(|a| {
+            a.codecs.iter().try_for_each(Codec::check)?;
             Ok(Audience {
                 codecs: crate::wish::with_wishes(a.codecs)?,
                 ..a

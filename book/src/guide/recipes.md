@@ -144,3 +144,27 @@ the row with another `taken_at` is filed as another row while the first stays,
 which no index refuses. Whatever reads or deletes by the key alone — a read of
 yours, or the engine deleting a record its replica deleted — visits every
 partition: bound your own reads by the partition column.
+
+## Something filed with every row a replica sends
+
+When a row a replica uploads should move something else of yours — a running
+total, a row in an index of everything that happened, a notification to
+queue — write it in the transaction that files the row, from the rows the
+engine wrote:
+
+```rust,ignore
+{{#include ../../snippets/src/server/filed.rs:filed}}
+```
+
+`filed` is handed only the rows the upload wrote, each as `place` left it. A
+record delivered twice, a setting older than the server's, a row the database
+refused: none is handed to it, so what it writes follows what the table holds.
+A row written again later, the newer version of a setting, is handed to it
+again. What it writes commits with the rows or not at all. When it fails, the
+engine files the upload's rows one by one, each with its own `filed`, and a
+row whose `filed` fails waits in the inbox as a row the database refused does,
+until a build that files it. A failure [`Error::is_transient`] calls the
+machine's fails the whole upload, which is filed again. The server refuses to
+start with a `filed` of another row type than its codec's.
+
+[`Error::is_transient`]: ../api/server/magic_sync/enum.Error.html#method.is_transient

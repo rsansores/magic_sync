@@ -1,6 +1,7 @@
 //! The server's side.
 
 pub mod audiences;
+pub mod filed;
 pub mod partitioned;
 
 use crate::rows::RegisterSetting;

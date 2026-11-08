@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
+contract 2 (unchanged).
+
+- **`Codec::filed`.** What the host files with the rows a replica uploads,
+  in the transaction that files them, once the engine wrote them: a running
+  total, a row in an index over several tables. It is handed only the rows
+  written — never a record already filed, a setting older than the server's,
+  or a row the database refused — each as `place` left it, and of a key an
+  upload carries twice the one written. When it fails, the rows are filed one
+  by one, and a row whose `filed` fails waits in the inbox with it; a
+  transient failure fails the upload, filed again whole. The server refuses
+  to start with a `filed` of another row type than its codec's, or a second
+  one. API: `wire::Filed`, `Codec::filed` (server). Recipe: *Something filed
+  with every row a replica sends*.
+
 ## 0.5.1 — 2026-10-27
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
