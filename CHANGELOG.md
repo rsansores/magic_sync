@@ -8,10 +8,11 @@ contract 2 (unchanged).
 - **`Codec::filed`.** What the host files with the rows a replica uploads,
   in the transaction that files them, once the engine wrote them: a running
   total, a row in an index over several tables. It is handed the rows an
-  upload writes, as the table holds them: a record's once; a versioned
+  upload writes, as the replica sent them: a record's once; a versioned
   record's or a setting's whenever an upload writes them, an upload
   delivered again and settings restated included; a two-way row's read back.
-  Never a row the database refused, nor a delete. When it fails, the rows
+  Never a row the database refused, nor a delete. It may run again on the
+  same rows: only what it writes through its connection is kept once. When it fails, the rows
   are filed one by one, and a row whose `filed` fails waits in the inbox
   with it; a transient failure fails the upload, filed again whole. The
   server refuses to start with a `filed` of another row type than its

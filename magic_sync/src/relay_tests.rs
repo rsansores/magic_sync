@@ -1404,6 +1404,114 @@ async fn what_the_host_files_with_uploaded_rows_is_written_once_with_them(pool: 
             .await,
         3
     );
+    assert_eq!(
+        world.count("SELECT count(*) FROM sync.inbox").await,
+        0,
+        "no row was handed twice and refused for it"
+    );
+}
+
+/// A setting a replica reports, for what its versions hand to `filed`.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "lamps",
+    schema = "fixture",
+    mirror = "setting",
+    key = "replica_id, id",
+    origin = "replica_id"
+)]
+struct Lamp {
+    replica_id: Uuid,
+    id: Uuid,
+    #[row(desired)]
+    level: i64,
+    #[row(version)]
+    revision: i64,
+}
+
+/// What the host files with a lamp: each version it is handed, in order.
+fn lamp_log<'c>(
+    conn: &'c mut crate::Conn,
+    lamps: &'c [Lamp],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async move {
+        for lamp in lamps {
+            sqlx::query("INSERT INTO fixture.lamp_log (level, revision) VALUES ($1, $2)")
+                .bind(lamp.level)
+                .bind(lamp.revision)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+/// A setting is handed whenever an upload writes it: a newer version, the
+/// same one delivered again, and an older one the replica restates; an older
+/// one it does not restate is not written, and not handed.
+#[sqlx::test(migrations = false)]
+async fn a_setting_is_handed_each_time_an_upload_writes_it(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Table as WireTable, Up};
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.lamps (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         level BIGINT NOT NULL, revision BIGINT NOT NULL, PRIMARY KEY (replica_id, id)); \
+         CREATE TABLE fixture.lamp_log (n BIGSERIAL, level BIGINT, revision BIGINT)",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let codecs = vec![Codec::<()>::json::<Lamp>(None).filed(lamp_log)];
+    let id = Uuid::now_v7();
+    let upload = |level: i64, revision: i64, restated: bool| {
+        let lamp = Lamp {
+            replica_id: a,
+            id,
+            level,
+            revision,
+        };
+        Up {
+            tables: vec![WireTable {
+                table: "lamps".to_owned(),
+                upserts: vec![crate::wire::json_encode(
+                    "lamps",
+                    &Table::of::<Lamp>().columns,
+                    &lamp,
+                )
+                .unwrap()],
+                keys: vec![WireKey {
+                    parts: vec![a.to_string(), id.to_string()],
+                }],
+                restated,
+                ..WireTable::default()
+            }],
+            protocol: envelope::PROTOCOL,
+            ..Up::default()
+        }
+    };
+    for (level, revision, restated) in [
+        (70, 9, false),
+        (70, 9, false),
+        (40, 3, false),
+        (40, 3, true),
+    ] {
+        crate::testkit::file(
+            &world.pool,
+            &codecs,
+            &upload(level, revision, restated),
+            a,
+            &(),
+        )
+        .await;
+    }
+    let handed: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT level, revision FROM fixture.lamp_log ORDER BY n")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(handed, [(70, 9), (70, 9), (40, 3)]);
 }
 
 /// A row the host's `filed` refuses is not filed either: it waits in the

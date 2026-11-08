@@ -208,10 +208,10 @@ impl<P: Sync + 'static> Codec<P> {
 
     /// The same table, and `filed` run with the rows each upload writes, in
     /// the transaction that files them, once the engine wrote them, each as
-    /// the table now holds it:
+    /// the replica sent it and `place` left it:
     ///
     /// - a record: the rows the upload added. One already filed — the same
-    ///   upload delivered again — is not handed again: each row once.
+    ///   upload delivered again — is not handed again.
     /// - a record with a version, or a setting: every row the upload wrote,
     ///   a version newer than the server's or equal to it — an upload
     ///   delivered again hands its rows again — and, when the replica
@@ -219,19 +219,31 @@ impl<P: Sync + 'static> Codec<P> {
     /// - a table both sides write: the rows the replica's columns were
     ///   written to, read back, the server's columns as the server holds them.
     ///
-    /// Of a key an upload carries twice, the row written; a row the database
-    /// refused, never. Deletes are not handed: [`Filed::gone`] is the keys a
-    /// replica deleted. So `filed` writes what it derives from a row by the
-    /// row's key — an upsert, not a running sum — for every table but a
-    /// record without a version.
+    /// A row is handed as sent, not read back: what the table makes of it
+    /// itself — a `created` column it keeps, a generated column, a trigger, a
+    /// value its type rounds — is the table's, not the row's. Of a key an
+    /// upload carries twice, the row written; a row the database refused,
+    /// never. Deletes are not handed: [`Filed::gone`] is the keys a replica
+    /// deleted. So `filed` writes what it derives from a row by the row's key
+    /// — an upsert, not a running sum — for every table but a record without
+    /// a version that no replica deletes.
+    ///
+    /// `filed` runs inside the filing, table by table in the order the upload
+    /// lists them, each table's rows before its deletes: it sees what the
+    /// upload filed before it, nothing after. It may run more than once on
+    /// the same rows — again one by one after a refusal, again on the next
+    /// delivery after a transient failure — and only what it writes through
+    /// the connection it is handed is kept once: a message it sends, or a
+    /// count it keeps in memory, is not.
     ///
     /// What it writes is filed with the rows or not at all. When it fails,
     /// the engine files the upload's rows one by one, each with its own
     /// `filed`, and a row whose `filed` fails waits in the inbox, as a row the
-    /// database refused does, until a build that files it. A failure
-    /// [`Error::is_transient`] calls the machine's — a lock or a statement
-    /// timeout among them — fails the whole upload, which is filed again: a
-    /// `filed` that is slow holds up its replica's uploads.
+    /// database refused does, until a build that files it. A constraint it
+    /// defers to the commit is judged after the rows, and fails the upload
+    /// whole. A failure [`Error::is_transient`] calls the machine's — a lock
+    /// or a statement timeout among them — fails the whole upload, which is
+    /// filed again: a `filed` that is slow holds up its replica's uploads.
     ///
     /// The server refuses to start ([`Error::Misuse`]) when `filed` is of
     /// another row type than the codec's, of a table replicas never write, or
