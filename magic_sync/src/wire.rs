@@ -240,7 +240,7 @@ impl<P: Sync + 'static> Codec<P> {
     /// What it writes is filed with the rows or not at all. When it fails —
     /// or leaves the transaction aborted, having caught a statement's error,
     /// which is a refusal whatever the error was — the engine files that
-    /// table's rows of the upload one by one, each
+    /// part's rows of the upload one by one, each
     /// with its own `filed`, and a row whose `filed` fails waits in the
     /// inbox, as a row the database refused does, until a build that files
     /// it. A constraint it defers to the commit is judged after every table:
@@ -891,8 +891,9 @@ where
     }
 
     /// Writes `rows`, and when the database refuses them for their data (a
-    /// duplicate, a dangling reference) writes them one by one, leaving out
-    /// each it refuses — a message must not be refused forever for one row;
+    /// duplicate, a dangling reference), or the host's `filed` fails or leaves
+    /// the transaction aborted, writes them one by one, leaving out each
+    /// refused — a message must not be refused forever for one row;
     /// the caller says what becomes of it. Answers the keys written, and the places of the rows
     /// refused with why.
     async fn guarded(
@@ -905,15 +906,6 @@ where
         if rows.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        // Of a key the rows carry twice, the last is the one written, by one
-        // write and one by one alike.
-        let mut seen = std::collections::HashSet::new();
-        let mut rows: Placed<R> = rows
-            .into_iter()
-            .rev()
-            .filter(|(_, row)| seen.insert(row.key()))
-            .collect();
-        rows.reverse();
         let all: Vec<R> = rows.iter().map(|(_, row)| row.clone()).collect();
         let all = match self.attempt(conn, all, how, known).await? {
             Ok(written) => return Ok((written, Vec::new())),

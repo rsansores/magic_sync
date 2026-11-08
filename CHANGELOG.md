@@ -21,10 +21,11 @@ contract 2 (unchanged).
   codec's, of a table replicas never write, or a second one.
   API: `wire::FiledWith`, `Codec::filed` (server). Recipe: *Something filed
   with every row a replica sends*.
-- **A key sent twice, beside a refused row.** Of a key one part of a
-  message carries twice, the last row is written, as before, now also when
-  another row of the part is refused and the rest are written one by one,
-  which wrote the first — on the server and on a replica alike.
+- **A key sent twice, beside a refused row.** Of a key one part of an
+  upload carries twice, the server writes the last row, as one statement
+  writes it, now also when another row of the part is refused and the rest
+  are written one by one, which wrote the first.
+
 ## 0.5.1 — 2026-10-27
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard

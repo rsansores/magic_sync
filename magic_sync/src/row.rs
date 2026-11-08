@@ -1237,7 +1237,13 @@ pub(crate) async fn released<T>(
             Ok(_) => return Ok(Ok(value)),
             Err(e) => match Error::from(e) {
                 e if !e.is_refusal() => return Err(e),
-                e => e,
+                e => Error::host(
+                    false,
+                    format!(
+                        "the work answered as done and left the transaction aborted — a \
+                         host's `filed` that caught a statement's error: {e}"
+                    ),
+                ),
             },
         },
         Err(e) if !e.is_refusal() => return Err(e),
