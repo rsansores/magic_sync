@@ -1218,7 +1218,8 @@ pub(crate) async fn savepoint(exec: &mut Conn) -> Result<(), Error> {
 /// Closes the savepoint [`savepoint`] opened around the work that answered
 /// `result`: a refusal of the rows ([`Error::is_refusal`]) comes back as the
 /// inner error, rolled back with the transaction still usable; any other
-/// failure is the outer one. When the database already rolled the whole
+/// failure is the outer one. Work that answered as done but left the
+/// transaction aborted — the release fails — is rolled back and refused too. When the database already rolled the whole
 /// transaction back (a trigger's `RAISE(ROLLBACK)`), the refusal is the
 /// outer error too: there is nothing left to go on with.
 pub(crate) async fn released<T>(
@@ -1226,12 +1227,26 @@ pub(crate) async fn released<T>(
     result: Result<T, Error>,
 ) -> Result<Result<T, Error>, Error> {
     let refusal = match result {
-        Ok(value) => {
-            sqlx::query("RELEASE SAVEPOINT sync_rows")
-                .execute(&mut *exec)
-                .await?;
-            return Ok(Ok(value));
-        }
+        // Work that answered as done but left the transaction aborted — a
+        // host's `filed` that caught a statement's error — is refused like
+        // the work that failed: the release fails, and the savepoint is
+        // rolled back to, not one around it.
+        Ok(value) => match sqlx::query("RELEASE SAVEPOINT sync_rows")
+            .execute(&mut *exec)
+            .await
+        {
+            Ok(_) => return Ok(Ok(value)),
+            Err(e) => match Error::from(e) {
+                e if !e.is_refusal() => return Err(e),
+                e => Error::host(
+                    false,
+                    format!(
+                        "the work answered as done and left the transaction aborted (on the \
+                         server, a host's `filed` that caught a statement's error): {e}"
+                    ),
+                ),
+            },
+        },
         Err(e) if !e.is_refusal() => return Err(e),
         Err(e) => e,
     };

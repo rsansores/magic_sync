@@ -1278,6 +1278,388 @@ async fn an_uploaded_row_the_server_cannot_file_waits_in_the_inbox_until_a_fix(
     assert_eq!(left, ("from_a_newer_build\u{FFFD}".to_owned(), 2));
 }
 
+/// What the host files with a table's rows ([`Codec::filed`]): a ledger of
+/// readings, written in the filing transaction from the rows the engine
+/// wrote. A plain `INSERT`, so a row handed twice would fail the test.
+fn ledger<'c>(
+    conn: &'c mut crate::Conn,
+    readings: &'c [crate::testkit::records::Reading],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async move {
+        for reading in readings {
+            match reading.value.as_str() {
+                "unledgered" if BUGGY.get() => {
+                    return Err(Error::host(false, "a reading the ledger refuses"));
+                }
+                "busy" if BUGGY.get() => return Err(Error::host(true, "the ledger is away")),
+                // A host that catches a statement's error, and goes on.
+                "swallowed" => {
+                    let _ = sqlx::query("INSERT INTO fixture.nowhere VALUES (1)")
+                        .execute(&mut *conn)
+                        .await;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            sqlx::query("INSERT INTO fixture.ledger VALUES ($1, $2, $3)")
+                .bind(reading.id)
+                .bind(reading.replica_id)
+                .bind(&reading.value)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+/// Files a reading under the replica that sent it, whatever it says.
+fn under_its_sender(reading: &mut crate::testkit::records::Reading, sender: Uuid, _: &()) {
+    reading.replica_id = sender;
+}
+
+/// The readings table, its ledger, and the codec that files one with the other.
+async fn ledgered(world: &World) -> Vec<Codec<()>> {
+    use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, \
+             value TEXT NOT NULL CHECK (value <> 'refused')); \
+         CREATE TABLE fixture.ledger (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL)",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    vec![Codec::<()>::new::<Reading, ReadingRow>(
+        reading_to_wire,
+        reading_from_wire,
+        Some(under_its_sender),
+    )
+    .filed(ledger)]
+}
+
+/// An upload of readings, each `(id, value)`, as a replica that names
+/// another as their writer sends them.
+fn readings(rows: &[(Uuid, &str)]) -> crate::envelope::Up {
+    use crate::envelope::{Key, Table as WireTable, Up};
+    use crate::testkit::records::ReadingRow;
+    let somebody = Uuid::now_v7().to_string();
+    Up {
+        tables: vec![WireTable {
+            table: "readings".to_owned(),
+            upserts: rows
+                .iter()
+                .map(|(id, value)| {
+                    ReadingRow {
+                        id: id.to_string(),
+                        replica_id: somebody.clone(),
+                        value: (*value).to_owned(),
+                    }
+                    .encode_to_vec()
+                })
+                .collect(),
+            keys: rows
+                .iter()
+                .map(|(id, _)| Key {
+                    parts: vec![id.to_string()],
+                })
+                .collect(),
+            ..WireTable::default()
+        }],
+        ..Up::default()
+    }
+}
+
+/// The host's ledger follows the readings filed: each once, as placed, a
+/// redelivered upload adding nothing, and of a key sent twice in one upload
+/// the one the table holds.
+#[sqlx::test(migrations = false)]
+async fn what_the_host_files_with_uploaded_rows_is_written_once_with_them(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let codecs = ledgered(&world).await;
+    let (one, two, three) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for upload in [
+        readings(&[(one, "one"), (two, "two"), (one, "one again")]),
+        readings(&[(one, "one"), (two, "two")]),
+        readings(&[(two, "two"), (three, "three")]),
+    ] {
+        let mut tx = world.pool.begin().await.unwrap();
+        crate::filing::file(&mut tx, &codecs, &upload, a, &(), i64::MAX)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let ledger: Vec<(Uuid, Uuid, String)> =
+        sqlx::query_as("SELECT id, replica_id, value FROM fixture.ledger ORDER BY id")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger,
+        vec![
+            (one, a, "one again".to_owned()),
+            (two, a, "two".to_owned()),
+            (three, a, "three".to_owned()),
+        ],
+        "every reading filed, once, as its sender's, the last of a key sent twice"
+    );
+    assert_eq!(
+        world
+            .count(
+                "SELECT count(*) FROM fixture.readings r JOIN fixture.ledger l USING (id, value)"
+            )
+            .await,
+        3
+    );
+    assert_eq!(
+        world.count("SELECT count(*) FROM sync.inbox").await,
+        0,
+        "no row was handed twice and refused for it"
+    );
+}
+
+/// A setting a replica reports, for what its versions hand to `filed`.
+#[derive(sqlx::FromRow, Clone, Debug, serde::Serialize, serde::Deserialize, crate::Row)]
+#[row(
+    table = "lamps",
+    schema = "fixture",
+    mirror = "setting",
+    key = "replica_id, id",
+    origin = "replica_id"
+)]
+struct Lamp {
+    replica_id: Uuid,
+    id: Uuid,
+    #[row(desired)]
+    level: i64,
+    #[row(version)]
+    revision: i64,
+}
+
+/// What the host files with a lamp: each version it is handed, in order.
+fn lamp_log<'c>(
+    conn: &'c mut crate::Conn,
+    lamps: &'c [Lamp],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async move {
+        for lamp in lamps {
+            sqlx::query("INSERT INTO fixture.lamp_log (level, revision) VALUES ($1, $2)")
+                .bind(lamp.level)
+                .bind(lamp.revision)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+/// A setting is handed whenever an upload writes it: a newer version, the
+/// same one delivered again, and an older one the replica restates; an older
+/// one it does not restate is not written, and not handed.
+#[sqlx::test(migrations = false)]
+async fn a_setting_is_handed_each_time_an_upload_writes_it(pool: crate::DbPool) {
+    use crate::envelope::{Key as WireKey, Table as WireTable, Up};
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    sqlx::raw_sql(
+        "CREATE TABLE fixture.lamps (replica_id UUID NOT NULL, id UUID NOT NULL, \
+         level BIGINT NOT NULL, revision BIGINT NOT NULL, PRIMARY KEY (replica_id, id)); \
+         CREATE TABLE fixture.lamp_log (n BIGSERIAL, level BIGINT, revision BIGINT)",
+    )
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let codecs = vec![Codec::<()>::json::<Lamp>(None).filed(lamp_log)];
+    let id = Uuid::now_v7();
+    let upload = |level: i64, revision: i64, restated: bool| {
+        let lamp = Lamp {
+            replica_id: a,
+            id,
+            level,
+            revision,
+        };
+        Up {
+            tables: vec![WireTable {
+                table: "lamps".to_owned(),
+                upserts: vec![crate::wire::json_encode(
+                    "lamps",
+                    &Table::of::<Lamp>().columns,
+                    &lamp,
+                )
+                .unwrap()],
+                keys: vec![WireKey {
+                    parts: vec![a.to_string(), id.to_string()],
+                }],
+                restated,
+                ..WireTable::default()
+            }],
+            protocol: envelope::PROTOCOL,
+            ..Up::default()
+        }
+    };
+    for (level, revision, restated) in [
+        (70, 9, false),
+        (70, 9, false),
+        (40, 3, false),
+        (40, 3, true),
+    ] {
+        crate::testkit::file(
+            &world.pool,
+            &codecs,
+            &upload(level, revision, restated),
+            a,
+            &(),
+        )
+        .await;
+    }
+    let handed: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT level, revision FROM fixture.lamp_log ORDER BY n")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(handed, [(70, 9), (70, 9), (40, 3)]);
+}
+
+/// A row the host's `filed` refuses is not filed either: it waits in the
+/// inbox, the rest of the upload filed with theirs, until a build that takes
+/// it. A failure of the machine's fails the whole upload, to be filed again.
+#[sqlx::test(migrations = false)]
+async fn a_row_the_host_cannot_file_with_waits_in_the_inbox_with_it(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let codecs = ledgered(&world).await;
+    let upload = readings(&[(Uuid::now_v7(), "fine"), (Uuid::now_v7(), "unledgered")]);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &upload, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let both = "SELECT count(*) FROM fixture.readings r JOIN fixture.ledger l USING (id)";
+    assert_eq!(
+        world.count("SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+    assert_eq!(
+        world.count(both).await,
+        1,
+        "the rest is filed, each with its ledger row"
+    );
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 1);
+
+    BUGGY.set(false);
+    let mut tx = world.pool.begin().await.unwrap();
+    let newest = crate::filing::newest(&mut tx).await.unwrap();
+    for kept in crate::filing::inbox(&mut tx, 0, newest, 10).await.unwrap() {
+        crate::filing::refile(&mut tx, &codecs, &kept, &())
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    BUGGY.set(true);
+    assert_eq!(world.count(both).await, 2, "filed once the ledger takes it");
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 0);
+
+    let busy = readings(&[(Uuid::now_v7(), "later"), (Uuid::now_v7(), "busy")]);
+    let mut tx = world.pool.begin().await.unwrap();
+    let failed = crate::filing::file(&mut tx, &codecs, &busy, a, &(), i64::MAX).await;
+    assert!(
+        failed.as_ref().is_err_and(Error::is_transient),
+        "the machine's failure is the upload's: {failed:?}"
+    );
+    drop(tx);
+    assert_eq!(world.count(both).await, 2, "nothing of it is filed");
+    BUGGY.set(false);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &busy, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    BUGGY.set(true);
+    assert_eq!(
+        world.count(both).await,
+        4,
+        "filed again whole, once the machine is back"
+    );
+}
+
+/// Of a key an upload carries twice beside a row the host refuses, the row
+/// filed — one by one, as the batch would have — is the one handed, once.
+#[sqlx::test(migrations = false)]
+async fn a_key_sent_twice_beside_a_refused_row_is_filed_and_handed_once(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let codecs = ledgered(&world).await;
+    let (one, two) = (Uuid::now_v7(), Uuid::now_v7());
+    let upload = readings(&[(one, "first"), (two, "unledgered"), (one, "last")]);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &upload, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let filed: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT r.id, r.value FROM fixture.readings r JOIN fixture.ledger l USING (id, value)",
+    )
+    .fetch_all(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!(filed, vec![(one, "last".to_owned())]);
+    assert_eq!(world.count("SELECT count(*) FROM fixture.ledger").await, 1);
+}
+
+/// What the host files with a tally, from the row as the server holds it.
+fn tallied<'c>(
+    conn: &'c mut crate::Conn,
+    tallies: &'c [Tally],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async move {
+        for tally in tallies {
+            sqlx::query("INSERT INTO fixture.tallied VALUES ($1, $2, $3)")
+                .bind(tally.id)
+                .bind(&tally.title)
+                .bind(tally.seen)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+/// A replica's edit of a row both sides write hands the row as the server
+/// holds it: its count, and the server's title, not the replica's copy.
+#[sqlx::test(migrations = false)]
+async fn a_two_way_row_is_handed_as_the_server_holds_it(pool: crate::DbPool) {
+    let world = world_of(pool, true).await;
+    let [a, _] = world.replicas;
+    sqlx::raw_sql("CREATE TABLE fixture.tallied (id UUID, title TEXT, seen INTEGER)")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let id = world.tally("count").await;
+    world.pass(&Fake::default()).await;
+    let codecs = vec![Codec::<()>::json::<Tally>(None).filed(tallied)];
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(
+        &mut tx,
+        &codecs,
+        &edit(world.partition, id, "stale", 3),
+        a,
+        &(),
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let handed: (Uuid, String, i32) = sqlx::query_as("SELECT id, title, seen FROM fixture.tallied")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(handed, (id, "count".to_owned(), 3));
+}
+
 /// A transaction that began before a pass read and commits after it: what
 /// it changed still reaches every replica, though the pass recorded a later
 /// send of the same row.
@@ -3470,4 +3852,35 @@ async fn an_engine_that_sends_nothing_down_plans_its_notes_to_nothing(pool: crat
         0
     );
     assert_eq!(world.count("SELECT count(*) FROM sync.outbox").await, 0);
+}
+
+/// A row the database refuses is not handed; one whose `filed` caught a
+/// statement's error, leaving the transaction aborted, is refused as if it
+/// had failed: each waits in the inbox, and the rest is filed with theirs.
+#[sqlx::test(migrations = false)]
+async fn a_row_refused_or_left_aborted_is_neither_filed_nor_handed(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let codecs = ledgered(&world).await;
+    let fine = Uuid::now_v7();
+    let upload = readings(&[
+        (fine, "fine"),
+        (Uuid::now_v7(), "refused"),
+        (Uuid::now_v7(), "swallowed"),
+    ]);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &upload, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let ledger: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM fixture.ledger")
+        .fetch_all(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(ledger, [fine]);
+    assert_eq!(
+        world.count("SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 2);
 }

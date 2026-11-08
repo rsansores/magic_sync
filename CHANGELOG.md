@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
+contract 2 (unchanged).
+
+- **`Codec::filed`.** What the host files with the rows a replica uploads,
+  in the transaction that files them, once the engine wrote them: a running
+  total, a row in an index over several tables. It is handed the rows an
+  upload writes, as the replica sent them and `place` left them: a record's once; a versioned
+  record's or a setting's whenever an upload writes them, an upload
+  delivered again and settings restated included; a two-way row's read back.
+  Never a row the database refused, nor a delete. It may run again on the
+  same rows: only what it writes through its connection is kept once.
+  When it fails, or catches a statement's error and leaves the transaction
+  aborted, that table's rows are filed one by one, and a row whose `filed`
+  fails waits in the inbox with it; a transient failure fails the
+  upload, filed again whole. The
+  server refuses to start with a `filed` of another row type than its
+  codec's, of a table replicas never write, or a second one.
+  API: `wire::FiledWith`, `Codec::filed` (server). Recipe: *Something filed
+  with every row a replica sends*.
+- **A key sent twice, beside a refused row.** Of a key one part of an
+  upload carries twice, the server writes the last row that decodes, as one statement
+  writes it, now also when another row of the part is refused and the rest
+  are written one by one, which wrote the first.
+
 ## 0.5.1 — 2026-10-27
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard

@@ -1813,3 +1813,55 @@ fn the_watch_warns_of_a_replica_as_it_falls_silent() {
         "silent again"
     );
 }
+
+/// What the host files with the items filed: nothing, here.
+fn nothing<'c>(
+    _: &'c mut Conn,
+    _: &'c [Item],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async { Ok(()) })
+}
+
+/// What the host files with the readings filed: nothing, here.
+fn none_read<'c>(
+    _: &'c mut Conn,
+    _: &'c [Reading],
+    _: &'c (),
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>> {
+    Box::pin(async { Ok(()) })
+}
+
+/// A codec given what files rows of another table, what files rows of a
+/// table replicas never write, or two, is the host's mistake: the server
+/// refuses to be built with it, naming it, rather than filing a table
+/// without what the host files with it.
+#[test]
+fn the_server_refuses_a_codec_given_a_filing_it_cannot_run() {
+    let readings =
+        || Codec::<()>::new::<Reading, ReadingRow>(reading_to_wire, reading_from_wire, None);
+    let items = || Codec::<()>::new::<Item, ItemRow>(to_wire, from_wire, None);
+    for (codec, what) in [
+        (readings().filed(nothing), "takes rows of another type"),
+        (items().filed(nothing), "replicas never write"),
+        (
+            readings().filed(none_read).filed(none_read),
+            "the table's second",
+        ),
+    ] {
+        let audience = Audience::new("registers", REPLICAS, vec![codec]);
+        match with_wishes(vec![audience]) {
+            Err(Error::Misuse(why)) => {
+                assert!(why.contains(what), "{what}: {why}");
+                assert!(why.contains("`filed` of"), "{why}");
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+    assert!(with_wishes(vec![Audience::new(
+        "registers",
+        REPLICAS,
+        vec![readings().filed(none_read)]
+    )])
+    .is_ok());
+}

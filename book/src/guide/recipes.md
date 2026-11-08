@@ -144,3 +144,53 @@ the row with another `taken_at` is filed as another row while the first stays,
 which no index refuses. Whatever reads or deletes by the key alone — a read of
 yours, or the engine deleting a record its replica deleted — visits every
 partition: bound your own reads by the partition column.
+
+## Something filed with every row a replica sends
+
+When a row a replica uploads should move something else of yours — a running
+total, a row in an index of everything that happened, a notification to
+queue in a table — write it in the transaction that files the row, from the rows the
+engine wrote:
+
+```rust,ignore
+{{#include ../../snippets/src/server/filed.rs:filed}}
+```
+
+`filed` is handed the rows each upload writes, as the replica sent them and
+`place` left them:
+
+- of a record, the rows the upload added. An upload delivered again adds
+  nothing, and hands nothing, so a running sum, as above, is right for a
+  record neither side deletes.
+- of a record with a version, or a setting, every row the upload wrote, newer
+  than the server's or as new. An upload delivered again hands its rows again,
+  and a replica that restates its settings hands every one it restates.
+- of a table both sides write, the rows the replica's columns were written to,
+  read back, so the server's columns are the server's.
+
+For all but such a record, write what a row implies by its key, an upsert,
+not a sum. Except for a table both sides write, a row is handed as sent, not
+read back: a column the table keeps or computes itself (a `created` one, a
+generated one, a trigger's) is the table's. A delete is not handed: `Server::receive` answers the keys a replica
+deleted, in `Filed::gone`, after the commit — so what you do with them is
+not filed with them — and a delete filed again from the inbox is answered in
+no `Filed`.
+
+`filed` runs table by table, in the order the upload lists them, so it sees
+the tables filed before its own; a row filed again from the inbox comes
+after whatever was filed since. It may run again on rows it was handed, one
+by one after a refusal or on the next delivery after a transient failure:
+only what it writes through its connection is kept once, so it queues a
+message in a table of yours rather than sending it.
+
+What it writes commits with the rows or not at all. When it fails, or
+catches a statement's error and so leaves the transaction aborted (a
+refusal, whatever the error was), the engine files that table's rows of the upload one by one, each with its own
+`filed`, and a row whose `filed` fails waits in the inbox as a row the
+database refused does, until a build that files it. A failure [`Error::is_transient`] calls
+the machine's, a lock or a statement timeout among them, fails the whole
+upload, which is filed again: keep `filed` quick. The server refuses to start
+with a `filed` of another row type than its codec's, or of a table replicas
+never write.
+
+[`Error::is_transient`]: ../api/server/magic_sync/enum.Error.html#method.is_transient

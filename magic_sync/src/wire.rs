@@ -20,6 +20,18 @@ type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 /// (`P`, the host's: the server's `Senders` says what it is).
 pub type Place<R, P> = fn(&mut R, Uuid, &P);
 
+/// What the host files with the rows a replica uploaded, in the transaction
+/// that files them: it is handed the connection, the rows the engine just
+/// wrote, and what the server knows of their sender. Which rows, and what
+/// becomes of a failure: [`Codec::filed`].
+#[cfg(feature = "postgres")]
+pub type FiledWith<R, P> =
+    for<'c> fn(
+        &'c mut Conn,
+        &'c [R],
+        &'c P,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>>;
+
 /// One mirrored table: how its rows turn into bytes and back, and how each
 /// side writes the other's, without its row type. `P` is what the server
 /// knows of a replica that uploads, handed to the table's [`Place`].
@@ -81,6 +93,10 @@ pub struct Codec<P> {
     #[cfg(feature = "sqlite")]
     pub(crate) row: std::any::TypeId,
     ops: Box<dyn Ops<P>>,
+    /// A builder called as it cannot be honoured, said when the server is
+    /// built ([`Codec::check`]): a builder answers the codec, not an error.
+    #[cfg(feature = "postgres")]
+    misuse: Option<String>,
 }
 
 impl<P> std::fmt::Debug for Codec<P> {
@@ -183,7 +199,120 @@ impl<P: Sync + 'static> Codec<P> {
     /// A codec of the engine's own, whose `ops` are its own.
     #[cfg(feature = "postgres")]
     pub(crate) fn custom(table: Table, ops: Box<dyn Ops<P>>) -> Self {
-        Self { table, ops }
+        Self {
+            table,
+            ops,
+            misuse: None,
+        }
+    }
+
+    /// The same table, and `filed` run with the rows each upload writes, in
+    /// the transaction that files them, once the engine wrote them:
+    ///
+    /// - a record: the rows the upload added. One already filed — the same
+    ///   upload delivered again — is not handed again.
+    /// - a record with a version, or a setting: every row the upload wrote,
+    ///   a version newer than the server's or equal to it — an upload
+    ///   delivered again hands its rows again — and, when the replica
+    ///   restates its settings, every row it restates, whatever its version.
+    /// - a table both sides write: the rows the replica's columns were
+    ///   written to, read back, the server's columns as the server holds them.
+    ///
+    /// Except for a table both sides write, a row is handed as the replica sent
+    /// it and `place` left it, not read back: what the table makes of it
+    /// itself — a `created` column it keeps, a generated column, a trigger, a
+    /// value its type rounds — is the table's, not the row's. Of a key one
+    /// part of an upload carries twice, the row written; a row the database refused,
+    /// never. Deletes are not handed: [`Filed::gone`] is the keys a replica
+    /// deleted. So `filed` writes what it derives from a row by the row's key
+    /// — an upsert, not a running sum — for every table but a record without
+    /// a version that neither side deletes.
+    ///
+    /// `filed` runs inside the filing, table by table in the order the upload
+    /// lists them, each table's rows before its deletes: it sees what the
+    /// upload filed before it, nothing after — but a row filed again from
+    /// the inbox is filed after whatever came since. It may run more than once on
+    /// the same rows — again one by one after a refusal, again on the next
+    /// delivery after a transient failure — and only what it writes through
+    /// the connection it is handed is kept once: a message it sends, or a
+    /// count it keeps in memory, is not.
+    ///
+    /// What it writes is filed with the rows or not at all. When it fails —
+    /// or leaves the transaction aborted, having caught a statement's error,
+    /// which is a refusal whatever the error was — the engine files that
+    /// part's rows of the upload one by one, each
+    /// with its own `filed`, and a row whose `filed` fails waits in the
+    /// inbox, as a row the database refused does, until a build that files
+    /// it. A constraint it defers to the commit is judged after every table:
+    /// the upload is kept whole in the inbox and filed again a row at a time. A failure [`Error::is_transient`] calls the machine's — a lock
+    /// or a statement timeout among them — fails the whole upload, which is
+    /// filed again: a `filed` that is slow holds up its replica's uploads.
+    ///
+    /// `filed` is the codec's, not the table's: a table two audiences
+    /// mirror runs it for the uploads of the audience whose codec has it.
+    ///
+    /// The server refuses to start ([`Error::Misuse`]) when `filed` is of
+    /// another row type than the codec's, of a table replicas never write, or
+    /// a codec is given two.
+    ///
+    /// [`Filed::gone`]: crate::run::server::Filed::gone
+    ///
+    /// ```
+    /// use magic_sync::wire::Codec;
+    /// use magic_sync::{Conn, Error};
+    /// use std::{future::Future, pin::Pin};
+    /// use uuid::Uuid;
+    ///
+    /// #[derive(sqlx::FromRow, Clone, serde::Serialize, serde::Deserialize, magic_sync::Row)]
+    /// #[row(table = "receipts", schema = "shop", mirror = "record")]
+    /// pub struct Receipt {
+    ///     pub id: Uuid,
+    ///     pub total_cents: i64,
+    /// }
+    ///
+    /// /// Each receipt filed is entered in the ledger, in the same transaction.
+    /// fn ledger<'c>(
+    ///     conn: &'c mut Conn,
+    ///     receipts: &'c [Receipt],
+    ///     _: &'c (),
+    /// ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'c>> {
+    ///     Box::pin(async move {
+    ///         for r in receipts {
+    ///             sqlx::query("INSERT INTO shop.ledger (receipt_id, cents) VALUES ($1, $2) \
+    ///                          ON CONFLICT (receipt_id) DO NOTHING")
+    ///                 .bind(r.id)
+    ///                 .bind(r.total_cents)
+    ///                 .execute(&mut *conn)
+    ///                 .await?;
+    ///         }
+    ///         Ok(())
+    ///     })
+    /// }
+    ///
+    /// let codec: Codec<()> = Codec::json::<Receipt>(None).filed(ledger);
+    /// ```
+    #[cfg(feature = "postgres")]
+    #[must_use]
+    pub fn filed<R: Row + 'static>(mut self, filed: FiledWith<R, P>) -> Self {
+        if let Err(why) = self.ops.file_with(&filed) {
+            self.misuse.get_or_insert_with(|| {
+                format!(
+                    "`{}`: `filed` of `{}` {why}",
+                    self.table.name,
+                    std::any::type_name::<R>()
+                )
+            });
+        }
+        self
+    }
+
+    /// Refuses a codec a builder was called on as it cannot be honoured.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        match &self.misuse {
+            Some(why) => Err(Error::Misuse(why.clone())),
+            None => Ok(()),
+        }
     }
 
     /// What builds a row of this table, as a wish of it wants it, to send:
@@ -239,6 +368,8 @@ impl<P: Sync + 'static> Codec<P> {
             ops: Box::new(Typed {
                 owned: table.replica_owned(),
                 #[cfg(feature = "postgres")]
+                filed: None,
+                #[cfg(feature = "postgres")]
                 origin: table
                     .origin
                     .and_then(|origin| table.key.iter().position(|k| *k == origin)),
@@ -247,6 +378,8 @@ impl<P: Sync + 'static> Codec<P> {
                 place,
             }),
             table,
+            #[cfg(feature = "postgres")]
+            misuse: None,
         }
     }
 
@@ -559,6 +692,13 @@ pub(crate) trait Ops<P>: Send + Sync {
     /// for a setting.
     #[cfg(feature = "postgres")]
     fn builder(&self) -> Option<std::sync::Arc<dyn Build>>;
+    /// Takes `filed`, a [`FiledWith`] of the table's row type: why not, when
+    /// it is not one, the table goes no further than its replicas, or has one
+    /// already.
+    #[cfg(feature = "postgres")]
+    fn file_with(&mut self, _filed: &dyn std::any::Any) -> Result<(), &'static str> {
+        Err("is given to a table of the engine's")
+    }
     /// Every row — of the replica `of`, when given — as `key \t version`
     /// lines.
     fn versions<'a>(&'a self, conn: &'a mut Conn, of: Option<Uuid>) -> Fut<'a, Vec<String>>;
@@ -633,6 +773,9 @@ struct Typed<R, P> {
     place: Option<Place<R, P>>,
     #[cfg(feature = "sqlite")]
     place: std::marker::PhantomData<fn(&P)>,
+    /// What the host files with the rows written: the server's alone.
+    #[cfg(feature = "postgres")]
+    filed: Option<FiledWith<R, P>>,
 }
 
 fn malformed(table: &str, e: impl std::fmt::Display) -> Error {
@@ -748,8 +891,9 @@ where
     }
 
     /// Writes `rows`, and when the database refuses them for their data (a
-    /// duplicate, a dangling reference) writes them one by one, leaving out
-    /// each it refuses — a message must not be refused forever for one row;
+    /// duplicate, a dangling reference), or the host's `filed` fails or leaves
+    /// the transaction aborted, writes them one by one, leaving out each
+    /// refused — a message must not be refused forever for one row;
     /// the caller says what becomes of it. Answers the keys written, and the places of the rows
     /// refused with why.
     async fn guarded(
@@ -757,12 +901,13 @@ where
         conn: &mut Conn,
         rows: Placed<R>,
         how: How,
+        known: Option<&P>,
     ) -> Result<(Vec<Key>, Vec<Refused>), Error> {
         if rows.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
         let all: Vec<R> = rows.iter().map(|(_, row)| row.clone()).collect();
-        let all = match self.attempt(conn, all, how).await? {
+        let all = match self.attempt(conn, all, how, known).await? {
             Ok(written) => return Ok((written, Vec::new())),
             Err(e) => e,
         };
@@ -773,7 +918,7 @@ where
         let mut written = Vec::new();
         let mut refused = Vec::new();
         for (at, one) in rows {
-            match self.attempt(conn, vec![one], how).await? {
+            match self.attempt(conn, vec![one], how, known).await? {
                 Ok(keys) => written.extend(keys),
                 Err(e) => refused.push(Refused {
                     at,
@@ -784,17 +929,50 @@ where
         Ok((written, refused))
     }
 
-    /// One write in a savepoint ([`row::released`]): a refusal comes back as
-    /// the inner error, for the rows to be tried one by one.
+    /// One write in a savepoint ([`row::released`]), with what the host files
+    /// with the rows it wrote: a refusal of either comes back as the inner
+    /// error, for the rows to be tried one by one.
     async fn attempt(
         &self,
         conn: &mut Conn,
         rows: Vec<R>,
         how: How,
+        known: Option<&P>,
     ) -> Result<Result<Vec<Key>, Error>, Error> {
         row::savepoint(conn).await?;
-        let result = self.write(conn, rows, how).await;
+        let result = self.filing(conn, rows, how, known).await;
         row::released(conn, result).await
+    }
+
+    /// Writes `rows`, then hands the host's [`FiledWith`] the ones written,
+    /// when there is one and the rows came from a replica (`known`): as
+    /// written, but read back for a table both sides write, whose server's
+    /// columns the replica's rows do not hold.
+    async fn filing(
+        &self,
+        conn: &mut Conn,
+        rows: Vec<R>,
+        how: How,
+        known: Option<&P>,
+    ) -> Result<Vec<Key>, Error> {
+        #[cfg(feature = "postgres")]
+        if let (Some(filed), Some(known)) = (self.filed, known) {
+            let keys = self.write(conn, rows.clone(), how).await?;
+            let written: Vec<R> = if let How::OnlyOwned(_) = how {
+                row::get_by_keys::<R>(conn, &keys).await?
+            } else {
+                let written: std::collections::HashSet<&Key> = keys.iter().collect();
+                rows.into_iter()
+                    .filter(|row| written.contains(&row.key()))
+                    .collect()
+            };
+            if !written.is_empty() {
+                filed(conn, &written, known).await?;
+            }
+            return Ok(keys);
+        }
+        let _ = known;
+        self.write(conn, rows, how).await
     }
 }
 
@@ -860,10 +1038,24 @@ async fn unheld<R: Row>(
     Ok(Vec::new())
 }
 
-impl<R, P: Sync> Ops<P> for Typed<R, P>
+impl<R, P: Sync + 'static> Ops<P> for Typed<R, P>
 where
     R: Row + Clone + Send + Sync,
 {
+    #[cfg(feature = "postgres")]
+    fn file_with(&mut self, filed: &dyn std::any::Any) -> Result<(), &'static str> {
+        let Some(filed) = filed.downcast_ref::<FiledWith<R, P>>() else {
+            return Err("takes rows of another type than the table's");
+        };
+        if !R::MIRROR.goes_up() {
+            return Err("is of a table replicas never write: nothing of it is filed");
+        }
+        if self.filed.replace(*filed).is_some() {
+            return Err("is the table's second: a table files one");
+        }
+        Ok(())
+    }
+
     fn load<'a>(&'a self, conn: &'a mut Conn, keys: &'a [Key]) -> Fut<'a, Encoded> {
         Box::pin(async move {
             let mut encoded = Encoded::default();
@@ -909,7 +1101,7 @@ where
                     });
                 }
             }
-            let (_, again) = self.guarded(conn, pending, How::AllButOwned).await?;
+            let (_, again) = self.guarded(conn, pending, How::AllButOwned, None).await?;
             refused.extend(again);
             Ok(refused)
         })
@@ -958,9 +1150,18 @@ where
                     own
                 });
             }
+            // Of a key the upload carries twice, the last row is the one
+            // offered, and the one written.
+            let mut seen = std::collections::HashSet::new();
+            let mut rows: Vec<(usize, R)> = rows
+                .into_iter()
+                .rev()
+                .filter(|(_, row)| seen.insert(row.key()))
+                .collect();
+            rows.reverse();
             let offered: Vec<(usize, Key)> =
                 rows.iter().map(|(at, row)| (*at, row.key())).collect();
-            let (written, refused) = self.guarded(conn, rows, how).await?;
+            let (written, refused) = self.guarded(conn, rows, how, Some(known)).await?;
             rejected.extend(refused);
             if let How::OnlyOwned(_) = how {
                 let unwritten: Vec<(usize, Key)> = offered
