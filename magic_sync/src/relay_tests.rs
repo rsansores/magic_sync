@@ -1293,6 +1293,12 @@ fn ledger<'c>(
                     return Err(Error::host(false, "a reading the ledger refuses"));
                 }
                 "busy" if BUGGY.get() => return Err(Error::host(true, "the ledger is away")),
+                // A host that catches a statement's error, and goes on.
+                "swallowed" => {
+                    let _ = sqlx::query("INSERT INTO fixture.nowhere VALUES (1)")
+                        .execute(&mut *conn)
+                        .await;
+                }
                 _ => {}
             }
             sqlx::query("INSERT INTO fixture.ledger VALUES ($1, $2, $3)")
@@ -1315,7 +1321,8 @@ fn under_its_sender(reading: &mut crate::testkit::records::Reading, sender: Uuid
 async fn ledgered(world: &World) -> Vec<Codec<()>> {
     use crate::testkit::records::{reading_from_wire, reading_to_wire, Reading, ReadingRow};
     sqlx::raw_sql(
-        "CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL); \
+        "CREATE TABLE fixture.readings (id UUID PRIMARY KEY, replica_id UUID NOT NULL, \
+             value TEXT NOT NULL CHECK (value <> 'refused')); \
          CREATE TABLE fixture.ledger (id UUID PRIMARY KEY, replica_id UUID NOT NULL, value TEXT NOT NULL)",
     )
     .execute(&world.pool)
@@ -3844,4 +3851,35 @@ async fn an_engine_that_sends_nothing_down_plans_its_notes_to_nothing(pool: crat
         0
     );
     assert_eq!(world.count("SELECT count(*) FROM sync.outbox").await, 0);
+}
+
+/// A row the database refuses is not handed; one whose `filed` caught a
+/// statement's error, leaving the transaction aborted, is refused as if it
+/// had failed: each waits in the inbox, and the rest is filed with theirs.
+#[sqlx::test(migrations = false)]
+async fn a_row_refused_or_left_aborted_is_neither_filed_nor_handed(pool: crate::DbPool) {
+    let world = world(pool).await;
+    let [a, _] = world.replicas;
+    let codecs = ledgered(&world).await;
+    let fine = Uuid::now_v7();
+    let upload = readings(&[
+        (fine, "fine"),
+        (Uuid::now_v7(), "refused"),
+        (Uuid::now_v7(), "swallowed"),
+    ]);
+    let mut tx = world.pool.begin().await.unwrap();
+    crate::filing::file(&mut tx, &codecs, &upload, a, &(), i64::MAX)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let ledger: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM fixture.ledger")
+        .fetch_all(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(ledger, [fine]);
+    assert_eq!(
+        world.count("SELECT count(*) FROM fixture.readings").await,
+        1
+    );
+    assert_eq!(world.count("SELECT count(*) FROM sync.inbox").await, 2);
 }

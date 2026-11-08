@@ -168,9 +168,9 @@ engine wrote:
   read back, so the server's columns are the server's.
 
 For all but such a record, write what a row implies by its key, an upsert,
-not a sum. A row is handed as sent, not read back: a column the table keeps
-or computes itself (a `created` one, a generated one, a trigger's) is the
-table's. A delete is not handed: `Server::receive` answers the keys a replica
+not a sum. But for a table both sides write, a row is handed as sent, not
+read back: a column the table keeps or computes itself (a `created` one, a
+generated one, a trigger's) is the table's. A delete is not handed: `Server::receive` answers the keys a replica
 deleted, in `Filed::gone`.
 
 `filed` runs table by table, in the order the upload lists them, so it sees
@@ -179,10 +179,11 @@ by one after a refusal or on the next delivery after a transient failure:
 only what it writes through its connection is kept once, so it queues a
 message in a table of yours rather than sending it.
 
-What it writes commits with the rows or not at all. When it fails, the
-engine files the upload's rows one by one, each with its own `filed`, and a
-row whose `filed` fails waits in the inbox as a row the database refused
-does, until a build that files it. A failure [`Error::is_transient`] calls
+What it writes commits with the rows or not at all. When it fails, or
+catches a statement's error and so leaves the transaction aborted, the
+engine files that table's rows of the upload one by one, each with its own
+`filed`, and a row whose `filed` fails waits in the inbox as a row the
+database refused does, until a build that files it. A failure [`Error::is_transient`] calls
 the machine's, a lock or a statement timeout among them, fails the whole
 upload, which is filed again: keep `filed` quick. The server refuses to start
 with a `filed` of another row type than its codec's, or of a table replicas

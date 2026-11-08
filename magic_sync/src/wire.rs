@@ -207,8 +207,7 @@ impl<P: Sync + 'static> Codec<P> {
     }
 
     /// The same table, and `filed` run with the rows each upload writes, in
-    /// the transaction that files them, once the engine wrote them, each as
-    /// the replica sent it and `place` left it:
+    /// the transaction that files them, once the engine wrote them:
     ///
     /// - a record: the rows the upload added. One already filed — the same
     ///   upload delivered again — is not handed again.
@@ -219,7 +218,8 @@ impl<P: Sync + 'static> Codec<P> {
     /// - a table both sides write: the rows the replica's columns were
     ///   written to, read back, the server's columns as the server holds them.
     ///
-    /// A row is handed as sent, not read back: what the table makes of it
+    /// But for a table both sides write, a row is handed as the replica sent
+    /// it and `place` left it, not read back: what the table makes of it
     /// itself — a `created` column it keeps, a generated column, a trigger, a
     /// value its type rounds — is the table's, not the row's. Of a key an
     /// upload carries twice, the row written; a row the database refused,
@@ -236,14 +236,18 @@ impl<P: Sync + 'static> Codec<P> {
     /// the connection it is handed is kept once: a message it sends, or a
     /// count it keeps in memory, is not.
     ///
-    /// What it writes is filed with the rows or not at all. When it fails,
-    /// the engine files the upload's rows one by one, each with its own
-    /// `filed`, and a row whose `filed` fails waits in the inbox, as a row the
-    /// database refused does, until a build that files it. A constraint it
-    /// defers to the commit is judged after the rows, and fails the upload
-    /// whole. A failure [`Error::is_transient`] calls the machine's — a lock
+    /// What it writes is filed with the rows or not at all. When it fails —
+    /// or leaves the transaction aborted, having caught a statement's error
+    /// — the engine files that table's rows of the upload one by one, each
+    /// with its own `filed`, and a row whose `filed` fails waits in the
+    /// inbox, as a row the database refused does, until a build that files
+    /// it. A constraint it defers to the commit is judged after every table:
+    /// the upload is kept whole in the inbox and filed again a row at a time. A failure [`Error::is_transient`] calls the machine's — a lock
     /// or a statement timeout among them — fails the whole upload, which is
     /// filed again: a `filed` that is slow holds up its replica's uploads.
+    ///
+    /// `filed` is the codec's, not the table's: a table two audiences
+    /// mirror runs it for the uploads of the audience whose codec has it.
     ///
     /// The server refuses to start ([`Error::Misuse`]) when `filed` is of
     /// another row type than the codec's, of a table replicas never write, or
@@ -1149,6 +1153,15 @@ where
                     own
                 });
             }
+            // Of a key the upload carries twice, the last row is the one
+            // offered, and the one written.
+            let mut seen = std::collections::HashSet::new();
+            let mut rows: Vec<(usize, R)> = rows
+                .into_iter()
+                .rev()
+                .filter(|(_, row)| seen.insert(row.key()))
+                .collect();
+            rows.reverse();
             let offered: Vec<(usize, Key)> =
                 rows.iter().map(|(at, row)| (*at, row.key())).collect();
             let (written, refused) = self.guarded(conn, rows, how, Some(known)).await?;

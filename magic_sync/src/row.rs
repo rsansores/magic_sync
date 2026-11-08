@@ -1226,12 +1226,17 @@ pub(crate) async fn released<T>(
     result: Result<T, Error>,
 ) -> Result<Result<T, Error>, Error> {
     let refusal = match result {
-        Ok(value) => {
-            sqlx::query("RELEASE SAVEPOINT sync_rows")
-                .execute(&mut *exec)
-                .await?;
-            return Ok(Ok(value));
-        }
+        // Work that answered as done but left the transaction aborted — a
+        // host's `filed` that caught a statement's error — is refused like
+        // the work that failed: the release fails, and the savepoint is
+        // rolled back to, not one around it.
+        Ok(value) => match sqlx::query("RELEASE SAVEPOINT sync_rows")
+            .execute(&mut *exec)
+            .await
+        {
+            Ok(_) => return Ok(Ok(value)),
+            Err(e) => Error::from(e),
+        },
         Err(e) if !e.is_refusal() => return Err(e),
         Err(e) => e,
     };
