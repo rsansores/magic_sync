@@ -107,6 +107,40 @@ impl<P> std::fmt::Debug for Codec<P> {
     }
 }
 
+/// What the codec's table is, as its row declares it: for a host that
+/// checks its own schema against what the engine reads — that every table a
+/// `from` view joins in is one whose writes the engine notes, say.
+impl<P> Codec<P> {
+    /// The table's name ([`Row::TABLE`](crate::row::Row::TABLE)).
+    #[must_use]
+    pub fn table(&self) -> &'static str {
+        self.table.name
+    }
+
+    /// The table's PostgreSQL schema ([`Row::SCHEMA`](crate::row::Row::SCHEMA)).
+    #[must_use]
+    pub fn schema(&self) -> &'static str {
+        self.table.schema
+    }
+
+    /// The view its rows are read from on the server when not the table:
+    /// the row's `from`.
+    #[cfg(feature = "postgres")]
+    #[must_use]
+    pub fn reads_from(&self) -> Option<&'static str> {
+        self.table.from
+    }
+
+    /// The columns whose parents' columns the row copies through its view:
+    /// the row's `depends`. A change of one of those parents is a change of
+    /// every row pointing at it.
+    #[cfg(feature = "postgres")]
+    #[must_use]
+    pub fn depends(&self) -> &'static [&'static str] {
+        self.table.depends
+    }
+}
+
 /// Why a row could not be mapped to its message, or a message back to its
 /// row: what a [`Codec::new`] mapper fails with. Any error converts into it
 /// with `?`.
