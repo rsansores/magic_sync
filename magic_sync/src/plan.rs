@@ -157,6 +157,12 @@ impl<P> Audience<P> {
     pub fn name(&self) -> &'static str {
         self.name
     }
+
+    /// The codecs of the tables it holds, parents first.
+    #[must_use]
+    pub fn codecs(&self) -> &[Codec<P>] {
+        &self.codecs
+    }
 }
 
 /// A foreign key from one mirrored table to another, as the child's columns

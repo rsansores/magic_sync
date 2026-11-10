@@ -668,6 +668,9 @@ pub struct magic_sync::wire::Codec<P>
 impl<P: core::marker::Sync + 'static> magic_sync::wire::Codec<P>
 pub fn magic_sync::wire::Codec<P>::json<R>(core::option::Option<magic_sync::wire::Place<R, P>>) -> Self where R: magic_sync::row::Row + core::clone::Clone + core::marker::Send + core::marker::Sync + serde_core::ser::Serialize + serde_core::de::DeserializeOwned
 pub fn magic_sync::wire::Codec<P>::new<R, M>(fn(R) -> core::result::Result<M, magic_sync::wire::MapError>, fn(M) -> core::result::Result<R, magic_sync::wire::MapError>, core::option::Option<magic_sync::wire::Place<R, P>>) -> Self where R: magic_sync::row::Row + core::clone::Clone + core::marker::Send + core::marker::Sync, M: prost::message::Message + core::default::Default + 'static
+impl<P> magic_sync::wire::Codec<P>
+pub fn magic_sync::wire::Codec<P>::schema(&self) -> &'static str
+pub fn magic_sync::wire::Codec<P>::table(&self) -> &'static str
 impl<P> core::fmt::Debug for magic_sync::wire::Codec<P>
 pub fn magic_sync::wire::Codec<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<P> core::marker::Freeze for magic_sync::wire::Codec<P> where alloc::boxed::Box<dyn Ops<P>>: core::marker::Freeze

@@ -1193,3 +1193,27 @@ async fn a_parent_keyed_by_its_partition_may_be_copied(pool: PgPool) {
     world.settle().await;
     assert_eq!(world.names(world.erp, "districts", "band"), set(&["high"]));
 }
+
+/// A host reads each table an audience holds as its row declares it, parents
+/// first: what it is, the view it is read from, and what it depends on.
+#[test]
+fn an_audience_says_what_it_holds() {
+    let erp = erp();
+    let held: Vec<_> = erp
+        .codecs()
+        .iter()
+        .map(|c| (c.schema(), c.table(), c.reads_from(), c.depends()))
+        .collect();
+    assert_eq!(
+        held,
+        [
+            ("fixture", "regions", None, &[][..]),
+            (
+                "fixture",
+                "districts",
+                Some("\"fixture\".\"erp_districts\""),
+                &["list_id"][..]
+            ),
+        ]
+    );
+}

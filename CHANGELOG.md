@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
+contract 2 (unchanged).
+
+- **What an audience holds, readable.** `Audience::codecs` answers the
+  codecs of the tables it holds, parents first, and each codec says what its
+  table is as its row declares it: `table` and `schema`, and on the server
+  `reads_from` (the row's `from`) and `depends`. For a host that checks its
+  own schema against what the engine reads — that every table a `from` view
+  joins in is one whose writes the engine notes — from the audience it
+  serves rather than a list of its rows kept beside it.
+  API: `plan::Audience::codecs`, `wire::Codec::{table, schema}`,
+  `wire::Codec::{reads_from, depends}` (server).
+
 ## 0.5.2 — 2026-11-08
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
