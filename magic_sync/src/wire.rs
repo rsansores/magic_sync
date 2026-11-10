@@ -111,13 +111,13 @@ impl<P> std::fmt::Debug for Codec<P> {
 /// checks its own schema against what the engine reads — that every table a
 /// `from` view joins in is one whose writes the engine notes, say.
 impl<P> Codec<P> {
-    /// The table's name ([`Row::TABLE`](crate::row::Row::TABLE)).
+    /// The table's name ([`Row::TABLE`]).
     #[must_use]
     pub fn table(&self) -> &'static str {
         self.table.name
     }
 
-    /// The table's PostgreSQL schema ([`Row::SCHEMA`](crate::row::Row::SCHEMA)).
+    /// The table's PostgreSQL schema ([`Row::SCHEMA`]).
     #[must_use]
     pub fn schema(&self) -> &'static str {
         self.table.schema
