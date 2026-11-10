@@ -11,6 +11,13 @@ all-features = true
 # graph (by default only a direct dependency is looked at); a yanked version too.
 yanked = "deny"
 unmaintained = "all"
+# FIXME: drop the entry once an sqlx release allows libsqlite3-sys 0.39 or
+# later. The fix is there, and sqlx 0.8 pins 0.30 while 0.9.0 caps it below
+# 0.38, so no sqlx can take it yet. The vulnerable C SQLite is the bundled one
+# sqlx's `sqlite` feature compiles in, on the replica side.
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys >= 0.39 is out of reach of every sqlx release" },
+]
 
 [licenses]
 # The example's programs and the book's snippets (publish = false) carry no
