@@ -50,7 +50,7 @@ use uuid::Uuid;
 ///     .live("enrolled_at IS NOT NULL")
 ///     .partitioned_by("company_id");
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Replicas {
     pub(crate) relation: &'static str,
     pub(crate) table: &'static str,
@@ -218,6 +218,7 @@ struct Group {
     assigned_replica: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct Plan {
     pub(crate) table: &'static str,
     relation: Relation,
@@ -392,11 +393,53 @@ pub fn migration(version: i32) -> Option<String> {
 /// the triggers and indexes it needs ([`Engine::triggers`],
 /// [`Engine::indexes`]), and how far along every
 /// replica is ([`status`](crate::status)).
+#[derive(Clone)]
 pub struct Engine {
     /// One planner per audience, in the order the host declared them.
     pub(crate) audiences: Vec<Planner>,
     /// Every trigger the audiences need, one per table.
     triggers: Vec<Trigger>,
+    /// What it was built from, for [`Engine::built_from`].
+    declared: Vec<Declaration>,
+}
+
+/// An audience as an engine was built from it: its name, its replicas and
+/// the schema and name of each table it holds, in order.
+#[derive(Clone, PartialEq, Eq)]
+struct Declaration {
+    name: &'static str,
+    replicas: Replicas,
+    tables: Vec<(&'static str, &'static str)>,
+}
+
+impl Declaration {
+    fn of(audiences: &[Declared<'_>]) -> Vec<Self> {
+        audiences
+            .iter()
+            .map(|a| Declaration {
+                name: a.name,
+                replicas: a.replicas,
+                tables: a.tables.iter().map(|t| (t.schema, t.name)).collect(),
+            })
+            .collect()
+    }
+}
+
+impl Engine {
+    /// Refuses `audiences` unless they are what this engine was built from:
+    /// the same audiences in the same order, each with the same replicas and
+    /// the same tables.
+    pub(crate) fn built_from(&self, audiences: &[Declared<'_>]) -> Result<(), Error> {
+        if self.declared == Declaration::of(audiences) {
+            Ok(())
+        } else {
+            Err(Error::Misuse(
+                "the engine was built from other audiences than these: a server takes the \
+                 engine of one over the same declarations"
+                    .to_owned(),
+            ))
+        }
+    }
 }
 
 impl std::fmt::Debug for Engine {
@@ -409,6 +452,7 @@ impl std::fmt::Debug for Engine {
 
 /// What one audience's replicas hold: its tables planned against its
 /// replicas.
+#[derive(Clone)]
 pub(crate) struct Planner {
     /// The audience's name.
     pub(crate) name: &'static str,
@@ -1318,6 +1362,7 @@ impl Engine {
         let mut engine = Engine {
             audiences: planners,
             triggers: Vec::new(),
+            declared: Declaration::of(audiences),
         };
         engine.triggers = engine.noted_rows()?;
         Ok(engine)

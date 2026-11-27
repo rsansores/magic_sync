@@ -54,6 +54,8 @@ pub async fn magic_sync::plan::Engine::wishes(&self, &mut magic_sync::Conn, magi
 impl magic_sync::plan::Engine
 pub async fn magic_sync::plan::Engine::indexes<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::plan::Audience<P>]) -> core::result::Result<alloc::string::String, magic_sync::Error>
 pub async fn magic_sync::plan::Engine::triggers<P: core::marker::Sync + 'static>(&mut magic_sync::Conn, &[magic_sync::plan::Audience<P>]) -> core::result::Result<alloc::string::String, magic_sync::Error>
+impl core::clone::Clone for magic_sync::plan::Engine
+pub fn magic_sync::plan::Engine::clone(&self) -> Self
 impl core::fmt::Debug for magic_sync::plan::Engine
 pub fn magic_sync::plan::Engine::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for magic_sync::plan::Engine
@@ -70,9 +72,13 @@ pub const fn magic_sync::plan::Replicas::new(&'static str, &'static str) -> Self
 pub const fn magic_sync::plan::Replicas::partitioned_by(self, &'static str) -> Self
 impl core::clone::Clone for magic_sync::plan::Replicas
 pub fn magic_sync::plan::Replicas::clone(&self) -> Self
+impl core::cmp::Eq for magic_sync::plan::Replicas
+impl core::cmp::PartialEq for magic_sync::plan::Replicas
+pub fn magic_sync::plan::Replicas::eq(&self, &Self) -> bool
 impl core::fmt::Debug for magic_sync::plan::Replicas
 pub fn magic_sync::plan::Replicas::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for magic_sync::plan::Replicas
+impl core::marker::StructuralPartialEq for magic_sync::plan::Replicas
 impl core::marker::Freeze for magic_sync::plan::Replicas
 impl core::marker::Send for magic_sync::plan::Replicas
 impl core::marker::Sync for magic_sync::plan::Replicas
@@ -280,6 +286,7 @@ pub async fn magic_sync::run::server::Server<S, T>::pass_now(&self) -> core::res
 pub async fn magic_sync::run::server::Server<S, T>::receive(&self, uuid::Uuid, &[u8]) -> core::result::Result<alloc::vec::Vec<magic_sync::run::server::Filed>, magic_sync::Error>
 pub async fn magic_sync::run::server::Server<S, T>::run(&self, impl core::future::future::Future<Output = ()>)
 pub async fn magic_sync::run::server::Server<S, T>::wishes<R: magic_sync::row::Setting>(&self, &mut magic_sync::Conn, &[magic_sync::row::Key]) -> core::result::Result<alloc::vec::Vec<magic_sync::run::server::WishOf<R>>, magic_sync::Error>
+pub fn magic_sync::run::server::Server<S, T>::with_engine(sqlx_postgres::PgPool, magic_sync::plan::Engine, alloc::vec::Vec<magic_sync::plan::Audience<<S as magic_sync::run::server::Senders>::Known>>, T, S, magic_sync::run::server::Settings) -> core::result::Result<Self, magic_sync::Error>
 pub async fn magic_sync::run::server::Server<S, T>::withdraw<R: magic_sync::row::Setting>(&self, &mut magic_sync::Conn, &magic_sync::row::Key) -> core::result::Result<bool, magic_sync::Error>
 impl<S: magic_sync::run::server::Senders, T: magic_sync::run::server::Transport> core::fmt::Debug for magic_sync::run::server::Server<S, T>
 pub fn magic_sync::run::server::Server<S, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
