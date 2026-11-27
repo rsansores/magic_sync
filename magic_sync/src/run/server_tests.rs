@@ -1865,3 +1865,61 @@ fn the_server_refuses_a_codec_given_a_filing_it_cannot_run() {
     )])
     .is_ok());
 }
+
+/// A server built on the engine another read from the same schema relays as
+/// that one does, with nothing read from the catalog again.
+#[sqlx::test(migrations = false)]
+async fn a_server_on_another_ones_engine_relays_as_it_does(pool: PgPool) {
+    let (partition, [a, _]) = world(&pool).await;
+    let audiences = || vec![crate::plan::Audience::new("test", REPLICAS, codecs())];
+    let first = Server::new(
+        pool.clone(),
+        audiences(),
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the first server");
+    let wire = Wire::default();
+    let second = Server::with_engine(
+        pool.clone(),
+        first.engine().clone(),
+        audiences(),
+        wire.clone(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .expect("a server on the first one's engine");
+    drop(first);
+    item(&pool, partition, "shared").await;
+    until(&[&second], || async { wire.items(a) == ["shared"] }).await;
+    assert_eq!(wire.items(a), ["shared"]);
+}
+
+/// An engine is taken only over the declarations it was built from.
+#[sqlx::test(migrations = false)]
+async fn an_engine_refuses_other_audiences(pool: PgPool) {
+    world(&pool).await;
+    let first = Server::new(
+        pool.clone(),
+        vec![crate::plan::Audience::new("test", REPLICAS, codecs())],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    )
+    .await
+    .expect("the first server");
+    let other = Server::with_engine(
+        pool.clone(),
+        first.engine().clone(),
+        vec![crate::plan::Audience::new("other", REPLICAS, codecs())],
+        Wire::default(),
+        Anyone::new(pool.clone()),
+        settings(),
+    );
+    assert!(
+        matches!(other, Err(Error::Misuse(ref m)) if m.contains("other audiences")),
+        "{other:?}"
+    );
+}

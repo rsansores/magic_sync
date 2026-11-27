@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.4 — unreleased
+
+Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard
+contract 2 (unchanged).
+
+- **A server on another one's engine.** `Server::with_engine` builds a server
+  from the engine another server read, over a database its migrations set up
+  the same way, without reading the catalog again: `Server::new` checks every
+  table against its row, every trigger and every index, which a host that
+  starts many servers over identical databases — a test harness, one per
+  test — paid every time. Nothing in the database is read; the engine is
+  refused unless it was built from the same audiences, replicas and tables.
+  API: `run::server::Server::with_engine` (server), `plan::Engine: Clone`,
+  `plan::Replicas: PartialEq + Eq`.
+
 ## 0.5.3 — 2026-11-10
 
 Schemas: server 5, replica 4 (unchanged). Protocol 1 (unchanged). Dashboard

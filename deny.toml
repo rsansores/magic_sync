@@ -17,6 +17,7 @@ unmaintained = "all"
 # sqlx's `sqlite` feature compiles in, on the replica side.
 ignore = [
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys >= 0.39 is out of reach of every sqlx release" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; its types are in the API, so leaving it is a breaking release of its own" },
 ]
 
 [licenses]

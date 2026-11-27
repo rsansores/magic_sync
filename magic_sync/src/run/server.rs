@@ -335,6 +335,34 @@ impl<S: Senders, T: Transport> Server<S, T> {
         ))
     }
 
+    /// [`Server::new`] with the engine of another server, over a database
+    /// its migrations set up the same way, instead of reading it again from
+    /// this one's catalog: for a host that starts many servers over identical
+    /// databases — a test harness, one per test — and checks the schema once.
+    /// Nothing in the database is read: the caller vouches that it is the
+    /// schema `engine` was read from (`server.engine().clone()`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Misuse`] when `engine` was not built from `audiences` — other
+    /// audiences, replicas or tables — or for settings the server cannot run
+    /// with.
+    pub fn with_engine(
+        pool: PgPool,
+        engine: Engine,
+        audiences: Vec<Audience<S::Known>>,
+        transport: T,
+        senders: S,
+        settings: Settings,
+    ) -> Result<Self, Error> {
+        settings.check()?;
+        let audiences = with_wishes(audiences)?;
+        engine.built_from(&Declared::of(&audiences))?;
+        Ok(Self::with(
+            pool, engine, audiences, transport, senders, settings,
+        ))
+    }
+
     /// [`Server::new`], having first brought the database to what it needs,
     /// for a host with no migrations of its own: in one transaction, and one
     /// process at a time, the engine's schema installed or upgraded and every
